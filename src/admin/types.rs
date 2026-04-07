@@ -193,6 +193,8 @@ pub struct LoadBalancingModeResponse {
     pub queue_max_size: usize,
     /// 最大等待时间（毫秒，0 表示禁用等待队列）
     pub queue_max_wait_ms: u64,
+    /// 单账号触发 429 后的冷却时间（毫秒，0 表示禁用 429 冷却）
+    pub rate_limit_cooldown_ms: u64,
     /// 当前正在排队的请求数
     pub waiting_requests: usize,
 }
@@ -207,6 +209,8 @@ pub struct SetLoadBalancingModeRequest {
     pub queue_max_size: Option<usize>,
     /// 最大等待时间（毫秒，0 表示禁用等待队列）
     pub queue_max_wait_ms: Option<u64>,
+    /// 单账号触发 429 后的冷却时间（毫秒，0 表示禁用 429 冷却）
+    pub rate_limit_cooldown_ms: Option<u64>,
 }
 
 // ============ 通用响应 ============

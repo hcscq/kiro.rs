@@ -414,8 +414,6 @@ struct CredentialEntry {
     active_requests: usize,
     /// 429 限流冷却到期时间
     rate_limit_cooldown_until: Option<Instant>,
-    /// 连续 429 次数，用于指数退避
-    rate_limit_backoff_level: u32,
 }
 
 /// 禁用原因
@@ -506,6 +504,7 @@ pub struct LoadBalancingConfigSnapshot {
     pub mode: String,
     pub queue_max_size: usize,
     pub queue_max_wait_ms: u64,
+    pub rate_limit_cooldown_ms: u64,
     pub waiting_requests: usize,
 }
 
@@ -514,6 +513,7 @@ struct DispatchConfig {
     mode: String,
     queue_max_size: usize,
     queue_max_wait_ms: u64,
+    rate_limit_cooldown_ms: u64,
 }
 
 impl DispatchConfig {
@@ -522,6 +522,7 @@ impl DispatchConfig {
             mode: config.load_balancing_mode.clone(),
             queue_max_size: config.queue_max_size,
             queue_max_wait_ms: config.queue_max_wait_ms,
+            rate_limit_cooldown_ms: config.rate_limit_cooldown_ms,
         }
     }
 
@@ -531,6 +532,11 @@ impl DispatchConfig {
 
     fn queue_wait_duration(&self) -> StdDuration {
         StdDuration::from_millis(self.queue_max_wait_ms)
+    }
+
+    fn rate_limit_cooldown_duration(&self) -> Option<StdDuration> {
+        (self.rate_limit_cooldown_ms > 0)
+            .then(|| StdDuration::from_millis(self.rate_limit_cooldown_ms))
     }
 }
 
@@ -691,7 +697,6 @@ impl MultiTokenManager {
                     last_used_at: None,
                     active_requests: 0,
                     rate_limit_cooldown_until: None,
-                    rate_limit_backoff_level: 0,
                 }
             })
             .collect();
@@ -802,8 +807,14 @@ impl MultiTokenManager {
                 .is_some_and(|until| until <= now)
             {
                 entry.rate_limit_cooldown_until = None;
-                entry.rate_limit_backoff_level = 0;
             }
+        }
+    }
+
+    fn clear_all_rate_limit_cooldowns(&self) {
+        let mut entries = self.entries.lock();
+        for entry in entries.iter_mut() {
+            entry.rate_limit_cooldown_until = None;
         }
     }
 
@@ -1380,7 +1391,6 @@ impl MultiTokenManager {
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
                 entry.rate_limit_cooldown_until = None;
-                entry.rate_limit_backoff_level = 0;
                 entry.success_count += 1;
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
                 tracing::debug!(
@@ -1397,8 +1407,10 @@ impl MultiTokenManager {
     ///
     /// 对单账号施加短暂冷却，避免重试流量持续打到同一个受限账号上。
     pub fn report_rate_limited(&self, id: u64) {
-        const BASE_COOLDOWN_MS: u64 = 2_000;
-        const MAX_COOLDOWN_MS: u64 = 15_000;
+        let Some(cooldown) = self.dispatch_config().rate_limit_cooldown_duration() else {
+            tracing::warn!("凭据 #{} 遭遇上游 429，但当前已禁用 429 冷却", id);
+            return;
+        };
 
         let mut entries = self.entries.lock();
         if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
@@ -1406,21 +1418,13 @@ impl MultiTokenManager {
                 return;
             }
 
-            let level = entry.rate_limit_backoff_level.saturating_add(1).min(6);
-            let backoff = BASE_COOLDOWN_MS
-                .saturating_mul(2u64.saturating_pow((level - 1) as u32))
-                .min(MAX_COOLDOWN_MS);
-
-            entry.rate_limit_backoff_level = level;
-            entry.rate_limit_cooldown_until =
-                Some(Instant::now() + StdDuration::from_millis(backoff));
+            entry.rate_limit_cooldown_until = Some(Instant::now() + cooldown);
             entry.last_used_at = Some(Utc::now().to_rfc3339());
 
             tracing::warn!(
-                "凭据 #{} 遭遇上游 429，进入冷却 {}ms（连续限流 {} 次）",
+                "凭据 #{} 遭遇上游 429，进入冷却 {}ms",
                 id,
-                backoff,
-                level
+                cooldown.as_millis()
             );
         }
     }
@@ -1713,7 +1717,6 @@ impl MultiTokenManager {
                 entry.refresh_failure_count = 0;
                 entry.disabled_reason = None;
                 entry.rate_limit_cooldown_until = None;
-                entry.rate_limit_backoff_level = 0;
             } else {
                 entry.disabled_reason = Some(DisabledReason::Manual);
             }
@@ -1774,7 +1777,6 @@ impl MultiTokenManager {
             entry.disabled = false;
             entry.disabled_reason = None;
             entry.rate_limit_cooldown_until = None;
-            entry.rate_limit_backoff_level = 0;
         }
         // 持久化更改
         self.persist_credentials()?;
@@ -1966,7 +1968,6 @@ impl MultiTokenManager {
                 last_used_at: None,
                 active_requests: 0,
                 rate_limit_cooldown_until: None,
-                rate_limit_backoff_level: 0,
             });
         }
 
@@ -2090,6 +2091,7 @@ impl MultiTokenManager {
             mode: dispatch.mode,
             queue_max_size: dispatch.queue_max_size,
             queue_max_wait_ms: dispatch.queue_max_wait_ms,
+            rate_limit_cooldown_ms: dispatch.rate_limit_cooldown_ms,
             waiting_requests: self.queue_depth(),
         }
     }
@@ -2106,10 +2108,11 @@ impl MultiTokenManager {
             Some(path) => path.to_path_buf(),
             None => {
                 tracing::warn!(
-                    "配置文件路径未知，调度配置仅在当前进程生效: mode={}, queueMaxSize={}, queueMaxWaitMs={}",
+                    "配置文件路径未知，调度配置仅在当前进程生效: mode={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}",
                     dispatch.mode,
                     dispatch.queue_max_size,
-                    dispatch.queue_max_wait_ms
+                    dispatch.queue_max_wait_ms,
+                    dispatch.rate_limit_cooldown_ms
                 );
                 return Ok(());
             }
@@ -2120,6 +2123,7 @@ impl MultiTokenManager {
         config.load_balancing_mode = dispatch.mode.clone();
         config.queue_max_size = dispatch.queue_max_size;
         config.queue_max_wait_ms = dispatch.queue_max_wait_ms;
+        config.rate_limit_cooldown_ms = dispatch.rate_limit_cooldown_ms;
         config
             .save()
             .with_context(|| format!("持久化调度配置失败: {}", config_path.display()))?;
@@ -2129,7 +2133,7 @@ impl MultiTokenManager {
 
     /// 设置负载均衡模式（Admin API）
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
-        self.set_load_balancing_config(Some(mode), None, None)
+        self.set_load_balancing_config(Some(mode), None, None, None)
     }
 
     /// 设置调度配置（Admin API）
@@ -2138,6 +2142,7 @@ impl MultiTokenManager {
         mode: Option<String>,
         queue_max_size: Option<usize>,
         queue_max_wait_ms: Option<u64>,
+        rate_limit_cooldown_ms: Option<u64>,
     ) -> anyhow::Result<()> {
         let previous = self.dispatch_config();
         let mut next = previous.clone();
@@ -2156,6 +2161,9 @@ impl MultiTokenManager {
         if let Some(queue_max_wait_ms) = queue_max_wait_ms {
             next.queue_max_wait_ms = queue_max_wait_ms;
         }
+        if let Some(rate_limit_cooldown_ms) = rate_limit_cooldown_ms {
+            next.rate_limit_cooldown_ms = rate_limit_cooldown_ms;
+        }
 
         if previous == next {
             return Ok(());
@@ -2168,12 +2176,19 @@ impl MultiTokenManager {
             return Err(err);
         }
 
+        if previous.rate_limit_cooldown_ms != next.rate_limit_cooldown_ms
+            && next.rate_limit_cooldown_ms == 0
+        {
+            self.clear_all_rate_limit_cooldowns();
+        }
+
         self.availability_notify.notify_waiters();
         tracing::info!(
-            "调度配置已更新: mode={}, queueMaxSize={}, queueMaxWaitMs={}",
+            "调度配置已更新: mode={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}",
             next.mode,
             next.queue_max_size,
-            next.queue_max_wait_ms
+            next.queue_max_wait_ms,
+            next.rate_limit_cooldown_ms
         );
         Ok(())
     }
@@ -2564,7 +2579,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limited_credential_enters_cooldown_and_falls_back() {
-        let config = Config::default();
+        let mut config = Config::default();
+        config.rate_limit_cooldown_ms = 3_500;
         let primary = available_credential(0);
         let secondary = available_credential(1);
 
@@ -2582,6 +2598,10 @@ mod tests {
             primary_entry.cooldown_remaining_ms.unwrap_or_default() > 0,
             "主账号应处于限流冷却中"
         );
+        assert!(
+            primary_entry.cooldown_remaining_ms.unwrap_or_default() <= 3_500,
+            "冷却时间应受 rate_limit_cooldown_ms 限制"
+        );
     }
 
     #[test]
@@ -2590,7 +2610,7 @@ mod tests {
             std::env::temp_dir().join(format!("kiro-load-balancing-{}.json", uuid::Uuid::new_v4()));
         std::fs::write(
             &config_path,
-            r#"{"loadBalancingMode":"priority","queueMaxSize":0,"queueMaxWaitMs":0}"#,
+            r#"{"loadBalancingMode":"priority","queueMaxSize":0,"queueMaxWaitMs":0,"rateLimitCooldownMs":2000}"#,
         )
         .unwrap();
 
@@ -2600,13 +2620,19 @@ mod tests {
                 .unwrap();
 
         manager
-            .set_load_balancing_config(Some("balanced".to_string()), Some(8), Some(1500))
+            .set_load_balancing_config(
+                Some("balanced".to_string()),
+                Some(8),
+                Some(1500),
+                Some(4500),
+            )
             .unwrap();
 
         let persisted = Config::load(&config_path).unwrap();
         assert_eq!(persisted.load_balancing_mode, "balanced");
         assert_eq!(persisted.queue_max_size, 8);
         assert_eq!(persisted.queue_max_wait_ms, 1500);
+        assert_eq!(persisted.rate_limit_cooldown_ms, 4500);
         assert_eq!(manager.get_load_balancing_mode(), "balanced");
 
         std::fs::remove_file(&config_path).unwrap();

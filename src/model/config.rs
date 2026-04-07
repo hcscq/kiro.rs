@@ -98,6 +98,10 @@ pub struct Config {
     #[serde(default)]
     pub queue_max_wait_ms: u64,
 
+    /// 单账号遭遇上游 429 后的冷却时间（毫秒，0 表示禁用 429 冷却）
+    #[serde(default = "default_rate_limit_cooldown_ms")]
+    pub rate_limit_cooldown_ms: u64,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -140,6 +144,10 @@ fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
 
+fn default_rate_limit_cooldown_ms() -> u64 {
+    2_000
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -164,6 +172,7 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             queue_max_size: 0,
             queue_max_wait_ms: 0,
+            rate_limit_cooldown_ms: default_rate_limit_cooldown_ms(),
             config_path: None,
         }
     }

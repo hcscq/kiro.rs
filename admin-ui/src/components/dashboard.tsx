@@ -41,6 +41,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [batchRefreshProgress, setBatchRefreshProgress] = useState({ current: 0, total: 0 })
   const [queueMaxSizeInput, setQueueMaxSizeInput] = useState('0')
   const [queueMaxWaitMsInput, setQueueMaxWaitMsInput] = useState('0')
+  const [rateLimitCooldownMsInput, setRateLimitCooldownMsInput] = useState('2000')
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
   const itemsPerPage = 12
@@ -80,7 +81,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
     setQueueMaxSizeInput(String(loadBalancingData.queueMaxSize))
     setQueueMaxWaitMsInput(String(loadBalancingData.queueMaxWaitMs))
-  }, [loadBalancingData?.queueMaxSize, loadBalancingData?.queueMaxWaitMs])
+    setRateLimitCooldownMsInput(String(loadBalancingData.rateLimitCooldownMs))
+  }, [loadBalancingData?.queueMaxSize, loadBalancingData?.queueMaxWaitMs, loadBalancingData?.rateLimitCooldownMs])
 
   // 只保留当前仍存在的凭据缓存，避免删除后残留旧数据
   useEffect(() => {
@@ -521,21 +523,25 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const handleSaveQueueSettings = () => {
     const parsedQueueMaxSize = queueMaxSizeInput.trim() === '' ? 0 : parseInt(queueMaxSizeInput, 10)
     const parsedQueueMaxWaitMs = queueMaxWaitMsInput.trim() === '' ? 0 : parseInt(queueMaxWaitMsInput, 10)
+    const parsedRateLimitCooldownMs = rateLimitCooldownMsInput.trim() === '' ? 0 : parseInt(rateLimitCooldownMsInput, 10)
 
     if (
       Number.isNaN(parsedQueueMaxSize) ||
       Number.isNaN(parsedQueueMaxWaitMs) ||
+      Number.isNaN(parsedRateLimitCooldownMs) ||
       parsedQueueMaxSize < 0 ||
-      parsedQueueMaxWaitMs < 0
+      parsedQueueMaxWaitMs < 0 ||
+      parsedRateLimitCooldownMs < 0
     ) {
-      toast.error('最大排队数量和最大等待时间必须是大于等于 0 的整数')
+      toast.error('最大排队数量、最大等待时间和 429 冷却时间必须是大于等于 0 的整数')
       return
     }
 
     setLoadBalancingMode(
       {
         queueMaxSize: parsedQueueMaxSize,
-        queueMaxWaitMs: parsedQueueMaxWaitMs
+        queueMaxWaitMs: parsedQueueMaxWaitMs,
+        rateLimitCooldownMs: parsedRateLimitCooldownMs
       },
       {
         onSuccess: () => {
@@ -663,7 +669,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
           <CardHeader className="pb-3">
             <CardTitle className="text-sm font-medium">调度设置</CardTitle>
           </CardHeader>
-          <CardContent className="grid gap-4 lg:grid-cols-[220px,1fr,1fr,auto] lg:items-end">
+          <CardContent className="grid gap-4 lg:grid-cols-[220px,1fr,1fr,1fr,auto] lg:items-end">
             <div className="space-y-2">
               <div className="text-sm text-muted-foreground">当前模式</div>
               <div className="flex items-center gap-2">
@@ -706,6 +712,21 @@ export function Dashboard({ onLogout }: DashboardProps) {
               />
             </div>
 
+            <div className="space-y-2">
+              <label className="text-sm font-medium" htmlFor="rateLimitCooldownMs">
+                429 冷却时间（毫秒）
+              </label>
+              <Input
+                id="rateLimitCooldownMs"
+                type="number"
+                min="0"
+                step="100"
+                value={rateLimitCooldownMsInput}
+                onChange={(e) => setRateLimitCooldownMsInput(e.target.value)}
+                placeholder="0 表示关闭 429 冷却"
+              />
+            </div>
+
             <Button
               onClick={handleSaveQueueSettings}
               disabled={isLoadingMode || isSettingMode}
@@ -713,8 +734,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
               保存配置
             </Button>
 
-            <p className="text-sm text-muted-foreground lg:col-span-4">
-              将任一项设为 0 可关闭等待队列。建议先从 `queueMaxWaitMs=1000-3000`、`queueMaxSize=总并发的 1-2 倍` 开始。
+            <p className="text-sm text-muted-foreground lg:col-span-5">
+              将任一项设为 0 可关闭对应能力。建议先从 `queueMaxWaitMs=1000-3000`、`queueMaxSize=总并发的 1-2 倍`、`rateLimitCooldownMs=2000-5000` 开始。
             </p>
           </CardContent>
         </Card>

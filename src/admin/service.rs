@@ -270,6 +270,7 @@ impl AdminService {
             mode: snapshot.mode,
             queue_max_size: snapshot.queue_max_size,
             queue_max_wait_ms: snapshot.queue_max_wait_ms,
+            rate_limit_cooldown_ms: snapshot.rate_limit_cooldown_ms,
             waiting_requests: snapshot.waiting_requests,
         }
     }
@@ -279,7 +280,11 @@ impl AdminService {
         &self,
         req: SetLoadBalancingModeRequest,
     ) -> Result<LoadBalancingModeResponse, AdminServiceError> {
-        if req.mode.is_none() && req.queue_max_size.is_none() && req.queue_max_wait_ms.is_none() {
+        if req.mode.is_none()
+            && req.queue_max_size.is_none()
+            && req.queue_max_wait_ms.is_none()
+            && req.rate_limit_cooldown_ms.is_none()
+        {
             return Ok(self.get_load_balancing_mode());
         }
         if let Some(mode) = &req.mode {
@@ -291,7 +296,12 @@ impl AdminService {
         }
 
         self.token_manager
-            .set_load_balancing_config(req.mode.clone(), req.queue_max_size, req.queue_max_wait_ms)
+            .set_load_balancing_config(
+                req.mode.clone(),
+                req.queue_max_size,
+                req.queue_max_wait_ms,
+                req.rate_limit_cooldown_ms,
+            )
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
         Ok(self.get_load_balancing_mode())

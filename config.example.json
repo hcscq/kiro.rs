@@ -7,5 +7,6 @@
   "adminApiKey": "sk-admin-your-secret-key",
   "loadBalancingMode": "balanced",
   "queueMaxSize": 16,
-  "queueMaxWaitMs": 1500
+  "queueMaxWaitMs": 1500,
+  "rateLimitCooldownMs": 2000
 }

@@ -91,6 +91,7 @@ export interface LoadBalancingConfigResponse {
   mode: 'priority' | 'balanced'
   queueMaxSize: number
   queueMaxWaitMs: number
+  rateLimitCooldownMs: number
   waitingRequests: number
 }
 
@@ -98,4 +99,5 @@ export interface UpdateLoadBalancingConfigRequest {
   mode?: 'priority' | 'balanced'
   queueMaxSize?: number
   queueMaxWaitMs?: number
+  rateLimitCooldownMs?: number
 }
