@@ -9,8 +9,8 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse,
+        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest,
+        SetMaxConcurrencyRequest, SetPriorityRequest, SuccessResponse,
     },
 };
 
@@ -48,6 +48,31 @@ pub async fn set_credential_priority(
         Ok(_) => Json(SuccessResponse::new(format!(
             "凭据 #{} 优先级已设置为 {}",
             id, payload.priority
+        )))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/max-concurrency
+/// 设置凭据并发上限
+pub async fn set_credential_max_concurrency(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetMaxConcurrencyRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .set_max_concurrency(id, payload.max_concurrency)
+    {
+        Ok(_) => Json(SuccessResponse::new(format!(
+            "凭据 #{} 并发上限已设置为 {}",
+            id,
+            payload
+                .max_concurrency
+                .filter(|limit| *limit > 0)
+                .map(|limit| limit.to_string())
+                .unwrap_or_else(|| "不限".to_string())
         )))
         .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),

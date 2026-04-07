@@ -20,6 +20,8 @@ export interface CredentialStatusItem {
   refreshTokenHash?: string
   successCount: number
   lastUsedAt: string | null
+  inFlight: number
+  maxConcurrency?: number | null
   hasProxy: boolean
   proxyUrl?: string
   refreshFailureCount: number
@@ -67,6 +69,7 @@ export interface AddCredentialRequest {
   clientId?: string
   clientSecret?: string
   priority?: number
+  maxConcurrency?: number
   authRegion?: string
   apiRegion?: string
   machineId?: string

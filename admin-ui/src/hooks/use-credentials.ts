@@ -2,6 +2,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   getCredentials,
   setCredentialDisabled,
+  setCredentialMaxConcurrency,
   setCredentialPriority,
   resetCredentialFailure,
   forceRefreshToken,
@@ -50,6 +51,18 @@ export function useSetPriority() {
   return useMutation({
     mutationFn: ({ id, priority }: { id: number; priority: number }) =>
       setCredentialPriority(id, priority),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 设置并发上限
+export function useSetMaxConcurrency() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, maxConcurrency }: { id: number; maxConcurrency: number | null }) =>
+      setCredentialMaxConcurrency(id, maxConcurrency),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },

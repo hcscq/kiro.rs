@@ -27,6 +27,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [clientId, setClientId] = useState('')
   const [clientSecret, setClientSecret] = useState('')
   const [priority, setPriority] = useState('0')
+  const [maxConcurrency, setMaxConcurrency] = useState('')
   const [machineId, setMachineId] = useState('')
   const [proxyUrl, setProxyUrl] = useState('')
   const [proxyUsername, setProxyUsername] = useState('')
@@ -42,6 +43,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setClientId('')
     setClientSecret('')
     setPriority('0')
+    setMaxConcurrency('')
     setMachineId('')
     setProxyUrl('')
     setProxyUsername('')
@@ -63,6 +65,17 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       return
     }
 
+    const parsedMaxConcurrency = maxConcurrency.trim()
+      ? parseInt(maxConcurrency, 10)
+      : undefined
+    if (
+      parsedMaxConcurrency !== undefined &&
+      (!Number.isInteger(parsedMaxConcurrency) || parsedMaxConcurrency <= 0)
+    ) {
+      toast.error('并发上限必须是大于 0 的整数')
+      return
+    }
+
     mutate(
       {
         refreshToken: refreshToken.trim(),
@@ -72,6 +85,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         clientId: clientId.trim() || undefined,
         clientSecret: clientSecret.trim() || undefined,
         priority: parseInt(priority) || 0,
+        maxConcurrency: parsedMaxConcurrency,
         machineId: machineId.trim() || undefined,
         proxyUrl: proxyUrl.trim() || undefined,
         proxyUsername: proxyUsername.trim() || undefined,
@@ -206,6 +220,24 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               />
               <p className="text-xs text-muted-foreground">
                 数字越小优先级越高，默认为 0
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <label htmlFor="maxConcurrency" className="text-sm font-medium">
+                并发上限
+              </label>
+              <Input
+                id="maxConcurrency"
+                type="number"
+                min="1"
+                placeholder="留空表示不限制"
+                value={maxConcurrency}
+                onChange={(e) => setMaxConcurrency(e.target.value)}
+                disabled={isPending}
+              />
+              <p className="text-xs text-muted-foreground">
+                每个账号允许同时处理的请求数。达到上限后会切到其他可用账号
               </p>
             </div>
 

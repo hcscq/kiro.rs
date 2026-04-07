@@ -18,6 +18,7 @@ import {
 import type { CredentialStatusItem, BalanceResponse } from '@/types/api'
 import {
   useSetDisabled,
+  useSetMaxConcurrency,
   useSetPriority,
   useResetFailure,
   useDeleteCredential,
@@ -59,9 +60,14 @@ export function CredentialCard({
 }: CredentialCardProps) {
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
+  const [editingMaxConcurrency, setEditingMaxConcurrency] = useState(false)
+  const [maxConcurrencyValue, setMaxConcurrencyValue] = useState(
+    credential.maxConcurrency ? String(credential.maxConcurrency) : ''
+  )
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
 
   const setDisabled = useSetDisabled()
+  const setMaxConcurrency = useSetMaxConcurrency()
   const setPriority = useSetPriority()
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
@@ -93,6 +99,31 @@ export function CredentialCard({
         onSuccess: (res) => {
           toast.success(res.message)
           setEditingPriority(false)
+        },
+        onError: (err) => {
+          toast.error('操作失败: ' + (err as Error).message)
+        },
+      }
+    )
+  }
+
+  const handleMaxConcurrencyChange = () => {
+    const trimmed = maxConcurrencyValue.trim()
+    const parsed = trimmed ? Number.parseInt(trimmed, 10) : undefined
+    if (
+      trimmed &&
+      (parsed === undefined || !Number.isInteger(parsed) || parsed <= 0)
+    ) {
+      toast.error('并发上限必须是大于 0 的整数，留空表示不限制')
+      return
+    }
+
+    setMaxConcurrency.mutate(
+      { id: credential.id, maxConcurrency: parsed ?? null },
+      {
+        onSuccess: (res) => {
+          toast.success(res.message)
+          setEditingMaxConcurrency(false)
         },
         onError: (err) => {
           toast.error('操作失败: ' + (err as Error).message)
@@ -220,6 +251,51 @@ export function CredentialCard({
               )}
             </div>
             <div>
+              <span className="text-muted-foreground">并发上限：</span>
+              {editingMaxConcurrency ? (
+                <div className="inline-flex items-center gap-1 ml-1">
+                  <Input
+                    type="number"
+                    value={maxConcurrencyValue}
+                    onChange={(e) => setMaxConcurrencyValue(e.target.value)}
+                    className="w-20 h-7 text-sm"
+                    min="1"
+                    placeholder="不限"
+                  />
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-7 w-7 p-0"
+                    onClick={handleMaxConcurrencyChange}
+                    disabled={setMaxConcurrency.isPending}
+                  >
+                    ✓
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-7 w-7 p-0"
+                    onClick={() => {
+                      setEditingMaxConcurrency(false)
+                      setMaxConcurrencyValue(
+                        credential.maxConcurrency ? String(credential.maxConcurrency) : ''
+                      )
+                    }}
+                  >
+                    ✕
+                  </Button>
+                </div>
+              ) : (
+                <span
+                  className="font-medium cursor-pointer hover:underline ml-1"
+                  onClick={() => setEditingMaxConcurrency(true)}
+                >
+                  {credential.maxConcurrency ?? '不限'}
+                  <span className="text-xs text-muted-foreground ml-1">(点击编辑)</span>
+                </span>
+              )}
+            </div>
+            <div>
               <span className="text-muted-foreground">失败次数：</span>
               <span className={credential.failureCount > 0 ? 'text-red-500 font-medium' : ''}>
                 {credential.failureCount}
@@ -242,6 +318,13 @@ export function CredentialCard({
             <div>
               <span className="text-muted-foreground">成功次数：</span>
               <span className="font-medium">{credential.successCount}</span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">当前并发：</span>
+              <span className="font-medium">
+                {credential.inFlight}
+                {credential.maxConcurrency ? ` / ${credential.maxConcurrency}` : ''}
+              </span>
             </div>
             <div className="col-span-2">
               <span className="text-muted-foreground">最后调用：</span>

@@ -57,6 +57,18 @@ export async function setCredentialPriority(
   return data
 }
 
+// 设置凭据并发上限
+export async function setCredentialMaxConcurrency(
+  id: number,
+  maxConcurrency: number | null
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/${id}/max-concurrency`,
+    { maxConcurrency }
+  )
+  return data
+}
+
 // 重置失败计数
 export async function resetCredentialFailure(
   id: number

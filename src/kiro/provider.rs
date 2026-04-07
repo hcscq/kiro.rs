@@ -4,6 +4,9 @@
 //! 支持流式和非流式请求
 //! 支持多凭据故障转移和重试
 
+use bytes::Bytes;
+use futures::stream::BoxStream;
+use futures::{StreamExt, stream};
 use reqwest::Client;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,7 +17,7 @@ use uuid::Uuid;
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{CallLease, MultiTokenManager};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
@@ -39,6 +42,46 @@ pub struct KiroProvider {
     tls_backend: TlsBackend,
 }
 
+pub struct ManagedResponse {
+    response: reqwest::Response,
+    _lease: CallLease,
+}
+
+impl ManagedResponse {
+    fn new(response: reqwest::Response, lease: CallLease) -> Self {
+        Self {
+            response,
+            _lease: lease,
+        }
+    }
+
+    pub async fn bytes(self) -> reqwest::Result<Bytes> {
+        let Self { response, _lease } = self;
+        response.bytes().await
+    }
+
+    pub async fn text(self) -> reqwest::Result<String> {
+        let Self { response, _lease } = self;
+        response.text().await
+    }
+
+    pub fn into_bytes_stream(self) -> BoxStream<'static, Result<Bytes, reqwest::Error>> {
+        let Self { response, _lease } = self;
+        let body_stream = response.bytes_stream();
+
+        stream::unfold(
+            (body_stream, _lease),
+            |(mut body_stream, lease)| async move {
+                body_stream
+                    .next()
+                    .await
+                    .map(|item| (item, (body_stream, lease)))
+            },
+        )
+        .boxed()
+    }
+}
+
 impl KiroProvider {
     /// 创建新的 KiroProvider 实例
     pub fn new(token_manager: Arc<MultiTokenManager>) -> Self {
@@ -49,8 +92,8 @@ impl KiroProvider {
     pub fn with_proxy(token_manager: Arc<MultiTokenManager>, proxy: Option<ProxyConfig>) -> Self {
         let tls_backend = token_manager.config().tls_backend;
         // 预热：构建全局代理对应的 Client
-        let initial_client = build_client(proxy.as_ref(), 720, tls_backend)
-            .expect("创建 HTTP 客户端失败");
+        let initial_client =
+            build_client(proxy.as_ref(), 720, tls_backend).expect("创建 HTTP 客户端失败");
         let mut cache = HashMap::new();
         cache.insert(proxy.clone(), initial_client);
 
@@ -97,7 +140,10 @@ impl KiroProvider {
 
     /// 获取 API 基础域名（使用 config 级 api_region）
     pub fn base_domain(&self) -> String {
-        format!("q.{}.amazonaws.com", self.token_manager.config().effective_api_region())
+        format!(
+            "q.{}.amazonaws.com",
+            self.token_manager.config().effective_api_region()
+        )
     }
 
     /// 获取凭据级 API 基础 URL
@@ -154,7 +200,7 @@ impl KiroProvider {
     ///
     /// # Returns
     /// 返回原始的 HTTP Response，不做解析
-    pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    pub async fn call_api(&self, request_body: &str) -> anyhow::Result<ManagedResponse> {
         self.call_api_with_retry(request_body, false).await
     }
 
@@ -171,7 +217,7 @@ impl KiroProvider {
     ///
     /// # Returns
     /// 返回原始的 HTTP Response，调用方负责处理流式数据
-    pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<ManagedResponse> {
         self.call_api_with_retry(request_body, true).await
     }
 
@@ -184,12 +230,12 @@ impl KiroProvider {
     ///
     /// # Returns
     /// 返回原始的 HTTP Response
-    pub async fn call_mcp(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    pub async fn call_mcp(&self, request_body: &str) -> anyhow::Result<ManagedResponse> {
         self.call_mcp_with_retry(request_body).await
     }
 
     /// 内部方法：带重试逻辑的 MCP API 调用
-    async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<ManagedResponse> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
@@ -200,13 +246,13 @@ impl KiroProvider {
             let ctx = match self.token_manager.acquire_context(None).await {
                 Ok(c) => c,
                 Err(e) => {
-                    last_error = Some(e);
-                    continue;
+                    return Err(e);
                 }
             };
+            let (ctx_id, credentials, token, lease) = ctx.into_parts();
 
             let config = self.token_manager.config();
-            let machine_id = match machine_id::generate_from_credentials(&ctx.credentials, config) {
+            let machine_id = match machine_id::generate_from_credentials(&credentials, config) {
                 Some(id) => id,
                 None => {
                     last_error = Some(anyhow::anyhow!("无法生成 machine_id，请检查凭证配置"));
@@ -214,8 +260,11 @@ impl KiroProvider {
                 }
             };
 
-            let url = self.mcp_url_for(&ctx.credentials);
-            let x_amz_user_agent = format!("aws-sdk-js/1.0.34 KiroIDE-{}-{}", config.kiro_version, machine_id);
+            let url = self.mcp_url_for(&credentials);
+            let x_amz_user_agent = format!(
+                "aws-sdk-js/1.0.34 KiroIDE-{}-{}",
+                config.kiro_version, machine_id
+            );
             let user_agent = format!(
                 "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
                 config.system_version, config.node_version, config.kiro_version, machine_id
@@ -223,23 +272,23 @@ impl KiroProvider {
 
             // 发送请求
             let mut request = self
-                .client_for(&ctx.credentials)?
+                .client_for(&credentials)?
                 .post(&url)
                 .body(request_body.to_string())
                 .header("content-type", "application/json");
 
             // MCP 请求需要携带 profile ARN（如果凭据中存在）
-            if let Some(ref arn) = ctx.credentials.profile_arn {
+            if let Some(ref arn) = credentials.profile_arn {
                 request = request.header("x-amzn-kiro-profile-arn", arn);
             }
 
             let response = match request
                 .header("x-amz-user-agent", &x_amz_user_agent)
                 .header("user-agent", &user_agent)
-                .header("host", &self.base_domain_for(&ctx.credentials))
+                .header("host", &self.base_domain_for(&credentials))
                 .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
                 .header("amz-sdk-request", "attempt=1; max=3")
-                .header("Authorization", format!("Bearer {}", ctx.token))
+                .header("Authorization", format!("Bearer {}", token))
                 .header("Connection", "close")
                 .send()
                 .await
@@ -264,8 +313,8 @@ impl KiroProvider {
 
             // 成功响应
             if status.is_success() {
-                self.token_manager.report_success(ctx.id);
-                return Ok(response);
+                self.token_manager.report_success(ctx_id);
+                return Ok(ManagedResponse::new(response, lease));
             }
 
             // 失败响应
@@ -273,7 +322,7 @@ impl KiroProvider {
 
             // 402 额度用尽
             if status.as_u16() == 402 && Self::is_monthly_request_limit(&body) {
-                let has_available = self.token_manager.report_quota_exhausted(ctx.id);
+                let has_available = self.token_manager.report_quota_exhausted(ctx_id);
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
                 }
@@ -288,7 +337,7 @@ impl KiroProvider {
 
             // 401/403 凭据问题
             if matches!(status.as_u16(), 401 | 403) {
-                let has_available = self.token_manager.report_failure(ctx.id);
+                let has_available = self.token_manager.report_failure(ctx_id);
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
                 }
@@ -339,7 +388,7 @@ impl KiroProvider {
         &self,
         request_body: &str,
         is_stream: bool,
-    ) -> anyhow::Result<reqwest::Response> {
+    ) -> anyhow::Result<ManagedResponse> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
@@ -353,13 +402,13 @@ impl KiroProvider {
             let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
                 Ok(c) => c,
                 Err(e) => {
-                    last_error = Some(e);
-                    continue;
+                    return Err(e);
                 }
             };
+            let (ctx_id, credentials, token, lease) = ctx.into_parts();
 
             let config = self.token_manager.config();
-            let machine_id = match machine_id::generate_from_credentials(&ctx.credentials, config) {
+            let machine_id = match machine_id::generate_from_credentials(&credentials, config) {
                 Some(id) => id,
                 None => {
                     last_error = Some(anyhow::anyhow!("无法生成 machine_id，请检查凭证配置"));
@@ -367,8 +416,11 @@ impl KiroProvider {
                 }
             };
 
-            let url = self.base_url_for(&ctx.credentials);
-            let x_amz_user_agent = format!("aws-sdk-js/1.0.34 KiroIDE-{}-{}", config.kiro_version, machine_id);
+            let url = self.base_url_for(&credentials);
+            let x_amz_user_agent = format!(
+                "aws-sdk-js/1.0.34 KiroIDE-{}-{}",
+                config.kiro_version, machine_id
+            );
             let user_agent = format!(
                 "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
                 config.system_version, config.node_version, config.kiro_version, machine_id
@@ -376,7 +428,7 @@ impl KiroProvider {
 
             // 发送请求
             let response = match self
-                .client_for(&ctx.credentials)?
+                .client_for(&credentials)?
                 .post(&url)
                 .body(request_body.to_string())
                 .header("content-type", "application/json")
@@ -384,10 +436,10 @@ impl KiroProvider {
                 .header("x-amzn-kiro-agent-mode", "vibe")
                 .header("x-amz-user-agent", &x_amz_user_agent)
                 .header("user-agent", &user_agent)
-                .header("host", &self.base_domain_for(&ctx.credentials))
+                .header("host", &self.base_domain_for(&credentials))
                 .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
                 .header("amz-sdk-request", "attempt=1; max=3")
-                .header("Authorization", format!("Bearer {}", ctx.token))
+                .header("Authorization", format!("Bearer {}", token))
                 .header("Connection", "close")
                 .send()
                 .await
@@ -414,8 +466,8 @@ impl KiroProvider {
 
             // 成功响应
             if status.is_success() {
-                self.token_manager.report_success(ctx.id);
-                return Ok(response);
+                self.token_manager.report_success(ctx_id);
+                return Ok(ManagedResponse::new(response, lease));
             }
 
             // 失败响应：读取 body 用于日志/错误信息
@@ -431,7 +483,7 @@ impl KiroProvider {
                     body
                 );
 
-                let has_available = self.token_manager.report_quota_exhausted(ctx.id);
+                let has_available = self.token_manager.report_quota_exhausted(ctx_id);
                 if !has_available {
                     anyhow::bail!(
                         "{} API 请求失败（所有凭据已用尽）: {} {}",
@@ -465,7 +517,7 @@ impl KiroProvider {
                     body
                 );
 
-                let has_available = self.token_manager.report_failure(ctx.id);
+                let has_available = self.token_manager.report_failure(ctx_id);
                 if !has_available {
                     anyhow::bail!(
                         "{} API 请求失败（所有凭据已用尽）: {} {}",

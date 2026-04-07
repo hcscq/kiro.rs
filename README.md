@@ -35,7 +35,7 @@
 - **流式响应**: 支持 SSE (Server-Sent Events) 流式输出
 - **Token 自动刷新**: 自动管理和刷新 OAuth Token
 - **多凭据支持**: 支持配置多个凭据，按优先级自动故障转移
-- **负载均衡**: 支持 `priority`（按优先级）和 `balanced`（均衡分配）两种模式
+- **负载均衡**: 支持 `priority`（按优先级）和 `balanced`（按实时并发 + 成功次数均衡）两种模式
 - **智能重试**: 单凭据最多重试 3 次，单请求最多重试 9 次
 - **凭据回写**: 多凭据格式下自动回写刷新后的 Token
 - **Thinking 模式**: 支持 Claude 的 extended thinking 功能
@@ -165,6 +165,12 @@ docker-compose up
 
 需要将 `config.json` 和 `credentials.json` 挂载到容器中，具体参见 `docker-compose.yml`。
 
+GitHub Actions 镜像构建：
+- 推送到 `master` / `main` 会触发 [docker-build.yaml](.github/workflows/docker-build.yaml)，发布到 `ghcr.io/<GitHub用户名>/kiro-rs`
+- 分支推送会更新滚动标签 `latest` 和 `beta`
+- 推送 `v*` 标签或手动触发 workflow 会发布对应版本标签，并同步更新 `latest`
+- 本 fork 默认可直接拉取 `ghcr.io/hcscq/kiro-rs:latest`
+
 ## 配置详解
 
 ### config.json
@@ -234,6 +240,7 @@ docker-compose up
 | `clientId`     | string | IdC 登录的客户端 ID（IdC 认证必填）                     |
 | `clientSecret` | string | IdC 登录的客户端密钥（IdC 认证必填）                      |
 | `priority`     | number | 凭据优先级，数字越小越优先，默认为 0                         |
+| `maxConcurrency` | number | 单账号并发上限（可选，留空或 <= 0 表示不限制）             |
 | `region`       | string | 凭据级 Auth Region, 兼容字段                       |
 | `authRegion`   | string | 凭据级 Auth Region，用于 Token 刷新, 未配置时回退到 region |
 | `apiRegion`    | string | 凭据级 API Region，用于 API 请求                    |
@@ -257,7 +264,8 @@ docker-compose up
    "expiresAt": "2025-12-31T02:32:45.144Z",
    "authMethod": "social",
    "clientId": "IdC 登录需要",
-   "clientSecret": "IdC 登录需要"
+   "clientSecret": "IdC 登录需要",
+   "maxConcurrency": 2
 }
 ```
 
@@ -269,7 +277,8 @@ docker-compose up
       "refreshToken": "第一个凭据的刷新token",
       "expiresAt": "2025-12-31T02:32:45.144Z",
       "authMethod": "social",
-      "priority": 0
+      "priority": 0,
+      "maxConcurrency": 2
    },
    {
       "refreshToken": "第二个凭据的刷新token",
@@ -279,6 +288,7 @@ docker-compose up
       "clientSecret": "xxxxxxxxx",
       "region": "us-east-2",
       "priority": 1,
+      "maxConcurrency": 1,
       "proxyUrl": "socks5://proxy.example.com:1080",
       "proxyUsername": "user",
       "proxyPassword": "pass"
@@ -295,6 +305,8 @@ docker-compose up
 
 多凭据特性：
 - 按 `priority` 字段排序，数字越小优先级越高（默认为 0）
+- `balanced` 模式会优先选择当前并发较低的账号；如果并发相同，再参考历史成功次数和 `priority`
+- `maxConcurrency` 可限制单账号最大并发，请求达到上限后会自动切到其他可用账号
 - 单凭据最多重试 3 次，单请求最多重试 9 次
 - 自动故障转移到下一个可用凭据
 - 多凭据格式下 Token 刷新后自动回写到源文件
@@ -448,6 +460,7 @@ RUST_LOG=debug ./target/release/kiro-rs
   - `DELETE /api/admin/credentials/:id` - 删除凭据
   - `POST /api/admin/credentials/:id/disabled` - 设置凭据禁用状态
   - `POST /api/admin/credentials/:id/priority` - 设置凭据优先级
+  - `POST /api/admin/credentials/:id/max-concurrency` - 设置凭据并发上限
   - `POST /api/admin/credentials/:id/reset` - 重置失败计数
   - `GET /api/admin/credentials/:id/balance` - 获取凭据余额
 

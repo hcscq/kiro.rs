@@ -46,6 +46,10 @@ pub struct CredentialStatusItem {
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
+    /// 当前运行中的请求数
+    pub in_flight: usize,
+    /// 单账号并发上限（空表示不限制）
+    pub max_concurrency: Option<u32>,
     /// 是否配置了凭据级代理
     pub has_proxy: bool,
     /// 代理 URL（用于前端展示）
@@ -76,6 +80,14 @@ pub struct SetPriorityRequest {
     pub priority: u32,
 }
 
+/// 修改并发上限请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetMaxConcurrencyRequest {
+    /// 并发上限，null 或 0 表示不限制
+    pub max_concurrency: Option<u32>,
+}
+
 /// 添加凭据请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -96,6 +108,9 @@ pub struct AddCredentialRequest {
     /// 优先级（可选，默认 0）
     #[serde(default)]
     pub priority: u32,
+
+    /// 单账号并发上限（可选）
+    pub max_concurrency: Option<u32>,
 
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region

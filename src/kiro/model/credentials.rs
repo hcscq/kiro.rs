@@ -51,6 +51,11 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "is_zero")]
     pub priority: u32,
 
+    /// 单账号并发上限（可选）
+    /// 未配置或 <= 0 时表示不限制
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<u32>,
+
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -267,6 +272,15 @@ impl KiroCredentials {
         }
     }
 
+    /// 获取有效的并发上限
+    ///
+    /// 返回 `None` 表示不限制并发。
+    pub fn effective_max_concurrency(&self) -> Option<usize> {
+        self.max_concurrency
+            .and_then(|limit| usize::try_from(limit).ok())
+            .filter(|limit| *limit > 0)
+    }
+
     /// 检查凭据是否支持 Opus 模型
     ///
     /// Free 账号不支持 Opus 模型，需要 PRO 或更高等级订阅
@@ -329,6 +343,7 @@ mod tests {
             client_id: None,
             client_secret: None,
             priority: 0,
+            max_concurrency: None,
             region: None,
             auth_region: None,
             api_region: None,
@@ -369,6 +384,23 @@ mod tests {
         let json = r#"{"refreshToken": "test", "priority": 5}"#;
         let creds = KiroCredentials::from_json(json).unwrap();
         assert_eq!(creds.priority, 5);
+    }
+
+    #[test]
+    fn test_effective_max_concurrency_none_when_missing_or_zero() {
+        let creds = KiroCredentials::default();
+        assert_eq!(creds.effective_max_concurrency(), None);
+
+        let json = r#"{"refreshToken":"test","maxConcurrency":0}"#;
+        let creds = KiroCredentials::from_json(json).unwrap();
+        assert_eq!(creds.effective_max_concurrency(), None);
+    }
+
+    #[test]
+    fn test_effective_max_concurrency_returns_positive_limit() {
+        let json = r#"{"refreshToken":"test","maxConcurrency":3}"#;
+        let creds = KiroCredentials::from_json(json).unwrap();
+        assert_eq!(creds.effective_max_concurrency(), Some(3));
     }
 
     #[test]
@@ -447,6 +479,7 @@ mod tests {
             client_id: None,
             client_secret: None,
             priority: 0,
+            max_concurrency: None,
             region: Some("eu-west-1".to_string()),
             auth_region: None,
             api_region: None,
@@ -477,6 +510,7 @@ mod tests {
             client_id: None,
             client_secret: None,
             priority: 0,
+            max_concurrency: None,
             region: None,
             auth_region: None,
             api_region: None,
@@ -589,6 +623,7 @@ mod tests {
             client_id: None,
             client_secret: None,
             priority: 3,
+            max_concurrency: None,
             region: Some("us-west-2".to_string()),
             auth_region: None,
             api_region: None,

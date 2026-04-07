@@ -73,6 +73,8 @@ impl AdminService {
                 email: entry.email,
                 success_count: entry.success_count,
                 last_used_at: entry.last_used_at.clone(),
+                in_flight: entry.active_requests,
+                max_concurrency: entry.max_concurrency,
                 has_proxy: entry.has_proxy,
                 proxy_url: entry.proxy_url,
                 refresh_failure_count: entry.refresh_failure_count,
@@ -112,6 +114,17 @@ impl AdminService {
     pub fn set_priority(&self, id: u64, priority: u32) -> Result<(), AdminServiceError> {
         self.token_manager
             .set_priority(id, priority)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 设置凭据并发上限
+    pub fn set_max_concurrency(
+        &self,
+        id: u64,
+        max_concurrency: Option<u32>,
+    ) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_max_concurrency(id, max_concurrency)
             .map_err(|e| self.classify_error(e, id))
     }
 
@@ -200,6 +213,7 @@ impl AdminService {
             client_id: req.client_id,
             client_secret: req.client_secret,
             priority: req.priority,
+            max_concurrency: req.max_concurrency,
             region: req.region,
             auth_region: req.auth_region,
             api_region: req.api_region,
@@ -415,7 +429,8 @@ impl AdminService {
         let msg = e.to_string();
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
-        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据") {
+        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据")
+        {
             AdminServiceError::InvalidCredential(msg)
         } else {
             AdminServiceError::InternalError(msg)
