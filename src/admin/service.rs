@@ -79,6 +79,7 @@ impl AdminService {
                 proxy_url: entry.proxy_url,
                 refresh_failure_count: entry.refresh_failure_count,
                 disabled_reason: entry.disabled_reason,
+                cooldown_remaining_ms: entry.cooldown_remaining_ms,
             })
             .collect();
 
@@ -264,8 +265,12 @@ impl AdminService {
 
     /// 获取负载均衡模式
     pub fn get_load_balancing_mode(&self) -> LoadBalancingModeResponse {
+        let snapshot = self.token_manager.load_balancing_config_snapshot();
         LoadBalancingModeResponse {
-            mode: self.token_manager.get_load_balancing_mode(),
+            mode: snapshot.mode,
+            queue_max_size: snapshot.queue_max_size,
+            queue_max_wait_ms: snapshot.queue_max_wait_ms,
+            waiting_requests: snapshot.waiting_requests,
         }
     }
 
@@ -274,18 +279,22 @@ impl AdminService {
         &self,
         req: SetLoadBalancingModeRequest,
     ) -> Result<LoadBalancingModeResponse, AdminServiceError> {
-        // 验证模式值
-        if req.mode != "priority" && req.mode != "balanced" {
-            return Err(AdminServiceError::InvalidCredential(
-                "mode 必须是 'priority' 或 'balanced'".to_string(),
-            ));
+        if req.mode.is_none() && req.queue_max_size.is_none() && req.queue_max_wait_ms.is_none() {
+            return Ok(self.get_load_balancing_mode());
+        }
+        if let Some(mode) = &req.mode {
+            if mode != "priority" && mode != "balanced" {
+                return Err(AdminServiceError::InvalidCredential(
+                    "mode 必须是 'priority' 或 'balanced'".to_string(),
+                ));
+            }
         }
 
         self.token_manager
-            .set_load_balancing_mode(req.mode.clone())
+            .set_load_balancing_config(req.mode.clone(), req.queue_max_size, req.queue_max_wait_ms)
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
-        Ok(LoadBalancingModeResponse { mode: req.mode })
+        Ok(self.get_load_balancing_mode())
     }
 
     /// 强制刷新指定凭据的 Token

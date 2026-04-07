@@ -90,6 +90,14 @@ pub struct Config {
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
+    /// 等待队列最大长度（0 表示禁用等待队列）
+    #[serde(default)]
+    pub queue_max_size: usize,
+
+    /// 请求在等待队列中的最大等待时间（毫秒，0 表示禁用等待队列）
+    #[serde(default)]
+    pub queue_max_wait_ms: u64,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -154,6 +162,8 @@ impl Default for Config {
             proxy_password: None,
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
+            queue_max_size: 0,
+            queue_max_wait_ms: 0,
             config_path: None,
         }
     }
@@ -206,7 +216,8 @@ impl Config {
             .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，无法保存配置"))?;
 
         let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
-        fs::write(path, content).with_context(|| format!("写入配置文件失败: {}", path.display()))?;
+        fs::write(path, content)
+            .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
     }
 }

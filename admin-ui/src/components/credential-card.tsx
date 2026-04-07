@@ -326,6 +326,14 @@ export function CredentialCard({
                 {credential.maxConcurrency ? ` / ${credential.maxConcurrency}` : ''}
               </span>
             </div>
+            {credential.cooldownRemainingMs && credential.cooldownRemainingMs > 0 && (
+              <div>
+                <span className="text-muted-foreground">429 冷却：</span>
+                <span className="font-medium text-amber-600">
+                  {(credential.cooldownRemainingMs / 1000).toFixed(1)}s
+                </span>
+              </div>
+            )}
             <div className="col-span-2">
               <span className="text-muted-foreground">最后调用：</span>
               <span className="font-medium">{formatLastUsed(credential.lastUsedAt)}</span>

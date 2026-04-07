@@ -60,6 +60,9 @@ pub struct CredentialStatusItem {
     /// 禁用原因
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
+    /// 429 冷却剩余时间（毫秒）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_remaining_ms: Option<u64>,
 }
 
 // ============ 操作请求 ============
@@ -180,20 +183,30 @@ pub struct BalanceResponse {
 
 // ============ 负载均衡配置 ============
 
-/// 负载均衡模式响应
+/// 负载均衡配置响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoadBalancingModeResponse {
     /// 当前模式（"priority" 或 "balanced"）
     pub mode: String,
+    /// 最大排队数量（0 表示禁用等待队列）
+    pub queue_max_size: usize,
+    /// 最大等待时间（毫秒，0 表示禁用等待队列）
+    pub queue_max_wait_ms: u64,
+    /// 当前正在排队的请求数
+    pub waiting_requests: usize,
 }
 
-/// 设置负载均衡模式请求
+/// 设置负载均衡配置请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetLoadBalancingModeRequest {
     /// 模式（"priority" 或 "balanced"）
-    pub mode: String,
+    pub mode: Option<String>,
+    /// 最大排队数量（0 表示禁用等待队列）
+    pub queue_max_size: Option<usize>,
+    /// 最大等待时间（毫秒，0 表示禁用等待队列）
+    pub queue_max_wait_ms: Option<u64>,
 }
 
 // ============ 通用响应 ============

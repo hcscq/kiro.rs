@@ -6,6 +6,7 @@ import { storage } from '@/lib/storage'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import { Input } from '@/components/ui/input'
 import { CredentialCard } from '@/components/credential-card'
 import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
@@ -38,6 +39,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [queryInfoProgress, setQueryInfoProgress] = useState({ current: 0, total: 0 })
   const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [batchRefreshProgress, setBatchRefreshProgress] = useState({ current: 0, total: 0 })
+  const [queueMaxSizeInput, setQueueMaxSizeInput] = useState('0')
+  const [queueMaxWaitMsInput, setQueueMaxWaitMsInput] = useState('0')
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
   const itemsPerPage = 12
@@ -70,6 +73,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
   useEffect(() => {
     setCurrentPage(1)
   }, [data?.credentials.length])
+
+  useEffect(() => {
+    if (!loadBalancingData) {
+      return
+    }
+    setQueueMaxSizeInput(String(loadBalancingData.queueMaxSize))
+    setQueueMaxWaitMsInput(String(loadBalancingData.queueMaxWaitMs))
+  }, [loadBalancingData?.queueMaxSize, loadBalancingData?.queueMaxWaitMs])
 
   // 只保留当前仍存在的凭据缓存，避免删除后残留旧数据
   useEffect(() => {
@@ -496,7 +507,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
     const currentMode = loadBalancingData?.mode || 'priority'
     const newMode = currentMode === 'priority' ? 'balanced' : 'priority'
 
-    setLoadBalancingMode(newMode, {
+    setLoadBalancingMode({ mode: newMode }, {
       onSuccess: () => {
         const modeName = newMode === 'priority' ? '优先级模式' : '均衡负载模式'
         toast.success(`已切换到${modeName}`)
@@ -505,6 +516,36 @@ export function Dashboard({ onLogout }: DashboardProps) {
         toast.error(`切换失败: ${extractErrorMessage(error)}`)
       }
     })
+  }
+
+  const handleSaveQueueSettings = () => {
+    const parsedQueueMaxSize = queueMaxSizeInput.trim() === '' ? 0 : parseInt(queueMaxSizeInput, 10)
+    const parsedQueueMaxWaitMs = queueMaxWaitMsInput.trim() === '' ? 0 : parseInt(queueMaxWaitMsInput, 10)
+
+    if (
+      Number.isNaN(parsedQueueMaxSize) ||
+      Number.isNaN(parsedQueueMaxWaitMs) ||
+      parsedQueueMaxSize < 0 ||
+      parsedQueueMaxWaitMs < 0
+    ) {
+      toast.error('最大排队数量和最大等待时间必须是大于等于 0 的整数')
+      return
+    }
+
+    setLoadBalancingMode(
+      {
+        queueMaxSize: parsedQueueMaxSize,
+        queueMaxWaitMs: parsedQueueMaxWaitMs
+      },
+      {
+        onSuccess: () => {
+          toast.success('调度配置已更新')
+        },
+        onError: (error) => {
+          toast.error(`保存失败: ${extractErrorMessage(error)}`)
+        }
+      }
+    )
   }
 
   if (isLoading) {
@@ -570,7 +611,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       {/* 主内容 */}
       <main className="container mx-auto px-4 md:px-8 py-6">
         {/* 统计卡片 */}
-        <div className="grid gap-4 md:grid-cols-3 mb-6">
+        <div className="grid gap-4 md:grid-cols-4 mb-6">
           <Card>
             <CardHeader className="pb-2">
               <CardTitle className="text-sm font-medium text-muted-foreground">
@@ -604,7 +645,79 @@ export function Dashboard({ onLogout }: DashboardProps) {
               </div>
             </CardContent>
           </Card>
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm font-medium text-muted-foreground">
+                当前排队
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="text-2xl font-bold">
+                {loadBalancingData?.waitingRequests ?? 0}
+              </div>
+            </CardContent>
+          </Card>
         </div>
+
+        <Card className="mb-6">
+          <CardHeader className="pb-3">
+            <CardTitle className="text-sm font-medium">调度设置</CardTitle>
+          </CardHeader>
+          <CardContent className="grid gap-4 lg:grid-cols-[220px,1fr,1fr,auto] lg:items-end">
+            <div className="space-y-2">
+              <div className="text-sm text-muted-foreground">当前模式</div>
+              <div className="flex items-center gap-2">
+                <Badge variant="secondary">
+                  {loadBalancingData?.mode === 'balanced' ? '均衡负载' : '优先级模式'}
+                </Badge>
+                <span className="text-sm text-muted-foreground">
+                  {loadBalancingData?.waitingRequests ?? 0} 个请求排队中
+                </span>
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-sm font-medium" htmlFor="queueMaxSize">
+                最大排队数量
+              </label>
+              <Input
+                id="queueMaxSize"
+                type="number"
+                min="0"
+                step="1"
+                value={queueMaxSizeInput}
+                onChange={(e) => setQueueMaxSizeInput(e.target.value)}
+                placeholder="0 表示关闭等待队列"
+              />
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-sm font-medium" htmlFor="queueMaxWaitMs">
+                最大等待时间（毫秒）
+              </label>
+              <Input
+                id="queueMaxWaitMs"
+                type="number"
+                min="0"
+                step="100"
+                value={queueMaxWaitMsInput}
+                onChange={(e) => setQueueMaxWaitMsInput(e.target.value)}
+                placeholder="0 表示关闭等待队列"
+              />
+            </div>
+
+            <Button
+              onClick={handleSaveQueueSettings}
+              disabled={isLoadingMode || isSettingMode}
+            >
+              保存配置
+            </Button>
+
+            <p className="text-sm text-muted-foreground lg:col-span-4">
+              将任一项设为 0 可关闭等待队列。建议先从 `queueMaxWaitMs=1000-3000`、`queueMaxSize=总并发的 1-2 倍` 开始。
+            </p>
+          </CardContent>
+        </Card>
 
         {/* 凭据列表 */}
         <div className="space-y-4">

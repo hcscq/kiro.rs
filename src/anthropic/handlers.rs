@@ -59,13 +59,35 @@ fn map_provider_error(err: Error) -> Response {
         )
             .into_response();
     }
-    if err_str.contains("并发上限") {
-        tracing::warn!(error = %err, "所有可用凭据并发已满");
+    if err_str.contains("等待队列已满") {
+        tracing::warn!(error = %err, "本地等待队列已满");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorResponse::new(
+                "rate_limit_error",
+                "Request queue is full. Retry later or raise queueMaxSize.",
+            )),
+        )
+            .into_response();
+    }
+    if err_str.contains("等待可用凭据超时") {
+        tracing::warn!(error = %err, "请求等待可用凭据超时");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse::new(
                 "service_unavailable",
-                "All available accounts are at their concurrency limit. Retry later or raise per-account maxConcurrency.",
+                "Timed out waiting for account capacity. Retry later or raise queueMaxWaitMs/maxConcurrency.",
+            )),
+        )
+            .into_response();
+    }
+    if err_str.contains("并发上限") {
+        tracing::warn!(error = %err, "所有可用凭据暂时不可用");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse::new(
+                "service_unavailable",
+                "All available accounts are saturated or cooling down. Retry later or raise per-account maxConcurrency.",
             )),
         )
             .into_response();

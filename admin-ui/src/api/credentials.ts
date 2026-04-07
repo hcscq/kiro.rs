@@ -8,6 +8,8 @@ import type {
   SetPriorityRequest,
   AddCredentialRequest,
   AddCredentialResponse,
+  LoadBalancingConfigResponse,
+  UpdateLoadBalancingConfigRequest,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -106,13 +108,15 @@ export async function deleteCredential(id: number): Promise<SuccessResponse> {
 }
 
 // 获取负载均衡模式
-export async function getLoadBalancingMode(): Promise<{ mode: 'priority' | 'balanced' }> {
-  const { data } = await api.get<{ mode: 'priority' | 'balanced' }>('/config/load-balancing')
+export async function getLoadBalancingMode(): Promise<LoadBalancingConfigResponse> {
+  const { data } = await api.get<LoadBalancingConfigResponse>('/config/load-balancing')
   return data
 }
 
 // 设置负载均衡模式
-export async function setLoadBalancingMode(mode: 'priority' | 'balanced'): Promise<{ mode: 'priority' | 'balanced' }> {
-  const { data } = await api.put<{ mode: 'priority' | 'balanced' }>('/config/load-balancing', { mode })
+export async function setLoadBalancingMode(
+  payload: UpdateLoadBalancingConfigRequest
+): Promise<LoadBalancingConfigResponse> {
+  const { data } = await api.put<LoadBalancingConfigResponse>('/config/load-balancing', payload)
   return data
 }

@@ -36,6 +36,8 @@
 - **Token 自动刷新**: 自动管理和刷新 OAuth Token
 - **多凭据支持**: 支持配置多个凭据，按优先级自动故障转移
 - **负载均衡**: 支持 `priority`（按优先级）和 `balanced`（按实时并发 + 成功次数均衡）两种模式
+- **等待队列**: 支持在账号瞬时打满时按 `queueMaxSize` / `queueMaxWaitMs` 做有界等待
+- **429 冷却**: 单账号触发上游 `429` 后会短暂冷却，避免重试继续打到同一账号
 - **智能重试**: 单凭据最多重试 3 次，单请求最多重试 9 次
 - **凭据回写**: 多凭据格式下自动回写刷新后的 Token
 - **Thinking 模式**: 支持 Claude 的 extended thinking 功能
@@ -196,6 +198,8 @@ GitHub Actions 镜像构建：
 | `proxyPassword` | string | - | 代理密码 |
 | `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
+| `queueMaxSize` | number | `0` | 等待队列最大长度；`0` 表示禁用等待队列 |
+| `queueMaxWaitMs` | number | `0` | 单请求最大排队等待时间（毫秒）；`0` 表示禁用等待队列 |
 
 完整配置示例：
 
@@ -219,7 +223,9 @@ GitHub Actions 镜像构建：
    "proxyUsername": "user",
    "proxyPassword": "pass",
    "adminApiKey": "sk-admin-your-secret-key",
-   "loadBalancingMode": "priority"
+   "loadBalancingMode": "balanced",
+   "queueMaxSize": 16,
+   "queueMaxWaitMs": 1500
 }
 ```
 
@@ -307,6 +313,8 @@ GitHub Actions 镜像构建：
 - 按 `priority` 字段排序，数字越小优先级越高（默认为 0）
 - `balanced` 模式会优先选择当前并发较低的账号；如果并发相同，再参考历史成功次数和 `priority`
 - `maxConcurrency` 可限制单账号最大并发，请求达到上限后会自动切到其他可用账号
+- `queueMaxSize` / `queueMaxWaitMs` 可为瞬时超并发请求提供短暂排队，减少尖峰时直接失败
+- 单账号触发上游 `429` 后会进入短暂冷却，调度器会优先切到其他可用账号
 - 单凭据最多重试 3 次，单请求最多重试 9 次
 - 自动故障转移到下一个可用凭据
 - 多凭据格式下 Token 刷新后自动回写到源文件

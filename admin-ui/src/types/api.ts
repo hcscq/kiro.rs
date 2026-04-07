@@ -26,6 +26,7 @@ export interface CredentialStatusItem {
   proxyUrl?: string
   refreshFailureCount: number
   disabledReason?: string
+  cooldownRemainingMs?: number | null
 }
 
 // 余额响应
@@ -84,4 +85,17 @@ export interface AddCredentialResponse {
   message: string
   credentialId: number
   email?: string
+}
+
+export interface LoadBalancingConfigResponse {
+  mode: 'priority' | 'balanced'
+  queueMaxSize: number
+  queueMaxWaitMs: number
+  waitingRequests: number
+}
+
+export interface UpdateLoadBalancingConfigRequest {
+  mode?: 'priority' | 'balanced'
+  queueMaxSize?: number
+  queueMaxWaitMs?: number
 }

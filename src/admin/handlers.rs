@@ -148,14 +148,14 @@ pub async fn force_refresh_token(
 }
 
 /// GET /api/admin/config/load-balancing
-/// 获取负载均衡模式
+/// 获取负载均衡与等待队列配置
 pub async fn get_load_balancing_mode(State(state): State<AdminState>) -> impl IntoResponse {
     let response = state.service.get_load_balancing_mode();
     Json(response)
 }
 
 /// PUT /api/admin/config/load-balancing
-/// 设置负载均衡模式
+/// 设置负载均衡与等待队列配置
 pub async fn set_load_balancing_mode(
     State(state): State<AdminState>,
     Json(payload): Json<SetLoadBalancingModeRequest>,

@@ -27,8 +27,8 @@ use super::{
 /// - `POST /credentials/:id/reset` - 重置失败计数
 /// - `POST /credentials/:id/refresh` - 强制刷新 Token
 /// - `GET /credentials/:id/balance` - 获取凭据余额
-/// - `GET /config/load-balancing` - 获取负载均衡模式
-/// - `PUT /config/load-balancing` - 设置负载均衡模式
+/// - `GET /config/load-balancing` - 获取负载均衡与等待队列配置
+/// - `PUT /config/load-balancing` - 设置负载均衡与等待队列配置
 ///
 /// # 认证
 /// 需要 Admin API Key 认证，支持：

@@ -8,7 +8,7 @@ use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::{Mutex as TokioMutex, Notify};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -412,6 +412,10 @@ struct CredentialEntry {
     last_used_at: Option<String>,
     /// 当前运行中的请求数
     active_requests: usize,
+    /// 429 限流冷却到期时间
+    rate_limit_cooldown_until: Option<Instant>,
+    /// 连续 429 次数，用于指数退避
+    rate_limit_backoff_level: u32,
 }
 
 /// 禁用原因
@@ -478,6 +482,9 @@ pub struct CredentialEntrySnapshot {
     /// 禁用原因
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
+    /// 429 限流冷却剩余时间（毫秒）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_remaining_ms: Option<u64>,
 }
 
 /// 凭据管理器状态快照
@@ -492,6 +499,39 @@ pub struct ManagerSnapshot {
     pub total: usize,
     /// 可用凭据数量
     pub available: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadBalancingConfigSnapshot {
+    pub mode: String,
+    pub queue_max_size: usize,
+    pub queue_max_wait_ms: u64,
+    pub waiting_requests: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DispatchConfig {
+    mode: String,
+    queue_max_size: usize,
+    queue_max_wait_ms: u64,
+}
+
+impl DispatchConfig {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            mode: config.load_balancing_mode.clone(),
+            queue_max_size: config.queue_max_size,
+            queue_max_wait_ms: config.queue_max_wait_ms,
+        }
+    }
+
+    fn queue_enabled(&self) -> bool {
+        self.queue_max_size > 0 && self.queue_max_wait_ms > 0
+    }
+
+    fn queue_wait_duration(&self) -> StdDuration {
+        StdDuration::from_millis(self.queue_max_wait_ms)
+    }
 }
 
 /// 多凭据 Token 管理器
@@ -511,8 +551,12 @@ pub struct MultiTokenManager {
     credentials_path: Option<PathBuf>,
     /// 是否为多凭据格式（数组格式才回写）
     is_multiple_format: bool,
-    /// 负载均衡模式（运行时可修改）
-    load_balancing_mode: Mutex<String>,
+    /// 调度配置（负载均衡模式、排队参数）
+    dispatch_config: Mutex<DispatchConfig>,
+    /// 可用性变更通知（并发释放、凭据启用、配置变更等）
+    availability_notify: Arc<Notify>,
+    /// 当前正在等待可用槽位的请求数
+    waiting_requests: Arc<std::sync::atomic::AtomicUsize>,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -553,6 +597,7 @@ pub(crate) struct CallLease {
 
 struct CallLeaseState {
     entries: Arc<Mutex<Vec<CredentialEntry>>>,
+    availability_notify: Arc<Notify>,
     id: u64,
 }
 
@@ -567,6 +612,8 @@ impl Drop for CallLeaseState {
                 entry.active_requests
             );
         }
+        drop(entries);
+        self.availability_notify.notify_one();
     }
 }
 
@@ -574,7 +621,17 @@ enum ReservationFailure {
     NoCredentials,
     AllDisabled,
     NoModelSupport,
-    AllAtCapacity,
+    AllTemporarilyUnavailable { next_ready_at: Option<Instant> },
+}
+
+struct WaitQueueGuard {
+    waiting_requests: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for WaitQueueGuard {
+    fn drop(&mut self) {
+        self.waiting_requests.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl MultiTokenManager {
@@ -633,6 +690,8 @@ impl MultiTokenManager {
                     success_count: 0,
                     last_used_at: None,
                     active_requests: 0,
+                    rate_limit_cooldown_until: None,
+                    rate_limit_backoff_level: 0,
                 }
             })
             .collect();
@@ -656,7 +715,7 @@ impl MultiTokenManager {
             .map(|e| e.id)
             .unwrap_or(0);
 
-        let load_balancing_mode = config.load_balancing_mode.clone();
+        let dispatch_config = DispatchConfig::from_config(&config);
         let manager = Self {
             config,
             proxy,
@@ -665,7 +724,9 @@ impl MultiTokenManager {
             refresh_lock: TokioMutex::new(()),
             credentials_path,
             is_multiple_format,
-            load_balancing_mode: Mutex::new(load_balancing_mode),
+            dispatch_config: Mutex::new(dispatch_config),
+            availability_notify: Arc::new(Notify::new()),
+            waiting_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
         };
@@ -711,6 +772,14 @@ impl MultiTokenManager {
         self.entries.lock().iter().filter(|e| !e.disabled).count()
     }
 
+    fn dispatch_config(&self) -> DispatchConfig {
+        self.dispatch_config.lock().clone()
+    }
+
+    fn queue_depth(&self) -> usize {
+        self.waiting_requests.load(Ordering::SeqCst)
+    }
+
     fn is_model_supported(credentials: &KiroCredentials, model: Option<&str>) -> bool {
         let is_opus = model
             .map(|m| m.to_lowercase().contains("opus"))
@@ -726,12 +795,87 @@ impl MultiTokenManager {
         }
     }
 
+    fn clear_expired_rate_limit_cooldowns(entries: &mut [CredentialEntry], now: Instant) {
+        for entry in entries {
+            if entry
+                .rate_limit_cooldown_until
+                .is_some_and(|until| until <= now)
+            {
+                entry.rate_limit_cooldown_until = None;
+                entry.rate_limit_backoff_level = 0;
+            }
+        }
+    }
+
+    fn is_rate_limited(entry: &CredentialEntry, now: Instant) -> bool {
+        entry
+            .rate_limit_cooldown_until
+            .is_some_and(|until| until > now)
+    }
+
+    fn next_rate_limit_ready_at(
+        entries: &[CredentialEntry],
+        model: Option<&str>,
+        now: Instant,
+    ) -> Option<Instant> {
+        entries
+            .iter()
+            .filter(|e| !e.disabled && Self::is_model_supported(&e.credentials, model))
+            .filter_map(|e| e.rate_limit_cooldown_until)
+            .filter(|until| *until > now)
+            .min()
+    }
+
     fn reserve_call_lease(&self, id: u64) -> CallLease {
         CallLease {
             _state: Arc::new(CallLeaseState {
                 entries: Arc::clone(&self.entries),
+                availability_notify: Arc::clone(&self.availability_notify),
                 id,
             }),
+        }
+    }
+
+    fn try_enter_wait_queue(&self, max_queue_size: usize) -> anyhow::Result<WaitQueueGuard> {
+        loop {
+            let current = self.waiting_requests.load(Ordering::SeqCst);
+            if current >= max_queue_size {
+                anyhow::bail!("等待队列已满（{}/{})", current, max_queue_size);
+            }
+
+            if self
+                .waiting_requests
+                .compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                tracing::debug!("请求进入等待队列，当前排队数: {}", current + 1);
+                return Ok(WaitQueueGuard {
+                    waiting_requests: Arc::clone(&self.waiting_requests),
+                });
+            }
+        }
+    }
+
+    async fn wait_for_availability(
+        &self,
+        deadline: Instant,
+        next_ready_at: Option<Instant>,
+    ) -> bool {
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+
+        let wake_at = next_ready_at
+            .map(|next| next.min(deadline))
+            .unwrap_or(deadline);
+        if wake_at <= now {
+            return true;
+        }
+
+        tokio::select! {
+            _ = self.availability_notify.notified() => true,
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(wake_at)) => Instant::now() < deadline,
         }
     }
 
@@ -752,6 +896,7 @@ impl MultiTokenManager {
             tracing::warn!(
                 "所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用（等价于重启）"
             );
+            self.availability_notify.notify_waiters();
         }
 
         recovered
@@ -764,12 +909,16 @@ impl MultiTokenManager {
         &self,
         model: Option<&str>,
     ) -> Result<(u64, KiroCredentials, CallLease), ReservationFailure> {
-        let mode = self.load_balancing_mode.lock().clone();
+        let dispatch = self.dispatch_config();
+        let mode = dispatch.mode;
         let mut entries = self.entries.lock();
+        let now = Instant::now();
 
         if entries.is_empty() {
             return Err(ReservationFailure::NoCredentials);
         }
+
+        Self::clear_expired_rate_limit_cooldowns(&mut entries, now);
 
         let enabled_count = entries.iter().filter(|e| !e.disabled).count();
         if enabled_count == 0 {
@@ -792,6 +941,7 @@ impl MultiTokenManager {
                 .filter(|e| {
                     !e.disabled
                         && Self::is_model_supported(&e.credentials, model)
+                        && !Self::is_rate_limited(e, now)
                         && Self::has_capacity(&e.credentials, e.active_requests)
                 })
                 .min_by_key(|e| {
@@ -808,6 +958,7 @@ impl MultiTokenManager {
                 e.id == *current_id
                     && !e.disabled
                     && Self::is_model_supported(&e.credentials, model)
+                    && !Self::is_rate_limited(e, now)
                     && Self::has_capacity(&e.credentials, e.active_requests)
             });
 
@@ -817,6 +968,7 @@ impl MultiTokenManager {
                     .filter(|e| {
                         !e.disabled
                             && Self::is_model_supported(&e.credentials, model)
+                            && !Self::is_rate_limited(e, now)
                             && Self::has_capacity(&e.credentials, e.active_requests)
                     })
                     .min_by_key(|e| (e.credentials.priority, e.active_requests, e.id))
@@ -826,7 +978,10 @@ impl MultiTokenManager {
 
         let selected_id = match selected_id {
             Some(id) => id,
-            None => return Err(ReservationFailure::AllAtCapacity),
+            None => {
+                let next_ready_at = Self::next_rate_limit_ready_at(&entries, model, now);
+                return Err(ReservationFailure::AllTemporarilyUnavailable { next_ready_at });
+            }
         };
 
         let entry = entries
@@ -868,6 +1023,8 @@ impl MultiTokenManager {
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
+        let mut wait_queue_guard: Option<WaitQueueGuard> = None;
+        let mut wait_deadline: Option<Instant> = None;
 
         loop {
             if attempt_count >= max_attempts {
@@ -879,7 +1036,11 @@ impl MultiTokenManager {
             }
 
             let (id, credentials, lease) = match self.reserve_next_credential(model) {
-                Ok(selection) => selection,
+                Ok(selection) => {
+                    wait_queue_guard = None;
+                    wait_deadline = None;
+                    selection
+                }
                 Err(ReservationFailure::NoCredentials) => anyhow::bail!("未配置任何凭据"),
                 Err(ReservationFailure::AllDisabled) => {
                     if self.recover_auto_disabled_credentials() {
@@ -890,8 +1051,23 @@ impl MultiTokenManager {
                 Err(ReservationFailure::NoModelSupport) => {
                     anyhow::bail!("当前没有可用凭据支持该模型");
                 }
-                Err(ReservationFailure::AllAtCapacity) => {
-                    anyhow::bail!("所有可用凭据已达到并发上限");
+                Err(ReservationFailure::AllTemporarilyUnavailable { next_ready_at }) => {
+                    let dispatch = self.dispatch_config();
+                    if !dispatch.queue_enabled() {
+                        anyhow::bail!("所有可用凭据已达到并发上限或处于限流冷却");
+                    }
+
+                    if wait_queue_guard.is_none() {
+                        wait_queue_guard =
+                            Some(self.try_enter_wait_queue(dispatch.queue_max_size)?);
+                        wait_deadline = Some(Instant::now() + dispatch.queue_wait_duration());
+                    }
+
+                    let deadline = wait_deadline.expect("wait deadline should exist");
+                    if !self.wait_for_availability(deadline, next_ready_at).await {
+                        anyhow::bail!("等待可用凭据超时");
+                    }
+                    continue;
                 }
             };
 
@@ -1203,6 +1379,8 @@ impl MultiTokenManager {
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
+                entry.rate_limit_cooldown_until = None;
+                entry.rate_limit_backoff_level = 0;
                 entry.success_count += 1;
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
                 tracing::debug!(
@@ -1213,6 +1391,38 @@ impl MultiTokenManager {
             }
         }
         self.save_stats_debounced();
+    }
+
+    /// 报告指定凭据遭遇上游 429 限流。
+    ///
+    /// 对单账号施加短暂冷却，避免重试流量持续打到同一个受限账号上。
+    pub fn report_rate_limited(&self, id: u64) {
+        const BASE_COOLDOWN_MS: u64 = 2_000;
+        const MAX_COOLDOWN_MS: u64 = 15_000;
+
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            if entry.disabled {
+                return;
+            }
+
+            let level = entry.rate_limit_backoff_level.saturating_add(1).min(6);
+            let backoff = BASE_COOLDOWN_MS
+                .saturating_mul(2u64.saturating_pow((level - 1) as u32))
+                .min(MAX_COOLDOWN_MS);
+
+            entry.rate_limit_backoff_level = level;
+            entry.rate_limit_cooldown_until =
+                Some(Instant::now() + StdDuration::from_millis(backoff));
+            entry.last_used_at = Some(Utc::now().to_rfc3339());
+
+            tracing::warn!(
+                "凭据 #{} 遭遇上游 429，进入冷却 {}ms（连续限流 {} 次）",
+                id,
+                backoff,
+                level
+            );
+        }
     }
 
     /// 报告指定凭据 API 调用失败
@@ -1436,6 +1646,7 @@ impl MultiTokenManager {
         let entries = self.entries.lock();
         let current_id = *self.current_id.lock();
         let available = entries.iter().filter(|e| !e.disabled).count();
+        let now = Instant::now();
 
         ManagerSnapshot {
             entries: entries
@@ -1475,6 +1686,10 @@ impl MultiTokenManager {
                         }
                         .to_string()
                     }),
+                    cooldown_remaining_ms: e
+                        .rate_limit_cooldown_until
+                        .and_then(|until| until.checked_duration_since(now))
+                        .map(|remaining| remaining.as_millis().min(u128::from(u64::MAX)) as u64),
                 })
                 .collect(),
             current_id,
@@ -1497,12 +1712,17 @@ impl MultiTokenManager {
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
                 entry.disabled_reason = None;
+                entry.rate_limit_cooldown_until = None;
+                entry.rate_limit_backoff_level = 0;
             } else {
                 entry.disabled_reason = Some(DisabledReason::Manual);
             }
         }
         // 持久化更改
         self.persist_credentials()?;
+        if !disabled {
+            self.availability_notify.notify_waiters();
+        }
         Ok(())
     }
 
@@ -1537,6 +1757,7 @@ impl MultiTokenManager {
             entry.credentials.max_concurrency = max_concurrency.filter(|limit| *limit > 0);
         }
         self.persist_credentials()?;
+        self.availability_notify.notify_waiters();
         Ok(())
     }
 
@@ -1552,9 +1773,12 @@ impl MultiTokenManager {
             entry.refresh_failure_count = 0;
             entry.disabled = false;
             entry.disabled_reason = None;
+            entry.rate_limit_cooldown_until = None;
+            entry.rate_limit_backoff_level = 0;
         }
         // 持久化更改
         self.persist_credentials()?;
+        self.availability_notify.notify_waiters();
         Ok(())
     }
 
@@ -1741,11 +1965,14 @@ impl MultiTokenManager {
                 success_count: 0,
                 last_used_at: None,
                 active_requests: 0,
+                rate_limit_cooldown_until: None,
+                rate_limit_backoff_level: 0,
             });
         }
 
         // 6. 持久化
         self.persist_credentials()?;
+        self.availability_notify.notify_waiters();
 
         tracing::info!("成功添加凭据 #{}", new_id);
         Ok(new_id)
@@ -1856,52 +2083,98 @@ impl MultiTokenManager {
         Ok(())
     }
 
-    /// 获取负载均衡模式（Admin API）
-    pub fn get_load_balancing_mode(&self) -> String {
-        self.load_balancing_mode.lock().clone()
+    /// 获取调度配置快照（Admin API）
+    pub fn load_balancing_config_snapshot(&self) -> LoadBalancingConfigSnapshot {
+        let dispatch = self.dispatch_config();
+        LoadBalancingConfigSnapshot {
+            mode: dispatch.mode,
+            queue_max_size: dispatch.queue_max_size,
+            queue_max_wait_ms: dispatch.queue_max_wait_ms,
+            waiting_requests: self.queue_depth(),
+        }
     }
 
-    fn persist_load_balancing_mode(&self, mode: &str) -> anyhow::Result<()> {
+    /// 获取负载均衡模式（Admin API）
+    pub fn get_load_balancing_mode(&self) -> String {
+        self.dispatch_config().mode
+    }
+
+    fn persist_dispatch_config(&self, dispatch: &DispatchConfig) -> anyhow::Result<()> {
         use anyhow::Context;
 
         let config_path = match self.config.config_path() {
             Some(path) => path.to_path_buf(),
             None => {
-                tracing::warn!("配置文件路径未知，负载均衡模式仅在当前进程生效: {}", mode);
+                tracing::warn!(
+                    "配置文件路径未知，调度配置仅在当前进程生效: mode={}, queueMaxSize={}, queueMaxWaitMs={}",
+                    dispatch.mode,
+                    dispatch.queue_max_size,
+                    dispatch.queue_max_wait_ms
+                );
                 return Ok(());
             }
         };
 
         let mut config = Config::load(&config_path)
             .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
-        config.load_balancing_mode = mode.to_string();
+        config.load_balancing_mode = dispatch.mode.clone();
+        config.queue_max_size = dispatch.queue_max_size;
+        config.queue_max_wait_ms = dispatch.queue_max_wait_ms;
         config
             .save()
-            .with_context(|| format!("持久化负载均衡模式失败: {}", config_path.display()))?;
+            .with_context(|| format!("持久化调度配置失败: {}", config_path.display()))?;
 
         Ok(())
     }
 
     /// 设置负载均衡模式（Admin API）
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
+        self.set_load_balancing_config(Some(mode), None, None)
+    }
+
+    /// 设置调度配置（Admin API）
+    pub fn set_load_balancing_config(
+        &self,
+        mode: Option<String>,
+        queue_max_size: Option<usize>,
+        queue_max_wait_ms: Option<u64>,
+    ) -> anyhow::Result<()> {
+        let previous = self.dispatch_config();
+        let mut next = previous.clone();
+
         // 验证模式值
-        if mode != "priority" && mode != "balanced" {
-            anyhow::bail!("无效的负载均衡模式: {}", mode);
+        if let Some(mode) = mode {
+            if mode != "priority" && mode != "balanced" {
+                anyhow::bail!("无效的负载均衡模式: {}", mode);
+            }
+            next.mode = mode;
         }
 
-        let previous_mode = self.get_load_balancing_mode();
-        if previous_mode == mode {
+        if let Some(queue_max_size) = queue_max_size {
+            next.queue_max_size = queue_max_size;
+        }
+        if let Some(queue_max_wait_ms) = queue_max_wait_ms {
+            next.queue_max_wait_ms = queue_max_wait_ms;
+        }
+
+        if previous == next {
             return Ok(());
         }
 
-        *self.load_balancing_mode.lock() = mode.clone();
+        *self.dispatch_config.lock() = next.clone();
 
-        if let Err(err) = self.persist_load_balancing_mode(&mode) {
-            *self.load_balancing_mode.lock() = previous_mode;
+        if let Err(err) = self.persist_dispatch_config(&next) {
+            *self.dispatch_config.lock() = previous;
             return Err(err);
         }
 
-        tracing::info!("负载均衡模式已设置为: {}", mode);
+        self.availability_notify.notify_waiters();
+        tracing::info!(
+            "调度配置已更新: mode={}, queueMaxSize={}, queueMaxWaitMs={}",
+            next.mode,
+            next.queue_max_size,
+            next.queue_max_wait_ms
+        );
         Ok(())
     }
 }
@@ -2205,11 +2478,121 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_acquire_context_waits_for_capacity_when_queue_enabled() {
+        let mut config = Config::default();
+        config.queue_max_size = 1;
+        config.queue_max_wait_ms = 200;
+
+        let mut cred = available_credential(0);
+        cred.max_concurrency = Some(1);
+
+        let manager =
+            Arc::new(MultiTokenManager::new(config, vec![cred], None, None, false).unwrap());
+
+        let first = manager.acquire_context(None).await.unwrap();
+        let waiter_manager = Arc::clone(&manager);
+        let waiter =
+            tokio::spawn(async move { waiter_manager.acquire_context(None).await.unwrap() });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished(), "第二个请求应进入等待队列");
+
+        drop(first);
+        let second = waiter.await.unwrap();
+        assert_eq!(second.id, 1);
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_returns_error_when_wait_queue_is_full() {
+        let mut config = Config::default();
+        config.queue_max_size = 1;
+        config.queue_max_wait_ms = 200;
+
+        let mut cred = available_credential(0);
+        cred.max_concurrency = Some(1);
+
+        let manager =
+            Arc::new(MultiTokenManager::new(config, vec![cred], None, None, false).unwrap());
+
+        let first = manager.acquire_context(None).await.unwrap();
+        let waiter_manager = Arc::clone(&manager);
+        let waiter = tokio::spawn(async move { waiter_manager.acquire_context(None).await });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+
+        let err = manager
+            .acquire_context(None)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("等待队列已满"),
+            "错误应提示等待队列已满，实际: {}",
+            err
+        );
+
+        drop(first);
+        waiter.abort();
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_returns_error_when_queue_wait_times_out() {
+        let mut config = Config::default();
+        config.queue_max_size = 1;
+        config.queue_max_wait_ms = 50;
+
+        let mut cred = available_credential(0);
+        cred.max_concurrency = Some(1);
+
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        let _ctx = manager.acquire_context(None).await.unwrap();
+        let err = manager
+            .acquire_context(None)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("等待可用凭据超时"),
+            "错误应提示等待超时，实际: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rate_limited_credential_enters_cooldown_and_falls_back() {
+        let config = Config::default();
+        let primary = available_credential(0);
+        let secondary = available_credential(1);
+
+        let manager =
+            MultiTokenManager::new(config, vec![primary, secondary], None, None, false).unwrap();
+
+        manager.report_rate_limited(1);
+
+        let ctx = manager.acquire_context(None).await.unwrap();
+        assert_eq!(ctx.id, 2);
+
+        let snapshot = manager.snapshot();
+        let primary_entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert!(
+            primary_entry.cooldown_remaining_ms.unwrap_or_default() > 0,
+            "主账号应处于限流冷却中"
+        );
+    }
+
     #[test]
     fn test_set_load_balancing_mode_persists_to_config_file() {
         let config_path =
             std::env::temp_dir().join(format!("kiro-load-balancing-{}.json", uuid::Uuid::new_v4()));
-        std::fs::write(&config_path, r#"{"loadBalancingMode":"priority"}"#).unwrap();
+        std::fs::write(
+            &config_path,
+            r#"{"loadBalancingMode":"priority","queueMaxSize":0,"queueMaxWaitMs":0}"#,
+        )
+        .unwrap();
 
         let config = Config::load(&config_path).unwrap();
         let manager =
@@ -2217,11 +2600,13 @@ mod tests {
                 .unwrap();
 
         manager
-            .set_load_balancing_mode("balanced".to_string())
+            .set_load_balancing_config(Some("balanced".to_string()), Some(8), Some(1500))
             .unwrap();
 
         let persisted = Config::load(&config_path).unwrap();
         assert_eq!(persisted.load_balancing_mode, "balanced");
+        assert_eq!(persisted.queue_max_size, 8);
+        assert_eq!(persisted.queue_max_wait_ms, 1500);
         assert_eq!(manager.get_load_balancing_mode(), "balanced");
 
         std::fs::remove_file(&config_path).unwrap();

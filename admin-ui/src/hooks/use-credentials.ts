@@ -12,7 +12,7 @@ import {
   getLoadBalancingMode,
   setLoadBalancingMode,
 } from '@/api/credentials'
-import type { AddCredentialRequest } from '@/types/api'
+import type { AddCredentialRequest, UpdateLoadBalancingConfigRequest } from '@/types/api'
 
 // 查询凭据列表
 export function useCredentials() {
@@ -125,7 +125,7 @@ export function useLoadBalancingMode() {
 export function useSetLoadBalancingMode() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: setLoadBalancingMode,
+    mutationFn: (payload: UpdateLoadBalancingConfigRequest) => setLoadBalancingMode(payload),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
     },
