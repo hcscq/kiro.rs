@@ -37,9 +37,9 @@
 - **多凭据支持**: 支持配置多个凭据，按优先级自动故障转移
 - **负载均衡**: 支持 `priority`（按优先级）和 `balanced`（按实时并发 + 成功次数均衡）两种模式
 - **等待队列**: 支持在账号瞬时打满时按 `queueMaxSize` / `queueMaxWaitMs` 做有界等待
-- **429 冷却**: 单账号触发上游 `429` 后会按 `rateLimitCooldownMs` 冷却，避免重试继续打到同一账号
+- **429 冷却**: 单账号触发上游 `429` 后会按 `rateLimitCooldownMs` 做固定短冷却，避免重试继续打到同一账号
 - **Token Bucket 限速**: 支持为每个账号设置本地 token bucket，平滑瞬时流量，避免弱账号被短时间打爆
-- **429 自适应退避**: 遭遇 `429` 时会清空该账号 bucket 并下调回填速率，成功后再逐步恢复
+- **429 自适应回填调节**: 遭遇 `429` 时会清空该账号 bucket 并下调回填速率，成功后再逐步恢复
 - **智能重试**: 单凭据最多重试 3 次，单请求最多重试 9 次
 - **凭据回写**: 多凭据格式下自动回写刷新后的 Token
 - **Thinking 模式**: 支持 Claude 的 extended thinking 功能
@@ -334,7 +334,7 @@ GitHub Actions 镜像构建：
 - `balanced` 模式会优先选择当前并发较低的账号；如果并发相同，再参考历史成功次数和 `priority`
 - `maxConcurrency` 可限制单账号最大并发，请求达到上限后会自动切到其他可用账号
 - `queueMaxSize` / `queueMaxWaitMs` 可为瞬时超并发请求提供短暂排队，减少尖峰时直接失败
-- `rateLimitCooldownMs` 可控制单账号触发上游 `429` 后的冷却时长；设为 `0` 可关闭该机制
+- `rateLimitCooldownMs` 可控制单账号触发上游 `429` 后的固定冷却时长；设为 `0` 可关闭该机制
 - `rateLimitBucketCapacity` / `rateLimitRefillPerSecond` 可限制单账号单位时间内的发放速率，适合给“真实承载能力偏弱”的账号单独降速
 - 遭遇 `429` 时，本地会清空该账号 bucket，并按 `rateLimitRefillBackoffFactor` 下调当前回填速率；成功请求后再按 `rateLimitRefillRecoveryStepPerSuccess` 逐步恢复
 - 单凭据最多重试 3 次，单请求最多重试 9 次

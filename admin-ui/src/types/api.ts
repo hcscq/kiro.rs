@@ -72,8 +72,8 @@ export interface SetPriorityRequest {
 }
 
 export interface SetCredentialRateLimitConfigRequest {
-  rateLimitBucketCapacity: number | null
-  rateLimitRefillPerSecond: number | null
+  rateLimitBucketCapacity?: number | null
+  rateLimitRefillPerSecond?: number | null
 }
 
 // 添加凭据请求

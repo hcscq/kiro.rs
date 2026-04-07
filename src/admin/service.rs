@@ -87,8 +87,7 @@ impl AdminService {
                 rate_limit_bucket_capacity: entry.rate_limit_bucket_capacity,
                 rate_limit_bucket_capacity_override: entry.rate_limit_bucket_capacity_override,
                 rate_limit_refill_per_second: entry.rate_limit_refill_per_second,
-                rate_limit_refill_per_second_override: entry
-                    .rate_limit_refill_per_second_override,
+                rate_limit_refill_per_second_override: entry.rate_limit_refill_per_second_override,
                 rate_limit_refill_base_per_second: entry.rate_limit_refill_base_per_second,
                 rate_limit_hit_streak: entry.rate_limit_hit_streak,
                 next_ready_in_ms: entry.next_ready_in_ms,
@@ -145,15 +144,11 @@ impl AdminService {
     pub fn set_rate_limit_config(
         &self,
         id: u64,
-        rate_limit_bucket_capacity: Option<f64>,
-        rate_limit_refill_per_second: Option<f64>,
+        rate_limit_bucket_capacity: Option<Option<f64>>,
+        rate_limit_refill_per_second: Option<Option<f64>>,
     ) -> Result<(), AdminServiceError> {
         self.token_manager
-            .set_rate_limit_config(
-                id,
-                rate_limit_bucket_capacity,
-                rate_limit_refill_per_second,
-            )
+            .set_rate_limit_config(id, rate_limit_bucket_capacity, rate_limit_refill_per_second)
             .map_err(|e| self.classify_error(e, id))
     }
 

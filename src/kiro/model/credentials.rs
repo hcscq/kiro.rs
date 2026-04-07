@@ -119,7 +119,10 @@ fn is_zero(value: &u32) -> bool {
 }
 
 fn non_negative_finite(value: f64) -> Option<f64> {
-    value.is_finite().then_some(value).filter(|value| *value >= 0.0)
+    value
+        .is_finite()
+        .then_some(value)
+        .filter(|value| *value >= 0.0)
 }
 
 fn canonicalize_auth_method_value(value: &str) -> &str {
@@ -297,7 +300,8 @@ impl KiroCredentials {
 
     /// 获取凭据级 token bucket 容量覆盖
     pub fn rate_limit_bucket_capacity_override(&self) -> Option<f64> {
-        self.rate_limit_bucket_capacity.and_then(non_negative_finite)
+        self.rate_limit_bucket_capacity
+            .and_then(non_negative_finite)
     }
 
     /// 获取凭据级 token bucket 回填速率覆盖

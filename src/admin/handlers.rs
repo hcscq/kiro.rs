@@ -9,9 +9,8 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest,
-        SetCredentialRateLimitConfigRequest, SetMaxConcurrencyRequest, SetPriorityRequest,
-        SuccessResponse,
+        AddCredentialRequest, SetCredentialRateLimitConfigRequest, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetMaxConcurrencyRequest, SetPriorityRequest, SuccessResponse,
     },
 };
 

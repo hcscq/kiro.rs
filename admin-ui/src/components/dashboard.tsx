@@ -578,6 +578,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
       return
     }
 
+    if (
+      parsedRateLimitRefillPerSecond > 0 &&
+      parsedRateLimitRefillMinPerSecond > parsedRateLimitRefillPerSecond
+    ) {
+      toast.error('最小回填速率不能大于基础回填速率')
+      return
+    }
+
     setLoadBalancingMode(
       {
         queueMaxSize: parsedQueueMaxSize,
@@ -855,7 +863,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </Button>
 
             <p className="text-sm text-muted-foreground md:col-span-2 xl:col-span-3">
-              `maxConcurrency` 控并发峰值，token bucket 控单位时间发放速率。建议先从 `queueMaxWaitMs=1000-3000`、`queueMaxSize=总并发的 1-2 倍`、`rateLimitCooldownMs=2000-5000`、`rateLimitBucketCapacity=2-4`、`rateLimitRefillPerSecond=0.5-1.5` 开始。
+              `maxConcurrency` 控并发峰值，token bucket 控单位时间发放速率，`rateLimitCooldownMs` 作为上游 `429` 后的固定短冷却兜底。建议先从 `queueMaxWaitMs=1000-3000`、`queueMaxSize=总并发的 1-2 倍`、`rateLimitCooldownMs=2000-5000`、`rateLimitBucketCapacity=2-4`、`rateLimitRefillPerSecond=0.5-1.5` 开始。
             </p>
           </CardContent>
         </Card>

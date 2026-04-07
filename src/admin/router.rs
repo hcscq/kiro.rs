@@ -9,8 +9,8 @@ use super::{
     handlers::{
         add_credential, delete_credential, force_refresh_token, get_all_credentials,
         get_credential_balance, get_load_balancing_mode, reset_failure_count,
-        set_credential_disabled, set_credential_max_concurrency,
-        set_credential_priority, set_credential_rate_limit_config, set_load_balancing_mode,
+        set_credential_disabled, set_credential_max_concurrency, set_credential_priority,
+        set_credential_rate_limit_config, set_load_balancing_mode,
     },
     middleware::{AdminState, admin_auth_middleware},
 };

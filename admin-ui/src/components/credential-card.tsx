@@ -493,7 +493,7 @@ export function CredentialCard({
             )}
             {credential.rateLimitHitStreak > 0 && (
               <div>
-                <span className="text-muted-foreground">429 Streak：</span>
+                <span className="text-muted-foreground">连续 429：</span>
                 <span className="font-medium text-amber-600">{credential.rateLimitHitStreak}</span>
               </div>
             )}

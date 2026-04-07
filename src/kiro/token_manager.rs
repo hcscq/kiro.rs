@@ -473,8 +473,8 @@ impl AdaptiveTokenBucket {
             .unwrap_or_default()
             .as_secs_f64();
         if elapsed > 0.0 {
-            self.tokens = (self.tokens + elapsed * self.current_refill_per_second)
-                .min(self.policy.capacity);
+            self.tokens =
+                (self.tokens + elapsed * self.current_refill_per_second).min(self.policy.capacity);
             self.last_refill_at = now;
         }
     }
@@ -507,8 +507,10 @@ impl AdaptiveTokenBucket {
         self.refill(now);
         self.tokens = 0.0;
         self.current_refill_per_second =
-            (self.current_refill_per_second * self.policy.backoff_factor)
-                .clamp(self.policy.min_refill_per_second, self.policy.refill_per_second);
+            (self.current_refill_per_second * self.policy.backoff_factor).clamp(
+                self.policy.min_refill_per_second,
+                self.policy.refill_per_second,
+            );
         self.last_refill_at = now;
     }
 
@@ -714,7 +716,10 @@ impl DispatchConfig {
             .rate_limit_refill_per_second_override()
             .unwrap_or(self.rate_limit_refill_per_second);
 
-        if !capacity.is_finite() || !refill_per_second.is_finite() || capacity <= 0.0 || refill_per_second <= 0.0
+        if !capacity.is_finite()
+            || !refill_per_second.is_finite()
+            || capacity <= 0.0
+            || refill_per_second <= 0.0
         {
             return None;
         }
@@ -1076,7 +1081,30 @@ impl MultiTokenManager {
             .min()
     }
 
-    fn reset_rate_limit_runtime(entry: &mut CredentialEntry, dispatch: &DispatchConfig, now: Instant) {
+    fn sync_rate_limit_bucket_runtime(
+        entry: &mut CredentialEntry,
+        dispatch: &DispatchConfig,
+        now: Instant,
+    ) {
+        match dispatch.bucket_policy_for(&entry.credentials) {
+            Some(policy) => {
+                if let Some(bucket) = entry.rate_limit_bucket.as_mut() {
+                    bucket.reconfigure(policy, now);
+                } else {
+                    entry.rate_limit_bucket = Some(AdaptiveTokenBucket::new(policy, now));
+                }
+            }
+            None => {
+                entry.rate_limit_bucket = None;
+            }
+        }
+    }
+
+    fn reset_rate_limit_runtime(
+        entry: &mut CredentialEntry,
+        dispatch: &DispatchConfig,
+        now: Instant,
+    ) {
         entry.rate_limit_cooldown_until = None;
         entry.rate_limit_hit_streak = 0;
         entry.rate_limit_bucket = dispatch
@@ -1088,19 +1116,56 @@ impl MultiTokenManager {
         let now = Instant::now();
         let mut entries = self.entries.lock();
         for entry in entries.iter_mut() {
-            match dispatch.bucket_policy_for(&entry.credentials) {
-                Some(policy) => {
-                    if let Some(bucket) = entry.rate_limit_bucket.as_mut() {
-                        bucket.reconfigure(policy, now);
-                    } else {
-                        entry.rate_limit_bucket = Some(AdaptiveTokenBucket::new(policy, now));
-                    }
-                }
-                None => {
-                    entry.rate_limit_bucket = None;
-                }
-            }
+            Self::sync_rate_limit_bucket_runtime(entry, dispatch, now);
         }
+    }
+
+    fn validate_non_negative_finite(name: &str, value: f64) -> anyhow::Result<()> {
+        if !value.is_finite() || value < 0.0 {
+            anyhow::bail!("{} 必须是大于等于 0 的有限数字", name);
+        }
+        Ok(())
+    }
+
+    fn validate_dispatch_rate_limit_config(dispatch: &DispatchConfig) -> anyhow::Result<()> {
+        for (name, value) in [
+            (
+                "rateLimitBucketCapacity",
+                dispatch.rate_limit_bucket_capacity,
+            ),
+            (
+                "rateLimitRefillPerSecond",
+                dispatch.rate_limit_refill_per_second,
+            ),
+            (
+                "rateLimitRefillMinPerSecond",
+                dispatch.rate_limit_refill_min_per_second,
+            ),
+            (
+                "rateLimitRefillRecoveryStepPerSuccess",
+                dispatch.rate_limit_refill_recovery_step_per_success,
+            ),
+            (
+                "rateLimitRefillBackoffFactor",
+                dispatch.rate_limit_refill_backoff_factor,
+            ),
+        ] {
+            Self::validate_non_negative_finite(name, value)?;
+        }
+
+        if dispatch.rate_limit_refill_backoff_factor < 0.05
+            || dispatch.rate_limit_refill_backoff_factor > 1.0
+        {
+            anyhow::bail!("rateLimitRefillBackoffFactor 必须在 [0.05, 1] 范围内");
+        }
+
+        if dispatch.rate_limit_refill_per_second > 0.0
+            && dispatch.rate_limit_refill_min_per_second > dispatch.rate_limit_refill_per_second
+        {
+            anyhow::bail!("rateLimitRefillMinPerSecond 不能大于 rateLimitRefillPerSecond");
+        }
+
+        Ok(())
     }
 
     fn reserve_call_lease(&self, id: u64) -> CallLease {
@@ -1349,7 +1414,9 @@ impl MultiTokenManager {
                 Err(ReservationFailure::AllTemporarilyUnavailable { next_ready_at }) => {
                     let dispatch = self.dispatch_config();
                     if !dispatch.queue_enabled() {
-                        anyhow::bail!("所有可用凭据已达到并发上限、处于限流冷却或正等待 token bucket 补充");
+                        anyhow::bail!(
+                            "所有可用凭据已达到并发上限、处于限流冷却或正等待 token bucket 补充"
+                        );
                     }
 
                     if wait_queue_guard.is_none() {
@@ -1684,7 +1751,7 @@ impl MultiTokenManager {
                 if let Some(bucket) = entry.rate_limit_bucket.as_mut() {
                     bucket.on_success(now);
                 }
-                entry.rate_limit_hit_streak = entry.rate_limit_hit_streak.saturating_sub(1);
+                entry.rate_limit_hit_streak = 0;
                 entry.success_count += 1;
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
                 tracing::debug!(
@@ -1715,17 +1782,14 @@ impl MultiTokenManager {
                     bucket.on_rate_limited(now);
                 }
 
-                let cooldown_multiplier = u64::from(entry.rate_limit_hit_streak.min(5).max(1));
-                let cooldown_ms = dispatch
-                    .rate_limit_cooldown_ms
-                    .saturating_mul(cooldown_multiplier);
-                entry.rate_limit_cooldown_until = (cooldown_ms > 0)
-                    .then(|| now + StdDuration::from_millis(cooldown_ms));
+                let cooldown_ms = dispatch.rate_limit_cooldown_ms;
+                entry.rate_limit_cooldown_until =
+                    (cooldown_ms > 0).then(|| now + StdDuration::from_millis(cooldown_ms));
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
 
                 if let Some(bucket) = entry.rate_limit_bucket.as_ref() {
                     tracing::warn!(
-                        "凭据 #{} 遭遇上游 429，进入冷却 {}ms，bucket 速率降至 {:.2}/{:.2} token/s（streak={}）",
+                        "凭据 #{} 遭遇上游 429，固定冷却 {}ms，bucket 速率降至 {:.2}/{:.2} token/s（streak={}）",
                         id,
                         cooldown_ms,
                         bucket.current_refill_per_second,
@@ -1734,7 +1798,7 @@ impl MultiTokenManager {
                     );
                 } else {
                     tracing::warn!(
-                        "凭据 #{} 遭遇上游 429，进入冷却 {}ms（streak={}，未启用 token bucket）",
+                        "凭据 #{} 遭遇上游 429，固定冷却 {}ms（streak={}，未启用 token bucket）",
                         id,
                         cooldown_ms,
                         entry.rate_limit_hit_streak
@@ -2113,18 +2177,14 @@ impl MultiTokenManager {
     pub fn set_rate_limit_config(
         &self,
         id: u64,
-        rate_limit_bucket_capacity: Option<f64>,
-        rate_limit_refill_per_second: Option<f64>,
+        rate_limit_bucket_capacity: Option<Option<f64>>,
+        rate_limit_refill_per_second: Option<Option<f64>>,
     ) -> anyhow::Result<()> {
-        for (name, value) in [
-            ("rateLimitBucketCapacity", rate_limit_bucket_capacity),
-            ("rateLimitRefillPerSecond", rate_limit_refill_per_second),
-        ] {
-            if let Some(value) = value {
-                if !value.is_finite() || value < 0.0 {
-                    anyhow::bail!("{} 必须是大于等于 0 的有限数字", name);
-                }
-            }
+        if let Some(Some(value)) = rate_limit_bucket_capacity {
+            Self::validate_non_negative_finite("rateLimitBucketCapacity", value)?;
+        }
+        if let Some(Some(value)) = rate_limit_refill_per_second {
+            Self::validate_non_negative_finite("rateLimitRefillPerSecond", value)?;
         }
 
         let dispatch = self.dispatch_config();
@@ -2135,9 +2195,13 @@ impl MultiTokenManager {
                 .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            entry.credentials.rate_limit_bucket_capacity = rate_limit_bucket_capacity;
-            entry.credentials.rate_limit_refill_per_second = rate_limit_refill_per_second;
-            Self::reset_rate_limit_runtime(entry, &dispatch, now);
+            if let Some(rate_limit_bucket_capacity) = rate_limit_bucket_capacity {
+                entry.credentials.rate_limit_bucket_capacity = rate_limit_bucket_capacity;
+            }
+            if let Some(rate_limit_refill_per_second) = rate_limit_refill_per_second {
+                entry.credentials.rate_limit_refill_per_second = rate_limit_refill_per_second;
+            }
+            Self::sync_rate_limit_bucket_runtime(entry, &dispatch, now);
         }
 
         self.persist_credentials()?;
@@ -2597,31 +2661,7 @@ impl MultiTokenManager {
             next.rate_limit_refill_backoff_factor = rate_limit_refill_backoff_factor;
         }
 
-        for (name, value) in [
-            ("rateLimitBucketCapacity", next.rate_limit_bucket_capacity),
-            ("rateLimitRefillPerSecond", next.rate_limit_refill_per_second),
-            (
-                "rateLimitRefillMinPerSecond",
-                next.rate_limit_refill_min_per_second,
-            ),
-            (
-                "rateLimitRefillRecoveryStepPerSuccess",
-                next.rate_limit_refill_recovery_step_per_success,
-            ),
-            (
-                "rateLimitRefillBackoffFactor",
-                next.rate_limit_refill_backoff_factor,
-            ),
-        ] {
-            if !value.is_finite() || value < 0.0 {
-                anyhow::bail!("{} 必须是大于等于 0 的有限数字", name);
-            }
-        }
-        if next.rate_limit_refill_backoff_factor < 0.05
-            || next.rate_limit_refill_backoff_factor > 1.0
-        {
-            anyhow::bail!("rateLimitRefillBackoffFactor 必须在 [0.05, 1] 范围内");
-        }
+        Self::validate_dispatch_rate_limit_config(&next)?;
 
         if previous == next {
             return Ok(());
@@ -2644,8 +2684,7 @@ impl MultiTokenManager {
             || previous.rate_limit_refill_min_per_second != next.rate_limit_refill_min_per_second
             || previous.rate_limit_refill_recovery_step_per_success
                 != next.rate_limit_refill_recovery_step_per_success
-            || previous.rate_limit_refill_backoff_factor
-                != next.rate_limit_refill_backoff_factor
+            || previous.rate_limit_refill_backoff_factor != next.rate_limit_refill_backoff_factor
         {
             self.reconfigure_rate_limit_runtime(&next);
         }
@@ -3061,19 +3100,83 @@ mod tests {
             MultiTokenManager::new(config, vec![primary, secondary], None, None, false).unwrap();
 
         manager.report_rate_limited(1);
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        manager.report_rate_limited(1);
 
         let ctx = manager.acquire_context(None).await.unwrap();
         assert_eq!(ctx.id, 2);
 
         let snapshot = manager.snapshot();
         let primary_entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert_eq!(primary_entry.rate_limit_hit_streak, 2);
         assert!(
             primary_entry.cooldown_remaining_ms.unwrap_or_default() > 0,
             "主账号应处于限流冷却中"
         );
         assert!(
             primary_entry.cooldown_remaining_ms.unwrap_or_default() <= 3_500,
-            "冷却时间应受 rate_limit_cooldown_ms 限制"
+            "固定冷却时间不应因连续 429 被额外放大"
+        );
+    }
+
+    #[test]
+    fn test_set_rate_limit_config_updates_only_requested_fields_and_preserves_cooldown() {
+        let mut config = Config::default();
+        config.rate_limit_cooldown_ms = 4_000;
+
+        let mut cred = available_credential(0);
+        cred.rate_limit_bucket_capacity = Some(5.0);
+        cred.rate_limit_refill_per_second = Some(0.8);
+
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        manager.report_rate_limited(1);
+        manager
+            .set_rate_limit_config(1, Some(Some(7.0)), None)
+            .unwrap();
+
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert_eq!(entry.rate_limit_bucket_capacity_override, Some(7.0));
+        assert_eq!(entry.rate_limit_refill_per_second_override, Some(0.8));
+        assert_eq!(entry.rate_limit_bucket_capacity, Some(7.0));
+        assert_eq!(entry.rate_limit_hit_streak, 1);
+        assert!(
+            entry.cooldown_remaining_ms.unwrap_or_default() > 0,
+            "修改 bucket 参数不应清空现有 429 冷却"
+        );
+    }
+
+    #[test]
+    fn test_set_load_balancing_config_rejects_min_refill_above_base_refill() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![available_credential(0)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let err = manager
+            .set_load_balancing_config(
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(1.0),
+                Some(1.2),
+                None,
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("rateLimitRefillMinPerSecond 不能大于 rateLimitRefillPerSecond"),
+            "错误应明确提示最小回填速率不能大于基础回填速率，实际: {}",
+            err
         );
     }
 

@@ -119,11 +119,11 @@ pub struct SetMaxConcurrencyRequest {
 #[serde(rename_all = "camelCase")]
 pub struct SetCredentialRateLimitConfigRequest {
     /// 凭据级 bucket 容量覆盖
-    /// null 表示跟随全局；0 表示仅对该账号禁用 bucket
-    pub rate_limit_bucket_capacity: Option<f64>,
+    /// 字段缺失表示不修改；null 表示跟随全局；0 表示仅对该账号禁用 bucket
+    pub rate_limit_bucket_capacity: Option<Option<f64>>,
     /// 凭据级回填速率覆盖（token/s）
-    /// null 表示跟随全局；0 表示仅对该账号禁用 bucket
-    pub rate_limit_refill_per_second: Option<f64>,
+    /// 字段缺失表示不修改；null 表示跟随全局；0 表示仅对该账号禁用 bucket
+    pub rate_limit_refill_per_second: Option<Option<f64>>,
 }
 
 /// 添加凭据请求
