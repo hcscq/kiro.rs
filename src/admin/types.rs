@@ -63,6 +63,29 @@ pub struct CredentialStatusItem {
     /// 429 冷却剩余时间（毫秒）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cooldown_remaining_ms: Option<u64>,
+    /// 当前 bucket token 数
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_bucket_tokens: Option<f64>,
+    /// 当前 bucket 容量
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_bucket_capacity: Option<f64>,
+    /// 凭据级 bucket 容量覆盖
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_bucket_capacity_override: Option<f64>,
+    /// 当前生效回填速率（token/s）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_refill_per_second: Option<f64>,
+    /// 凭据级回填速率覆盖
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_refill_per_second_override: Option<f64>,
+    /// 配置的基础回填速率（token/s）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_refill_base_per_second: Option<f64>,
+    /// 连续 429 次数
+    pub rate_limit_hit_streak: u32,
+    /// 当前账号再次可被调度的剩余时间（毫秒）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_ready_in_ms: Option<u64>,
 }
 
 // ============ 操作请求 ============
@@ -91,6 +114,18 @@ pub struct SetMaxConcurrencyRequest {
     pub max_concurrency: Option<u32>,
 }
 
+/// 修改凭据级 token bucket 配置
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCredentialRateLimitConfigRequest {
+    /// 凭据级 bucket 容量覆盖
+    /// null 表示跟随全局；0 表示仅对该账号禁用 bucket
+    pub rate_limit_bucket_capacity: Option<f64>,
+    /// 凭据级回填速率覆盖（token/s）
+    /// null 表示跟随全局；0 表示仅对该账号禁用 bucket
+    pub rate_limit_refill_per_second: Option<f64>,
+}
+
 /// 添加凭据请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -114,6 +149,12 @@ pub struct AddCredentialRequest {
 
     /// 单账号并发上限（可选）
     pub max_concurrency: Option<u32>,
+
+    /// 凭据级 token bucket 容量覆盖（可选）
+    pub rate_limit_bucket_capacity: Option<f64>,
+
+    /// 凭据级 token bucket 回填速率覆盖（token/s，可选）
+    pub rate_limit_refill_per_second: Option<f64>,
 
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region
@@ -195,6 +236,16 @@ pub struct LoadBalancingModeResponse {
     pub queue_max_wait_ms: u64,
     /// 单账号触发 429 后的冷却时间（毫秒，0 表示禁用 429 冷却）
     pub rate_limit_cooldown_ms: u64,
+    /// 单账号 token bucket 容量（<= 0 表示禁用）
+    pub rate_limit_bucket_capacity: f64,
+    /// 单账号 token bucket 基础回填速率（token/s，<= 0 表示禁用）
+    pub rate_limit_refill_per_second: f64,
+    /// 429 退避后允许降到的最小回填速率（token/s）
+    pub rate_limit_refill_min_per_second: f64,
+    /// 每次成功请求恢复的回填速率增量（token/s）
+    pub rate_limit_refill_recovery_step_per_success: f64,
+    /// 遭遇 429 时的回填速率衰减系数（0.05-1）
+    pub rate_limit_refill_backoff_factor: f64,
     /// 当前正在排队的请求数
     pub waiting_requests: usize,
 }
@@ -211,6 +262,16 @@ pub struct SetLoadBalancingModeRequest {
     pub queue_max_wait_ms: Option<u64>,
     /// 单账号触发 429 后的冷却时间（毫秒，0 表示禁用 429 冷却）
     pub rate_limit_cooldown_ms: Option<u64>,
+    /// 单账号 token bucket 容量（<= 0 表示禁用）
+    pub rate_limit_bucket_capacity: Option<f64>,
+    /// 单账号 token bucket 基础回填速率（token/s，<= 0 表示禁用）
+    pub rate_limit_refill_per_second: Option<f64>,
+    /// 429 退避后允许降到的最小回填速率（token/s）
+    pub rate_limit_refill_min_per_second: Option<f64>,
+    /// 每次成功请求恢复的回填速率增量（token/s）
+    pub rate_limit_refill_recovery_step_per_success: Option<f64>,
+    /// 遭遇 429 时的回填速率衰减系数（0.05-1）
+    pub rate_limit_refill_backoff_factor: Option<f64>,
 }
 
 // ============ 通用响应 ============

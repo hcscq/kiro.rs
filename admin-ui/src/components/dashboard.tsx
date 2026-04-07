@@ -42,6 +42,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [queueMaxSizeInput, setQueueMaxSizeInput] = useState('0')
   const [queueMaxWaitMsInput, setQueueMaxWaitMsInput] = useState('0')
   const [rateLimitCooldownMsInput, setRateLimitCooldownMsInput] = useState('2000')
+  const [rateLimitBucketCapacityInput, setRateLimitBucketCapacityInput] = useState('3')
+  const [rateLimitRefillPerSecondInput, setRateLimitRefillPerSecondInput] = useState('1')
+  const [rateLimitRefillMinPerSecondInput, setRateLimitRefillMinPerSecondInput] = useState('0.2')
+  const [rateLimitRefillRecoveryStepInput, setRateLimitRefillRecoveryStepInput] = useState('0.1')
+  const [rateLimitRefillBackoffFactorInput, setRateLimitRefillBackoffFactorInput] = useState('0.5')
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
   const itemsPerPage = 12
@@ -82,7 +87,21 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setQueueMaxSizeInput(String(loadBalancingData.queueMaxSize))
     setQueueMaxWaitMsInput(String(loadBalancingData.queueMaxWaitMs))
     setRateLimitCooldownMsInput(String(loadBalancingData.rateLimitCooldownMs))
-  }, [loadBalancingData?.queueMaxSize, loadBalancingData?.queueMaxWaitMs, loadBalancingData?.rateLimitCooldownMs])
+    setRateLimitBucketCapacityInput(String(loadBalancingData.rateLimitBucketCapacity))
+    setRateLimitRefillPerSecondInput(String(loadBalancingData.rateLimitRefillPerSecond))
+    setRateLimitRefillMinPerSecondInput(String(loadBalancingData.rateLimitRefillMinPerSecond))
+    setRateLimitRefillRecoveryStepInput(String(loadBalancingData.rateLimitRefillRecoveryStepPerSuccess))
+    setRateLimitRefillBackoffFactorInput(String(loadBalancingData.rateLimitRefillBackoffFactor))
+  }, [
+    loadBalancingData?.queueMaxSize,
+    loadBalancingData?.queueMaxWaitMs,
+    loadBalancingData?.rateLimitCooldownMs,
+    loadBalancingData?.rateLimitBucketCapacity,
+    loadBalancingData?.rateLimitRefillPerSecond,
+    loadBalancingData?.rateLimitRefillMinPerSecond,
+    loadBalancingData?.rateLimitRefillRecoveryStepPerSuccess,
+    loadBalancingData?.rateLimitRefillBackoffFactor,
+  ])
 
   // 只保留当前仍存在的凭据缓存，避免删除后残留旧数据
   useEffect(() => {
@@ -524,16 +543,38 @@ export function Dashboard({ onLogout }: DashboardProps) {
     const parsedQueueMaxSize = queueMaxSizeInput.trim() === '' ? 0 : parseInt(queueMaxSizeInput, 10)
     const parsedQueueMaxWaitMs = queueMaxWaitMsInput.trim() === '' ? 0 : parseInt(queueMaxWaitMsInput, 10)
     const parsedRateLimitCooldownMs = rateLimitCooldownMsInput.trim() === '' ? 0 : parseInt(rateLimitCooldownMsInput, 10)
+    const parsedRateLimitBucketCapacity = rateLimitBucketCapacityInput.trim() === '' ? 0 : Number.parseFloat(rateLimitBucketCapacityInput)
+    const parsedRateLimitRefillPerSecond = rateLimitRefillPerSecondInput.trim() === '' ? 0 : Number.parseFloat(rateLimitRefillPerSecondInput)
+    const parsedRateLimitRefillMinPerSecond = rateLimitRefillMinPerSecondInput.trim() === '' ? 0 : Number.parseFloat(rateLimitRefillMinPerSecondInput)
+    const parsedRateLimitRefillRecoveryStep = rateLimitRefillRecoveryStepInput.trim() === '' ? 0 : Number.parseFloat(rateLimitRefillRecoveryStepInput)
+    const parsedRateLimitRefillBackoffFactor = rateLimitRefillBackoffFactorInput.trim() === '' ? 0 : Number.parseFloat(rateLimitRefillBackoffFactorInput)
 
     if (
       Number.isNaN(parsedQueueMaxSize) ||
       Number.isNaN(parsedQueueMaxWaitMs) ||
       Number.isNaN(parsedRateLimitCooldownMs) ||
+      Number.isNaN(parsedRateLimitBucketCapacity) ||
+      Number.isNaN(parsedRateLimitRefillPerSecond) ||
+      Number.isNaN(parsedRateLimitRefillMinPerSecond) ||
+      Number.isNaN(parsedRateLimitRefillRecoveryStep) ||
+      Number.isNaN(parsedRateLimitRefillBackoffFactor) ||
       parsedQueueMaxSize < 0 ||
       parsedQueueMaxWaitMs < 0 ||
-      parsedRateLimitCooldownMs < 0
+      parsedRateLimitCooldownMs < 0 ||
+      parsedRateLimitBucketCapacity < 0 ||
+      parsedRateLimitRefillPerSecond < 0 ||
+      parsedRateLimitRefillMinPerSecond < 0 ||
+      parsedRateLimitRefillRecoveryStep < 0
     ) {
-      toast.error('最大排队数量、最大等待时间和 429 冷却时间必须是大于等于 0 的整数')
+      toast.error('调度参数必须是大于等于 0 的数字')
+      return
+    }
+
+    if (
+      parsedRateLimitRefillBackoffFactor < 0.05 ||
+      parsedRateLimitRefillBackoffFactor > 1
+    ) {
+      toast.error('429 衰减系数必须在 0.05 到 1 之间')
       return
     }
 
@@ -541,7 +582,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
       {
         queueMaxSize: parsedQueueMaxSize,
         queueMaxWaitMs: parsedQueueMaxWaitMs,
-        rateLimitCooldownMs: parsedRateLimitCooldownMs
+        rateLimitCooldownMs: parsedRateLimitCooldownMs,
+        rateLimitBucketCapacity: parsedRateLimitBucketCapacity,
+        rateLimitRefillPerSecond: parsedRateLimitRefillPerSecond,
+        rateLimitRefillMinPerSecond: parsedRateLimitRefillMinPerSecond,
+        rateLimitRefillRecoveryStepPerSuccess: parsedRateLimitRefillRecoveryStep,
+        rateLimitRefillBackoffFactor: parsedRateLimitRefillBackoffFactor,
       },
       {
         onSuccess: () => {
@@ -669,7 +715,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
           <CardHeader className="pb-3">
             <CardTitle className="text-sm font-medium">调度设置</CardTitle>
           </CardHeader>
-          <CardContent className="grid gap-4 lg:grid-cols-[220px,1fr,1fr,1fr,auto] lg:items-end">
+          <CardContent className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
             <div className="space-y-2">
               <div className="text-sm text-muted-foreground">当前模式</div>
               <div className="flex items-center gap-2">
@@ -727,15 +773,89 @@ export function Dashboard({ onLogout }: DashboardProps) {
               />
             </div>
 
+            <div className="space-y-2">
+              <label className="text-sm font-medium" htmlFor="rateLimitBucketCapacity">
+                Bucket 容量
+              </label>
+              <Input
+                id="rateLimitBucketCapacity"
+                type="number"
+                min="0"
+                step="0.1"
+                value={rateLimitBucketCapacityInput}
+                onChange={(e) => setRateLimitBucketCapacityInput(e.target.value)}
+                placeholder="0 表示关闭 token bucket"
+              />
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-sm font-medium" htmlFor="rateLimitRefillPerSecond">
+                基础回填速率（token/s）
+              </label>
+              <Input
+                id="rateLimitRefillPerSecond"
+                type="number"
+                min="0"
+                step="0.1"
+                value={rateLimitRefillPerSecondInput}
+                onChange={(e) => setRateLimitRefillPerSecondInput(e.target.value)}
+                placeholder="0 表示关闭 token bucket"
+              />
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-sm font-medium" htmlFor="rateLimitRefillMinPerSecond">
+                最小回填速率（token/s）
+              </label>
+              <Input
+                id="rateLimitRefillMinPerSecond"
+                type="number"
+                min="0"
+                step="0.1"
+                value={rateLimitRefillMinPerSecondInput}
+                onChange={(e) => setRateLimitRefillMinPerSecondInput(e.target.value)}
+              />
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-sm font-medium" htmlFor="rateLimitRefillRecoveryStep">
+                成功恢复步长（token/s）
+              </label>
+              <Input
+                id="rateLimitRefillRecoveryStep"
+                type="number"
+                min="0"
+                step="0.1"
+                value={rateLimitRefillRecoveryStepInput}
+                onChange={(e) => setRateLimitRefillRecoveryStepInput(e.target.value)}
+              />
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-sm font-medium" htmlFor="rateLimitRefillBackoffFactor">
+                429 衰减系数
+              </label>
+              <Input
+                id="rateLimitRefillBackoffFactor"
+                type="number"
+                min="0.05"
+                max="1"
+                step="0.05"
+                value={rateLimitRefillBackoffFactorInput}
+                onChange={(e) => setRateLimitRefillBackoffFactorInput(e.target.value)}
+              />
+            </div>
+
             <Button
               onClick={handleSaveQueueSettings}
               disabled={isLoadingMode || isSettingMode}
+              className="md:col-span-2 xl:col-span-3"
             >
               保存配置
             </Button>
 
-            <p className="text-sm text-muted-foreground lg:col-span-5">
-              将任一项设为 0 可关闭对应能力。建议先从 `queueMaxWaitMs=1000-3000`、`queueMaxSize=总并发的 1-2 倍`、`rateLimitCooldownMs=2000-5000` 开始。
+            <p className="text-sm text-muted-foreground md:col-span-2 xl:col-span-3">
+              `maxConcurrency` 控并发峰值，token bucket 控单位时间发放速率。建议先从 `queueMaxWaitMs=1000-3000`、`queueMaxSize=总并发的 1-2 倍`、`rateLimitCooldownMs=2000-5000`、`rateLimitBucketCapacity=2-4`、`rateLimitRefillPerSecond=0.5-1.5` 开始。
             </p>
           </CardContent>
         </Card>

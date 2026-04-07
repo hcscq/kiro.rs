@@ -56,6 +56,16 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_concurrency: Option<u32>,
 
+    /// 凭据级 token bucket 容量覆盖（可选）
+    /// 未配置时回退到 config.json / Admin API 的全局值
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_bucket_capacity: Option<f64>,
+
+    /// 凭据级 token bucket 回填速率覆盖（token/s，可选）
+    /// 未配置时回退到 config.json / Admin API 的全局值
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_refill_per_second: Option<f64>,
+
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -106,6 +116,10 @@ pub struct KiroCredentials {
 /// 判断是否为零（用于跳过序列化）
 fn is_zero(value: &u32) -> bool {
     *value == 0
+}
+
+fn non_negative_finite(value: f64) -> Option<f64> {
+    value.is_finite().then_some(value).filter(|value| *value >= 0.0)
 }
 
 fn canonicalize_auth_method_value(value: &str) -> &str {
@@ -281,6 +295,17 @@ impl KiroCredentials {
             .filter(|limit| *limit > 0)
     }
 
+    /// 获取凭据级 token bucket 容量覆盖
+    pub fn rate_limit_bucket_capacity_override(&self) -> Option<f64> {
+        self.rate_limit_bucket_capacity.and_then(non_negative_finite)
+    }
+
+    /// 获取凭据级 token bucket 回填速率覆盖
+    pub fn rate_limit_refill_per_second_override(&self) -> Option<f64> {
+        self.rate_limit_refill_per_second
+            .and_then(non_negative_finite)
+    }
+
     /// 检查凭据是否支持 Opus 模型
     ///
     /// Free 账号不支持 Opus 模型，需要 PRO 或更高等级订阅
@@ -344,6 +369,8 @@ mod tests {
             client_secret: None,
             priority: 0,
             max_concurrency: None,
+            rate_limit_bucket_capacity: None,
+            rate_limit_refill_per_second: None,
             region: None,
             auth_region: None,
             api_region: None,
@@ -480,6 +507,8 @@ mod tests {
             client_secret: None,
             priority: 0,
             max_concurrency: None,
+            rate_limit_bucket_capacity: None,
+            rate_limit_refill_per_second: None,
             region: Some("eu-west-1".to_string()),
             auth_region: None,
             api_region: None,
@@ -511,6 +540,8 @@ mod tests {
             client_secret: None,
             priority: 0,
             max_concurrency: None,
+            rate_limit_bucket_capacity: None,
+            rate_limit_refill_per_second: None,
             region: None,
             auth_region: None,
             api_region: None,
@@ -624,6 +655,8 @@ mod tests {
             client_secret: None,
             priority: 3,
             max_concurrency: None,
+            rate_limit_bucket_capacity: None,
+            rate_limit_refill_per_second: None,
             region: Some("us-west-2".to_string()),
             auth_region: None,
             api_region: None,

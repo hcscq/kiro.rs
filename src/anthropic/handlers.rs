@@ -87,7 +87,7 @@ fn map_provider_error(err: Error) -> Response {
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse::new(
                 "service_unavailable",
-                "All available accounts are saturated or cooling down. Retry later or raise per-account maxConcurrency.",
+                "All available accounts are saturated, cooling down, or throttled by the local token bucket. Retry later or tune maxConcurrency/token-bucket settings.",
             )),
         )
             .into_response();

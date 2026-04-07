@@ -3,6 +3,7 @@ import {
   getCredentials,
   setCredentialDisabled,
   setCredentialMaxConcurrency,
+  setCredentialRateLimitConfig,
   setCredentialPriority,
   resetCredentialFailure,
   forceRefreshToken,
@@ -63,6 +64,29 @@ export function useSetMaxConcurrency() {
   return useMutation({
     mutationFn: ({ id, maxConcurrency }: { id: number; maxConcurrency: number | null }) =>
       setCredentialMaxConcurrency(id, maxConcurrency),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 设置凭据级 token bucket 参数
+export function useSetCredentialRateLimitConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      id,
+      rateLimitBucketCapacity,
+      rateLimitRefillPerSecond,
+    }: {
+      id: number
+      rateLimitBucketCapacity: number | null
+      rateLimitRefillPerSecond: number | null
+    }) =>
+      setCredentialRateLimitConfig(id, {
+        rateLimitBucketCapacity,
+        rateLimitRefillPerSecond,
+      }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },

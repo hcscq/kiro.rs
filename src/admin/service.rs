@@ -56,6 +56,9 @@ impl AdminService {
     /// 获取所有凭据状态
     pub fn get_all_credentials(&self) -> CredentialsStatusResponse {
         let snapshot = self.token_manager.snapshot();
+        let current_id = snapshot.current_id;
+        let total = snapshot.total;
+        let available = snapshot.available;
 
         let mut credentials: Vec<CredentialStatusItem> = snapshot
             .entries
@@ -65,7 +68,7 @@ impl AdminService {
                 priority: entry.priority,
                 disabled: entry.disabled,
                 failure_count: entry.failure_count,
-                is_current: entry.id == snapshot.current_id,
+                is_current: entry.id == current_id,
                 expires_at: entry.expires_at,
                 auth_method: entry.auth_method,
                 has_profile_arn: entry.has_profile_arn,
@@ -80,6 +83,15 @@ impl AdminService {
                 refresh_failure_count: entry.refresh_failure_count,
                 disabled_reason: entry.disabled_reason,
                 cooldown_remaining_ms: entry.cooldown_remaining_ms,
+                rate_limit_bucket_tokens: entry.rate_limit_bucket_tokens,
+                rate_limit_bucket_capacity: entry.rate_limit_bucket_capacity,
+                rate_limit_bucket_capacity_override: entry.rate_limit_bucket_capacity_override,
+                rate_limit_refill_per_second: entry.rate_limit_refill_per_second,
+                rate_limit_refill_per_second_override: entry
+                    .rate_limit_refill_per_second_override,
+                rate_limit_refill_base_per_second: entry.rate_limit_refill_base_per_second,
+                rate_limit_hit_streak: entry.rate_limit_hit_streak,
+                next_ready_in_ms: entry.next_ready_in_ms,
             })
             .collect();
 
@@ -87,9 +99,9 @@ impl AdminService {
         credentials.sort_by_key(|c| c.priority);
 
         CredentialsStatusResponse {
-            total: snapshot.total,
-            available: snapshot.available,
-            current_id: snapshot.current_id,
+            total,
+            available,
+            current_id,
             credentials,
         }
     }
@@ -126,6 +138,22 @@ impl AdminService {
     ) -> Result<(), AdminServiceError> {
         self.token_manager
             .set_max_concurrency(id, max_concurrency)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 设置凭据级 token bucket 配置
+    pub fn set_rate_limit_config(
+        &self,
+        id: u64,
+        rate_limit_bucket_capacity: Option<f64>,
+        rate_limit_refill_per_second: Option<f64>,
+    ) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_rate_limit_config(
+                id,
+                rate_limit_bucket_capacity,
+                rate_limit_refill_per_second,
+            )
             .map_err(|e| self.classify_error(e, id))
     }
 
@@ -215,6 +243,8 @@ impl AdminService {
             client_secret: req.client_secret,
             priority: req.priority,
             max_concurrency: req.max_concurrency,
+            rate_limit_bucket_capacity: req.rate_limit_bucket_capacity,
+            rate_limit_refill_per_second: req.rate_limit_refill_per_second,
             region: req.region,
             auth_region: req.auth_region,
             api_region: req.api_region,
@@ -271,6 +301,12 @@ impl AdminService {
             queue_max_size: snapshot.queue_max_size,
             queue_max_wait_ms: snapshot.queue_max_wait_ms,
             rate_limit_cooldown_ms: snapshot.rate_limit_cooldown_ms,
+            rate_limit_bucket_capacity: snapshot.rate_limit_bucket_capacity,
+            rate_limit_refill_per_second: snapshot.rate_limit_refill_per_second,
+            rate_limit_refill_min_per_second: snapshot.rate_limit_refill_min_per_second,
+            rate_limit_refill_recovery_step_per_success: snapshot
+                .rate_limit_refill_recovery_step_per_success,
+            rate_limit_refill_backoff_factor: snapshot.rate_limit_refill_backoff_factor,
             waiting_requests: snapshot.waiting_requests,
         }
     }
@@ -284,6 +320,11 @@ impl AdminService {
             && req.queue_max_size.is_none()
             && req.queue_max_wait_ms.is_none()
             && req.rate_limit_cooldown_ms.is_none()
+            && req.rate_limit_bucket_capacity.is_none()
+            && req.rate_limit_refill_per_second.is_none()
+            && req.rate_limit_refill_min_per_second.is_none()
+            && req.rate_limit_refill_recovery_step_per_success.is_none()
+            && req.rate_limit_refill_backoff_factor.is_none()
         {
             return Ok(self.get_load_balancing_mode());
         }
@@ -301,6 +342,11 @@ impl AdminService {
                 req.queue_max_size,
                 req.queue_max_wait_ms,
                 req.rate_limit_cooldown_ms,
+                req.rate_limit_bucket_capacity,
+                req.rate_limit_refill_per_second,
+                req.rate_limit_refill_min_per_second,
+                req.rate_limit_refill_recovery_step_per_success,
+                req.rate_limit_refill_backoff_factor,
             )
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 

@@ -28,6 +28,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [clientSecret, setClientSecret] = useState('')
   const [priority, setPriority] = useState('0')
   const [maxConcurrency, setMaxConcurrency] = useState('')
+  const [rateLimitBucketCapacity, setRateLimitBucketCapacity] = useState('')
+  const [rateLimitRefillPerSecond, setRateLimitRefillPerSecond] = useState('')
   const [machineId, setMachineId] = useState('')
   const [proxyUrl, setProxyUrl] = useState('')
   const [proxyUsername, setProxyUsername] = useState('')
@@ -44,6 +46,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setClientSecret('')
     setPriority('0')
     setMaxConcurrency('')
+    setRateLimitBucketCapacity('')
+    setRateLimitRefillPerSecond('')
     setMachineId('')
     setProxyUrl('')
     setProxyUsername('')
@@ -76,6 +80,27 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       return
     }
 
+    const parsedRateLimitBucketCapacity = rateLimitBucketCapacity.trim()
+      ? Number.parseFloat(rateLimitBucketCapacity)
+      : undefined
+    const parsedRateLimitRefillPerSecond = rateLimitRefillPerSecond.trim()
+      ? Number.parseFloat(rateLimitRefillPerSecond)
+      : undefined
+    if (
+      parsedRateLimitBucketCapacity !== undefined &&
+      (!Number.isFinite(parsedRateLimitBucketCapacity) || parsedRateLimitBucketCapacity < 0)
+    ) {
+      toast.error('Bucket 容量必须是大于等于 0 的数字')
+      return
+    }
+    if (
+      parsedRateLimitRefillPerSecond !== undefined &&
+      (!Number.isFinite(parsedRateLimitRefillPerSecond) || parsedRateLimitRefillPerSecond < 0)
+    ) {
+      toast.error('回填速率必须是大于等于 0 的数字')
+      return
+    }
+
     mutate(
       {
         refreshToken: refreshToken.trim(),
@@ -86,6 +111,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         clientSecret: clientSecret.trim() || undefined,
         priority: parseInt(priority) || 0,
         maxConcurrency: parsedMaxConcurrency,
+        rateLimitBucketCapacity: parsedRateLimitBucketCapacity,
+        rateLimitRefillPerSecond: parsedRateLimitRefillPerSecond,
         machineId: machineId.trim() || undefined,
         proxyUrl: proxyUrl.trim() || undefined,
         proxyUsername: proxyUsername.trim() || undefined,
@@ -238,6 +265,35 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               />
               <p className="text-xs text-muted-foreground">
                 每个账号允许同时处理的请求数。达到上限后会切到其他可用账号
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-sm font-medium">凭据级限速覆盖</label>
+              <div className="grid grid-cols-2 gap-2">
+                <Input
+                  id="rateLimitBucketCapacity"
+                  type="number"
+                  min="0"
+                  step="0.1"
+                  placeholder="Bucket 容量"
+                  value={rateLimitBucketCapacity}
+                  onChange={(e) => setRateLimitBucketCapacity(e.target.value)}
+                  disabled={isPending}
+                />
+                <Input
+                  id="rateLimitRefillPerSecond"
+                  type="number"
+                  min="0"
+                  step="0.1"
+                  placeholder="回填速率 token/s"
+                  value={rateLimitRefillPerSecond}
+                  onChange={(e) => setRateLimitRefillPerSecond(e.target.value)}
+                  disabled={isPending}
+                />
+              </div>
+              <p className="text-xs text-muted-foreground">
+                留空表示跟随全局，填 `0` 表示只对该账号禁用 token bucket
               </p>
             </div>
 
