@@ -18,6 +18,7 @@ import {
 import type { CredentialStatusItem, BalanceResponse } from '@/types/api'
 import {
   useSetDisabled,
+  useSetCredentialRateLimitConfig,
   useSetMaxConcurrency,
   useSetPriority,
   useResetFailure,
@@ -64,10 +65,24 @@ export function CredentialCard({
   const [maxConcurrencyValue, setMaxConcurrencyValue] = useState(
     credential.maxConcurrency ? String(credential.maxConcurrency) : ''
   )
+  const [editingRateLimitConfig, setEditingRateLimitConfig] = useState(false)
+  const [bucketCapacityValue, setBucketCapacityValue] = useState(
+    credential.rateLimitBucketCapacityOverride !== undefined &&
+    credential.rateLimitBucketCapacityOverride !== null
+      ? String(credential.rateLimitBucketCapacityOverride)
+      : ''
+  )
+  const [refillPerSecondValue, setRefillPerSecondValue] = useState(
+    credential.rateLimitRefillPerSecondOverride !== undefined &&
+    credential.rateLimitRefillPerSecondOverride !== null
+      ? String(credential.rateLimitRefillPerSecondOverride)
+      : ''
+  )
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
 
   const setDisabled = useSetDisabled()
   const setMaxConcurrency = useSetMaxConcurrency()
+  const setRateLimitConfig = useSetCredentialRateLimitConfig()
   const setPriority = useSetPriority()
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
@@ -124,6 +139,49 @@ export function CredentialCard({
         onSuccess: (res) => {
           toast.success(res.message)
           setEditingMaxConcurrency(false)
+        },
+        onError: (err) => {
+          toast.error('操作失败: ' + (err as Error).message)
+        },
+      }
+    )
+  }
+
+  const handleRateLimitConfigChange = () => {
+    const trimmedBucketCapacity = bucketCapacityValue.trim()
+    const trimmedRefillPerSecond = refillPerSecondValue.trim()
+    const parsedBucketCapacity = trimmedBucketCapacity
+      ? Number.parseFloat(trimmedBucketCapacity)
+      : undefined
+    const parsedRefillPerSecond = trimmedRefillPerSecond
+      ? Number.parseFloat(trimmedRefillPerSecond)
+      : undefined
+
+    if (
+      parsedBucketCapacity !== undefined &&
+      (!Number.isFinite(parsedBucketCapacity) || parsedBucketCapacity < 0)
+    ) {
+      toast.error('Bucket 容量必须是大于等于 0 的数字，留空表示跟随全局')
+      return
+    }
+    if (
+      parsedRefillPerSecond !== undefined &&
+      (!Number.isFinite(parsedRefillPerSecond) || parsedRefillPerSecond < 0)
+    ) {
+      toast.error('回填速率必须是大于等于 0 的数字，留空表示跟随全局')
+      return
+    }
+
+    setRateLimitConfig.mutate(
+      {
+        id: credential.id,
+        rateLimitBucketCapacity: parsedBucketCapacity ?? null,
+        rateLimitRefillPerSecond: parsedRefillPerSecond ?? null,
+      },
+      {
+        onSuccess: (res) => {
+          toast.success(res.message)
+          setEditingRateLimitConfig(false)
         },
         onError: (err) => {
           toast.error('操作失败: ' + (err as Error).message)
@@ -295,6 +353,85 @@ export function CredentialCard({
                 </span>
               )}
             </div>
+            <div className="col-span-2">
+              <span className="text-muted-foreground">凭据级限速覆盖：</span>
+              {editingRateLimitConfig ? (
+                <div className="mt-2 flex flex-wrap items-center gap-2">
+                  <Input
+                    type="number"
+                    value={bucketCapacityValue}
+                    onChange={(e) => setBucketCapacityValue(e.target.value)}
+                    className="w-28 h-7 text-sm"
+                    min="0"
+                    step="0.1"
+                    placeholder="容量"
+                  />
+                  <Input
+                    type="number"
+                    value={refillPerSecondValue}
+                    onChange={(e) => setRefillPerSecondValue(e.target.value)}
+                    className="w-32 h-7 text-sm"
+                    min="0"
+                    step="0.1"
+                    placeholder="回填 token/s"
+                  />
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-7 w-7 p-0"
+                    onClick={handleRateLimitConfigChange}
+                    disabled={setRateLimitConfig.isPending}
+                  >
+                    ✓
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-7 w-7 p-0"
+                    onClick={() => {
+                      setEditingRateLimitConfig(false)
+                      setBucketCapacityValue(
+                        credential.rateLimitBucketCapacityOverride !== undefined &&
+                        credential.rateLimitBucketCapacityOverride !== null
+                          ? String(credential.rateLimitBucketCapacityOverride)
+                          : ''
+                      )
+                      setRefillPerSecondValue(
+                        credential.rateLimitRefillPerSecondOverride !== undefined &&
+                        credential.rateLimitRefillPerSecondOverride !== null
+                          ? String(credential.rateLimitRefillPerSecondOverride)
+                          : ''
+                      )
+                    }}
+                  >
+                    ✕
+                  </Button>
+                  <span className="text-xs text-muted-foreground">
+                    留空跟随全局，0 为仅禁用该账号
+                  </span>
+                </div>
+              ) : (
+                <span
+                  className="font-medium cursor-pointer hover:underline ml-1"
+                  onClick={() => setEditingRateLimitConfig(true)}
+                >
+                  {credential.rateLimitBucketCapacityOverride === undefined ||
+                  credential.rateLimitBucketCapacityOverride === null
+                    ? 'Bucket 跟随全局'
+                    : credential.rateLimitBucketCapacityOverride === 0
+                      ? 'Bucket 已禁用'
+                      : `Bucket=${credential.rateLimitBucketCapacityOverride}`}
+                  {' / '}
+                  {credential.rateLimitRefillPerSecondOverride === undefined ||
+                  credential.rateLimitRefillPerSecondOverride === null
+                    ? '回填跟随全局'
+                    : credential.rateLimitRefillPerSecondOverride === 0
+                      ? '回填已禁用'
+                      : `回填=${credential.rateLimitRefillPerSecondOverride} token/s`}
+                  <span className="text-xs text-muted-foreground ml-1">(点击编辑)</span>
+                </span>
+              )}
+            </div>
             <div>
               <span className="text-muted-foreground">失败次数：</span>
               <span className={credential.failureCount > 0 ? 'text-red-500 font-medium' : ''}>
@@ -326,11 +463,45 @@ export function CredentialCard({
                 {credential.maxConcurrency ? ` / ${credential.maxConcurrency}` : ''}
               </span>
             </div>
+            {credential.rateLimitBucketCapacity !== undefined && credential.rateLimitBucketCapacity !== null && (
+              <div>
+                <span className="text-muted-foreground">Bucket：</span>
+                <span className="font-medium">
+                  {(credential.rateLimitBucketTokens ?? 0).toFixed(2)} / {credential.rateLimitBucketCapacity.toFixed(2)}
+                </span>
+              </div>
+            )}
             {credential.cooldownRemainingMs && credential.cooldownRemainingMs > 0 && (
               <div>
                 <span className="text-muted-foreground">429 冷却：</span>
                 <span className="font-medium text-amber-600">
                   {(credential.cooldownRemainingMs / 1000).toFixed(1)}s
+                </span>
+              </div>
+            )}
+            {(credential.rateLimitRefillPerSecond !== undefined && credential.rateLimitRefillPerSecond !== null) && (
+              <div>
+                <span className="text-muted-foreground">当前回填：</span>
+                <span className="font-medium">
+                  {credential.rateLimitRefillPerSecond.toFixed(2)}
+                  {credential.rateLimitRefillBasePerSecond !== undefined && credential.rateLimitRefillBasePerSecond !== null
+                    ? ` / ${credential.rateLimitRefillBasePerSecond.toFixed(2)}`
+                    : ''}
+                  {' '}token/s
+                </span>
+              </div>
+            )}
+            {credential.rateLimitHitStreak > 0 && (
+              <div>
+                <span className="text-muted-foreground">429 Streak：</span>
+                <span className="font-medium text-amber-600">{credential.rateLimitHitStreak}</span>
+              </div>
+            )}
+            {credential.nextReadyInMs !== undefined && credential.nextReadyInMs !== null && credential.nextReadyInMs > 0 && (
+              <div>
+                <span className="text-muted-foreground">下次可调度：</span>
+                <span className="font-medium">
+                  {(credential.nextReadyInMs / 1000).toFixed(1)}s
                 </span>
               </div>
             )}

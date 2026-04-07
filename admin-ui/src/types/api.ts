@@ -27,6 +27,14 @@ export interface CredentialStatusItem {
   refreshFailureCount: number
   disabledReason?: string
   cooldownRemainingMs?: number | null
+  rateLimitBucketTokens?: number | null
+  rateLimitBucketCapacity?: number | null
+  rateLimitBucketCapacityOverride?: number | null
+  rateLimitRefillPerSecond?: number | null
+  rateLimitRefillPerSecondOverride?: number | null
+  rateLimitRefillBasePerSecond?: number | null
+  rateLimitHitStreak: number
+  nextReadyInMs?: number | null
 }
 
 // 余额响应
@@ -63,6 +71,11 @@ export interface SetPriorityRequest {
   priority: number
 }
 
+export interface SetCredentialRateLimitConfigRequest {
+  rateLimitBucketCapacity: number | null
+  rateLimitRefillPerSecond: number | null
+}
+
 // 添加凭据请求
 export interface AddCredentialRequest {
   refreshToken: string
@@ -71,9 +84,13 @@ export interface AddCredentialRequest {
   clientSecret?: string
   priority?: number
   maxConcurrency?: number
+  rateLimitBucketCapacity?: number
+  rateLimitRefillPerSecond?: number
+  region?: string
   authRegion?: string
   apiRegion?: string
   machineId?: string
+  email?: string
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string
@@ -92,6 +109,11 @@ export interface LoadBalancingConfigResponse {
   queueMaxSize: number
   queueMaxWaitMs: number
   rateLimitCooldownMs: number
+  rateLimitBucketCapacity: number
+  rateLimitRefillPerSecond: number
+  rateLimitRefillMinPerSecond: number
+  rateLimitRefillRecoveryStepPerSuccess: number
+  rateLimitRefillBackoffFactor: number
   waitingRequests: number
 }
 
@@ -100,4 +122,9 @@ export interface UpdateLoadBalancingConfigRequest {
   queueMaxSize?: number
   queueMaxWaitMs?: number
   rateLimitCooldownMs?: number
+  rateLimitBucketCapacity?: number
+  rateLimitRefillPerSecond?: number
+  rateLimitRefillMinPerSecond?: number
+  rateLimitRefillRecoveryStepPerSuccess?: number
+  rateLimitRefillBackoffFactor?: number
 }

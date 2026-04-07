@@ -414,6 +414,10 @@ struct CredentialEntry {
     active_requests: usize,
     /// 429 限流冷却到期时间
     rate_limit_cooldown_until: Option<Instant>,
+    /// 本地 token bucket 与自适应退避状态
+    rate_limit_bucket: Option<AdaptiveTokenBucket>,
+    /// 连续 429 次数，用于放大冷却时间
+    rate_limit_hit_streak: u32,
 }
 
 /// 禁用原因
@@ -434,6 +438,107 @@ enum DisabledReason {
 struct StatsEntry {
     success_count: u64,
     last_used_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TokenBucketPolicy {
+    capacity: f64,
+    refill_per_second: f64,
+    min_refill_per_second: f64,
+    recovery_step_per_success: f64,
+    backoff_factor: f64,
+}
+
+#[derive(Debug, Clone)]
+struct AdaptiveTokenBucket {
+    policy: TokenBucketPolicy,
+    tokens: f64,
+    current_refill_per_second: f64,
+    last_refill_at: Instant,
+}
+
+impl AdaptiveTokenBucket {
+    fn new(policy: TokenBucketPolicy, now: Instant) -> Self {
+        Self {
+            tokens: policy.capacity,
+            current_refill_per_second: policy.refill_per_second,
+            policy,
+            last_refill_at: now,
+        }
+    }
+
+    fn refill(&mut self, now: Instant) {
+        let elapsed = now
+            .checked_duration_since(self.last_refill_at)
+            .unwrap_or_default()
+            .as_secs_f64();
+        if elapsed > 0.0 {
+            self.tokens = (self.tokens + elapsed * self.current_refill_per_second)
+                .min(self.policy.capacity);
+            self.last_refill_at = now;
+        }
+    }
+
+    fn has_available_token(&mut self, now: Instant) -> bool {
+        self.refill(now);
+        self.tokens >= 1.0
+    }
+
+    fn consume(&mut self, now: Instant) -> bool {
+        if !self.has_available_token(now) {
+            return false;
+        }
+        self.tokens = (self.tokens - 1.0).max(0.0);
+        true
+    }
+
+    fn ready_at(&mut self, now: Instant) -> Option<Instant> {
+        self.refill(now);
+        if self.tokens >= 1.0 {
+            return None;
+        }
+
+        let missing_tokens = 1.0 - self.tokens;
+        let wait_seconds = missing_tokens / self.current_refill_per_second;
+        Some(now + StdDuration::from_secs_f64(wait_seconds.max(0.0)))
+    }
+
+    fn on_rate_limited(&mut self, now: Instant) {
+        self.refill(now);
+        self.tokens = 0.0;
+        self.current_refill_per_second =
+            (self.current_refill_per_second * self.policy.backoff_factor)
+                .clamp(self.policy.min_refill_per_second, self.policy.refill_per_second);
+        self.last_refill_at = now;
+    }
+
+    fn on_success(&mut self, now: Instant) {
+        self.refill(now);
+        self.current_refill_per_second = (self.current_refill_per_second
+            + self.policy.recovery_step_per_success)
+            .min(self.policy.refill_per_second);
+    }
+
+    fn reconfigure(&mut self, policy: TokenBucketPolicy, now: Instant) {
+        self.refill(now);
+
+        let token_ratio = if self.policy.capacity > 0.0 {
+            (self.tokens / self.policy.capacity).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let refill_ratio = if self.policy.refill_per_second > 0.0 {
+            (self.current_refill_per_second / self.policy.refill_per_second).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+
+        self.policy = policy;
+        self.tokens = (token_ratio * policy.capacity).clamp(0.0, policy.capacity);
+        self.current_refill_per_second = (policy.refill_per_second * refill_ratio)
+            .clamp(policy.min_refill_per_second, policy.refill_per_second);
+        self.last_refill_at = now;
+    }
 }
 
 // ============================================================================
@@ -483,6 +588,29 @@ pub struct CredentialEntrySnapshot {
     /// 429 限流冷却剩余时间（毫秒）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cooldown_remaining_ms: Option<u64>,
+    /// 当前 bucket 可用 token 数
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_bucket_tokens: Option<f64>,
+    /// 当前 bucket 容量
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_bucket_capacity: Option<f64>,
+    /// 凭据级 bucket 容量覆盖
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_bucket_capacity_override: Option<f64>,
+    /// 当前生效回填速率（token/s）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_refill_per_second: Option<f64>,
+    /// 凭据级回填速率覆盖
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_refill_per_second_override: Option<f64>,
+    /// 配置的基础回填速率（token/s）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_refill_base_per_second: Option<f64>,
+    /// 连续 429 次数
+    pub rate_limit_hit_streak: u32,
+    /// 当前账号再次可被调度的剩余时间（毫秒）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_ready_in_ms: Option<u64>,
 }
 
 /// 凭据管理器状态快照
@@ -505,24 +633,68 @@ pub struct LoadBalancingConfigSnapshot {
     pub queue_max_size: usize,
     pub queue_max_wait_ms: u64,
     pub rate_limit_cooldown_ms: u64,
+    pub rate_limit_bucket_capacity: f64,
+    pub rate_limit_refill_per_second: f64,
+    pub rate_limit_refill_min_per_second: f64,
+    pub rate_limit_refill_recovery_step_per_success: f64,
+    pub rate_limit_refill_backoff_factor: f64,
     pub waiting_requests: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct DispatchConfig {
     mode: String,
     queue_max_size: usize,
     queue_max_wait_ms: u64,
     rate_limit_cooldown_ms: u64,
+    rate_limit_bucket_capacity: f64,
+    rate_limit_refill_per_second: f64,
+    rate_limit_refill_min_per_second: f64,
+    rate_limit_refill_recovery_step_per_success: f64,
+    rate_limit_refill_backoff_factor: f64,
 }
 
 impl DispatchConfig {
     fn from_config(config: &Config) -> Self {
+        let normalize_non_negative = |value: f64, fallback: f64| {
+            if value.is_finite() && value >= 0.0 {
+                value
+            } else {
+                fallback
+            }
+        };
+        let normalize_backoff = |value: f64| {
+            if value.is_finite() && value > 0.0 {
+                value.clamp(0.05, 1.0)
+            } else {
+                0.5
+            }
+        };
+
         Self {
             mode: config.load_balancing_mode.clone(),
             queue_max_size: config.queue_max_size,
             queue_max_wait_ms: config.queue_max_wait_ms,
             rate_limit_cooldown_ms: config.rate_limit_cooldown_ms,
+            rate_limit_bucket_capacity: normalize_non_negative(
+                config.rate_limit_bucket_capacity,
+                3.0,
+            ),
+            rate_limit_refill_per_second: normalize_non_negative(
+                config.rate_limit_refill_per_second,
+                1.0,
+            ),
+            rate_limit_refill_min_per_second: normalize_non_negative(
+                config.rate_limit_refill_min_per_second,
+                0.2,
+            ),
+            rate_limit_refill_recovery_step_per_success: normalize_non_negative(
+                config.rate_limit_refill_recovery_step_per_success,
+                0.1,
+            ),
+            rate_limit_refill_backoff_factor: normalize_backoff(
+                config.rate_limit_refill_backoff_factor,
+            ),
         }
     }
 
@@ -534,9 +706,44 @@ impl DispatchConfig {
         StdDuration::from_millis(self.queue_max_wait_ms)
     }
 
-    fn rate_limit_cooldown_duration(&self) -> Option<StdDuration> {
-        (self.rate_limit_cooldown_ms > 0)
-            .then(|| StdDuration::from_millis(self.rate_limit_cooldown_ms))
+    fn bucket_policy_for(&self, credentials: &KiroCredentials) -> Option<TokenBucketPolicy> {
+        let capacity = credentials
+            .rate_limit_bucket_capacity_override()
+            .unwrap_or(self.rate_limit_bucket_capacity);
+        let refill_per_second = credentials
+            .rate_limit_refill_per_second_override()
+            .unwrap_or(self.rate_limit_refill_per_second);
+
+        if !capacity.is_finite() || !refill_per_second.is_finite() || capacity <= 0.0 || refill_per_second <= 0.0
+        {
+            return None;
+        }
+
+        let min_refill_per_second = if self.rate_limit_refill_min_per_second.is_finite() {
+            self.rate_limit_refill_min_per_second
+                .clamp(0.0, refill_per_second)
+        } else {
+            0.0
+        };
+        let recovery_step_per_success =
+            if self.rate_limit_refill_recovery_step_per_success.is_finite() {
+                self.rate_limit_refill_recovery_step_per_success.max(0.0)
+            } else {
+                0.0
+            };
+        let backoff_factor = if self.rate_limit_refill_backoff_factor.is_finite() {
+            self.rate_limit_refill_backoff_factor.clamp(0.05, 1.0)
+        } else {
+            0.5
+        };
+
+        Some(TokenBucketPolicy {
+            capacity,
+            refill_per_second,
+            min_refill_per_second,
+            recovery_step_per_success,
+            backoff_factor,
+        })
     }
 }
 
@@ -656,6 +863,9 @@ impl MultiTokenManager {
         credentials_path: Option<PathBuf>,
         is_multiple_format: bool,
     ) -> anyhow::Result<Self> {
+        let dispatch_config = DispatchConfig::from_config(&config);
+        let now = Instant::now();
+
         // 计算当前最大 ID，为没有 ID 的凭据分配新 ID
         let max_existing_id = credentials.iter().filter_map(|c| c.id).max().unwrap_or(0);
         let mut next_id = max_existing_id + 1;
@@ -697,6 +907,10 @@ impl MultiTokenManager {
                     last_used_at: None,
                     active_requests: 0,
                     rate_limit_cooldown_until: None,
+                    rate_limit_bucket: dispatch_config
+                        .bucket_policy_for(&cred)
+                        .map(|policy| AdaptiveTokenBucket::new(policy, now)),
+                    rate_limit_hit_streak: 0,
                 }
             })
             .collect();
@@ -720,7 +934,6 @@ impl MultiTokenManager {
             .map(|e| e.id)
             .unwrap_or(0);
 
-        let dispatch_config = DispatchConfig::from_config(&config);
         let manager = Self {
             config,
             proxy,
@@ -800,13 +1013,16 @@ impl MultiTokenManager {
         }
     }
 
-    fn clear_expired_rate_limit_cooldowns(entries: &mut [CredentialEntry], now: Instant) {
+    fn refresh_runtime_state(entries: &mut [CredentialEntry], now: Instant) {
         for entry in entries {
             if entry
                 .rate_limit_cooldown_until
                 .is_some_and(|until| until <= now)
             {
                 entry.rate_limit_cooldown_until = None;
+            }
+            if let Some(bucket) = entry.rate_limit_bucket.as_mut() {
+                bucket.refill(now);
             }
         }
     }
@@ -824,17 +1040,67 @@ impl MultiTokenManager {
             .is_some_and(|until| until > now)
     }
 
-    fn next_rate_limit_ready_at(
-        entries: &[CredentialEntry],
+    fn bucket_is_ready(entry: &CredentialEntry) -> bool {
+        entry
+            .rate_limit_bucket
+            .as_ref()
+            .map_or(true, |bucket| bucket.tokens >= 1.0)
+    }
+
+    fn combined_ready_at(entry: &mut CredentialEntry, now: Instant) -> Option<Instant> {
+        let cooldown_ready_at = entry.rate_limit_cooldown_until.filter(|until| *until > now);
+        let bucket_ready_at = entry
+            .rate_limit_bucket
+            .as_mut()
+            .and_then(|bucket| bucket.ready_at(now));
+
+        match (cooldown_ready_at, bucket_ready_at) {
+            (Some(cooldown_ready_at), Some(bucket_ready_at)) => {
+                Some(cooldown_ready_at.max(bucket_ready_at))
+            }
+            (Some(cooldown_ready_at), None) => Some(cooldown_ready_at),
+            (None, Some(bucket_ready_at)) => Some(bucket_ready_at),
+            (None, None) => None,
+        }
+    }
+
+    fn next_ready_at(
+        entries: &mut [CredentialEntry],
         model: Option<&str>,
         now: Instant,
     ) -> Option<Instant> {
         entries
-            .iter()
-            .filter(|e| !e.disabled && Self::is_model_supported(&e.credentials, model))
-            .filter_map(|e| e.rate_limit_cooldown_until)
-            .filter(|until| *until > now)
+            .iter_mut()
+            .filter(|entry| !entry.disabled && Self::is_model_supported(&entry.credentials, model))
+            .filter_map(|entry| Self::combined_ready_at(entry, now))
             .min()
+    }
+
+    fn reset_rate_limit_runtime(entry: &mut CredentialEntry, dispatch: &DispatchConfig, now: Instant) {
+        entry.rate_limit_cooldown_until = None;
+        entry.rate_limit_hit_streak = 0;
+        entry.rate_limit_bucket = dispatch
+            .bucket_policy_for(&entry.credentials)
+            .map(|policy| AdaptiveTokenBucket::new(policy, now));
+    }
+
+    fn reconfigure_rate_limit_runtime(&self, dispatch: &DispatchConfig) {
+        let now = Instant::now();
+        let mut entries = self.entries.lock();
+        for entry in entries.iter_mut() {
+            match dispatch.bucket_policy_for(&entry.credentials) {
+                Some(policy) => {
+                    if let Some(bucket) = entry.rate_limit_bucket.as_mut() {
+                        bucket.reconfigure(policy, now);
+                    } else {
+                        entry.rate_limit_bucket = Some(AdaptiveTokenBucket::new(policy, now));
+                    }
+                }
+                None => {
+                    entry.rate_limit_bucket = None;
+                }
+            }
+        }
     }
 
     fn reserve_call_lease(&self, id: u64) -> CallLease {
@@ -891,6 +1157,8 @@ impl MultiTokenManager {
     }
 
     fn recover_auto_disabled_credentials(&self) -> bool {
+        let dispatch = self.dispatch_config();
+        let now = Instant::now();
         let mut entries = self.entries.lock();
         let mut recovered = false;
 
@@ -899,6 +1167,7 @@ impl MultiTokenManager {
                 entry.disabled = false;
                 entry.disabled_reason = None;
                 entry.failure_count = 0;
+                Self::reset_rate_limit_runtime(entry, &dispatch, now);
                 recovered = true;
             }
         }
@@ -929,7 +1198,7 @@ impl MultiTokenManager {
             return Err(ReservationFailure::NoCredentials);
         }
 
-        Self::clear_expired_rate_limit_cooldowns(&mut entries, now);
+        Self::refresh_runtime_state(&mut entries, now);
 
         let enabled_count = entries.iter().filter(|e| !e.disabled).count();
         if enabled_count == 0 {
@@ -953,6 +1222,7 @@ impl MultiTokenManager {
                     !e.disabled
                         && Self::is_model_supported(&e.credentials, model)
                         && !Self::is_rate_limited(e, now)
+                        && Self::bucket_is_ready(e)
                         && Self::has_capacity(&e.credentials, e.active_requests)
                 })
                 .min_by_key(|e| {
@@ -970,6 +1240,7 @@ impl MultiTokenManager {
                     && !e.disabled
                     && Self::is_model_supported(&e.credentials, model)
                     && !Self::is_rate_limited(e, now)
+                    && Self::bucket_is_ready(e)
                     && Self::has_capacity(&e.credentials, e.active_requests)
             });
 
@@ -980,6 +1251,7 @@ impl MultiTokenManager {
                         !e.disabled
                             && Self::is_model_supported(&e.credentials, model)
                             && !Self::is_rate_limited(e, now)
+                            && Self::bucket_is_ready(e)
                             && Self::has_capacity(&e.credentials, e.active_requests)
                     })
                     .min_by_key(|e| (e.credentials.priority, e.active_requests, e.id))
@@ -990,15 +1262,27 @@ impl MultiTokenManager {
         let selected_id = match selected_id {
             Some(id) => id,
             None => {
-                let next_ready_at = Self::next_rate_limit_ready_at(&entries, model, now);
+                let next_ready_at = Self::next_ready_at(&mut entries, model, now);
                 return Err(ReservationFailure::AllTemporarilyUnavailable { next_ready_at });
             }
         };
 
-        let entry = entries
-            .iter_mut()
-            .find(|e| e.id == selected_id)
+        let entry_index = entries
+            .iter()
+            .position(|e| e.id == selected_id)
             .expect("selected credential should exist");
+        let token_consumed = {
+            let entry = &mut entries[entry_index];
+            entry
+                .rate_limit_bucket
+                .as_mut()
+                .map_or(true, |bucket| bucket.consume(now))
+        };
+        if !token_consumed {
+            let next_ready_at = Self::next_ready_at(&mut entries, model, now);
+            return Err(ReservationFailure::AllTemporarilyUnavailable { next_ready_at });
+        }
+        let entry = &mut entries[entry_index];
         entry.active_requests += 1;
         *current_id = selected_id;
 
@@ -1065,7 +1349,7 @@ impl MultiTokenManager {
                 Err(ReservationFailure::AllTemporarilyUnavailable { next_ready_at }) => {
                     let dispatch = self.dispatch_config();
                     if !dispatch.queue_enabled() {
-                        anyhow::bail!("所有可用凭据已达到并发上限或处于限流冷却");
+                        anyhow::bail!("所有可用凭据已达到并发上限、处于限流冷却或正等待 token bucket 补充");
                     }
 
                     if wait_queue_guard.is_none() {
@@ -1385,12 +1669,22 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `id` - 凭据 ID（来自 CallContext）
     pub fn report_success(&self, id: u64) {
+        let now = Instant::now();
         {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
-                entry.rate_limit_cooldown_until = None;
+                if entry
+                    .rate_limit_cooldown_until
+                    .is_some_and(|until| until <= now)
+                {
+                    entry.rate_limit_cooldown_until = None;
+                }
+                if let Some(bucket) = entry.rate_limit_bucket.as_mut() {
+                    bucket.on_success(now);
+                }
+                entry.rate_limit_hit_streak = entry.rate_limit_hit_streak.saturating_sub(1);
                 entry.success_count += 1;
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
                 tracing::debug!(
@@ -1407,26 +1701,48 @@ impl MultiTokenManager {
     ///
     /// 对单账号施加短暂冷却，避免重试流量持续打到同一个受限账号上。
     pub fn report_rate_limited(&self, id: u64) {
-        let Some(cooldown) = self.dispatch_config().rate_limit_cooldown_duration() else {
-            tracing::warn!("凭据 #{} 遭遇上游 429，但当前已禁用 429 冷却", id);
-            return;
-        };
+        let dispatch = self.dispatch_config();
+        let now = Instant::now();
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                if entry.disabled {
+                    return;
+                }
 
-        let mut entries = self.entries.lock();
-        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-            if entry.disabled {
-                return;
+                entry.rate_limit_hit_streak = entry.rate_limit_hit_streak.saturating_add(1);
+                if let Some(bucket) = entry.rate_limit_bucket.as_mut() {
+                    bucket.on_rate_limited(now);
+                }
+
+                let cooldown_multiplier = u64::from(entry.rate_limit_hit_streak.min(5).max(1));
+                let cooldown_ms = dispatch
+                    .rate_limit_cooldown_ms
+                    .saturating_mul(cooldown_multiplier);
+                entry.rate_limit_cooldown_until = (cooldown_ms > 0)
+                    .then(|| now + StdDuration::from_millis(cooldown_ms));
+                entry.last_used_at = Some(Utc::now().to_rfc3339());
+
+                if let Some(bucket) = entry.rate_limit_bucket.as_ref() {
+                    tracing::warn!(
+                        "凭据 #{} 遭遇上游 429，进入冷却 {}ms，bucket 速率降至 {:.2}/{:.2} token/s（streak={}）",
+                        id,
+                        cooldown_ms,
+                        bucket.current_refill_per_second,
+                        bucket.policy.refill_per_second,
+                        entry.rate_limit_hit_streak
+                    );
+                } else {
+                    tracing::warn!(
+                        "凭据 #{} 遭遇上游 429，进入冷却 {}ms（streak={}，未启用 token bucket）",
+                        id,
+                        cooldown_ms,
+                        entry.rate_limit_hit_streak
+                    );
+                }
             }
-
-            entry.rate_limit_cooldown_until = Some(Instant::now() + cooldown);
-            entry.last_used_at = Some(Utc::now().to_rfc3339());
-
-            tracing::warn!(
-                "凭据 #{} 遭遇上游 429，进入冷却 {}ms",
-                id,
-                cooldown.as_millis()
-            );
         }
+        self.save_stats_debounced();
     }
 
     /// 报告指定凭据 API 调用失败
@@ -1647,14 +1963,15 @@ impl MultiTokenManager {
 
     /// 获取管理器状态快照（用于 Admin API）
     pub fn snapshot(&self) -> ManagerSnapshot {
-        let entries = self.entries.lock();
+        let now = Instant::now();
+        let mut entries = self.entries.lock();
+        Self::refresh_runtime_state(&mut entries, now);
         let current_id = *self.current_id.lock();
         let available = entries.iter().filter(|e| !e.disabled).count();
-        let now = Instant::now();
 
         ManagerSnapshot {
             entries: entries
-                .iter()
+                .iter_mut()
                 .map(|e| CredentialEntrySnapshot {
                     id: e.id,
                     priority: e.credentials.priority,
@@ -1694,6 +2011,32 @@ impl MultiTokenManager {
                         .rate_limit_cooldown_until
                         .and_then(|until| until.checked_duration_since(now))
                         .map(|remaining| remaining.as_millis().min(u128::from(u64::MAX)) as u64),
+                    rate_limit_bucket_tokens: e
+                        .rate_limit_bucket
+                        .as_ref()
+                        .map(|bucket| (bucket.tokens * 100.0).round() / 100.0),
+                    rate_limit_bucket_capacity: e
+                        .rate_limit_bucket
+                        .as_ref()
+                        .map(|bucket| bucket.policy.capacity),
+                    rate_limit_bucket_capacity_override: e
+                        .credentials
+                        .rate_limit_bucket_capacity_override(),
+                    rate_limit_refill_per_second: e
+                        .rate_limit_bucket
+                        .as_ref()
+                        .map(|bucket| (bucket.current_refill_per_second * 100.0).round() / 100.0),
+                    rate_limit_refill_per_second_override: e
+                        .credentials
+                        .rate_limit_refill_per_second_override(),
+                    rate_limit_refill_base_per_second: e
+                        .rate_limit_bucket
+                        .as_ref()
+                        .map(|bucket| bucket.policy.refill_per_second),
+                    rate_limit_hit_streak: e.rate_limit_hit_streak,
+                    next_ready_in_ms: Self::combined_ready_at(e, now)
+                        .and_then(|ready_at| ready_at.checked_duration_since(now))
+                        .map(|remaining| remaining.as_millis().min(u128::from(u64::MAX)) as u64),
                 })
                 .collect(),
             current_id,
@@ -1704,6 +2047,8 @@ impl MultiTokenManager {
 
     /// 设置凭据禁用状态（Admin API）
     pub fn set_disabled(&self, id: u64, disabled: bool) -> anyhow::Result<()> {
+        let dispatch = self.dispatch_config();
+        let now = Instant::now();
         {
             let mut entries = self.entries.lock();
             let entry = entries
@@ -1716,7 +2061,7 @@ impl MultiTokenManager {
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
                 entry.disabled_reason = None;
-                entry.rate_limit_cooldown_until = None;
+                Self::reset_rate_limit_runtime(entry, &dispatch, now);
             } else {
                 entry.disabled_reason = Some(DisabledReason::Manual);
             }
@@ -1764,8 +2109,46 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 设置凭据级 token bucket 配置（Admin API）
+    pub fn set_rate_limit_config(
+        &self,
+        id: u64,
+        rate_limit_bucket_capacity: Option<f64>,
+        rate_limit_refill_per_second: Option<f64>,
+    ) -> anyhow::Result<()> {
+        for (name, value) in [
+            ("rateLimitBucketCapacity", rate_limit_bucket_capacity),
+            ("rateLimitRefillPerSecond", rate_limit_refill_per_second),
+        ] {
+            if let Some(value) = value {
+                if !value.is_finite() || value < 0.0 {
+                    anyhow::bail!("{} 必须是大于等于 0 的有限数字", name);
+                }
+            }
+        }
+
+        let dispatch = self.dispatch_config();
+        let now = Instant::now();
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.rate_limit_bucket_capacity = rate_limit_bucket_capacity;
+            entry.credentials.rate_limit_refill_per_second = rate_limit_refill_per_second;
+            Self::reset_rate_limit_runtime(entry, &dispatch, now);
+        }
+
+        self.persist_credentials()?;
+        self.availability_notify.notify_waiters();
+        Ok(())
+    }
+
     /// 重置凭据失败计数并重新启用（Admin API）
     pub fn reset_and_enable(&self, id: u64) -> anyhow::Result<()> {
+        let dispatch = self.dispatch_config();
+        let now = Instant::now();
         {
             let mut entries = self.entries.lock();
             let entry = entries
@@ -1776,7 +2159,7 @@ impl MultiTokenManager {
             entry.refresh_failure_count = 0;
             entry.disabled = false;
             entry.disabled_reason = None;
-            entry.rate_limit_cooldown_until = None;
+            Self::reset_rate_limit_runtime(entry, &dispatch, now);
         }
         // 持久化更改
         self.persist_credentials()?;
@@ -1951,10 +2334,17 @@ impl MultiTokenManager {
         validated_cred.machine_id = new_cred.machine_id;
         validated_cred.email = new_cred.email;
         validated_cred.max_concurrency = new_cred.max_concurrency;
+        validated_cred.rate_limit_bucket_capacity = new_cred.rate_limit_bucket_capacity;
+        validated_cred.rate_limit_refill_per_second = new_cred.rate_limit_refill_per_second;
         validated_cred.proxy_url = new_cred.proxy_url;
         validated_cred.proxy_username = new_cred.proxy_username;
         validated_cred.proxy_password = new_cred.proxy_password;
 
+        let dispatch = self.dispatch_config();
+        let now = Instant::now();
+        let rate_limit_bucket = dispatch
+            .bucket_policy_for(&validated_cred)
+            .map(|policy| AdaptiveTokenBucket::new(policy, now));
         {
             let mut entries = self.entries.lock();
             entries.push(CredentialEntry {
@@ -1968,6 +2358,8 @@ impl MultiTokenManager {
                 last_used_at: None,
                 active_requests: 0,
                 rate_limit_cooldown_until: None,
+                rate_limit_bucket,
+                rate_limit_hit_streak: 0,
             });
         }
 
@@ -2092,6 +2484,12 @@ impl MultiTokenManager {
             queue_max_size: dispatch.queue_max_size,
             queue_max_wait_ms: dispatch.queue_max_wait_ms,
             rate_limit_cooldown_ms: dispatch.rate_limit_cooldown_ms,
+            rate_limit_bucket_capacity: dispatch.rate_limit_bucket_capacity,
+            rate_limit_refill_per_second: dispatch.rate_limit_refill_per_second,
+            rate_limit_refill_min_per_second: dispatch.rate_limit_refill_min_per_second,
+            rate_limit_refill_recovery_step_per_success: dispatch
+                .rate_limit_refill_recovery_step_per_success,
+            rate_limit_refill_backoff_factor: dispatch.rate_limit_refill_backoff_factor,
             waiting_requests: self.queue_depth(),
         }
     }
@@ -2108,11 +2506,16 @@ impl MultiTokenManager {
             Some(path) => path.to_path_buf(),
             None => {
                 tracing::warn!(
-                    "配置文件路径未知，调度配置仅在当前进程生效: mode={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}",
+                    "配置文件路径未知，调度配置仅在当前进程生效: mode={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}",
                     dispatch.mode,
                     dispatch.queue_max_size,
                     dispatch.queue_max_wait_ms,
-                    dispatch.rate_limit_cooldown_ms
+                    dispatch.rate_limit_cooldown_ms,
+                    dispatch.rate_limit_bucket_capacity,
+                    dispatch.rate_limit_refill_per_second,
+                    dispatch.rate_limit_refill_min_per_second,
+                    dispatch.rate_limit_refill_recovery_step_per_success,
+                    dispatch.rate_limit_refill_backoff_factor
                 );
                 return Ok(());
             }
@@ -2124,6 +2527,12 @@ impl MultiTokenManager {
         config.queue_max_size = dispatch.queue_max_size;
         config.queue_max_wait_ms = dispatch.queue_max_wait_ms;
         config.rate_limit_cooldown_ms = dispatch.rate_limit_cooldown_ms;
+        config.rate_limit_bucket_capacity = dispatch.rate_limit_bucket_capacity;
+        config.rate_limit_refill_per_second = dispatch.rate_limit_refill_per_second;
+        config.rate_limit_refill_min_per_second = dispatch.rate_limit_refill_min_per_second;
+        config.rate_limit_refill_recovery_step_per_success =
+            dispatch.rate_limit_refill_recovery_step_per_success;
+        config.rate_limit_refill_backoff_factor = dispatch.rate_limit_refill_backoff_factor;
         config
             .save()
             .with_context(|| format!("持久化调度配置失败: {}", config_path.display()))?;
@@ -2133,7 +2542,7 @@ impl MultiTokenManager {
 
     /// 设置负载均衡模式（Admin API）
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
-        self.set_load_balancing_config(Some(mode), None, None, None)
+        self.set_load_balancing_config(Some(mode), None, None, None, None, None, None, None, None)
     }
 
     /// 设置调度配置（Admin API）
@@ -2143,6 +2552,11 @@ impl MultiTokenManager {
         queue_max_size: Option<usize>,
         queue_max_wait_ms: Option<u64>,
         rate_limit_cooldown_ms: Option<u64>,
+        rate_limit_bucket_capacity: Option<f64>,
+        rate_limit_refill_per_second: Option<f64>,
+        rate_limit_refill_min_per_second: Option<f64>,
+        rate_limit_refill_recovery_step_per_success: Option<f64>,
+        rate_limit_refill_backoff_factor: Option<f64>,
     ) -> anyhow::Result<()> {
         let previous = self.dispatch_config();
         let mut next = previous.clone();
@@ -2164,6 +2578,50 @@ impl MultiTokenManager {
         if let Some(rate_limit_cooldown_ms) = rate_limit_cooldown_ms {
             next.rate_limit_cooldown_ms = rate_limit_cooldown_ms;
         }
+        if let Some(rate_limit_bucket_capacity) = rate_limit_bucket_capacity {
+            next.rate_limit_bucket_capacity = rate_limit_bucket_capacity;
+        }
+        if let Some(rate_limit_refill_per_second) = rate_limit_refill_per_second {
+            next.rate_limit_refill_per_second = rate_limit_refill_per_second;
+        }
+        if let Some(rate_limit_refill_min_per_second) = rate_limit_refill_min_per_second {
+            next.rate_limit_refill_min_per_second = rate_limit_refill_min_per_second;
+        }
+        if let Some(rate_limit_refill_recovery_step_per_success) =
+            rate_limit_refill_recovery_step_per_success
+        {
+            next.rate_limit_refill_recovery_step_per_success =
+                rate_limit_refill_recovery_step_per_success;
+        }
+        if let Some(rate_limit_refill_backoff_factor) = rate_limit_refill_backoff_factor {
+            next.rate_limit_refill_backoff_factor = rate_limit_refill_backoff_factor;
+        }
+
+        for (name, value) in [
+            ("rateLimitBucketCapacity", next.rate_limit_bucket_capacity),
+            ("rateLimitRefillPerSecond", next.rate_limit_refill_per_second),
+            (
+                "rateLimitRefillMinPerSecond",
+                next.rate_limit_refill_min_per_second,
+            ),
+            (
+                "rateLimitRefillRecoveryStepPerSuccess",
+                next.rate_limit_refill_recovery_step_per_success,
+            ),
+            (
+                "rateLimitRefillBackoffFactor",
+                next.rate_limit_refill_backoff_factor,
+            ),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                anyhow::bail!("{} 必须是大于等于 0 的有限数字", name);
+            }
+        }
+        if next.rate_limit_refill_backoff_factor < 0.05
+            || next.rate_limit_refill_backoff_factor > 1.0
+        {
+            anyhow::bail!("rateLimitRefillBackoffFactor 必须在 [0.05, 1] 范围内");
+        }
 
         if previous == next {
             return Ok(());
@@ -2181,14 +2639,29 @@ impl MultiTokenManager {
         {
             self.clear_all_rate_limit_cooldowns();
         }
+        if previous.rate_limit_bucket_capacity != next.rate_limit_bucket_capacity
+            || previous.rate_limit_refill_per_second != next.rate_limit_refill_per_second
+            || previous.rate_limit_refill_min_per_second != next.rate_limit_refill_min_per_second
+            || previous.rate_limit_refill_recovery_step_per_success
+                != next.rate_limit_refill_recovery_step_per_success
+            || previous.rate_limit_refill_backoff_factor
+                != next.rate_limit_refill_backoff_factor
+        {
+            self.reconfigure_rate_limit_runtime(&next);
+        }
 
         self.availability_notify.notify_waiters();
         tracing::info!(
-            "调度配置已更新: mode={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}",
+            "调度配置已更新: mode={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}",
             next.mode,
             next.queue_max_size,
             next.queue_max_wait_ms,
-            next.rate_limit_cooldown_ms
+            next.rate_limit_cooldown_ms,
+            next.rate_limit_bucket_capacity,
+            next.rate_limit_refill_per_second,
+            next.rate_limit_refill_min_per_second,
+            next.rate_limit_refill_recovery_step_per_success,
+            next.rate_limit_refill_backoff_factor
         );
         Ok(())
     }
@@ -2625,6 +3098,11 @@ mod tests {
                 Some(8),
                 Some(1500),
                 Some(4500),
+                Some(4.0),
+                Some(1.2),
+                Some(0.3),
+                Some(0.15),
+                Some(0.6),
             )
             .unwrap();
 
@@ -2633,6 +3111,11 @@ mod tests {
         assert_eq!(persisted.queue_max_size, 8);
         assert_eq!(persisted.queue_max_wait_ms, 1500);
         assert_eq!(persisted.rate_limit_cooldown_ms, 4500);
+        assert_eq!(persisted.rate_limit_bucket_capacity, 4.0);
+        assert_eq!(persisted.rate_limit_refill_per_second, 1.2);
+        assert_eq!(persisted.rate_limit_refill_min_per_second, 0.3);
+        assert_eq!(persisted.rate_limit_refill_recovery_step_per_success, 0.15);
+        assert_eq!(persisted.rate_limit_refill_backoff_factor, 0.6);
         assert_eq!(manager.get_load_balancing_mode(), "balanced");
 
         std::fs::remove_file(&config_path).unwrap();

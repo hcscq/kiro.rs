@@ -10,7 +10,8 @@ use super::{
     middleware::AdminState,
     types::{
         AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest,
-        SetMaxConcurrencyRequest, SetPriorityRequest, SuccessResponse,
+        SetCredentialRateLimitConfigRequest, SetMaxConcurrencyRequest, SetPriorityRequest,
+        SuccessResponse,
     },
 };
 
@@ -73,6 +74,27 @@ pub async fn set_credential_max_concurrency(
                 .filter(|limit| *limit > 0)
                 .map(|limit| limit.to_string())
                 .unwrap_or_else(|| "不限".to_string())
+        )))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/rate-limit-config
+/// 设置凭据级 token bucket 配置
+pub async fn set_credential_rate_limit_config(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetCredentialRateLimitConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_rate_limit_config(
+        id,
+        payload.rate_limit_bucket_capacity,
+        payload.rate_limit_refill_per_second,
+    ) {
+        Ok(_) => Json(SuccessResponse::new(format!(
+            "凭据 #{} token bucket 参数已更新",
+            id
         )))
         .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),

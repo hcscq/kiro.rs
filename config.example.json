@@ -8,5 +8,10 @@
   "loadBalancingMode": "balanced",
   "queueMaxSize": 16,
   "queueMaxWaitMs": 1500,
-  "rateLimitCooldownMs": 2000
+  "rateLimitCooldownMs": 2000,
+  "rateLimitBucketCapacity": 3.0,
+  "rateLimitRefillPerSecond": 1.0,
+  "rateLimitRefillMinPerSecond": 0.2,
+  "rateLimitRefillRecoveryStepPerSuccess": 0.1,
+  "rateLimitRefillBackoffFactor": 0.5
 }

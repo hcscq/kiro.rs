@@ -6,6 +6,7 @@ import type {
   SuccessResponse,
   SetDisabledRequest,
   SetPriorityRequest,
+  SetCredentialRateLimitConfigRequest,
   AddCredentialRequest,
   AddCredentialResponse,
   LoadBalancingConfigResponse,
@@ -67,6 +68,18 @@ export async function setCredentialMaxConcurrency(
   const { data } = await api.post<SuccessResponse>(
     `/credentials/${id}/max-concurrency`,
     { maxConcurrency }
+  )
+  return data
+}
+
+// 设置凭据级 token bucket 参数
+export async function setCredentialRateLimitConfig(
+  id: number,
+  payload: SetCredentialRateLimitConfigRequest
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/${id}/rate-limit-config`,
+    payload
   )
   return data
 }

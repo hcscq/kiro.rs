@@ -102,6 +102,26 @@ pub struct Config {
     #[serde(default = "default_rate_limit_cooldown_ms")]
     pub rate_limit_cooldown_ms: u64,
 
+    /// 单账号本地 token bucket 的容量（<= 0 表示禁用 token bucket）
+    #[serde(default = "default_rate_limit_bucket_capacity")]
+    pub rate_limit_bucket_capacity: f64,
+
+    /// 单账号本地 token bucket 的基础回填速率（token/s，<= 0 表示禁用 token bucket）
+    #[serde(default = "default_rate_limit_refill_per_second")]
+    pub rate_limit_refill_per_second: f64,
+
+    /// 429 自适应退避后允许降到的最小回填速率（token/s）
+    #[serde(default = "default_rate_limit_refill_min_per_second")]
+    pub rate_limit_refill_min_per_second: f64,
+
+    /// 每次成功请求后恢复的回填速率增量（token/s）
+    #[serde(default = "default_rate_limit_refill_recovery_step_per_success")]
+    pub rate_limit_refill_recovery_step_per_success: f64,
+
+    /// 遭遇 429 时当前回填速率的衰减系数（0.05-1，越小退避越激进）
+    #[serde(default = "default_rate_limit_refill_backoff_factor")]
+    pub rate_limit_refill_backoff_factor: f64,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -148,6 +168,26 @@ fn default_rate_limit_cooldown_ms() -> u64 {
     2_000
 }
 
+fn default_rate_limit_bucket_capacity() -> f64 {
+    3.0
+}
+
+fn default_rate_limit_refill_per_second() -> f64 {
+    1.0
+}
+
+fn default_rate_limit_refill_min_per_second() -> f64 {
+    0.2
+}
+
+fn default_rate_limit_refill_recovery_step_per_success() -> f64 {
+    0.1
+}
+
+fn default_rate_limit_refill_backoff_factor() -> f64 {
+    0.5
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -173,6 +213,12 @@ impl Default for Config {
             queue_max_size: 0,
             queue_max_wait_ms: 0,
             rate_limit_cooldown_ms: default_rate_limit_cooldown_ms(),
+            rate_limit_bucket_capacity: default_rate_limit_bucket_capacity(),
+            rate_limit_refill_per_second: default_rate_limit_refill_per_second(),
+            rate_limit_refill_min_per_second: default_rate_limit_refill_min_per_second(),
+            rate_limit_refill_recovery_step_per_success:
+                default_rate_limit_refill_recovery_step_per_success(),
+            rate_limit_refill_backoff_factor: default_rate_limit_refill_backoff_factor(),
             config_path: None,
         }
     }

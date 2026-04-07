@@ -38,6 +38,8 @@
 - **负载均衡**: 支持 `priority`（按优先级）和 `balanced`（按实时并发 + 成功次数均衡）两种模式
 - **等待队列**: 支持在账号瞬时打满时按 `queueMaxSize` / `queueMaxWaitMs` 做有界等待
 - **429 冷却**: 单账号触发上游 `429` 后会按 `rateLimitCooldownMs` 冷却，避免重试继续打到同一账号
+- **Token Bucket 限速**: 支持为每个账号设置本地 token bucket，平滑瞬时流量，避免弱账号被短时间打爆
+- **429 自适应退避**: 遭遇 `429` 时会清空该账号 bucket 并下调回填速率，成功后再逐步恢复
 - **智能重试**: 单凭据最多重试 3 次，单请求最多重试 9 次
 - **凭据回写**: 多凭据格式下自动回写刷新后的 Token
 - **Thinking 模式**: 支持 Claude 的 extended thinking 功能
@@ -201,6 +203,11 @@ GitHub Actions 镜像构建：
 | `queueMaxSize` | number | `0` | 等待队列最大长度；`0` 表示禁用等待队列 |
 | `queueMaxWaitMs` | number | `0` | 单请求最大排队等待时间（毫秒）；`0` 表示禁用等待队列 |
 | `rateLimitCooldownMs` | number | `2000` | 单账号触发上游 `429` 后的冷却时间（毫秒）；`0` 表示禁用 429 冷却 |
+| `rateLimitBucketCapacity` | number | `3.0` | 单账号 token bucket 容量；`<= 0` 表示禁用 token bucket |
+| `rateLimitRefillPerSecond` | number | `1.0` | 单账号 token bucket 基础回填速率（token/s）；`<= 0` 表示禁用 token bucket |
+| `rateLimitRefillMinPerSecond` | number | `0.2` | 遭遇 `429` 后允许降到的最小回填速率（token/s） |
+| `rateLimitRefillRecoveryStepPerSuccess` | number | `0.1` | 每次成功请求后恢复的回填速率增量（token/s） |
+| `rateLimitRefillBackoffFactor` | number | `0.5` | 遭遇 `429` 时当前回填速率的衰减系数，范围 `[0.05, 1]` |
 
 完整配置示例：
 
@@ -227,7 +234,12 @@ GitHub Actions 镜像构建：
    "loadBalancingMode": "balanced",
    "queueMaxSize": 16,
    "queueMaxWaitMs": 1500,
-   "rateLimitCooldownMs": 2000
+   "rateLimitCooldownMs": 2000,
+   "rateLimitBucketCapacity": 3.0,
+   "rateLimitRefillPerSecond": 1.0,
+   "rateLimitRefillMinPerSecond": 0.2,
+   "rateLimitRefillRecoveryStepPerSuccess": 0.1,
+   "rateLimitRefillBackoffFactor": 0.5
 }
 ```
 
@@ -249,6 +261,8 @@ GitHub Actions 镜像构建：
 | `clientSecret` | string | IdC 登录的客户端密钥（IdC 认证必填）                      |
 | `priority`     | number | 凭据优先级，数字越小越优先，默认为 0                         |
 | `maxConcurrency` | number | 单账号并发上限（可选，留空或 <= 0 表示不限制）             |
+| `rateLimitBucketCapacity` | number | 凭据级 token bucket 容量覆盖（可选，设为 `0` 可对该账号禁用） |
+| `rateLimitRefillPerSecond` | number | 凭据级 token bucket 回填速率覆盖（token/s，可选，设为 `0` 可对该账号禁用） |
 | `region`       | string | 凭据级 Auth Region, 兼容字段                       |
 | `authRegion`   | string | 凭据级 Auth Region，用于 Token 刷新, 未配置时回退到 region |
 | `apiRegion`    | string | 凭据级 API Region，用于 API 请求                    |
@@ -273,7 +287,9 @@ GitHub Actions 镜像构建：
    "authMethod": "social",
    "clientId": "IdC 登录需要",
    "clientSecret": "IdC 登录需要",
-   "maxConcurrency": 2
+   "maxConcurrency": 2,
+   "rateLimitBucketCapacity": 3,
+   "rateLimitRefillPerSecond": 0.8
 }
 ```
 
@@ -286,7 +302,9 @@ GitHub Actions 镜像构建：
       "expiresAt": "2025-12-31T02:32:45.144Z",
       "authMethod": "social",
       "priority": 0,
-      "maxConcurrency": 2
+      "maxConcurrency": 2,
+      "rateLimitBucketCapacity": 3,
+      "rateLimitRefillPerSecond": 0.8
    },
    {
       "refreshToken": "第二个凭据的刷新token",
@@ -317,6 +335,8 @@ GitHub Actions 镜像构建：
 - `maxConcurrency` 可限制单账号最大并发，请求达到上限后会自动切到其他可用账号
 - `queueMaxSize` / `queueMaxWaitMs` 可为瞬时超并发请求提供短暂排队，减少尖峰时直接失败
 - `rateLimitCooldownMs` 可控制单账号触发上游 `429` 后的冷却时长；设为 `0` 可关闭该机制
+- `rateLimitBucketCapacity` / `rateLimitRefillPerSecond` 可限制单账号单位时间内的发放速率，适合给“真实承载能力偏弱”的账号单独降速
+- 遭遇 `429` 时，本地会清空该账号 bucket，并按 `rateLimitRefillBackoffFactor` 下调当前回填速率；成功请求后再按 `rateLimitRefillRecoveryStepPerSuccess` 逐步恢复
 - 单凭据最多重试 3 次，单请求最多重试 9 次
 - 自动故障转移到下一个可用凭据
 - 多凭据格式下 Token 刷新后自动回写到源文件
