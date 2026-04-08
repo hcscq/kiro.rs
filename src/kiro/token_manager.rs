@@ -28,12 +28,14 @@ use crate::model::config::Config;
 /// Token 管理器
 ///
 /// 负责管理凭据和 Token 的自动刷新
+#[allow(dead_code)]
 pub struct TokenManager {
     config: Config,
     credentials: KiroCredentials,
     proxy: Option<ProxyConfig>,
 }
 
+#[allow(dead_code)]
 impl TokenManager {
     /// 创建新的 TokenManager 实例
     pub fn new(config: Config, credentials: KiroCredentials, proxy: Option<ProxyConfig>) -> Self {
@@ -975,6 +977,7 @@ impl MultiTokenManager {
     }
 
     /// 获取当前活动凭据的克隆
+    #[allow(dead_code)]
     pub fn credentials(&self) -> KiroCredentials {
         let entries = self.entries.lock();
         let current_id = *self.current_id.lock();
@@ -1456,30 +1459,9 @@ impl MultiTokenManager {
         }
     }
 
-    /// 切换到下一个优先级最高的可用凭据（内部方法）
-    fn switch_to_next_by_priority(&self) {
-        let entries = self.entries.lock();
-        let mut current_id = self.current_id.lock();
-
-        // 选择优先级最高的未禁用凭据（排除当前凭据）
-        if let Some(entry) = entries
-            .iter()
-            .filter(|e| !e.disabled && e.id != *current_id)
-            .min_by_key(|e| e.credentials.priority)
-        {
-            *current_id = entry.id;
-            tracing::info!(
-                "已切换到凭据 #{}（优先级 {}）",
-                entry.id,
-                entry.credentials.priority
-            );
-        }
-    }
-
     /// 选择优先级最高的未禁用凭据作为当前凭据（内部方法）
     ///
-    /// 与 `switch_to_next_by_priority` 不同，此方法不排除当前凭据，
-    /// 纯粹按优先级选择，用于优先级变更后立即生效
+    /// 纯粹按优先级选择，不排除当前凭据，用于优先级变更后立即生效
     fn select_highest_priority(&self) {
         let entries = self.entries.lock();
         let mut current_id = self.current_id.lock();
@@ -2006,19 +1988,6 @@ impl MultiTokenManager {
             // 没有其他可用凭据，检查当前凭据是否可用
             entries.iter().any(|e| e.id == *current_id && !e.disabled)
         }
-    }
-
-    /// 获取使用额度信息
-    pub async fn get_usage_limits(&self) -> anyhow::Result<UsageLimitsResponse> {
-        let ctx = self.acquire_context(None).await?;
-        let effective_proxy = ctx.credentials.effective_proxy(self.proxy.as_ref());
-        get_usage_limits(
-            &ctx.credentials,
-            &self.config,
-            &ctx.token,
-            effective_proxy.as_ref(),
-        )
-        .await
     }
 
     // ========================================================================

@@ -190,22 +190,6 @@ impl CredentialsConfig {
         }
     }
 
-    /// 获取凭据数量
-    pub fn len(&self) -> usize {
-        match self {
-            CredentialsConfig::Single(_) => 1,
-            CredentialsConfig::Multiple(creds) => creds.len(),
-        }
-    }
-
-    /// 判断是否为空
-    pub fn is_empty(&self) -> bool {
-        match self {
-            CredentialsConfig::Single(_) => false,
-            CredentialsConfig::Multiple(creds) => creds.is_empty(),
-        }
-    }
-
     /// 判断是否为多凭据格式（数组格式）
     pub fn is_multiple(&self) -> bool {
         matches!(self, CredentialsConfig::Multiple(_))
@@ -258,21 +242,13 @@ impl KiroCredentials {
     }
 
     /// 从 JSON 字符串解析凭证
+    #[allow(dead_code)]
     pub fn from_json(json_string: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(json_string)
     }
 
-    /// 从文件加载凭证
-    pub fn load<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
-        let content = fs::read_to_string(path.as_ref())?;
-        if content.is_empty() {
-            anyhow::bail!("凭证文件为空: {:?}", path.as_ref());
-        }
-        let credentials = Self::from_json(&content)?;
-        Ok(credentials)
-    }
-
     /// 序列化为格式化的 JSON 字符串
+    #[allow(dead_code)]
     pub fn to_pretty_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(self)
     }
@@ -439,7 +415,6 @@ mod tests {
         let json = r#"{"refreshToken": "test", "expiresAt": "2025-12-31T00:00:00Z"}"#;
         let config: CredentialsConfig = serde_json::from_str(json).unwrap();
         assert!(matches!(config, CredentialsConfig::Single(_)));
-        assert_eq!(config.len(), 1);
     }
 
     #[test]
@@ -450,7 +425,7 @@ mod tests {
         ]"#;
         let config: CredentialsConfig = serde_json::from_str(json).unwrap();
         assert!(matches!(config, CredentialsConfig::Multiple(_)));
-        assert_eq!(config.len(), 2);
+        assert_eq!(config.into_sorted_credentials().len(), 2);
     }
 
     #[test]
