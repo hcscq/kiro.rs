@@ -351,7 +351,6 @@ impl KiroProvider {
 
             // 401/403 凭据问题
             if matches!(status.as_u16(), 401 | 403) {
-<<<<<<< HEAD
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
                 if Self::is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx_id) {
                     force_refreshed.insert(ctx_id);
@@ -550,7 +549,6 @@ impl KiroProvider {
                     body
                 );
 
-<<<<<<< HEAD
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
                 if Self::is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx_id) {
                     force_refreshed.insert(ctx_id);
