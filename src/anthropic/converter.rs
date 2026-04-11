@@ -273,7 +273,7 @@ pub fn convert_request_with_probe(
     let mut tools = convert_tools(&req.tools, &mut tool_name_map);
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
-    let mut history = build_history(req, messages, &model_id, &mut tool_name_map, probe)?;
+    let mut history = build_history(req, messages, &model_id, &mut tool_name_map, &probe)?;
 
     // 8. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
@@ -316,9 +316,7 @@ pub fn convert_request_with_probe(
         .with_context(context)
         .with_origin("AI_EDITOR");
 
-    if probe.omit_origin {
-        user_input.origin = None;
-    }
+    probe.apply_origin(&mut user_input.origin);
 
     if !images.is_empty() {
         user_input = user_input.with_images(images);
@@ -673,7 +671,7 @@ fn build_history(
     messages: &[super::types::Message],
     model_id: &str,
     tool_name_map: &mut HashMap<String, String>,
-    probe: UpstreamProbe,
+    probe: &UpstreamProbe,
 ) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
@@ -705,9 +703,7 @@ fn build_history(
 
             // 系统消息作为 user + assistant 配对
             let mut user_msg = HistoryUserMessage::new(final_content, model_id);
-            if probe.omit_origin {
-                user_msg.user_input_message.origin = None;
-            }
+            probe.apply_origin(&mut user_msg.user_input_message.origin);
             history.push(Message::User(user_msg));
 
             let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
@@ -716,9 +712,7 @@ fn build_history(
     } else if let Some(ref prefix) = thinking_prefix {
         // 没有系统消息但有thinking配置，插入新的系统消息
         let mut user_msg = HistoryUserMessage::new(prefix.clone(), model_id);
-        if probe.omit_origin {
-            user_msg.user_input_message.origin = None;
-        }
+        probe.apply_origin(&mut user_msg.user_input_message.origin);
         history.push(Message::User(user_msg));
 
         let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
@@ -749,9 +743,7 @@ fn build_history(
             // 先处理累积的 user 消息
             if !user_buffer.is_empty() {
                 let mut merged_user = merge_user_messages(&user_buffer, model_id)?;
-                if probe.omit_origin {
-                    merged_user.user_input_message.origin = None;
-                }
+                probe.apply_origin(&mut merged_user.user_input_message.origin);
                 history.push(Message::User(merged_user));
                 user_buffer.clear();
             }
@@ -769,9 +761,7 @@ fn build_history(
     // 处理结尾的孤立 user 消息
     if !user_buffer.is_empty() {
         let mut merged_user = merge_user_messages(&user_buffer, model_id)?;
-        if probe.omit_origin {
-            merged_user.user_input_message.origin = None;
-        }
+        probe.apply_origin(&mut merged_user.user_input_message.origin);
         history.push(Message::User(merged_user));
 
         // 自动配对一个 "OK" 的 assistant 响应
@@ -1038,6 +1028,7 @@ mod tests {
             &req,
             UpstreamProbe {
                 omit_origin: true,
+                origin_override: None,
                 omit_agent_task_type: true,
                 omit_chat_trigger_type: true,
                 omit_agent_mode_header: false,
@@ -1091,6 +1082,7 @@ mod tests {
             &req,
             UpstreamProbe {
                 omit_origin: true,
+                origin_override: None,
                 omit_agent_task_type: false,
                 omit_chat_trigger_type: false,
                 omit_agent_mode_header: false,
@@ -1101,6 +1093,64 @@ mod tests {
         for entry in result.conversation_state.history {
             if let Message::User(user) = entry {
                 assert_eq!(user.user_input_message.origin, None);
+            }
+        }
+    }
+
+    #[test]
+    fn test_convert_request_with_probe_overrides_origin_everywhere() {
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                super::types::Message {
+                    role: "user".to_string(),
+                    content: serde_json::Value::String("前文".to_string()),
+                },
+                super::types::Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::Value::String("收到".to_string()),
+                },
+                super::types::Message {
+                    role: "user".to_string(),
+                    content: serde_json::Value::String("你是谁？".to_string()),
+                },
+            ],
+            stream: false,
+            system: Some(vec![super::types::SystemMessage {
+                text: "System".to_string(),
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request_with_probe(
+            &req,
+            UpstreamProbe {
+                omit_origin: false,
+                origin_override: Some("CLI".to_string()),
+                omit_agent_task_type: false,
+                omit_chat_trigger_type: false,
+                omit_agent_mode_header: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .origin,
+            Some("CLI".to_string())
+        );
+
+        for entry in result.conversation_state.history {
+            if let Message::User(user) = entry {
+                assert_eq!(user.user_input_message.origin, Some("CLI".to_string()));
             }
         }
     }
