@@ -25,6 +25,7 @@
 mod converter;
 mod handlers;
 mod middleware;
+mod probe;
 mod router;
 mod stream;
 pub mod types;

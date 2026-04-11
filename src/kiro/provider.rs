@@ -47,6 +47,11 @@ pub struct ManagedResponse {
     _lease: CallLease,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RequestOptions {
+    pub omit_agent_mode_header: bool,
+}
+
 impl ManagedResponse {
     fn new(response: reqwest::Response, lease: CallLease) -> Self {
         Self {
@@ -180,7 +185,16 @@ impl KiroProvider {
     /// # Returns
     /// 返回原始的 HTTP Response，不做解析
     pub async fn call_api(&self, request_body: &str) -> anyhow::Result<ManagedResponse> {
-        self.call_api_with_retry(request_body, false).await
+        self.call_api_with_options(request_body, RequestOptions::default())
+            .await
+    }
+
+    pub async fn call_api_with_options(
+        &self,
+        request_body: &str,
+        options: RequestOptions,
+    ) -> anyhow::Result<ManagedResponse> {
+        self.call_api_with_retry(request_body, false, options).await
     }
 
     /// 发送流式 API 请求
@@ -197,7 +211,16 @@ impl KiroProvider {
     /// # Returns
     /// 返回原始的 HTTP Response，调用方负责处理流式数据
     pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<ManagedResponse> {
-        self.call_api_with_retry(request_body, true).await
+        self.call_api_stream_with_options(request_body, RequestOptions::default())
+            .await
+    }
+
+    pub async fn call_api_stream_with_options(
+        &self,
+        request_body: &str,
+        options: RequestOptions,
+    ) -> anyhow::Result<ManagedResponse> {
+        self.call_api_with_retry(request_body, true, options).await
     }
 
     /// 发送 MCP API 请求
@@ -382,6 +405,7 @@ impl KiroProvider {
         &self,
         request_body: &str,
         is_stream: bool,
+        options: RequestOptions,
     ) -> anyhow::Result<ManagedResponse> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
@@ -425,23 +449,25 @@ impl KiroProvider {
             let body = Self::inject_profile_arn(request_body, &credentials.profile_arn);
 
             // 发送请求
-            let response = match self
+            let mut request = self
                 .client_for(&credentials)?
                 .post(&url)
                 .body(body)
                 .header("content-type", "application/json")
                 .header("x-amzn-codewhisperer-optout", "true")
-                .header("x-amzn-kiro-agent-mode", "vibe")
                 .header("x-amz-user-agent", &x_amz_user_agent)
                 .header("user-agent", &user_agent)
                 .header("host", &self.base_domain_for(&credentials))
                 .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
                 .header("amz-sdk-request", "attempt=1; max=3")
                 .header("Authorization", format!("Bearer {}", token))
-                .header("Connection", "close")
-                .send()
-                .await
-            {
+                .header("Connection", "close");
+
+            if !options.omit_agent_mode_header {
+                request = request.header("x-amzn-kiro-agent-mode", "vibe");
+            }
+
+            let response = match request.send().await {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::warn!(

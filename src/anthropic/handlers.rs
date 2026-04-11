@@ -11,7 +11,7 @@ use axum::{
     Json as JsonExtractor,
     body::Body,
     extract::State,
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
 use bytes::Bytes;
@@ -21,14 +21,16 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
-use super::converter::{ConversionError, convert_request};
+use super::converter::{ConversionError, convert_request_with_probe};
 use super::middleware::AppState;
+use super::probe::parse_upstream_probe;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
     OutputConfig, Thinking,
 };
 use super::websearch;
+use crate::kiro::provider::RequestOptions;
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
@@ -213,6 +215,7 @@ pub async fn get_models() -> impl IntoResponse {
 /// 创建消息（对话）
 pub async fn post_messages(
     State(state): State<AppState>,
+    headers: HeaderMap,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     tracing::info!(
@@ -238,6 +241,11 @@ pub async fn post_messages(
         }
     };
 
+    let probe = parse_upstream_probe(&headers);
+    if probe.is_enabled() {
+        tracing::info!(?probe, "启用上游裸探针选项");
+    }
+
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
@@ -257,7 +265,7 @@ pub async fn post_messages(
     }
 
     // 转换请求
-    let conversion_result = match convert_request(&payload) {
+    let conversion_result = match convert_request_with_probe(&payload, probe) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
@@ -326,6 +334,9 @@ pub async fn post_messages(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            RequestOptions {
+                omit_agent_mode_header: probe.omit_agent_mode_header,
+            },
         )
         .await
     } else {
@@ -336,6 +347,9 @@ pub async fn post_messages(
             &payload.model,
             input_tokens,
             tool_name_map,
+            RequestOptions {
+                omit_agent_mode_header: probe.omit_agent_mode_header,
+            },
         )
         .await
     }
@@ -349,9 +363,13 @@ async fn handle_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    request_options: RequestOptions,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
+    let response = match provider
+        .call_api_stream_with_options(request_body, request_options)
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -485,9 +503,13 @@ async fn handle_non_stream_request(
     model: &str,
     input_tokens: i32,
     tool_name_map: std::collections::HashMap<String, String>,
+    request_options: RequestOptions,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api(request_body).await {
+    let response = match provider
+        .call_api_with_options(request_body, request_options)
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -708,6 +730,7 @@ pub async fn count_tokens(
 /// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
 pub async fn post_messages_cc(
     State(state): State<AppState>,
+    headers: HeaderMap,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     tracing::info!(
@@ -734,6 +757,11 @@ pub async fn post_messages_cc(
         }
     };
 
+    let probe = parse_upstream_probe(&headers);
+    if probe.is_enabled() {
+        tracing::info!(?probe, "启用上游裸探针选项");
+    }
+
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
@@ -753,7 +781,7 @@ pub async fn post_messages_cc(
     }
 
     // 转换请求
-    let conversion_result = match convert_request(&payload) {
+    let conversion_result = match convert_request_with_probe(&payload, probe) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
@@ -822,6 +850,9 @@ pub async fn post_messages_cc(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            RequestOptions {
+                omit_agent_mode_header: probe.omit_agent_mode_header,
+            },
         )
         .await
     } else {
@@ -832,6 +863,9 @@ pub async fn post_messages_cc(
             &payload.model,
             input_tokens,
             tool_name_map,
+            RequestOptions {
+                omit_agent_mode_header: probe.omit_agent_mode_header,
+            },
         )
         .await
     }
@@ -848,9 +882,13 @@ async fn handle_stream_request_buffered(
     estimated_input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    request_options: RequestOptions,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
+    let response = match provider
+        .call_api_stream_with_options(request_body, request_options)
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
