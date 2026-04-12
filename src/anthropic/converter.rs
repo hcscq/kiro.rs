@@ -264,22 +264,31 @@ pub fn convert_request_with_probe(
     // 4. 确定触发类型
     let chat_trigger_type = determine_chat_trigger_type(req);
 
-    // 5. 处理最后一条消息作为 current_message（经过 prefill 预处理，末尾必为 user）
-    let last_message = messages.last().unwrap();
-    let (text_content, images, tool_results) = process_message_content(&last_message.content)?;
+    // 5. 将尾部连续 user 消息视为同一个 current_message。
+    // Anthropic 工具调用结果可能被拆成多个连续 user turn；如果只取最后一条，
+    // 会把本应属于同一轮的 tool_result 拆到 history/current 两侧，导致上游 400。
+    let current_message_start = trailing_user_message_cluster_start(messages);
+    let current_messages: Vec<_> = messages[current_message_start..].iter().collect();
+    let merged_current = merge_user_message_parts(&current_messages)?;
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射）
     let mut tool_name_map = HashMap::new();
     let mut tools = convert_tools(&req.tools, &mut tool_name_map);
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
-    let mut history = build_history(req, messages, &model_id, &mut tool_name_map, &probe)?;
+    let mut history = build_history(
+        req,
+        &messages[..current_message_start],
+        &model_id,
+        &mut tool_name_map,
+        &probe,
+    )?;
 
     // 8. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
     // 同时返回孤立的 tool_use_id 集合，用于后续清理
     let (validated_tool_results, orphaned_tool_use_ids) =
-        validate_tool_pairing(&history, &tool_results);
+        validate_tool_pairing(&history, &merged_current.tool_results);
 
     // 9. 从历史中移除孤立的 tool_use（Kiro API 要求 tool_use 必须有对应的 tool_result）
     remove_orphaned_tool_uses(&mut history, &orphaned_tool_use_ids);
@@ -310,16 +319,14 @@ pub fn convert_request_with_probe(
 
     // 12. 构建当前消息
     // 保留文本内容，即使有工具结果也不丢弃用户文本
-    let content = text_content;
-
-    let mut user_input = UserInputMessage::new(content, &model_id)
+    let mut user_input = UserInputMessage::new(merged_current.content, &model_id)
         .with_context(context)
         .with_origin("AI_EDITOR");
 
     probe.apply_origin(&mut user_input.origin);
 
-    if !images.is_empty() {
-        user_input = user_input.with_images(images);
+    if !merged_current.images.is_empty() {
+        user_input = user_input.with_images(merged_current.images);
     }
 
     let current_message = CurrentMessage::new(user_input);
@@ -348,6 +355,13 @@ pub fn convert_request_with_probe(
         conversation_state,
         tool_name_map,
     })
+}
+
+fn trailing_user_message_cluster_start(messages: &[super::types::Message]) -> usize {
+    messages
+        .iter()
+        .rposition(|msg| msg.role != "user")
+        .map_or(0, |idx| idx + 1)
 }
 
 /// 确定聊天触发类型
@@ -662,9 +676,9 @@ fn has_thinking_tags(content: &str) -> bool {
 ///
 /// # Arguments
 /// * `req` - 原始请求，用于读取 `system`、`thinking` 等配置字段
-/// * `messages` - 经过 prefill 预处理的消息切片，末尾必定是 user 消息。
-///   注意：该切片与 `req.messages` 可能不同（prefill 时会截断末尾的 assistant 消息），
-///   调用方应始终使用此参数而非 `req.messages`。
+/// * `messages` - 经过 prefill 预处理且已排除 current user cluster 的历史消息切片。
+///   注意：该切片与 `req.messages` 可能不同（prefill 时会截断末尾 assistant，
+///   current message 也可能由多条连续 user 消息合并而成）。
 /// * `model_id` - 已映射的 Kiro 模型 ID
 fn build_history(
     req: &MessagesRequest,
@@ -720,17 +734,11 @@ fn build_history(
     }
 
     // 2. 处理常规消息历史
-    // 最后一条消息作为 currentMessage，不加入历史
-    // 经过 prefill 预处理后，messages 末尾必定是 user，故直接截掉最后一条即可
-    let history_end_index = messages.len().saturating_sub(1);
-
     // 收集并配对消息
     let mut user_buffer: Vec<&super::types::Message> = Vec::new();
     let mut assistant_buffer: Vec<&super::types::Message> = Vec::new();
 
-    for i in 0..history_end_index {
-        let msg = &messages[i];
-
+    for msg in messages {
         if msg.role == "user" {
             // 先处理累积的 assistant 消息
             if !assistant_buffer.is_empty() {
@@ -772,35 +780,51 @@ fn build_history(
     Ok(history)
 }
 
+struct MergedUserMessageParts {
+    content: String,
+    images: Vec<KiroImage>,
+    tool_results: Vec<ToolResult>,
+}
+
+fn merge_user_message_parts(
+    messages: &[&super::types::Message],
+) -> Result<MergedUserMessageParts, ConversionError> {
+    let mut content_parts = Vec::new();
+    let mut images = Vec::new();
+    let mut tool_results = Vec::new();
+
+    for msg in messages {
+        let (text, msg_images, msg_tool_results) = process_message_content(&msg.content)?;
+        if !text.is_empty() {
+            content_parts.push(text);
+        }
+        images.extend(msg_images);
+        tool_results.extend(msg_tool_results);
+    }
+
+    Ok(MergedUserMessageParts {
+        content: content_parts.join("\n"),
+        images,
+        tool_results,
+    })
+}
+
 /// 合并多个 user 消息
 fn merge_user_messages(
     messages: &[&super::types::Message],
     model_id: &str,
 ) -> Result<HistoryUserMessage, ConversionError> {
-    let mut content_parts = Vec::new();
-    let mut all_images = Vec::new();
-    let mut all_tool_results = Vec::new();
-
-    for msg in messages {
-        let (text, images, tool_results) = process_message_content(&msg.content)?;
-        if !text.is_empty() {
-            content_parts.push(text);
-        }
-        all_images.extend(images);
-        all_tool_results.extend(tool_results);
-    }
-
-    let content = content_parts.join("\n");
+    let merged = merge_user_message_parts(messages)?;
     // 保留文本内容，即使有工具结果也不丢弃用户文本
-    let mut user_msg = UserMessage::new(&content, model_id);
+    let mut user_msg = UserMessage::new(&merged.content, model_id);
 
-    if !all_images.is_empty() {
-        user_msg = user_msg.with_images(all_images);
+    if !merged.images.is_empty() {
+        user_msg = user_msg.with_images(merged.images);
     }
 
-    if !all_tool_results.is_empty() {
+    if !merged.tool_results.is_empty() {
         let mut ctx = UserInputMessageContext::new();
-        ctx = ctx.with_tool_results(all_tool_results);
+        ctx = ctx.with_tool_results(merged.tool_results);
         user_msg = user_msg.with_context(ctx);
     }
 
@@ -1950,5 +1974,111 @@ mod tests {
             }
         }
         assert!(found_tool_use, "合并后的 assistant 消息应包含 tool_use");
+    }
+
+    #[test]
+    fn test_convert_request_merges_trailing_user_tool_results_into_current_message() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Analyze the retention query"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "text", "text": "I'll inspect the candidates."},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_01A",
+                            "name": "search_metrics",
+                            "input": {"keyword": "active_ret_rate_d1"}
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_01B",
+                            "name": "search_metrics_by_table",
+                            "input": {"table_name": "dws.dws_user_daily_summary_di"}
+                        }
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_01A",
+                            "content": "ACT.active_ret_rate_d1"
+                        }
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_01B",
+                            "content": "ACT.active_ret_rate_d1\nGRO.dau"
+                        },
+                        {
+                            "type": "text",
+                            "text": "Use these candidates and finish the classification."
+                        }
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req)
+            .expect("尾部连续 user tool_result 应合并为同一 current message");
+        let state = result.conversation_state;
+
+        assert_eq!(
+            state.history.len(),
+            2,
+            "history 应只保留首条 user 与 tool_use assistant"
+        );
+
+        let current = &state.current_message.user_input_message;
+        assert_eq!(
+            current.content,
+            "Use these candidates and finish the classification."
+        );
+        assert_eq!(
+            current.user_input_message_context.tool_results.len(),
+            2,
+            "current message 应同时携带两条 tool_result"
+        );
+
+        let tool_result_ids: Vec<_> = current
+            .user_input_message_context
+            .tool_results
+            .iter()
+            .map(|result| result.tool_use_id.as_str())
+            .collect();
+        assert_eq!(tool_result_ids, vec!["toolu_01A", "toolu_01B"]);
+
+        match &state.history[1] {
+            Message::Assistant(assistant) => {
+                let tool_uses = assistant
+                    .assistant_response_message
+                    .tool_uses
+                    .as_ref()
+                    .expect("history 中 assistant 应保留 tool_use");
+                assert_eq!(tool_uses.len(), 2);
+            }
+            other => panic!("history[1] 应为 assistant，got {:?}", other),
+        }
     }
 }
