@@ -9,6 +9,8 @@ use uuid::Uuid;
 
 use crate::kiro::model::events::Event;
 
+use super::thinking_compat::build_synthetic_thinking_signature;
+
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
 /// UTF-8字符可能占用1-4个字节，直接按字节位置切片可能会切在多字节字符中间导致panic。
@@ -488,6 +490,8 @@ pub struct StreamContext {
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
+    /// 已发送给客户端的 thinking 内容，用于生成 synthetic signature
+    thinking_signature_source: String,
 }
 
 impl StreamContext {
@@ -514,6 +518,7 @@ impl StreamContext {
             thinking_block_index: None,
             text_block_index: None,
             strip_thinking_leading_newline: false,
+            thinking_signature_source: String::new(),
         }
     }
 
@@ -669,6 +674,7 @@ impl StreamContext {
                     // 创建 thinking 块的 content_block_start 事件
                     let thinking_index = self.state_manager.next_block_index();
                     self.thinking_block_index = Some(thinking_index);
+                    self.thinking_signature_source.clear();
                     let start_events = self.state_manager.handle_content_block_start(
                         thinking_index,
                         "thinking",
@@ -723,9 +729,10 @@ impl StreamContext {
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
                     if !thinking_content.is_empty() {
                         if let Some(thinking_index) = self.thinking_block_index {
-                            events.push(
-                                self.create_thinking_delta_event(thinking_index, &thinking_content),
-                            );
+                            events.push(self.create_tracked_thinking_delta_event(
+                                thinking_index,
+                                &thinking_content,
+                            ));
                         }
                     }
 
@@ -735,14 +742,7 @@ impl StreamContext {
 
                     // 发送空的 thinking_delta 事件，然后发送 content_block_stop 事件
                     if let Some(thinking_index) = self.thinking_block_index {
-                        // 先发送空的 thinking_delta
-                        events.push(self.create_thinking_delta_event(thinking_index, ""));
-                        // 再发送 content_block_stop
-                        if let Some(stop_event) =
-                            self.state_manager.handle_content_block_stop(thinking_index)
-                        {
-                            events.push(stop_event);
-                        }
+                        self.close_thinking_block(&mut events, thinking_index);
                     }
 
                     // 剥离 `</thinking>\n\n`（find_real_thinking_end_tag 已确认 \n\n 存在）
@@ -764,9 +764,10 @@ impl StreamContext {
                         let safe_content = self.thinking_buffer[..safe_len].to_string();
                         if !safe_content.is_empty() {
                             if let Some(thinking_index) = self.thinking_block_index {
-                                events.push(
-                                    self.create_thinking_delta_event(thinking_index, &safe_content),
-                                );
+                                events.push(self.create_tracked_thinking_delta_event(
+                                    thinking_index,
+                                    &safe_content,
+                                ));
                             }
                         }
                         self.thinking_buffer = self.thinking_buffer[safe_len..].to_string();
@@ -862,6 +863,48 @@ impl StreamContext {
         )
     }
 
+    /// 创建 thinking_delta 事件并累计内容，供 synthetic signature 使用
+    fn create_tracked_thinking_delta_event(&mut self, index: i32, thinking: &str) -> SseEvent {
+        if !thinking.is_empty() {
+            self.thinking_signature_source.push_str(thinking);
+        }
+        self.create_thinking_delta_event(index, thinking)
+    }
+
+    /// 创建 synthetic signature_delta 事件
+    fn create_signature_delta_event(&self, index: i32) -> Option<SseEvent> {
+        if self.thinking_signature_source.is_empty() {
+            return None;
+        }
+        let signature = build_synthetic_thinking_signature(
+            &self.message_id,
+            index,
+            &self.thinking_signature_source,
+        );
+        Some(SseEvent::new(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {
+                    "type": "signature_delta",
+                    "signature": signature
+                }
+            }),
+        ))
+    }
+
+    /// 按兼容顺序结束 thinking 块：空 thinking_delta -> signature_delta -> stop
+    fn close_thinking_block(&mut self, events: &mut Vec<SseEvent>, thinking_index: i32) {
+        events.push(self.create_thinking_delta_event(thinking_index, ""));
+        if let Some(signature_event) = self.create_signature_delta_event(thinking_index) {
+            events.push(signature_event);
+        }
+        if let Some(stop_event) = self.state_manager.handle_content_block_stop(thinking_index) {
+            events.push(stop_event);
+        }
+    }
+
     /// 处理工具使用事件
     fn process_tool_use(
         &mut self,
@@ -880,9 +923,10 @@ impl StreamContext {
                 let thinking_content = self.thinking_buffer[..end_pos].to_string();
                 if !thinking_content.is_empty() {
                     if let Some(thinking_index) = self.thinking_block_index {
-                        events.push(
-                            self.create_thinking_delta_event(thinking_index, &thinking_content),
-                        );
+                        events.push(self.create_tracked_thinking_delta_event(
+                            thinking_index,
+                            &thinking_content,
+                        ));
                     }
                 }
 
@@ -891,14 +935,7 @@ impl StreamContext {
                 self.thinking_extracted = true;
 
                 if let Some(thinking_index) = self.thinking_block_index {
-                    // 先发送空的 thinking_delta
-                    events.push(self.create_thinking_delta_event(thinking_index, ""));
-                    // 再发送 content_block_stop
-                    if let Some(stop_event) =
-                        self.state_manager.handle_content_block_stop(thinking_index)
-                    {
-                        events.push(stop_event);
-                    }
+                    self.close_thinking_block(&mut events, thinking_index);
                 }
 
                 // 把结束标签后的内容当作普通文本（通常为空或空白）
@@ -1000,20 +1037,15 @@ impl StreamContext {
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
                     if !thinking_content.is_empty() {
                         if let Some(thinking_index) = self.thinking_block_index {
-                            events.push(
-                                self.create_thinking_delta_event(thinking_index, &thinking_content),
-                            );
+                            events.push(self.create_tracked_thinking_delta_event(
+                                thinking_index,
+                                &thinking_content,
+                            ));
                         }
                     }
 
-                    // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
                     if let Some(thinking_index) = self.thinking_block_index {
-                        events.push(self.create_thinking_delta_event(thinking_index, ""));
-                        if let Some(stop_event) =
-                            self.state_manager.handle_content_block_stop(thinking_index)
-                        {
-                            events.push(stop_event);
-                        }
+                        self.close_thinking_block(&mut events, thinking_index);
                     }
 
                     // 把结束标签后的内容当作普通文本（通常为空或空白）
@@ -1027,21 +1059,15 @@ impl StreamContext {
                     }
                 } else {
                     // 如果还在 thinking 块内，发送剩余内容作为 thinking_delta
+                    let remaining_thinking = self.thinking_buffer.clone();
                     if let Some(thinking_index) = self.thinking_block_index {
-                        events.push(
-                            self.create_thinking_delta_event(thinking_index, &self.thinking_buffer),
-                        );
+                        events.push(self.create_tracked_thinking_delta_event(
+                            thinking_index,
+                            &remaining_thinking,
+                        ));
                     }
-                    // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
                     if let Some(thinking_index) = self.thinking_block_index {
-                        // 先发送空的 thinking_delta
-                        events.push(self.create_thinking_delta_event(thinking_index, ""));
-                        // 再发送 content_block_stop
-                        if let Some(stop_event) =
-                            self.state_manager.handle_content_block_stop(thinking_index)
-                        {
-                            events.push(stop_event);
-                        }
+                        self.close_thinking_block(&mut events, thinking_index);
                     }
                 }
             } else {

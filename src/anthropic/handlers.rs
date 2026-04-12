@@ -25,6 +25,7 @@ use super::converter::{ConversionError, convert_request_with_probe};
 use super::middleware::AppState;
 use super::probe::parse_upstream_probe;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
+use super::thinking_compat::{build_synthetic_thinking_signature, extract_thinking_and_text};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
     OutputConfig, Thinking,
@@ -631,12 +632,32 @@ async fn handle_non_stream_request(
 
     // 构建响应内容
     let mut content: Vec<serde_json::Value> = Vec::new();
+    let response_id = format!("msg_{}", Uuid::new_v4().to_string().replace('-', ""));
 
     if !text_content.is_empty() {
-        content.push(json!({
-            "type": "text",
-            "text": text_content
-        }));
+        if let Some((thinking, remaining_text)) = extract_thinking_and_text(&text_content) {
+            let signature = build_synthetic_thinking_signature(
+                &response_id,
+                0,
+                &thinking,
+            );
+            content.push(json!({
+                "type": "thinking",
+                "thinking": thinking,
+                "signature": signature
+            }));
+            if !remaining_text.is_empty() {
+                content.push(json!({
+                    "type": "text",
+                    "text": remaining_text
+                }));
+            }
+        } else {
+            content.push(json!({
+                "type": "text",
+                "text": text_content
+            }));
+        }
     }
 
     content.extend(tool_uses);
@@ -649,7 +670,7 @@ async fn handle_non_stream_request(
 
     // 构建 Anthropic 响应
     let response_body = json!({
-        "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
+        "id": response_id,
         "type": "message",
         "role": "assistant",
         "content": content,

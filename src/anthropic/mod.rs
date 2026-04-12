@@ -28,6 +28,7 @@ mod middleware;
 mod probe;
 mod router;
 mod stream;
+mod thinking_compat;
 pub mod types;
 mod websearch;
 
