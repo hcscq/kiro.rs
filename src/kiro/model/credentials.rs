@@ -257,7 +257,18 @@ impl KiroCredentials {
     ///
     /// 返回 `None` 表示不限制并发。
     pub fn effective_max_concurrency(&self) -> Option<usize> {
+        self.effective_max_concurrency_with_default(None)
+    }
+
+    /// 获取有效的并发上限，并在凭据未配置时回退到默认值。
+    ///
+    /// 返回 `None` 表示不限制并发。
+    pub fn effective_max_concurrency_with_default(
+        &self,
+        default_limit: Option<u32>,
+    ) -> Option<usize> {
         self.max_concurrency
+            .or(default_limit)
             .and_then(|limit| usize::try_from(limit).ok())
             .filter(|limit| *limit > 0)
     }

@@ -6,6 +6,7 @@
   "region": "us-east-1",
   "adminApiKey": "sk-admin-your-secret-key",
   "loadBalancingMode": "balanced",
+  "defaultMaxConcurrency": 3,
   "queueMaxSize": 16,
   "queueMaxWaitMs": 1500,
   "rateLimitCooldownMs": 2000,

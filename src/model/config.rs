@@ -90,6 +90,12 @@ pub struct Config {
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
+    /// 默认单账号并发上限（可选）
+    /// 仅在凭据未单独配置 maxConcurrency 时生效
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_max_concurrency: Option<u32>,
+
     /// 等待队列最大长度（0 表示禁用等待队列）
     #[serde(default)]
     pub queue_max_size: usize,
@@ -210,6 +216,7 @@ impl Default for Config {
             proxy_password: None,
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
+            default_max_concurrency: None,
             queue_max_size: 0,
             queue_max_wait_ms: 0,
             rate_limit_cooldown_ms: default_rate_limit_cooldown_ms(),

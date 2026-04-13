@@ -296,6 +296,7 @@ impl AdminService {
             queue_max_size: snapshot.queue_max_size,
             queue_max_wait_ms: snapshot.queue_max_wait_ms,
             rate_limit_cooldown_ms: snapshot.rate_limit_cooldown_ms,
+            default_max_concurrency: snapshot.default_max_concurrency,
             rate_limit_bucket_capacity: snapshot.rate_limit_bucket_capacity,
             rate_limit_refill_per_second: snapshot.rate_limit_refill_per_second,
             rate_limit_refill_min_per_second: snapshot.rate_limit_refill_min_per_second,
@@ -315,6 +316,7 @@ impl AdminService {
             && req.queue_max_size.is_none()
             && req.queue_max_wait_ms.is_none()
             && req.rate_limit_cooldown_ms.is_none()
+            && req.default_max_concurrency.is_none()
             && req.rate_limit_bucket_capacity.is_none()
             && req.rate_limit_refill_per_second.is_none()
             && req.rate_limit_refill_min_per_second.is_none()
@@ -337,6 +339,7 @@ impl AdminService {
                 req.queue_max_size,
                 req.queue_max_wait_ms,
                 req.rate_limit_cooldown_ms,
+                req.default_max_concurrency,
                 req.rate_limit_bucket_capacity,
                 req.rate_limit_refill_per_second,
                 req.rate_limit_refill_min_per_second,

@@ -292,7 +292,6 @@ impl KiroProvider {
                 .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
                 .header("amz-sdk-request", "attempt=1; max=3")
                 .header("Authorization", format!("Bearer {}", token))
-                .header("Connection", "close")
                 .send()
                 .await
             {
@@ -460,8 +459,7 @@ impl KiroProvider {
                 .header("host", &self.base_domain_for(&credentials))
                 .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
                 .header("amz-sdk-request", "attempt=1; max=3")
-                .header("Authorization", format!("Bearer {}", token))
-                .header("Connection", "close");
+                .header("Authorization", format!("Bearer {}", token));
 
             if !options.omit_agent_mode_header {
                 request = request.header("x-amzn-kiro-agent-mode", "vibe");

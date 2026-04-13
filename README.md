@@ -200,6 +200,7 @@ GitHub Actions 镜像构建：
 | `proxyPassword` | string | - | 代理密码 |
 | `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
+| `defaultMaxConcurrency` | number | - | 全局默认单账号并发上限；仅在凭据未单独配置 `maxConcurrency` 时生效，留空或 <= 0 表示不限制 |
 | `queueMaxSize` | number | `0` | 等待队列最大长度；`0` 表示禁用等待队列 |
 | `queueMaxWaitMs` | number | `0` | 单请求最大排队等待时间（毫秒）；`0` 表示禁用等待队列 |
 | `rateLimitCooldownMs` | number | `2000` | 单账号触发上游 `429` 后的冷却时间（毫秒）；`0` 表示禁用 429 冷却 |
@@ -232,6 +233,7 @@ GitHub Actions 镜像构建：
    "proxyPassword": "pass",
    "adminApiKey": "sk-admin-your-secret-key",
    "loadBalancingMode": "balanced",
+   "defaultMaxConcurrency": 3,
    "queueMaxSize": 16,
    "queueMaxWaitMs": 1500,
    "rateLimitCooldownMs": 2000,
@@ -332,6 +334,7 @@ GitHub Actions 镜像构建：
 多凭据特性：
 - 按 `priority` 字段排序，数字越小优先级越高（默认为 0）
 - `balanced` 模式会优先选择当前并发较低的账号；如果并发相同，再参考历史成功次数和 `priority`
+- `defaultMaxConcurrency` 可为所有未单独配置 `maxConcurrency` 的账号设置统一并发上限，适合快速收敛单号过载
 - `maxConcurrency` 可限制单账号最大并发，请求达到上限后会自动切到其他可用账号
 - `queueMaxSize` / `queueMaxWaitMs` 可为瞬时超并发请求提供短暂排队，减少尖峰时直接失败
 - `rateLimitCooldownMs` 可控制单账号触发上游 `429` 后的固定冷却时长；设为 `0` 可关闭该机制
@@ -493,6 +496,8 @@ RUST_LOG=debug ./target/release/kiro-rs
   - `POST /api/admin/credentials/:id/max-concurrency` - 设置凭据并发上限
   - `POST /api/admin/credentials/:id/reset` - 重置失败计数
   - `GET /api/admin/credentials/:id/balance` - 获取凭据余额
+  - `GET /api/admin/config/load-balancing` - 获取当前负载均衡、默认并发和限流配置
+  - `PUT /api/admin/config/load-balancing` - 更新负载均衡、默认并发和限流配置
 
 - **Admin UI**
   - `GET /admin` - 访问管理页面（需要在编译前构建 `admin-ui/dist`）

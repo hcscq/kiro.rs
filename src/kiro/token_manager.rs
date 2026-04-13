@@ -156,7 +156,6 @@ async fn refresh_social_token(
         )
         .header("Accept-Encoding", "gzip, compress, deflate, br")
         .header("host", &refresh_domain)
-        .header("Connection", "close")
         .json(&body)
         .send()
         .await?;
@@ -253,7 +252,6 @@ async fn refresh_idc_token(
         .header("host", format!("oidc.{}.amazonaws.com", region))
         .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
         .header("amz-sdk-request", "attempt=1; max=4")
-        .header("Connection", "close")
         .json(&body)
         .send()
         .await?;
@@ -351,7 +349,6 @@ pub(crate) async fn get_usage_limits(
         .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
         .header("amz-sdk-request", "attempt=1; max=1")
         .header("Authorization", format!("Bearer {}", token))
-        .header("Connection", "close")
         .send()
         .await?;
 
@@ -621,6 +618,7 @@ pub struct LoadBalancingConfigSnapshot {
     pub queue_max_size: usize,
     pub queue_max_wait_ms: u64,
     pub rate_limit_cooldown_ms: u64,
+    pub default_max_concurrency: Option<u32>,
     pub rate_limit_bucket_capacity: f64,
     pub rate_limit_refill_per_second: f64,
     pub rate_limit_refill_min_per_second: f64,
@@ -635,6 +633,7 @@ struct DispatchConfig {
     queue_max_size: usize,
     queue_max_wait_ms: u64,
     rate_limit_cooldown_ms: u64,
+    default_max_concurrency: Option<u32>,
     rate_limit_bucket_capacity: f64,
     rate_limit_refill_per_second: f64,
     rate_limit_refill_min_per_second: f64,
@@ -664,6 +663,9 @@ impl DispatchConfig {
             queue_max_size: config.queue_max_size,
             queue_max_wait_ms: config.queue_max_wait_ms,
             rate_limit_cooldown_ms: config.rate_limit_cooldown_ms,
+            default_max_concurrency: config
+                .default_max_concurrency
+                .filter(|limit| *limit > 0),
             rate_limit_bucket_capacity: normalize_non_negative(
                 config.rate_limit_bucket_capacity,
                 3.0,
@@ -986,8 +988,12 @@ impl MultiTokenManager {
         !is_opus || credentials.supports_opus()
     }
 
-    fn has_capacity(credentials: &KiroCredentials, active_requests: usize) -> bool {
-        match credentials.effective_max_concurrency() {
+    fn has_capacity(
+        credentials: &KiroCredentials,
+        active_requests: usize,
+        default_max_concurrency: Option<u32>,
+    ) -> bool {
+        match credentials.effective_max_concurrency_with_default(default_max_concurrency) {
             Some(limit) => active_requests < limit,
             None => true,
         }
@@ -1263,7 +1269,11 @@ impl MultiTokenManager {
                         && Self::is_model_supported(&e.credentials, model)
                         && !Self::is_rate_limited(e, now)
                         && Self::bucket_is_ready(e)
-                        && Self::has_capacity(&e.credentials, e.active_requests)
+                        && Self::has_capacity(
+                            &e.credentials,
+                            e.active_requests,
+                            dispatch.default_max_concurrency,
+                        )
                 })
                 .min_by_key(|e| {
                     (
@@ -1281,7 +1291,11 @@ impl MultiTokenManager {
                     && Self::is_model_supported(&e.credentials, model)
                     && !Self::is_rate_limited(e, now)
                     && Self::bucket_is_ready(e)
-                    && Self::has_capacity(&e.credentials, e.active_requests)
+                    && Self::has_capacity(
+                        &e.credentials,
+                        e.active_requests,
+                        dispatch.default_max_concurrency,
+                    )
             });
 
             current_candidate.map(|e| e.id).or_else(|| {
@@ -1292,7 +1306,11 @@ impl MultiTokenManager {
                             && Self::is_model_supported(&e.credentials, model)
                             && !Self::is_rate_limited(e, now)
                             && Self::bucket_is_ready(e)
-                            && Self::has_capacity(&e.credentials, e.active_requests)
+                            && Self::has_capacity(
+                                &e.credentials,
+                                e.active_requests,
+                                dispatch.default_max_concurrency,
+                            )
                     })
                     .min_by_key(|e| (e.credentials.priority, e.active_requests, e.id))
                     .map(|e| e.id)
@@ -1332,7 +1350,7 @@ impl MultiTokenManager {
             entry.active_requests,
             entry
                 .credentials
-                .effective_max_concurrency()
+                .effective_max_concurrency_with_default(dispatch.default_max_concurrency)
                 .map(|limit| format!("/{}", limit))
                 .unwrap_or_default()
         );
@@ -2542,6 +2560,7 @@ impl MultiTokenManager {
             queue_max_size: dispatch.queue_max_size,
             queue_max_wait_ms: dispatch.queue_max_wait_ms,
             rate_limit_cooldown_ms: dispatch.rate_limit_cooldown_ms,
+            default_max_concurrency: dispatch.default_max_concurrency,
             rate_limit_bucket_capacity: dispatch.rate_limit_bucket_capacity,
             rate_limit_refill_per_second: dispatch.rate_limit_refill_per_second,
             rate_limit_refill_min_per_second: dispatch.rate_limit_refill_min_per_second,
@@ -2564,11 +2583,12 @@ impl MultiTokenManager {
             Some(path) => path.to_path_buf(),
             None => {
                 tracing::warn!(
-                    "配置文件路径未知，调度配置仅在当前进程生效: mode={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}",
+                    "配置文件路径未知，调度配置仅在当前进程生效: mode={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, defaultMaxConcurrency={:?}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}",
                     dispatch.mode,
                     dispatch.queue_max_size,
                     dispatch.queue_max_wait_ms,
                     dispatch.rate_limit_cooldown_ms,
+                    dispatch.default_max_concurrency,
                     dispatch.rate_limit_bucket_capacity,
                     dispatch.rate_limit_refill_per_second,
                     dispatch.rate_limit_refill_min_per_second,
@@ -2585,6 +2605,7 @@ impl MultiTokenManager {
         config.queue_max_size = dispatch.queue_max_size;
         config.queue_max_wait_ms = dispatch.queue_max_wait_ms;
         config.rate_limit_cooldown_ms = dispatch.rate_limit_cooldown_ms;
+        config.default_max_concurrency = dispatch.default_max_concurrency;
         config.rate_limit_bucket_capacity = dispatch.rate_limit_bucket_capacity;
         config.rate_limit_refill_per_second = dispatch.rate_limit_refill_per_second;
         config.rate_limit_refill_min_per_second = dispatch.rate_limit_refill_min_per_second;
@@ -2600,7 +2621,18 @@ impl MultiTokenManager {
 
     /// 设置负载均衡模式（Admin API）
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
-        self.set_load_balancing_config(Some(mode), None, None, None, None, None, None, None, None)
+        self.set_load_balancing_config(
+            Some(mode),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
     }
 
     /// 设置调度配置（Admin API）
@@ -2610,6 +2642,7 @@ impl MultiTokenManager {
         queue_max_size: Option<usize>,
         queue_max_wait_ms: Option<u64>,
         rate_limit_cooldown_ms: Option<u64>,
+        default_max_concurrency: Option<u32>,
         rate_limit_bucket_capacity: Option<f64>,
         rate_limit_refill_per_second: Option<f64>,
         rate_limit_refill_min_per_second: Option<f64>,
@@ -2635,6 +2668,10 @@ impl MultiTokenManager {
         }
         if let Some(rate_limit_cooldown_ms) = rate_limit_cooldown_ms {
             next.rate_limit_cooldown_ms = rate_limit_cooldown_ms;
+        }
+        if let Some(default_max_concurrency) = default_max_concurrency {
+            next.default_max_concurrency =
+                Some(default_max_concurrency).filter(|limit| *limit > 0);
         }
         if let Some(rate_limit_bucket_capacity) = rate_limit_bucket_capacity {
             next.rate_limit_bucket_capacity = rate_limit_bucket_capacity;
@@ -2685,11 +2722,12 @@ impl MultiTokenManager {
 
         self.availability_notify.notify_waiters();
         tracing::info!(
-            "调度配置已更新: mode={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}",
+            "调度配置已更新: mode={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, defaultMaxConcurrency={:?}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}",
             next.mode,
             next.queue_max_size,
             next.queue_max_wait_ms,
             next.rate_limit_cooldown_ms,
+            next.default_max_concurrency,
             next.rate_limit_bucket_capacity,
             next.rate_limit_refill_per_second,
             next.rate_limit_refill_min_per_second,
@@ -3144,6 +3182,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some(1.0),
                 Some(1.2),
                 None,
@@ -3165,7 +3204,7 @@ mod tests {
             std::env::temp_dir().join(format!("kiro-load-balancing-{}.json", uuid::Uuid::new_v4()));
         std::fs::write(
             &config_path,
-            r#"{"loadBalancingMode":"priority","queueMaxSize":0,"queueMaxWaitMs":0,"rateLimitCooldownMs":2000}"#,
+            r#"{"loadBalancingMode":"priority","queueMaxSize":0,"queueMaxWaitMs":0,"rateLimitCooldownMs":2000,"defaultMaxConcurrency":2}"#,
         )
         .unwrap();
 
@@ -3180,6 +3219,7 @@ mod tests {
                 Some(8),
                 Some(1500),
                 Some(4500),
+                Some(3),
                 Some(4.0),
                 Some(1.2),
                 Some(0.3),
@@ -3193,6 +3233,7 @@ mod tests {
         assert_eq!(persisted.queue_max_size, 8);
         assert_eq!(persisted.queue_max_wait_ms, 1500);
         assert_eq!(persisted.rate_limit_cooldown_ms, 4500);
+        assert_eq!(persisted.default_max_concurrency, Some(3));
         assert_eq!(persisted.rate_limit_bucket_capacity, 4.0);
         assert_eq!(persisted.rate_limit_refill_per_second, 1.2);
         assert_eq!(persisted.rate_limit_refill_min_per_second, 0.3);
@@ -3201,6 +3242,30 @@ mod tests {
         assert_eq!(manager.get_load_balancing_mode(), "balanced");
 
         std::fs::remove_file(&config_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_priority_mode_uses_default_max_concurrency_when_credential_has_no_override() {
+        let mut config = Config::default();
+        config.default_max_concurrency = Some(1);
+
+        let primary = available_credential(0);
+        let secondary = available_credential(1);
+
+        let manager =
+            MultiTokenManager::new(config, vec![primary, secondary], None, None, false).unwrap();
+
+        let first = manager.acquire_context(None).await.unwrap();
+        assert_eq!(first.id, 1);
+
+        let second = manager.acquire_context(None).await.unwrap();
+        assert_eq!(second.id, 2);
+
+        let snapshot = manager.snapshot();
+        let first_entry = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        let second_entry = snapshot.entries.iter().find(|e| e.id == 2).unwrap();
+        assert_eq!(first_entry.active_requests, 1);
+        assert_eq!(second_entry.active_requests, 1);
     }
 
     #[tokio::test]
