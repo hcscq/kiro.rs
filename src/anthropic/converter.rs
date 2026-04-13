@@ -890,6 +890,20 @@ fn split_images_for_kiro_turn_limit(
     (history_chunks, final_images)
 }
 
+fn split_images_for_kiro_content_compat(
+    images: Vec<KiroImage>,
+) -> (Vec<Vec<KiroImage>>, Vec<KiroImage>) {
+    if images.len() <= 1 {
+        return (Vec::new(), images);
+    }
+
+    let mut images = images;
+    let final_images = images.split_off(images.len() - 1);
+    let history_chunks = images.into_iter().map(|image| vec![image]).collect();
+
+    (history_chunks, final_images)
+}
+
 fn append_history_image_chunks(
     history: &mut Vec<Message>,
     model_id: &str,
@@ -931,25 +945,42 @@ fn append_history_user_messages(
         tool_results
     };
 
-    if images.len() > KIRO_MAX_IMAGES_PER_USER_TURN {
-        let (history_image_chunks, final_images) = split_images_for_kiro_turn_limit(images);
-        let moved_image_count: usize = history_image_chunks.iter().map(Vec::len).sum();
+    let mut final_images = images;
+    let mut history_image_chunks: Vec<Vec<KiroImage>> = Vec::new();
+
+    if final_images.len() > KIRO_MAX_IMAGES_PER_USER_TURN {
+        let (overflow_chunks, overflow_final_images) =
+            split_images_for_kiro_turn_limit(final_images);
+        let moved_image_count: usize = overflow_chunks.iter().map(Vec::len).sum();
         tracing::info!(
             moved_image_count,
-            final_image_count = final_images.len(),
+            final_image_count = overflow_final_images.len(),
             "拆分 image-heavy user message：将超限图片块下沉到 history，保留最后一块在原始语义位置"
         );
 
-        append_history_image_chunks(history, model_id, probe, history_image_chunks);
-
-        let user_msg =
-            build_history_user_message_from_parts(content, model_id, final_images, final_tool_results);
-        push_history_user_message(history, probe, user_msg);
-    } else {
-        let user_msg =
-            build_history_user_message_from_parts(content, model_id, images, final_tool_results);
-        push_history_user_message(history, probe, user_msg);
+        history_image_chunks.extend(overflow_chunks);
+        final_images = overflow_final_images;
     }
+
+    if !content.is_empty() && final_images.len() > 1 {
+        let (compat_chunks, compat_final_images) =
+            split_images_for_kiro_content_compat(final_images);
+        let moved_image_count: usize = compat_chunks.iter().map(Vec::len).sum();
+        tracing::info!(
+            moved_image_count,
+            final_image_count = compat_final_images.len(),
+            "细分 content-bearing multi-image user message：将前置图片下沉为独立 Kiro user turns，保留最后一张在原始语义位置"
+        );
+
+        history_image_chunks.extend(compat_chunks);
+        final_images = compat_final_images;
+    }
+
+    append_history_image_chunks(history, model_id, probe, history_image_chunks);
+
+    let user_msg =
+        build_history_user_message_from_parts(content, model_id, final_images, final_tool_results);
+    push_history_user_message(history, probe, user_msg);
 
     if close_with_ack {
         history.push(Message::Assistant(HistoryAssistantMessage::new("OK")));
@@ -983,24 +1014,48 @@ fn move_current_extra_images_to_history_for_image_compat(
     probe: &UpstreamProbe,
     merged_current: &mut MergedUserMessageParts,
 ) {
-    if merged_current.images.len() <= KIRO_MAX_IMAGES_PER_USER_TURN {
+    if merged_current.images.len() <= 1 {
         return;
     }
 
     let total_images = merged_current.images.len();
-    let (history_image_chunks, final_images) =
-        split_images_for_kiro_turn_limit(std::mem::take(&mut merged_current.images));
-    let moved_image_count: usize = history_image_chunks.iter().map(Vec::len).sum();
+    let mut current_images = std::mem::take(&mut merged_current.images);
+    let mut history_image_chunks: Vec<Vec<KiroImage>> = Vec::new();
 
-    tracing::info!(
-        total_images,
-        moved_image_count,
-        current_image_count = final_images.len(),
-        "拆分 current image-heavy user message：将前置图片块下沉到 history，保留最后一块在 current"
-    );
+    if current_images.len() > KIRO_MAX_IMAGES_PER_USER_TURN {
+        let (overflow_chunks, overflow_final_images) =
+            split_images_for_kiro_turn_limit(current_images);
+        let moved_image_count: usize = overflow_chunks.iter().map(Vec::len).sum();
+
+        tracing::info!(
+            total_images,
+            moved_image_count,
+            current_image_count = overflow_final_images.len(),
+            "拆分 current image-heavy user message：将前置图片块下沉到 history，保留最后一块在 current"
+        );
+
+        history_image_chunks.extend(overflow_chunks);
+        current_images = overflow_final_images;
+    }
+
+    if !merged_current.content.is_empty() && current_images.len() > 1 {
+        let (compat_chunks, compat_final_images) =
+            split_images_for_kiro_content_compat(current_images);
+        let moved_image_count: usize = compat_chunks.iter().map(Vec::len).sum();
+
+        tracing::info!(
+            total_images,
+            moved_image_count,
+            current_image_count = compat_final_images.len(),
+            "细分 current content-bearing multi-image user message：将前置图片下沉到 history，保留最后一张在 current"
+        );
+
+        history_image_chunks.extend(compat_chunks);
+        current_images = compat_final_images;
+    }
 
     append_history_image_chunks(history, model_id, probe, history_image_chunks);
-    merged_current.images = final_images;
+    merged_current.images = current_images;
 }
 
 /// 转换 assistant 消息
@@ -2529,6 +2584,90 @@ mod tests {
     }
 
     #[test]
+    fn test_convert_request_splits_current_content_bearing_multi_image_turn() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let mut content = repeated_png_image_blocks(4);
+        content.push(serde_json::json!({
+            "type": "text",
+            "text": "Compare all screenshots."
+        }));
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::Value::Array(content),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let state = convert_request(&req)
+            .expect("content-bearing multi-image current turn should be split for kiro compatibility")
+            .conversation_state;
+
+        assert_eq!(state.history.len(), 6);
+        for idx in [0usize, 2, 4] {
+            match &state.history[idx] {
+                Message::User(user) => {
+                    assert_eq!(user.user_input_message.content, "");
+                    assert_eq!(user.user_input_message.images.len(), 1);
+                }
+                other => panic!("history[{idx}] should be synthetic image user, got {:?}", other),
+            }
+        }
+
+        for idx in [1usize, 3, 5] {
+            match &state.history[idx] {
+                Message::Assistant(assistant) => {
+                    assert_eq!(assistant.assistant_response_message.content, "OK");
+                }
+                other => panic!("history[{idx}] should be synthetic assistant ack, got {:?}", other),
+            }
+        }
+
+        let current = &state.current_message.user_input_message;
+        assert_eq!(current.content, "Compare all screenshots.");
+        assert_eq!(current.images.len(), 1);
+    }
+
+    #[test]
+    fn test_convert_request_keeps_current_image_only_multi_image_turn_under_limit() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::Value::Array(repeated_png_image_blocks(4)),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let state = convert_request(&req)
+            .expect("image-only current turn should stay unchanged under the kiro turn limit")
+            .conversation_state;
+
+        assert!(state.history.is_empty());
+        assert!(state.current_message.user_input_message.content.is_empty());
+        assert_eq!(state.current_message.user_input_message.images.len(), 4);
+    }
+
+    #[test]
     fn test_convert_request_splits_history_image_overflow_before_following_assistant() {
         use super::super::types::Message as AnthropicMessage;
 
@@ -2602,6 +2741,87 @@ mod tests {
                 assert_eq!(assistant.assistant_response_message.content, "I can continue now.");
             }
             other => panic!("history[3] should be original assistant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_convert_request_splits_history_content_bearing_multi_image_turn() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let mut content = repeated_png_image_blocks(4);
+        content.push(serde_json::json!({
+            "type": "text",
+            "text": "Use these screenshots in the answer."
+        }));
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::Value::Array(content),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("I can continue now."),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Summarize the outcome."),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let state = convert_request(&req)
+            .expect("history multi-image user message should be split for kiro compatibility")
+            .conversation_state;
+
+        assert_eq!(state.current_message.user_input_message.content, "Summarize the outcome.");
+        assert_eq!(state.history.len(), 8);
+
+        for idx in [0usize, 2, 4] {
+            match &state.history[idx] {
+                Message::User(user) => {
+                    assert_eq!(user.user_input_message.content, "");
+                    assert_eq!(user.user_input_message.images.len(), 1);
+                }
+                other => panic!("history[{idx}] should be synthetic image user, got {:?}", other),
+            }
+        }
+
+        for idx in [1usize, 3, 5] {
+            match &state.history[idx] {
+                Message::Assistant(assistant) => {
+                    assert_eq!(assistant.assistant_response_message.content, "OK");
+                }
+                other => panic!("history[{idx}] should be synthetic assistant ack, got {:?}", other),
+            }
+        }
+
+        match &state.history[6] {
+            Message::User(user) => {
+                assert_eq!(
+                    user.user_input_message.content,
+                    "Use these screenshots in the answer."
+                );
+                assert_eq!(user.user_input_message.images.len(), 1);
+            }
+            other => panic!("history[6] should be final split image user, got {:?}", other),
+        }
+
+        match &state.history[7] {
+            Message::Assistant(assistant) => {
+                assert_eq!(assistant.assistant_response_message.content, "I can continue now.");
+            }
+            other => panic!("history[7] should be original assistant, got {:?}", other),
         }
     }
 
