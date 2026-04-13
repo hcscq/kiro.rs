@@ -1035,7 +1035,7 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4-6".to_string(),
             max_tokens: 1024,
-            messages: vec![super::types::Message {
+            messages: vec![super::super::types::Message {
                 role: "user".to_string(),
                 content: serde_json::Value::String("你是谁？".to_string()),
             }],
@@ -1078,21 +1078,21 @@ mod tests {
             model: "claude-sonnet-4-6".to_string(),
             max_tokens: 1024,
             messages: vec![
-                super::types::Message {
+                super::super::types::Message {
                     role: "user".to_string(),
                     content: serde_json::Value::String("前文".to_string()),
                 },
-                super::types::Message {
+                super::super::types::Message {
                     role: "assistant".to_string(),
                     content: serde_json::Value::String("收到".to_string()),
                 },
-                super::types::Message {
+                super::super::types::Message {
                     role: "user".to_string(),
                     content: serde_json::Value::String("你是谁？".to_string()),
                 },
             ],
             stream: false,
-            system: Some(vec![super::types::SystemMessage {
+            system: Some(vec![super::super::types::SystemMessage {
                 text: "System".to_string(),
             }]),
             tools: None,
@@ -1127,21 +1127,21 @@ mod tests {
             model: "claude-sonnet-4-6".to_string(),
             max_tokens: 1024,
             messages: vec![
-                super::types::Message {
+                super::super::types::Message {
                     role: "user".to_string(),
                     content: serde_json::Value::String("前文".to_string()),
                 },
-                super::types::Message {
+                super::super::types::Message {
                     role: "assistant".to_string(),
                     content: serde_json::Value::String("收到".to_string()),
                 },
-                super::types::Message {
+                super::super::types::Message {
                     role: "user".to_string(),
                     content: serde_json::Value::String("你是谁？".to_string()),
                 },
             ],
             stream: false,
-            system: Some(vec![super::types::SystemMessage {
+            system: Some(vec![super::super::types::SystemMessage {
                 text: "System".to_string(),
             }]),
             tools: None,

@@ -16,7 +16,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::stream::SseEvent;
-use super::types::{ErrorResponse, MessagesRequest};
+use super::types::{ErrorResponse, MessagesRequest, Tool};
 
 /// MCP 请求
 #[derive(Debug, Serialize)]
@@ -78,6 +78,7 @@ pub struct McpContent {
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct WebSearchResults {
+    #[serde(default)]
     pub results: Vec<WebSearchResult>,
     #[serde(rename = "totalResults")]
     pub total_results: Option<i32>,
@@ -102,47 +103,104 @@ pub struct WebSearchResult {
     pub public_domain: Option<bool>,
 }
 
+#[derive(Debug)]
+enum WebSearchOutcome {
+    Results(WebSearchResults),
+    Unavailable(String),
+    ParseError(String),
+}
+
 /// 检查请求是否为纯 WebSearch 请求
 ///
-/// 条件：tools 有且只有一个，且 name 为 web_search
+/// 条件：tools 有且只有一个，且该工具是 Anthropic/Kiro WebSearch 声明
 pub fn has_web_search_tool(req: &MessagesRequest) -> bool {
-    req.tools.as_ref().is_some_and(|tools| {
-        tools.len() == 1 && tools.first().is_some_and(|t| t.name == "web_search")
-    })
+    req.tools
+        .as_ref()
+        .is_some_and(|tools| tools.len() == 1 && tools.first().is_some_and(is_web_search_tool))
+}
+
+fn is_web_search_tool(tool: &Tool) -> bool {
+    let name = tool.name.trim();
+    let tool_type = tool.tool_type.as_deref().unwrap_or("").trim();
+
+    name == "web_search" || tool_type == "web_search" || tool_type.starts_with("web_search_")
 }
 
 /// 从消息中提取搜索查询
 ///
-/// 读取 messages 的第一条消息的第一个内容块
-/// 并去除 "Perform a web search for the query: " 前缀
+/// 优先读取最后一条 user 消息，并兼容常见 WebSearch 前缀。
 pub fn extract_search_query(req: &MessagesRequest) -> Option<String> {
-    // 获取第一条消息
-    let first_msg = req.messages.first()?;
+    let msg = req
+        .messages
+        .iter()
+        .rev()
+        .find(|msg| msg.role == "user")
+        .or_else(|| req.messages.last())?;
 
-    // 提取文本内容
-    let text = match &first_msg.content {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Array(arr) => {
-            // 获取第一个内容块
-            let first_block = arr.first()?;
-            if first_block.get("type")?.as_str()? == "text" {
-                first_block.get("text")?.as_str()?.to_string()
+    let text = extract_text_content(&msg.content)?;
+    normalize_search_query(&text)
+}
+
+fn extract_text_content(content: &serde_json::Value) -> Option<String> {
+    match content {
+        serde_json::Value::String(s) => {
+            let text = s.trim();
+            if text.is_empty() {
+                None
             } else {
-                return None;
+                Some(text.to_string())
             }
         }
-        _ => return None,
-    };
+        serde_json::Value::Array(arr) => {
+            let parts: Vec<&str> = arr
+                .iter()
+                .filter_map(|block| {
+                    if block.get("type").and_then(|v| v.as_str()) == Some("text") {
+                        block.get("text").and_then(|v| v.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .filter(|text| !text.trim().is_empty())
+                .collect();
 
-    // 去除前缀 "Perform a web search for the query: "
-    const PREFIX: &str = "Perform a web search for the query: ";
-    let query = if text.starts_with(PREFIX) {
-        text[PREFIX.len()..].to_string()
-    } else {
-        text
-    };
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n"))
+            }
+        }
+        _ => None,
+    }
+}
 
-    if query.is_empty() { None } else { Some(query) }
+fn normalize_search_query(text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+
+    const PREFIXES: &[&str] = &[
+        "perform a web search for the query",
+        "web search for the query",
+        "search for",
+        "搜索",
+    ];
+
+    let lower = text.to_ascii_lowercase();
+    for prefix in PREFIXES {
+        if let Some(pos) = lower.find(prefix) {
+            let start = pos + prefix.len();
+            let query = text[start..]
+                .trim_start_matches(|c: char| c == ':' || c == '：' || c.is_whitespace())
+                .trim();
+            if !query.is_empty() {
+                return Some(query.to_string());
+            }
+        }
+    }
+
+    Some(text.to_string())
 }
 
 /// 生成22位大小写字母和数字的随机字符串
@@ -203,26 +261,43 @@ pub fn create_mcp_request(query: &str) -> (String, McpRequest) {
 
 /// 解析 MCP 响应中的搜索结果
 pub fn parse_search_results(mcp_response: &McpResponse) -> Option<WebSearchResults> {
-    let result = mcp_response.result.as_ref()?;
-    let content = result.content.first()?;
+    parse_search_results_checked(mcp_response).ok()
+}
 
-    if content.content_type != "text" {
-        return None;
+fn parse_search_results_checked(mcp_response: &McpResponse) -> Result<WebSearchResults, String> {
+    let result = mcp_response
+        .result
+        .as_ref()
+        .ok_or_else(|| "missing MCP result".to_string())?;
+    if result.is_error {
+        return Err("MCP returned isError=true".to_string());
     }
 
-    serde_json::from_str(&content.text).ok()
+    let content = result
+        .content
+        .first()
+        .ok_or_else(|| "missing MCP text content".to_string())?;
+
+    if content.content_type != "text" {
+        return Err(format!(
+            "unsupported MCP content type: {}",
+            content.content_type
+        ));
+    }
+
+    serde_json::from_str(&content.text)
+        .map_err(|err| format!("invalid MCP search result JSON: {}", err))
 }
 
 /// 生成 WebSearch SSE 响应流
-pub fn create_websearch_sse_stream(
+fn create_websearch_sse_stream(
     model: String,
     query: String,
     tool_use_id: String,
-    search_results: Option<WebSearchResults>,
+    outcome: WebSearchOutcome,
     input_tokens: i32,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    let events =
-        generate_websearch_events(&model, &query, &tool_use_id, search_results, input_tokens);
+    let events = generate_websearch_events(&model, &query, &tool_use_id, &outcome, input_tokens);
 
     stream::iter(
         events
@@ -236,7 +311,7 @@ fn generate_websearch_events(
     model: &str,
     query: &str,
     tool_use_id: &str,
-    search_results: Option<WebSearchResults>,
+    outcome: &WebSearchOutcome,
     input_tokens: i32,
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
@@ -329,27 +404,7 @@ fn generate_websearch_events(
 
     // 5. content_block_start (web_search_tool_result, index 2)
     // 官方 API 的 web_search_tool_result 没有 tool_use_id 字段
-    let search_content = if let Some(ref results) = search_results {
-        results
-            .results
-            .iter()
-            .map(|r| {
-                let page_age = r.published_date.and_then(|ms| {
-                    chrono::DateTime::from_timestamp_millis(ms)
-                        .map(|dt| dt.format("%B %-d, %Y").to_string())
-                });
-                json!({
-                    "type": "web_search_result",
-                    "title": r.title,
-                    "url": r.url,
-                    "encrypted_content": r.snippet.clone().unwrap_or_default(),
-                    "page_age": page_age
-                })
-            })
-            .collect::<Vec<_>>()
-    } else {
-        vec![]
-    };
+    let search_content = build_search_content(outcome);
 
     events.push(SseEvent::new(
         "content_block_start",
@@ -386,7 +441,7 @@ fn generate_websearch_events(
     ));
 
     // 8. content_block_delta (text_delta) - 生成搜索结果摘要
-    let summary = generate_search_summary(query, &search_results);
+    let summary = generate_search_summary(query, outcome);
 
     // 分块发送文本
     let chunk_size = 100;
@@ -416,7 +471,7 @@ fn generate_websearch_events(
 
     // 10. message_delta
     // 官方 API 的 message_delta.delta 中没有 stop_sequence 字段
-    let output_tokens = (summary.len() as i32 + 3) / 4; // 简单估算
+    let output_tokens = estimate_websearch_output_tokens(&summary);
     events.push(SseEvent::new(
         "message_delta",
         json!({
@@ -444,25 +499,123 @@ fn generate_websearch_events(
     events
 }
 
+/// 生成 WebSearch 非流式 Anthropic Messages 响应
+fn create_websearch_json_response(
+    model: &str,
+    query: &str,
+    tool_use_id: &str,
+    outcome: &WebSearchOutcome,
+    input_tokens: i32,
+) -> serde_json::Value {
+    let decision_text = format!("I'll search for \"{}\".", query);
+    let search_content = build_search_content(outcome);
+    let summary = generate_search_summary(query, outcome);
+    let content = vec![
+        json!({
+            "type": "text",
+            "text": decision_text
+        }),
+        json!({
+            "id": tool_use_id,
+            "type": "server_tool_use",
+            "name": "web_search",
+            "input": {"query": query}
+        }),
+        json!({
+            "type": "web_search_tool_result",
+            "content": search_content
+        }),
+        json!({
+            "type": "text",
+            "text": summary
+        }),
+    ];
+    let output_tokens = estimate_websearch_output_tokens(&summary);
+    let message_id = format!(
+        "msg_{}",
+        Uuid::new_v4().to_string().replace('-', "")[..24].to_string()
+    );
+
+    json!({
+        "id": message_id,
+        "type": "message",
+        "role": "assistant",
+        "content": content,
+        "model": model,
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "server_tool_use": {
+                "web_search_requests": 1
+            }
+        }
+    })
+}
+
+fn build_search_content(outcome: &WebSearchOutcome) -> Vec<serde_json::Value> {
+    match outcome {
+        WebSearchOutcome::Results(results) => results
+            .results
+            .iter()
+            .map(|r| {
+                let page_age = r.published_date.and_then(|ms| {
+                    chrono::DateTime::from_timestamp_millis(ms)
+                        .map(|dt| dt.format("%B %-d, %Y").to_string())
+                });
+                json!({
+                    "type": "web_search_result",
+                    "title": r.title,
+                    "url": r.url,
+                    "encrypted_content": r.snippet.clone().unwrap_or_default(),
+                    "page_age": page_age
+                })
+            })
+            .collect(),
+        WebSearchOutcome::Unavailable(_) | WebSearchOutcome::ParseError(_) => vec![],
+    }
+}
+
+fn estimate_websearch_output_tokens(summary: &str) -> i32 {
+    ((summary.len() as i32 + 3) / 4).max(1)
+}
+
 /// 生成搜索结果摘要
-fn generate_search_summary(query: &str, results: &Option<WebSearchResults>) -> String {
+fn generate_search_summary(query: &str, outcome: &WebSearchOutcome) -> String {
     let mut summary = format!("Here are the search results for \"{}\":\n\n", query);
 
-    if let Some(results) = results {
-        for (i, result) in results.results.iter().enumerate() {
-            summary.push_str(&format!("{}. **{}**\n", i + 1, result.title));
-            if let Some(ref snippet) = result.snippet {
-                // 截断过长的摘要（安全处理 UTF-8 多字节字符）
-                let truncated = match snippet.char_indices().nth(200) {
-                    Some((idx, _)) => format!("{}...", &snippet[..idx]),
-                    None => snippet.clone(),
-                };
-                summary.push_str(&format!("   {}\n", truncated));
+    match outcome {
+        WebSearchOutcome::Results(results) => {
+            if results.results.is_empty() {
+                summary.push_str("No results found.\n");
             }
-            summary.push_str(&format!("   Source: {}\n\n", result.url));
+
+            for (i, result) in results.results.iter().enumerate() {
+                summary.push_str(&format!("{}. **{}**\n", i + 1, result.title));
+                if let Some(ref snippet) = result.snippet {
+                    // 截断过长的摘要（安全处理 UTF-8 多字节字符）
+                    let truncated = match snippet.char_indices().nth(200) {
+                        Some((idx, _)) => format!("{}...", &snippet[..idx]),
+                        None => snippet.clone(),
+                    };
+                    summary.push_str(&format!("   {}\n", truncated));
+                }
+                summary.push_str(&format!("   Source: {}\n\n", result.url));
+            }
         }
-    } else {
-        summary.push_str("No results found.\n");
+        WebSearchOutcome::Unavailable(error) => {
+            summary.push_str(&format!(
+                "The web_search tool is currently unavailable: {}\n",
+                error
+            ));
+        }
+        WebSearchOutcome::ParseError(error) => {
+            summary.push_str(&format!(
+                "The web_search tool returned a response that could not be parsed: {}\n",
+                error
+            ));
+        }
     }
 
     summary.push_str("\nPlease note that these are web search results and may not be fully accurate or up-to-date.");
@@ -497,18 +650,36 @@ pub async fn handle_websearch_request(
     let (tool_use_id, mcp_request) = create_mcp_request(&query);
 
     // 3. 调用 Kiro MCP API
-    let search_results = match call_mcp_api(&provider, &mcp_request).await {
-        Ok(response) => parse_search_results(&response),
+    let outcome = match call_mcp_api(&provider, &mcp_request).await {
+        Ok(response) => match parse_search_results_checked(&response) {
+            Ok(results) => {
+                if let Some(error) = results.error.as_deref().filter(|e| !e.trim().is_empty()) {
+                    tracing::warn!(error = %error, "MCP WebSearch 返回错误结果");
+                    WebSearchOutcome::Unavailable(error.to_string())
+                } else {
+                    WebSearchOutcome::Results(results)
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "MCP WebSearch 结果解析失败");
+                WebSearchOutcome::ParseError(e)
+            }
+        },
         Err(e) => {
             tracing::warn!("MCP API 调用失败: {}", e);
-            None
+            WebSearchOutcome::Unavailable(e.to_string())
         }
     };
 
-    // 4. 生成 SSE 响应
+    // 4. 根据 stream 参数生成响应
     let model = payload.model.clone();
-    let stream =
-        create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens);
+    if !payload.stream {
+        let response_body =
+            create_websearch_json_response(&model, &query, &tool_use_id, &outcome, input_tokens);
+        return (StatusCode::OK, Json(response_body)).into_response();
+    }
+
+    let stream = create_websearch_sse_stream(model, query, tool_use_id, outcome, input_tokens);
 
     Response::builder()
         .status(StatusCode::OK)
@@ -569,6 +740,35 @@ mod tests {
                 description: String::new(),
                 input_schema: Default::default(),
                 max_uses: Some(8),
+            }]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        assert!(has_web_search_tool(&req));
+    }
+
+    #[test]
+    fn test_has_web_search_tool_by_type_without_name() {
+        use crate::anthropic::types::{Message, Tool};
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!("test"),
+            }],
+            stream: true,
+            system: None,
+            tools: Some(vec![Tool {
+                tool_type: Some("web_search".to_string()),
+                name: String::new(),
+                description: String::new(),
+                input_schema: Default::default(),
+                max_uses: None,
             }]),
             tool_choice: None,
             thinking: None,
@@ -644,6 +844,91 @@ mod tests {
         let query = extract_search_query(&req);
         // 前缀应该被去除
         assert_eq!(query, Some("rust latest version 2026".to_string()));
+    }
+
+    #[test]
+    fn test_extract_search_query_uses_last_user_message() {
+        use crate::anthropic::types::Message;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!("old query"),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("ok"),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!("search for latest rust release"),
+                },
+            ],
+            stream: true,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let query = extract_search_query(&req);
+        assert_eq!(query, Some("latest rust release".to_string()));
+    }
+
+    #[test]
+    fn test_extract_search_query_joins_multiple_text_blocks() {
+        use crate::anthropic::types::Message;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "text", "text": "search for"},
+                    {"type": "text", "text": "Kiro MCP web_search"}
+                ]),
+            }],
+            stream: true,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let query = extract_search_query(&req);
+        assert_eq!(query, Some("Kiro MCP web_search".to_string()));
+    }
+
+    #[test]
+    fn test_extract_search_query_chinese_prefix() {
+        use crate::anthropic::types::Message;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!("请帮我搜索 Rust 2026 最新版本"),
+            }],
+            stream: true,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let query = extract_search_query(&req);
+        assert_eq!(query, Some("Rust 2026 最新版本".to_string()));
     }
 
     #[test]
@@ -752,10 +1037,65 @@ mod tests {
             error: None,
         };
 
-        let summary = generate_search_summary("test", &Some(results));
+        let summary = generate_search_summary("test", &WebSearchOutcome::Results(results));
 
         assert!(summary.contains("Test Result"));
         assert!(summary.contains("https://example.com"));
         assert!(summary.contains("This is a test snippet"));
+    }
+
+    #[test]
+    fn test_generate_search_summary_reports_mcp_unavailable() {
+        let summary = generate_search_summary(
+            "test",
+            &WebSearchOutcome::Unavailable("network error".to_string()),
+        );
+
+        assert!(summary.contains("web_search tool is currently unavailable"));
+        assert!(summary.contains("network error"));
+    }
+
+    #[test]
+    fn test_create_websearch_json_response_non_stream() {
+        let results = WebSearchResults {
+            results: vec![WebSearchResult {
+                title: "Test Result".to_string(),
+                url: "https://example.com".to_string(),
+                snippet: Some("This is a test snippet".to_string()),
+                published_date: None,
+                id: None,
+                domain: None,
+                max_verbatim_word_limit: None,
+                public_domain: None,
+            }],
+            total_results: Some(1),
+            query: Some("test".to_string()),
+            error: None,
+        };
+
+        let response = create_websearch_json_response(
+            "claude-sonnet-4",
+            "test",
+            "srvtoolu_test",
+            &WebSearchOutcome::Results(results),
+            123,
+        );
+
+        assert_eq!(response["type"], "message");
+        assert_eq!(response["role"], "assistant");
+        assert_eq!(response["model"], "claude-sonnet-4");
+        assert_eq!(response["stop_reason"], "end_turn");
+        assert_eq!(response["usage"]["input_tokens"], 123);
+        assert_eq!(
+            response["usage"]["server_tool_use"]["web_search_requests"],
+            1
+        );
+
+        let content = response["content"].as_array().expect("content array");
+        assert_eq!(content[1]["type"], "server_tool_use");
+        assert_eq!(content[1]["name"], "web_search");
+        assert_eq!(content[1]["input"]["query"], "test");
+        assert_eq!(content[2]["type"], "web_search_tool_result");
+        assert_eq!(content[2]["content"][0]["title"], "Test Result");
     }
 }
