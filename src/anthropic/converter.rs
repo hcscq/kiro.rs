@@ -287,11 +287,22 @@ pub fn convert_request_with_probe(
     // 8. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
     // 同时返回孤立的 tool_use_id 集合，用于后续清理
-    let (validated_tool_results, orphaned_tool_use_ids) =
+    let (mut validated_tool_results, orphaned_tool_use_ids) =
         validate_tool_pairing(&history, &merged_current.tool_results);
 
     // 9. 从历史中移除孤立的 tool_use（Kiro API 要求 tool_use 必须有对应的 tool_result）
     remove_orphaned_tool_uses(&mut history, &orphaned_tool_use_ids);
+
+    // 9.5. Kiro 上游对同一个 user turn 同时携带 tool_results 和 images 的容忍度较差，
+    // 会触发 400 Improperly formed request。将 tool_results 下沉为紧邻 current 之前的
+    // history user turn，并补一个最小 assistant 占位，尽量保持原始语义顺序。
+    move_current_tool_results_to_history_for_image_compat(
+        &mut history,
+        &model_id,
+        &probe,
+        &merged_current,
+        &mut validated_tool_results,
+    );
 
     // 10. 收集历史中使用的工具名称，为缺失的工具生成占位符定义
     // Kiro API 要求：历史消息中引用的工具必须在 tools 列表中有定义
@@ -750,9 +761,8 @@ fn build_history(
         } else if msg.role == "assistant" {
             // 先处理累积的 user 消息
             if !user_buffer.is_empty() {
-                let mut merged_user = merge_user_messages(&user_buffer, model_id)?;
-                probe.apply_origin(&mut merged_user.user_input_message.origin);
-                history.push(Message::User(merged_user));
+                let merged_user = merge_user_message_parts(&user_buffer)?;
+                append_history_user_messages(&mut history, merged_user, model_id, probe, false);
                 user_buffer.clear();
             }
             // 累积 assistant 消息（支持连续多条）
@@ -768,13 +778,8 @@ fn build_history(
 
     // 处理结尾的孤立 user 消息
     if !user_buffer.is_empty() {
-        let mut merged_user = merge_user_messages(&user_buffer, model_id)?;
-        probe.apply_origin(&mut merged_user.user_input_message.origin);
-        history.push(Message::User(merged_user));
-
-        // 自动配对一个 "OK" 的 assistant 响应
-        let auto_assistant = HistoryAssistantMessage::new("OK");
-        history.push(Message::Assistant(auto_assistant));
+        let merged_user = merge_user_message_parts(&user_buffer)?;
+        append_history_user_messages(&mut history, merged_user, model_id, probe, true);
     }
 
     Ok(history)
@@ -784,6 +789,12 @@ struct MergedUserMessageParts {
     content: String,
     images: Vec<KiroImage>,
     tool_results: Vec<ToolResult>,
+}
+
+impl MergedUserMessageParts {
+    fn has_mixed_tool_results_and_images(&self) -> bool {
+        !self.tool_results.is_empty() && !self.images.is_empty()
+    }
 }
 
 fn merge_user_message_parts(
@@ -809,28 +820,92 @@ fn merge_user_message_parts(
     })
 }
 
-/// 合并多个 user 消息
-fn merge_user_messages(
-    messages: &[&super::types::Message],
+fn build_history_user_message_from_parts(
+    content: impl Into<String>,
     model_id: &str,
-) -> Result<HistoryUserMessage, ConversionError> {
-    let merged = merge_user_message_parts(messages)?;
-    // 保留文本内容，即使有工具结果也不丢弃用户文本
-    let mut user_msg = UserMessage::new(&merged.content, model_id);
+    images: Vec<KiroImage>,
+    tool_results: Vec<ToolResult>,
+) -> HistoryUserMessage {
+    let mut user_msg = UserMessage::new(content, model_id);
 
-    if !merged.images.is_empty() {
-        user_msg = user_msg.with_images(merged.images);
+    if !images.is_empty() {
+        user_msg = user_msg.with_images(images);
     }
 
-    if !merged.tool_results.is_empty() {
+    if !tool_results.is_empty() {
         let mut ctx = UserInputMessageContext::new();
-        ctx = ctx.with_tool_results(merged.tool_results);
+        ctx = ctx.with_tool_results(tool_results);
         user_msg = user_msg.with_context(ctx);
     }
 
-    Ok(HistoryUserMessage {
+    HistoryUserMessage {
         user_input_message: user_msg,
-    })
+    }
+}
+
+fn append_history_user_messages(
+    history: &mut Vec<Message>,
+    merged: MergedUserMessageParts,
+    model_id: &str,
+    probe: &UpstreamProbe,
+    close_with_ack: bool,
+) {
+    if merged.has_mixed_tool_results_and_images() {
+        tracing::info!(
+            "拆分 mixed user message：tool_results 与 images 分离到不同 Kiro user turns"
+        );
+
+        let mut tool_result_msg =
+            build_history_user_message_from_parts("", model_id, Vec::new(), merged.tool_results);
+        probe.apply_origin(&mut tool_result_msg.user_input_message.origin);
+        history.push(Message::User(tool_result_msg));
+        history.push(Message::Assistant(HistoryAssistantMessage::new("OK")));
+
+        let mut image_msg = build_history_user_message_from_parts(
+            merged.content,
+            model_id,
+            merged.images,
+            Vec::new(),
+        );
+        probe.apply_origin(&mut image_msg.user_input_message.origin);
+        history.push(Message::User(image_msg));
+    } else {
+        let mut user_msg = build_history_user_message_from_parts(
+            merged.content,
+            model_id,
+            merged.images,
+            merged.tool_results,
+        );
+        probe.apply_origin(&mut user_msg.user_input_message.origin);
+        history.push(Message::User(user_msg));
+    }
+
+    if close_with_ack {
+        history.push(Message::Assistant(HistoryAssistantMessage::new("OK")));
+    }
+}
+
+fn move_current_tool_results_to_history_for_image_compat(
+    history: &mut Vec<Message>,
+    model_id: &str,
+    probe: &UpstreamProbe,
+    merged_current: &MergedUserMessageParts,
+    validated_tool_results: &mut Vec<ToolResult>,
+) {
+    if validated_tool_results.is_empty() || merged_current.images.is_empty() {
+        return;
+    }
+
+    tracing::info!(
+        "拆分 current mixed user message：将 tool_results 下沉到 history，保留 images/text 在 current"
+    );
+
+    let moved_results = std::mem::take(validated_tool_results);
+    let mut user_msg =
+        build_history_user_message_from_parts("", model_id, Vec::new(), moved_results);
+    probe.apply_origin(&mut user_msg.user_input_message.origin);
+    history.push(Message::User(user_msg));
+    history.push(Message::Assistant(HistoryAssistantMessage::new("OK")));
 }
 
 /// 转换 assistant 消息
@@ -2079,6 +2154,191 @@ mod tests {
                 assert_eq!(tool_uses.len(), 2);
             }
             other => panic!("history[1] 应为 assistant，got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_convert_request_moves_mixed_current_tool_results_with_images_into_history() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Inspect the generated artifact"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "text", "text": "I'll inspect the artifact."},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_img_01",
+                            "name": "read_artifact",
+                            "input": {"path": "/tmp/report.json"}
+                        }
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_img_01",
+                            "content": "{\"status\":\"ok\"}"
+                        },
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": "aGVsbG8="
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": "Use the screenshot to finish the comparison."
+                        }
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let state = convert_request(&req)
+            .expect("mixed current user message should be split for kiro compatibility")
+            .conversation_state;
+
+        assert_eq!(state.history.len(), 4, "history should include a synthetic tool_result turn");
+
+        let current = &state.current_message.user_input_message;
+        assert_eq!(current.content, "Use the screenshot to finish the comparison.");
+        assert_eq!(current.images.len(), 1, "current message should keep the image");
+        assert!(
+            current.user_input_message_context.tool_results.is_empty(),
+            "current message should no longer carry tool_results when it also has images"
+        );
+
+        match &state.history[2] {
+            Message::User(user) => {
+                assert_eq!(user.user_input_message.content, "");
+                assert!(user.user_input_message.images.is_empty());
+                assert_eq!(user.user_input_message.user_input_message_context.tool_results.len(), 1);
+                assert_eq!(
+                    user.user_input_message.user_input_message_context.tool_results[0].tool_use_id,
+                    "toolu_img_01"
+                );
+            }
+            other => panic!("history[2] should be synthetic tool_result user, got {:?}", other),
+        }
+
+        match &state.history[3] {
+            Message::Assistant(assistant) => {
+                assert_eq!(assistant.assistant_response_message.content, "OK");
+            }
+            other => panic!("history[3] should be synthetic assistant ack, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_convert_request_splits_mixed_history_user_message_before_following_assistant() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Review the fetched screenshot"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "text", "text": "I'll fetch the screenshot."},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_hist_01",
+                            "name": "capture_screen",
+                            "input": {"url": "https://example.com"}
+                        }
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_hist_01",
+                            "content": "capture complete"
+                        },
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": "aGVsbG8="
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": "Use this screenshot in the answer."
+                        }
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("I can continue now."),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Summarize the outcome."),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let state = convert_request(&req)
+            .expect("mixed history user message should be split for kiro compatibility")
+            .conversation_state;
+
+        assert_eq!(state.current_message.user_input_message.content, "Summarize the outcome.");
+        assert_eq!(state.history.len(), 6, "history should insert a synthetic split turn");
+
+        for (idx, msg) in state.history.iter().enumerate() {
+            if let Message::User(user) = msg {
+                assert!(
+                    user.user_input_message.images.is_empty()
+                        || user
+                            .user_input_message
+                            .user_input_message_context
+                            .tool_results
+                            .is_empty(),
+                    "history user message at index {} should not mix images and tool_results",
+                    idx
+                );
+            }
+        }
+
+        match &state.history[3] {
+            Message::Assistant(assistant) => {
+                assert_eq!(assistant.assistant_response_message.content, "OK");
+            }
+            other => panic!("history[3] should be synthetic assistant ack, got {:?}", other),
         }
     }
 }
