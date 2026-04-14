@@ -8,6 +8,10 @@ services:
       - "host.docker.internal:host-gateway"
     ports:
       - "8990:8990"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     volumes:
       - ./config/:/app/config/
     restart: unless-stopped
