@@ -81,6 +81,11 @@ Never suggest bypassing these limits via alternative tools. \
 Never ask the user whether to switch approaches. \
 Complete all chunked operations without commentary.";
 
+/// 当 current user turn 只剩 tool_result、没有文本时，Kiro 上游偶发返回
+/// `content: []` + `stop_reason: end_turn` 的空响应。补一条最小 continuation
+/// 文本可以稳定恢复正常生成，同时尽量不改变原始语义。
+const CURRENT_TOOL_RESULT_FALLBACK_TEXT: &str = "Please continue based on the tool result.";
+
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 ///
 /// 按照用户要求：
@@ -312,6 +317,7 @@ pub fn convert_request_with_probe(
         &probe,
         &mut merged_current,
     );
+    inject_current_tool_result_fallback_text(&mut merged_current, &validated_tool_results);
 
     // 10. 收集历史中使用的工具名称，为缺失的工具生成占位符定义
     // Kiro API 要求：历史消息中引用的工具必须在 tools 列表中有定义
@@ -375,6 +381,20 @@ pub fn convert_request_with_probe(
         conversation_state,
         tool_name_map,
     })
+}
+
+fn inject_current_tool_result_fallback_text(
+    merged_current: &mut MergedUserMessageParts,
+    validated_tool_results: &[ToolResult],
+) {
+    if validated_tool_results.is_empty() || !merged_current.content.trim().is_empty() {
+        return;
+    }
+
+    tracing::info!(
+        "为仅含 tool_result 的 current message 注入最小 continuation 文本，避免上游空响应"
+    );
+    merged_current.content = CURRENT_TOOL_RESULT_FALLBACK_TEXT.to_string();
 }
 
 fn trailing_user_message_cluster_start(messages: &[super::types::Message]) -> usize {
@@ -2306,6 +2326,64 @@ mod tests {
             }
             other => panic!("history[1] 应为 assistant，got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_convert_request_injects_fallback_text_for_tool_result_only_current_message() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("继续"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "text", "text": "我先确认一下。"},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_err_01",
+                            "name": "AskUserQuestion",
+                            "input": {"questions": [{"header": "位置", "question": "放在哪?", "multiSelect": false, "options": [{"label": "A", "description": "A"}, {"label": "B", "description": "B"}]}]}
+                        }
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_err_01",
+                            "is_error": true,
+                            "content": "The user wants to clarify this question."
+                        }
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).expect("tool_result-only current message should convert");
+        let state = result.conversation_state;
+        let current = &state.current_message.user_input_message;
+
+        assert_eq!(current.content, CURRENT_TOOL_RESULT_FALLBACK_TEXT);
+        assert_eq!(current.user_input_message_context.tool_results.len(), 1);
+        assert_eq!(
+            current.user_input_message_context.tool_results[0].tool_use_id,
+            "toolu_err_01"
+        );
+        assert!(current.user_input_message_context.tool_results[0].is_error);
     }
 
     #[test]
