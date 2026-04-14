@@ -42,6 +42,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [queueMaxSizeInput, setQueueMaxSizeInput] = useState('0')
   const [queueMaxWaitMsInput, setQueueMaxWaitMsInput] = useState('0')
   const [rateLimitCooldownMsInput, setRateLimitCooldownMsInput] = useState('2000')
+  const [defaultMaxConcurrencyInput, setDefaultMaxConcurrencyInput] = useState('')
   const [rateLimitBucketCapacityInput, setRateLimitBucketCapacityInput] = useState('3')
   const [rateLimitRefillPerSecondInput, setRateLimitRefillPerSecondInput] = useState('1')
   const [rateLimitRefillMinPerSecondInput, setRateLimitRefillMinPerSecondInput] = useState('0.2')
@@ -87,6 +88,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setQueueMaxSizeInput(String(loadBalancingData.queueMaxSize))
     setQueueMaxWaitMsInput(String(loadBalancingData.queueMaxWaitMs))
     setRateLimitCooldownMsInput(String(loadBalancingData.rateLimitCooldownMs))
+    setDefaultMaxConcurrencyInput(loadBalancingData.defaultMaxConcurrency ? String(loadBalancingData.defaultMaxConcurrency) : '')
     setRateLimitBucketCapacityInput(String(loadBalancingData.rateLimitBucketCapacity))
     setRateLimitRefillPerSecondInput(String(loadBalancingData.rateLimitRefillPerSecond))
     setRateLimitRefillMinPerSecondInput(String(loadBalancingData.rateLimitRefillMinPerSecond))
@@ -96,6 +98,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
     loadBalancingData?.queueMaxSize,
     loadBalancingData?.queueMaxWaitMs,
     loadBalancingData?.rateLimitCooldownMs,
+    loadBalancingData?.defaultMaxConcurrency,
     loadBalancingData?.rateLimitBucketCapacity,
     loadBalancingData?.rateLimitRefillPerSecond,
     loadBalancingData?.rateLimitRefillMinPerSecond,
@@ -543,6 +546,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
     const parsedQueueMaxSize = queueMaxSizeInput.trim() === '' ? 0 : parseInt(queueMaxSizeInput, 10)
     const parsedQueueMaxWaitMs = queueMaxWaitMsInput.trim() === '' ? 0 : parseInt(queueMaxWaitMsInput, 10)
     const parsedRateLimitCooldownMs = rateLimitCooldownMsInput.trim() === '' ? 0 : parseInt(rateLimitCooldownMsInput, 10)
+    const parsedDefaultMaxConcurrency = defaultMaxConcurrencyInput.trim() === '' ? 0 : parseInt(defaultMaxConcurrencyInput, 10)
     const parsedRateLimitBucketCapacity = rateLimitBucketCapacityInput.trim() === '' ? 0 : Number.parseFloat(rateLimitBucketCapacityInput)
     const parsedRateLimitRefillPerSecond = rateLimitRefillPerSecondInput.trim() === '' ? 0 : Number.parseFloat(rateLimitRefillPerSecondInput)
     const parsedRateLimitRefillMinPerSecond = rateLimitRefillMinPerSecondInput.trim() === '' ? 0 : Number.parseFloat(rateLimitRefillMinPerSecondInput)
@@ -553,6 +557,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       Number.isNaN(parsedQueueMaxSize) ||
       Number.isNaN(parsedQueueMaxWaitMs) ||
       Number.isNaN(parsedRateLimitCooldownMs) ||
+      Number.isNaN(parsedDefaultMaxConcurrency) ||
       Number.isNaN(parsedRateLimitBucketCapacity) ||
       Number.isNaN(parsedRateLimitRefillPerSecond) ||
       Number.isNaN(parsedRateLimitRefillMinPerSecond) ||
@@ -561,6 +566,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       parsedQueueMaxSize < 0 ||
       parsedQueueMaxWaitMs < 0 ||
       parsedRateLimitCooldownMs < 0 ||
+      parsedDefaultMaxConcurrency < 0 ||
       parsedRateLimitBucketCapacity < 0 ||
       parsedRateLimitRefillPerSecond < 0 ||
       parsedRateLimitRefillMinPerSecond < 0 ||
@@ -591,6 +597,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
         queueMaxSize: parsedQueueMaxSize,
         queueMaxWaitMs: parsedQueueMaxWaitMs,
         rateLimitCooldownMs: parsedRateLimitCooldownMs,
+        defaultMaxConcurrency: parsedDefaultMaxConcurrency,
         rateLimitBucketCapacity: parsedRateLimitBucketCapacity,
         rateLimitRefillPerSecond: parsedRateLimitRefillPerSecond,
         rateLimitRefillMinPerSecond: parsedRateLimitRefillMinPerSecond,
@@ -685,11 +692,16 @@ export function Dashboard({ onLogout }: DashboardProps) {
           <Card>
             <CardHeader className="pb-2">
               <CardTitle className="text-sm font-medium text-muted-foreground">
-                可用凭据
+                可调度凭据
               </CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="text-2xl font-bold text-green-600">{data?.available || 0}</div>
+              <div className="text-2xl font-bold text-green-600">
+                {data?.dispatchable || 0}
+              </div>
+              <div className="text-xs text-muted-foreground mt-1">
+                未禁用 {data?.available || 0}
+              </div>
             </CardContent>
           </Card>
           <Card>
@@ -782,6 +794,21 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </div>
 
             <div className="space-y-2">
+              <label className="text-sm font-medium" htmlFor="defaultMaxConcurrency">
+                默认单账号并发上限
+              </label>
+              <Input
+                id="defaultMaxConcurrency"
+                type="number"
+                min="0"
+                step="1"
+                value={defaultMaxConcurrencyInput}
+                onChange={(e) => setDefaultMaxConcurrencyInput(e.target.value)}
+                placeholder="留空或 0 表示不限制"
+              />
+            </div>
+
+            <div className="space-y-2">
               <label className="text-sm font-medium" htmlFor="rateLimitBucketCapacity">
                 Bucket 容量
               </label>
@@ -863,7 +890,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </Button>
 
             <p className="text-sm text-muted-foreground md:col-span-2 xl:col-span-3">
-              `maxConcurrency` 控并发峰值，token bucket 控单位时间发放速率，`rateLimitCooldownMs` 作为上游 `429` 后的固定短冷却兜底。建议先从 `queueMaxWaitMs=1000-3000`、`queueMaxSize=总并发的 1-2 倍`、`rateLimitCooldownMs=2000-5000`、`rateLimitBucketCapacity=2-4`、`rateLimitRefillPerSecond=0.5-1.5` 开始。
+              `defaultMaxConcurrency` 是未单独设置账号的默认并发上限，`maxConcurrency` 控单账号覆盖值，token bucket 控单位时间发放速率，`rateLimitCooldownMs` 作为上游 `429` 后的固定短冷却兜底。建议先从 `queueMaxWaitMs=1000-3000`、`queueMaxSize=总并发的 1-2 倍`、`defaultMaxConcurrency=4-8`、`rateLimitCooldownMs=2000-5000`、`rateLimitBucketCapacity=2-4`、`rateLimitRefillPerSecond=0.5-1.5` 开始。
             </p>
           </CardContent>
         </Card>

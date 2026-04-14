@@ -610,6 +610,8 @@ pub struct ManagerSnapshot {
     pub total: usize,
     /// 可用凭据数量
     pub available: usize,
+    /// 当前可立即被调度的凭据数量
+    pub dispatchable: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -2041,11 +2043,25 @@ impl MultiTokenManager {
 
     /// 获取管理器状态快照（用于 Admin API）
     pub fn snapshot(&self) -> ManagerSnapshot {
+        let dispatch = self.dispatch_config();
         let now = Instant::now();
         let mut entries = self.entries.lock();
         Self::refresh_runtime_state(&mut entries, now);
         let current_id = *self.current_id.lock();
         let available = entries.iter().filter(|e| !e.disabled).count();
+        let dispatchable = entries
+            .iter()
+            .filter(|e| !e.disabled)
+            .filter(|e| !Self::is_rate_limited(e, now))
+            .filter(|e| Self::bucket_is_ready(e))
+            .filter(|e| {
+                Self::has_capacity(
+                    &e.credentials,
+                    e.active_requests,
+                    dispatch.default_max_concurrency,
+                )
+            })
+            .count();
 
         ManagerSnapshot {
             entries: entries
@@ -2071,7 +2087,7 @@ impl MultiTokenManager {
                     active_requests: e.active_requests,
                     max_concurrency: e
                         .credentials
-                        .effective_max_concurrency()
+                        .effective_max_concurrency_with_default(dispatch.default_max_concurrency)
                         .and_then(|limit| u32::try_from(limit).ok()),
                     has_proxy: e.credentials.proxy_url.is_some(),
                     proxy_url: e.credentials.proxy_url.clone(),
@@ -2118,6 +2134,7 @@ impl MultiTokenManager {
             current_id,
             total: entries.len(),
             available,
+            dispatchable,
         }
     }
 

@@ -12,6 +12,8 @@ pub struct CredentialsStatusResponse {
     pub total: usize,
     /// 可用凭据数量（未禁用）
     pub available: usize,
+    /// 当前可立即调度的凭据数量
+    pub dispatchable: usize,
     /// 当前活跃凭据 ID
     pub current_id: u64,
     /// 各凭据状态列表

@@ -89,7 +89,7 @@ fn map_provider_error(err: Error) -> Response {
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse::new(
                 "service_unavailable",
-                "Timed out waiting for account capacity. Retry later or raise queueMaxWaitMs/maxConcurrency.",
+                "Timed out waiting for a dispatchable account. Accounts may be at maxConcurrency, cooling down after 429s, or waiting for local token-bucket refill. Retry later or tune queueMaxWaitMs/maxConcurrency/token-bucket settings.",
             )),
         )
             .into_response();

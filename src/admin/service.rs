@@ -59,6 +59,7 @@ impl AdminService {
         let current_id = snapshot.current_id;
         let total = snapshot.total;
         let available = snapshot.available;
+        let dispatchable = snapshot.dispatchable;
 
         let mut credentials: Vec<CredentialStatusItem> = snapshot
             .entries
@@ -100,6 +101,7 @@ impl AdminService {
         CredentialsStatusResponse {
             total,
             available,
+            dispatchable,
             current_id,
             credentials,
         }

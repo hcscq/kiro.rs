@@ -2,6 +2,7 @@
 export interface CredentialsStatusResponse {
   total: number
   available: number
+  dispatchable: number
   currentId: number
   credentials: CredentialStatusItem[]
 }
@@ -109,6 +110,7 @@ export interface LoadBalancingConfigResponse {
   queueMaxSize: number
   queueMaxWaitMs: number
   rateLimitCooldownMs: number
+  defaultMaxConcurrency: number | null
   rateLimitBucketCapacity: number
   rateLimitRefillPerSecond: number
   rateLimitRefillMinPerSecond: number
@@ -122,6 +124,7 @@ export interface UpdateLoadBalancingConfigRequest {
   queueMaxSize?: number
   queueMaxWaitMs?: number
   rateLimitCooldownMs?: number
+  defaultMaxConcurrency?: number
   rateLimitBucketCapacity?: number
   rateLimitRefillPerSecond?: number
   rateLimitRefillMinPerSecond?: number
