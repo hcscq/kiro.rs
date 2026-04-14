@@ -1,8 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2 } from 'lucide-react'
+import { RefreshCw, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { storage } from '@/lib/storage'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -13,14 +12,10 @@ import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
-import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
+import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { cn, extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse, CredentialStatusItem } from '@/types/api'
-
-interface DashboardProps {
-  onLogout: () => void
-}
 
 const ALL_LEVELS = '__all_levels__'
 const UNKNOWN_LEVEL = '__unknown_level__'
@@ -45,19 +40,18 @@ interface SegmentedTabsProps {
 
 function SegmentedTabs({ label, options, value, onChange }: SegmentedTabsProps) {
   return (
-    <div className="space-y-2">
-      <div className="text-sm font-medium">{label}</div>
-      <div className="flex flex-wrap gap-2">
+    <div className="flex items-center gap-2 flex-wrap">
+      <span className="text-xs font-medium text-muted-foreground whitespace-nowrap">{label}</span>
+      <div className="flex flex-wrap gap-1">
         {options.map((option) => {
           const active = option.value === value
-
           return (
             <Button
               key={option.value}
               type="button"
               size="sm"
               variant={active ? 'default' : 'outline'}
-              className={cn('h-8 rounded-full px-3', !active && 'text-muted-foreground')}
+              className={cn('h-7 rounded-full px-2.5 text-xs', !active && 'text-muted-foreground')}
               onClick={() => onChange(option.value)}
             >
               {option.label}
@@ -68,7 +62,6 @@ function SegmentedTabs({ label, options, value, onChange }: SegmentedTabsProps) 
     </div>
   )
 }
-
 function normalizeSubscriptionTitle(credential: CredentialStatusItem): string | null {
   const title = credential.subscriptionTitle?.trim()
   return title ? title : null
@@ -125,7 +118,7 @@ function getDefaultSortDirection(field: SortField): SortDirection {
   return field === 'priority' ? 'asc' : 'desc'
 }
 
-export function Dashboard({ onLogout }: DashboardProps) {
+export function Dashboard() {
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
@@ -142,15 +135,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [queryInfoProgress, setQueryInfoProgress] = useState({ current: 0, total: 0 })
   const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [batchRefreshProgress, setBatchRefreshProgress] = useState({ current: 0, total: 0 })
-  const [queueMaxSizeInput, setQueueMaxSizeInput] = useState('0')
-  const [queueMaxWaitMsInput, setQueueMaxWaitMsInput] = useState('0')
-  const [rateLimitCooldownMsInput, setRateLimitCooldownMsInput] = useState('2000')
-  const [defaultMaxConcurrencyInput, setDefaultMaxConcurrencyInput] = useState('')
-  const [rateLimitBucketCapacityInput, setRateLimitBucketCapacityInput] = useState('3')
-  const [rateLimitRefillPerSecondInput, setRateLimitRefillPerSecondInput] = useState('1')
-  const [rateLimitRefillMinPerSecondInput, setRateLimitRefillMinPerSecondInput] = useState('0.2')
-  const [rateLimitRefillRecoveryStepInput, setRateLimitRefillRecoveryStepInput] = useState('0.1')
-  const [rateLimitRefillBackoffFactorInput, setRateLimitRefillBackoffFactorInput] = useState('0.5')
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
   const [levelFilter, setLevelFilter] = useState<string>(ALL_LEVELS)
@@ -161,20 +145,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [sortField, setSortField] = useState<SortField>('importedAt')
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc')
   const itemsPerPage = 12
-  const [darkMode, setDarkMode] = useState(() => {
-    if (typeof window !== 'undefined') {
-      return document.documentElement.classList.contains('dark')
-    }
-    return false
-  })
 
   const queryClient = useQueryClient()
   const { data, isLoading, error, refetch } = useCredentials()
   const { mutate: deleteCredential } = useDeleteCredential()
   const { mutate: resetFailure } = useResetFailure()
-  const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
-  const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
-
+  const { data: loadBalancingData } = useLoadBalancingMode()
   const credentials = data?.credentials || []
   const levelOptions = [
     { value: ALL_LEVELS, label: '全部' },
@@ -310,32 +286,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
       setCurrentPage(totalPages)
     }
   }, [currentPage, totalPages])
-
-  useEffect(() => {
-    if (!loadBalancingData) {
-      return
-    }
-    setQueueMaxSizeInput(String(loadBalancingData.queueMaxSize))
-    setQueueMaxWaitMsInput(String(loadBalancingData.queueMaxWaitMs))
-    setRateLimitCooldownMsInput(String(loadBalancingData.rateLimitCooldownMs))
-    setDefaultMaxConcurrencyInput(loadBalancingData.defaultMaxConcurrency ? String(loadBalancingData.defaultMaxConcurrency) : '')
-    setRateLimitBucketCapacityInput(String(loadBalancingData.rateLimitBucketCapacity))
-    setRateLimitRefillPerSecondInput(String(loadBalancingData.rateLimitRefillPerSecond))
-    setRateLimitRefillMinPerSecondInput(String(loadBalancingData.rateLimitRefillMinPerSecond))
-    setRateLimitRefillRecoveryStepInput(String(loadBalancingData.rateLimitRefillRecoveryStepPerSuccess))
-    setRateLimitRefillBackoffFactorInput(String(loadBalancingData.rateLimitRefillBackoffFactor))
-  }, [
-    loadBalancingData?.queueMaxSize,
-    loadBalancingData?.queueMaxWaitMs,
-    loadBalancingData?.rateLimitCooldownMs,
-    loadBalancingData?.defaultMaxConcurrency,
-    loadBalancingData?.rateLimitBucketCapacity,
-    loadBalancingData?.rateLimitRefillPerSecond,
-    loadBalancingData?.rateLimitRefillMinPerSecond,
-    loadBalancingData?.rateLimitRefillRecoveryStepPerSuccess,
-    loadBalancingData?.rateLimitRefillBackoffFactor,
-  ])
-
   // 只保留当前仍存在的凭据缓存，避免删除后残留旧数据
   useEffect(() => {
     if (!data?.credentials) {
@@ -369,12 +319,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
       return next.size === prev.size ? prev : next
     })
   }, [data?.credentials])
-
-  const toggleDarkMode = () => {
-    setDarkMode(!darkMode)
-    document.documentElement.classList.toggle('dark')
-  }
-
   const handleViewBalance = async (id: number) => {
     setSelectedCredentialId(id)
     setBalanceDialogOpen(true)
@@ -406,12 +350,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
       })
     }
   }
-
-  const handleRefresh = () => {
-    refetch()
-    toast.success('已刷新凭据列表')
-  }
-
   const resetFilters = () => {
     setLevelFilter(ALL_LEVELS)
     setEnabledFilter('all')
@@ -422,12 +360,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setSortDirection('desc')
   }
 
-  const handleLogout = () => {
-    storage.removeApiKey()
-    queryClient.clear()
-    onLogout()
+  const handleSortFieldChange = (value: string) => {
+    const nextField = value as SortField
+    setSortField(nextField)
+    setSortDirection(getDefaultSortDirection(nextField))
   }
-
   // 选择管理
   const toggleSelect = (id: number) => {
     const newSelected = new Set(selectedIds)
@@ -793,107 +730,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setVerifying(false)
   }
 
-  // 切换负载均衡模式
-  const handleToggleLoadBalancing = () => {
-    const currentMode = loadBalancingData?.mode || 'priority'
-    const newMode = currentMode === 'priority' ? 'balanced' : 'priority'
-
-    setLoadBalancingMode({ mode: newMode }, {
-      onSuccess: () => {
-        const modeName = newMode === 'priority' ? '优先级模式' : '均衡负载模式'
-        toast.success(`已切换到${modeName}`)
-      },
-      onError: (error) => {
-        toast.error(`切换失败: ${extractErrorMessage(error)}`)
-      }
-    })
-  }
-
-  const handleSortFieldChange = (value: string) => {
-    const nextField = value as SortField
-    setSortField(nextField)
-    setSortDirection(getDefaultSortDirection(nextField))
-  }
-
-  const handleSaveQueueSettings = () => {
-    const parsedQueueMaxSize = queueMaxSizeInput.trim() === '' ? 0 : parseInt(queueMaxSizeInput, 10)
-    const parsedQueueMaxWaitMs = queueMaxWaitMsInput.trim() === '' ? 0 : parseInt(queueMaxWaitMsInput, 10)
-    const parsedRateLimitCooldownMs = rateLimitCooldownMsInput.trim() === '' ? 0 : parseInt(rateLimitCooldownMsInput, 10)
-    const parsedDefaultMaxConcurrency = defaultMaxConcurrencyInput.trim() === '' ? 0 : parseInt(defaultMaxConcurrencyInput, 10)
-    const parsedRateLimitBucketCapacity = rateLimitBucketCapacityInput.trim() === '' ? 0 : Number.parseFloat(rateLimitBucketCapacityInput)
-    const parsedRateLimitRefillPerSecond = rateLimitRefillPerSecondInput.trim() === '' ? 0 : Number.parseFloat(rateLimitRefillPerSecondInput)
-    const parsedRateLimitRefillMinPerSecond = rateLimitRefillMinPerSecondInput.trim() === '' ? 0 : Number.parseFloat(rateLimitRefillMinPerSecondInput)
-    const parsedRateLimitRefillRecoveryStep = rateLimitRefillRecoveryStepInput.trim() === '' ? 0 : Number.parseFloat(rateLimitRefillRecoveryStepInput)
-    const parsedRateLimitRefillBackoffFactor = rateLimitRefillBackoffFactorInput.trim() === '' ? 0 : Number.parseFloat(rateLimitRefillBackoffFactorInput)
-
-    if (
-      Number.isNaN(parsedQueueMaxSize) ||
-      Number.isNaN(parsedQueueMaxWaitMs) ||
-      Number.isNaN(parsedRateLimitCooldownMs) ||
-      Number.isNaN(parsedDefaultMaxConcurrency) ||
-      Number.isNaN(parsedRateLimitBucketCapacity) ||
-      Number.isNaN(parsedRateLimitRefillPerSecond) ||
-      Number.isNaN(parsedRateLimitRefillMinPerSecond) ||
-      Number.isNaN(parsedRateLimitRefillRecoveryStep) ||
-      Number.isNaN(parsedRateLimitRefillBackoffFactor) ||
-      parsedQueueMaxSize < 0 ||
-      parsedQueueMaxWaitMs < 0 ||
-      parsedRateLimitCooldownMs < 0 ||
-      parsedDefaultMaxConcurrency < 0 ||
-      parsedRateLimitBucketCapacity < 0 ||
-      parsedRateLimitRefillPerSecond < 0 ||
-      parsedRateLimitRefillMinPerSecond < 0 ||
-      parsedRateLimitRefillRecoveryStep < 0
-    ) {
-      toast.error('调度参数必须是大于等于 0 的数字')
-      return
-    }
-
-    if (
-      parsedRateLimitRefillBackoffFactor < 0.05 ||
-      parsedRateLimitRefillBackoffFactor > 1
-    ) {
-      toast.error('429 衰减系数必须在 0.05 到 1 之间')
-      return
-    }
-
-    if (
-      parsedRateLimitRefillPerSecond > 0 &&
-      parsedRateLimitRefillMinPerSecond > parsedRateLimitRefillPerSecond
-    ) {
-      toast.error('最小回填速率不能大于基础回填速率')
-      return
-    }
-
-    setLoadBalancingMode(
-      {
-        queueMaxSize: parsedQueueMaxSize,
-        queueMaxWaitMs: parsedQueueMaxWaitMs,
-        rateLimitCooldownMs: parsedRateLimitCooldownMs,
-        defaultMaxConcurrency: parsedDefaultMaxConcurrency,
-        rateLimitBucketCapacity: parsedRateLimitBucketCapacity,
-        rateLimitRefillPerSecond: parsedRateLimitRefillPerSecond,
-        rateLimitRefillMinPerSecond: parsedRateLimitRefillMinPerSecond,
-        rateLimitRefillRecoveryStepPerSuccess: parsedRateLimitRefillRecoveryStep,
-        rateLimitRefillBackoffFactor: parsedRateLimitRefillBackoffFactor,
-      },
-      {
-        onSuccess: () => {
-          toast.success('调度配置已更新')
-        },
-        onError: (error) => {
-          toast.error(`保存失败: ${extractErrorMessage(error)}`)
-        }
-      }
-    )
-  }
-
   if (isLoading) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-background">
+      <div className="flex h-[300px] items-center justify-center rounded-lg border">
         <div className="text-center">
-          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary mx-auto mb-4"></div>
-          <p className="text-muted-foreground">加载中...</p>
+          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary mx-auto mb-4"></div>
+          <p className="text-muted-foreground">加载凭据列表...</p>
         </div>
       </div>
     )
@@ -901,15 +743,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
   if (error) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-background p-4">
-        <Card className="w-full max-w-md">
+      <div className="flex items-center justify-center p-4 h-[300px] rounded-lg border">
+        <Card className="w-full max-w-md shadow-none border-none">
           <CardContent className="pt-6 text-center">
-            <div className="text-red-500 mb-4">加载失败</div>
+            <div className="text-destructive mb-4">加载失败</div>
             <p className="text-muted-foreground mb-4">{(error as Error).message}</p>
-            <div className="space-x-2">
-              <Button onClick={() => refetch()}>重试</Button>
-              <Button variant="outline" onClick={handleLogout}>重新登录</Button>
-            </div>
+            <Button onClick={() => refetch()}>重试加载</Button>
           </CardContent>
         </Card>
       </div>
@@ -917,41 +756,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
   }
 
   return (
-    <div className="min-h-screen bg-background">
-      {/* 顶部导航 */}
-      <header className="sticky top-0 z-50 w-full border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
-        <div className="container flex h-14 items-center justify-between px-4 md:px-8">
-          <div className="flex items-center gap-2">
-            <Server className="h-5 w-5" />
-            <span className="font-semibold">Kiro Admin</span>
-          </div>
-          <div className="flex items-center gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={handleToggleLoadBalancing}
-              disabled={isLoadingMode || isSettingMode}
-              title="切换负载均衡模式"
-            >
-              {isLoadingMode ? '加载中...' : (loadBalancingData?.mode === 'priority' ? '优先级模式' : '均衡负载')}
-            </Button>
-            <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
-              {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
-            </Button>
-            <Button variant="ghost" size="icon" onClick={handleRefresh}>
-              <RefreshCw className="h-5 w-5" />
-            </Button>
-            <Button variant="ghost" size="icon" onClick={handleLogout}>
-              <LogOut className="h-5 w-5" />
-            </Button>
-          </div>
-        </div>
-      </header>
-
-      {/* 主内容 */}
-      <main className="container mx-auto px-4 md:px-8 py-6">
+    <div className="space-y-6">
         {/* 统计卡片 */}
-        <div className="grid gap-4 md:grid-cols-4 mb-6">
+        <div className="grid gap-4 md:grid-cols-4">
           <Card>
             <CardHeader className="pb-2">
               <CardTitle className="text-sm font-medium text-muted-foreground">
@@ -1003,170 +810,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </CardContent>
           </Card>
         </div>
-
-        <Card className="mb-6">
-          <CardHeader className="pb-3">
-            <CardTitle className="text-sm font-medium">调度设置</CardTitle>
-          </CardHeader>
-          <CardContent className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-            <div className="space-y-2">
-              <div className="text-sm text-muted-foreground">当前模式</div>
-              <div className="flex items-center gap-2">
-                <Badge variant="secondary">
-                  {loadBalancingData?.mode === 'balanced' ? '均衡负载' : '优先级模式'}
-                </Badge>
-                <span className="text-sm text-muted-foreground">
-                  {loadBalancingData?.waitingRequests ?? 0} 个请求排队中
-                </span>
-              </div>
-            </div>
-
-            <div className="space-y-2">
-              <label className="text-sm font-medium" htmlFor="queueMaxSize">
-                最大排队数量
-              </label>
-              <Input
-                id="queueMaxSize"
-                type="number"
-                min="0"
-                step="1"
-                value={queueMaxSizeInput}
-                onChange={(e) => setQueueMaxSizeInput(e.target.value)}
-                placeholder="0 表示关闭等待队列"
-              />
-            </div>
-
-            <div className="space-y-2">
-              <label className="text-sm font-medium" htmlFor="queueMaxWaitMs">
-                最大等待时间（毫秒）
-              </label>
-              <Input
-                id="queueMaxWaitMs"
-                type="number"
-                min="0"
-                step="100"
-                value={queueMaxWaitMsInput}
-                onChange={(e) => setQueueMaxWaitMsInput(e.target.value)}
-                placeholder="0 表示关闭等待队列"
-              />
-            </div>
-
-            <div className="space-y-2">
-              <label className="text-sm font-medium" htmlFor="rateLimitCooldownMs">
-                429 冷却时间（毫秒）
-              </label>
-              <Input
-                id="rateLimitCooldownMs"
-                type="number"
-                min="0"
-                step="100"
-                value={rateLimitCooldownMsInput}
-                onChange={(e) => setRateLimitCooldownMsInput(e.target.value)}
-                placeholder="0 表示关闭 429 冷却"
-              />
-            </div>
-
-            <div className="space-y-2">
-              <label className="text-sm font-medium" htmlFor="defaultMaxConcurrency">
-                默认单账号并发上限
-              </label>
-              <Input
-                id="defaultMaxConcurrency"
-                type="number"
-                min="0"
-                step="1"
-                value={defaultMaxConcurrencyInput}
-                onChange={(e) => setDefaultMaxConcurrencyInput(e.target.value)}
-                placeholder="留空或 0 表示不限制"
-              />
-            </div>
-
-            <div className="space-y-2">
-              <label className="text-sm font-medium" htmlFor="rateLimitBucketCapacity">
-                Bucket 容量
-              </label>
-              <Input
-                id="rateLimitBucketCapacity"
-                type="number"
-                min="0"
-                step="0.1"
-                value={rateLimitBucketCapacityInput}
-                onChange={(e) => setRateLimitBucketCapacityInput(e.target.value)}
-                placeholder="0 表示关闭 token bucket"
-              />
-            </div>
-
-            <div className="space-y-2">
-              <label className="text-sm font-medium" htmlFor="rateLimitRefillPerSecond">
-                基础回填速率（token/s）
-              </label>
-              <Input
-                id="rateLimitRefillPerSecond"
-                type="number"
-                min="0"
-                step="0.1"
-                value={rateLimitRefillPerSecondInput}
-                onChange={(e) => setRateLimitRefillPerSecondInput(e.target.value)}
-                placeholder="0 表示关闭 token bucket"
-              />
-            </div>
-
-            <div className="space-y-2">
-              <label className="text-sm font-medium" htmlFor="rateLimitRefillMinPerSecond">
-                最小回填速率（token/s）
-              </label>
-              <Input
-                id="rateLimitRefillMinPerSecond"
-                type="number"
-                min="0"
-                step="0.1"
-                value={rateLimitRefillMinPerSecondInput}
-                onChange={(e) => setRateLimitRefillMinPerSecondInput(e.target.value)}
-              />
-            </div>
-
-            <div className="space-y-2">
-              <label className="text-sm font-medium" htmlFor="rateLimitRefillRecoveryStep">
-                成功恢复步长（token/s）
-              </label>
-              <Input
-                id="rateLimitRefillRecoveryStep"
-                type="number"
-                min="0"
-                step="0.1"
-                value={rateLimitRefillRecoveryStepInput}
-                onChange={(e) => setRateLimitRefillRecoveryStepInput(e.target.value)}
-              />
-            </div>
-
-            <div className="space-y-2">
-              <label className="text-sm font-medium" htmlFor="rateLimitRefillBackoffFactor">
-                429 衰减系数
-              </label>
-              <Input
-                id="rateLimitRefillBackoffFactor"
-                type="number"
-                min="0.05"
-                max="1"
-                step="0.05"
-                value={rateLimitRefillBackoffFactorInput}
-                onChange={(e) => setRateLimitRefillBackoffFactorInput(e.target.value)}
-              />
-            </div>
-
-            <Button
-              onClick={handleSaveQueueSettings}
-              disabled={isLoadingMode || isSettingMode}
-              className="md:col-span-2 xl:col-span-3"
-            >
-              保存配置
-            </Button>
-
-            <p className="text-sm text-muted-foreground md:col-span-2 xl:col-span-3">
-              `defaultMaxConcurrency` 是未单独设置账号的默认并发上限，`maxConcurrency` 控单账号覆盖值，token bucket 控单位时间发放速率，`rateLimitCooldownMs` 作为上游 `429` 后的固定短冷却兜底。建议先从 `queueMaxWaitMs=1000-3000`、`queueMaxSize=总并发的 1-2 倍`、`defaultMaxConcurrency=4-8`、`rateLimitCooldownMs=2000-5000`、`rateLimitBucketCapacity=2-4`、`rateLimitRefillPerSecond=0.5-1.5` 开始。
-            </p>
-          </CardContent>
-        </Card>
 
         {/* 凭据列表 */}
         <div className="space-y-4">
@@ -1260,84 +903,41 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </div>
           </div>
           <Card>
-            <CardContent className="space-y-4 pt-6">
-              <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_auto]">
-                <div className="space-y-2">
-                  <label className="text-sm font-medium" htmlFor="credential-search">
-                    关键词搜索
-                  </label>
-                  <Input
-                    id="credential-search"
-                    value={searchKeyword}
-                    onChange={(e) => setSearchKeyword(e.target.value)}
-                    placeholder="搜索邮箱 / ID / 订阅等级 / 代理 / 禁用原因"
-                  />
-                </div>
-                <div className="flex flex-wrap items-end gap-2">
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant={quickFilter === 'dispatchable' ? 'default' : 'outline'}
-                    onClick={() => setQuickFilter(prev => prev === 'dispatchable' ? 'all' : 'dispatchable')}
-                  >
-                    只看当前可调度
-                  </Button>
-                  <Button type="button" size="sm" variant="outline" onClick={resetFilters}>
-                    重置筛选
-                  </Button>
-                </div>
-              </div>
-
-              <SegmentedTabs
-                label="账号层级"
-                options={levelOptions}
-                value={levelFilter}
-                onChange={setLevelFilter}
-              />
-
-              <SegmentedTabs
-                label="启用状态"
-                options={enabledOptions}
-                value={enabledFilter}
-                onChange={(value) => setEnabledFilter(value as EnabledFilter)}
-              />
-
-              <SegmentedTabs
-                label="账号状态"
-                options={accountStatusOptions}
-                value={accountStatusFilter}
-                onChange={(value) => setAccountStatusFilter(value as AccountStatusFilter)}
-              />
-
-              <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-end">
-                <SegmentedTabs
-                  label="排序方式"
-                  options={sortOptions}
-                  value={sortField}
-                  onChange={handleSortFieldChange}
+            <CardContent className="space-y-3 pt-4 pb-3">
+              <div className="flex gap-3 items-center">
+                <Input
+                  id="credential-search"
+                  value={searchKeyword}
+                  onChange={(e) => setSearchKeyword(e.target.value)}
+                  placeholder="搜索邮箱 / ID / 订阅等级 / 代理 / 禁用原因"
+                  className="h-8 text-sm"
                 />
-                <div className="space-y-2">
-                  <div className="text-sm font-medium">排序方向</div>
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    onClick={() => setSortDirection(prev => prev === 'asc' ? 'desc' : 'asc')}
-                  >
-                    {sortDirection === 'asc' ? '升序' : '降序'}
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={quickFilter === 'dispatchable' ? 'default' : 'outline'}
+                  className="h-7 whitespace-nowrap text-xs"
+                  onClick={() => setQuickFilter(prev => prev === 'dispatchable' ? 'all' : 'dispatchable')}
+                >
+                  只看可调度
+                </Button>
+                <Button type="button" size="sm" variant="outline" onClick={resetFilters} className="h-7 whitespace-nowrap text-xs">
+                  重置
+                </Button>
+              </div>
+              <div className="grid grid-cols-1 xl:grid-cols-2 gap-x-6 gap-y-2">
+                <SegmentedTabs label="层级" options={levelOptions} value={levelFilter} onChange={setLevelFilter} />
+                <SegmentedTabs label="启用" options={enabledOptions} value={enabledFilter} onChange={(value) => setEnabledFilter(value as EnabledFilter)} />
+                <SegmentedTabs label="状态" options={accountStatusOptions} value={accountStatusFilter} onChange={(value) => setAccountStatusFilter(value as AccountStatusFilter)} />
+                <div className="flex items-center gap-2 flex-wrap">
+                  <SegmentedTabs label="排序" options={sortOptions} value={sortField} onChange={handleSortFieldChange} />
+                  <Button type="button" size="sm" variant="outline" className="h-7 text-xs" onClick={() => setSortDirection(prev => prev === 'asc' ? 'desc' : 'asc')}>
+                    {sortDirection === 'asc' ? '↑升序' : '↓降序'}
                   </Button>
                 </div>
               </div>
-
-              <div className="flex flex-wrap items-center justify-between gap-2 border-t pt-4 text-sm text-muted-foreground">
-                <span>
-                  筛选后 {filteredCredentials.length} / {credentials.length} 个账号
-                </span>
-                <div className="flex flex-wrap gap-2">
-                  <Badge variant="secondary">补充筛选：关键词搜索</Badge>
-                  <Badge variant="secondary">补充筛选：只看当前可调度</Badge>
-                  <Badge variant="secondary">补充排序：最后调用</Badge>
-                </div>
+              <div className="flex items-center text-xs text-muted-foreground border-t pt-2">
+                <span>筛选后 {filteredCredentials.length} / {credentials.length} 个账号</span>
               </div>
             </CardContent>
           </Card>
@@ -1359,7 +959,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </Card>
           ) : (
             <>
-              <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+              <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
                 {currentCredentials.map((credential) => (
                   <CredentialCard
                     key={credential.id}
@@ -1400,7 +1000,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </>
           )}
         </div>
-      </main>
 
       {/* 余额对话框 */}
       <BalanceDialog
