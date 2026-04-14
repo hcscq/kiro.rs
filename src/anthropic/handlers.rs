@@ -33,6 +33,16 @@ use super::types::{
 use super::websearch;
 use crate::kiro::provider::RequestOptions;
 
+fn request_id_from_headers(headers: &HeaderMap) -> String {
+    headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("kirors-{}", Uuid::new_v4().simple()))
+}
+
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
     let err_str = err.to_string();
@@ -219,7 +229,9 @@ pub async fn post_messages(
     headers: HeaderMap,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    let request_id = request_id_from_headers(&headers);
     tracing::info!(
+        request_id = %request_id,
         model = %payload.model,
         max_tokens = %payload.max_tokens,
         stream = %payload.stream,
@@ -244,7 +256,7 @@ pub async fn post_messages(
 
     let probe = parse_upstream_probe(&headers);
     if probe.is_enabled() {
-        tracing::info!(?probe, "启用上游裸探针选项");
+        tracing::info!(request_id = %request_id, ?probe, "启用上游裸探针选项");
     }
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
@@ -252,7 +264,7 @@ pub async fn post_messages(
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
-        tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
+        tracing::info!(request_id = %request_id, "检测到 WebSearch 工具，路由到 WebSearch 处理");
 
         // 估算输入 tokens
         let input_tokens = token::count_all_tokens(
@@ -277,7 +289,7 @@ pub async fn post_messages(
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
             };
-            tracing::warn!("请求转换失败: {}", e);
+            tracing::warn!(request_id = %request_id, error = %e, "请求转换失败");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse::new(error_type, message)),
@@ -337,6 +349,7 @@ pub async fn post_messages(
             tool_name_map,
             RequestOptions {
                 omit_agent_mode_header: probe.omit_agent_mode_header,
+                request_id: Some(request_id.clone()),
             },
         )
         .await
@@ -350,6 +363,7 @@ pub async fn post_messages(
             tool_name_map,
             RequestOptions {
                 omit_agent_mode_header: probe.omit_agent_mode_header,
+                request_id: Some(request_id),
             },
         )
         .await
@@ -754,7 +768,9 @@ pub async fn post_messages_cc(
     headers: HeaderMap,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    let request_id = request_id_from_headers(&headers);
     tracing::info!(
+        request_id = %request_id,
         model = %payload.model,
         max_tokens = %payload.max_tokens,
         stream = %payload.stream,
@@ -780,7 +796,7 @@ pub async fn post_messages_cc(
 
     let probe = parse_upstream_probe(&headers);
     if probe.is_enabled() {
-        tracing::info!(?probe, "启用上游裸探针选项");
+        tracing::info!(request_id = %request_id, ?probe, "启用上游裸探针选项");
     }
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
@@ -788,7 +804,7 @@ pub async fn post_messages_cc(
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
-        tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
+        tracing::info!(request_id = %request_id, "检测到 WebSearch 工具，路由到 WebSearch 处理");
 
         // 估算输入 tokens
         let input_tokens = token::count_all_tokens(
@@ -813,7 +829,7 @@ pub async fn post_messages_cc(
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
             };
-            tracing::warn!("请求转换失败: {}", e);
+            tracing::warn!(request_id = %request_id, error = %e, "请求转换失败");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse::new(error_type, message)),
@@ -873,6 +889,7 @@ pub async fn post_messages_cc(
             tool_name_map,
             RequestOptions {
                 omit_agent_mode_header: probe.omit_agent_mode_header,
+                request_id: Some(request_id.clone()),
             },
         )
         .await
@@ -886,6 +903,7 @@ pub async fn post_messages_cc(
             tool_name_map,
             RequestOptions {
                 omit_agent_mode_header: probe.omit_agent_mode_header,
+                request_id: Some(request_id),
             },
         )
         .await

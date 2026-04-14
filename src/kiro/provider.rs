@@ -10,7 +10,7 @@ use futures::{StreamExt, stream};
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use uuid::Uuid;
 
@@ -26,6 +26,9 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
+const SLOW_UPSTREAM_HEADERS_MS: u128 = 3_000;
+const SLOW_FIRST_CHUNK_MS: u128 = 3_000;
+const SLOW_HEADERS_TO_FIRST_CHUNK_MS: u128 = 1_000;
 
 /// Kiro API Provider
 ///
@@ -45,45 +48,225 @@ pub struct KiroProvider {
 pub struct ManagedResponse {
     response: reqwest::Response,
     _lease: CallLease,
+    trace: Option<ResponseTrace>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct RequestOptions {
     pub omit_agent_mode_header: bool,
+    pub request_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ResponseTrace {
+    request_id: String,
+    api_type: &'static str,
+    model: Option<String>,
+    credential_id: u64,
+    attempt: usize,
+    max_retries: usize,
+    region: String,
+    status_code: u16,
+    overall_started_at: Instant,
+    upstream_request_started_at: Instant,
+    response_headers_at: Instant,
 }
 
 impl ManagedResponse {
-    fn new(response: reqwest::Response, lease: CallLease) -> Self {
+    fn new(response: reqwest::Response, lease: CallLease, trace: Option<ResponseTrace>) -> Self {
         Self {
             response,
             _lease: lease,
+            trace,
         }
     }
 
     pub async fn bytes(self) -> reqwest::Result<Bytes> {
-        let Self { response, _lease } = self;
-        response.bytes().await
+        let Self {
+            response,
+            _lease,
+            trace,
+        } = self;
+        let bytes = response.bytes().await?;
+        if let Some(trace) = trace {
+            trace.log_body_complete(bytes.len());
+        }
+        Ok(bytes)
     }
 
     pub async fn text(self) -> reqwest::Result<String> {
-        let Self { response, _lease } = self;
-        response.text().await
+        let Self {
+            response,
+            _lease,
+            trace,
+        } = self;
+        let text = response.text().await?;
+        if let Some(trace) = trace {
+            trace.log_body_complete(text.len());
+        }
+        Ok(text)
     }
 
     pub fn into_bytes_stream(self) -> BoxStream<'static, Result<Bytes, reqwest::Error>> {
-        let Self { response, _lease } = self;
+        let Self {
+            response,
+            _lease,
+            trace,
+        } = self;
         let body_stream = response.bytes_stream();
 
         stream::unfold(
-            (body_stream, _lease),
-            |(mut body_stream, lease)| async move {
-                body_stream
-                    .next()
-                    .await
-                    .map(|item| (item, (body_stream, lease)))
+            (body_stream, _lease, trace, false, 0usize, false),
+            |(mut body_stream, lease, trace, seen_first_chunk, total_bytes, finished)| async move {
+                if finished {
+                    return None;
+                }
+
+                match body_stream.next().await {
+                    Some(Ok(chunk)) => {
+                        let chunk_len = chunk.len();
+                        let next_total_bytes = total_bytes + chunk_len;
+                        if !seen_first_chunk {
+                            if let Some(trace) = trace.as_ref() {
+                                trace.log_first_chunk(chunk_len);
+                            }
+                        }
+                        Some((
+                            Ok(chunk),
+                            (body_stream, lease, trace, true, next_total_bytes, false),
+                        ))
+                    }
+                    Some(Err(err)) => {
+                        if let Some(trace) = trace.as_ref() {
+                            trace.log_stream_error(seen_first_chunk, total_bytes, &err);
+                        }
+                        Some((
+                            Err(err),
+                            (body_stream, lease, trace, seen_first_chunk, total_bytes, true),
+                        ))
+                    }
+                    None => {
+                        if let Some(trace) = trace.as_ref() {
+                            trace.log_stream_complete(seen_first_chunk, total_bytes);
+                        }
+                        None
+                    }
+                }
             },
         )
         .boxed()
+    }
+}
+
+impl ResponseTrace {
+    fn model_label(&self) -> &str {
+        self.model.as_deref().unwrap_or("unknown")
+    }
+
+    fn log_body_complete(&self, body_len: usize) {
+        tracing::info!(
+            request_id = %self.request_id,
+            api_type = self.api_type,
+            model = self.model_label(),
+            credential_id = self.credential_id,
+            attempt = self.attempt,
+            max_retries = self.max_retries,
+            region = %self.region,
+            status_code = self.status_code,
+            body_len,
+            total_elapsed_ms = self.overall_started_at.elapsed().as_millis(),
+            upstream_elapsed_ms = self.upstream_request_started_at.elapsed().as_millis(),
+            "上游响应体读取完成"
+        );
+    }
+
+    fn log_first_chunk(&self, chunk_len: usize) {
+        let total_elapsed_ms = self.overall_started_at.elapsed().as_millis();
+        let first_chunk_wait_ms = self.upstream_request_started_at.elapsed().as_millis();
+        let headers_to_first_chunk_ms = self.response_headers_at.elapsed().as_millis();
+        let log_slow =
+            first_chunk_wait_ms >= SLOW_FIRST_CHUNK_MS
+                || headers_to_first_chunk_ms >= SLOW_HEADERS_TO_FIRST_CHUNK_MS;
+
+        let request_id = &self.request_id;
+        let api_type = self.api_type;
+        let model = self.model_label();
+        let credential_id = self.credential_id;
+        let attempt = self.attempt;
+        let max_retries = self.max_retries;
+        let region = &self.region;
+        let status_code = self.status_code;
+
+        if log_slow {
+            tracing::warn!(
+                request_id = %request_id,
+                api_type,
+                model,
+                credential_id,
+                attempt,
+                max_retries,
+                region = %region,
+                status_code,
+                chunk_len,
+                total_elapsed_ms,
+                first_chunk_wait_ms,
+                headers_to_first_chunk_ms,
+                "上游流首包偏慢"
+            );
+        } else {
+            tracing::info!(
+                request_id = %request_id,
+                api_type,
+                model,
+                credential_id,
+                attempt,
+                max_retries,
+                region = %region,
+                status_code,
+                chunk_len,
+                total_elapsed_ms,
+                first_chunk_wait_ms,
+                headers_to_first_chunk_ms,
+                "上游流首包已到达"
+            );
+        }
+    }
+
+    fn log_stream_complete(&self, seen_first_chunk: bool, total_bytes: usize) {
+        tracing::info!(
+            request_id = %self.request_id,
+            api_type = self.api_type,
+            model = self.model_label(),
+            credential_id = self.credential_id,
+            attempt = self.attempt,
+            max_retries = self.max_retries,
+            region = %self.region,
+            status_code = self.status_code,
+            seen_first_chunk,
+            total_bytes,
+            total_elapsed_ms = self.overall_started_at.elapsed().as_millis(),
+            stream_elapsed_ms = self.response_headers_at.elapsed().as_millis(),
+            "上游流读取完成"
+        );
+    }
+
+    fn log_stream_error(&self, seen_first_chunk: bool, total_bytes: usize, error: &reqwest::Error) {
+        tracing::warn!(
+            request_id = %self.request_id,
+            api_type = self.api_type,
+            model = self.model_label(),
+            credential_id = self.credential_id,
+            attempt = self.attempt,
+            max_retries = self.max_retries,
+            region = %self.region,
+            status_code = self.status_code,
+            seen_first_chunk,
+            total_bytes,
+            total_elapsed_ms = self.overall_started_at.elapsed().as_millis(),
+            stream_elapsed_ms = self.response_headers_at.elapsed().as_millis(),
+            error = %error,
+            "上游流读取失败"
+        );
     }
 }
 
@@ -316,7 +499,7 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx_id);
-                return Ok(ManagedResponse::new(response, lease));
+                return Ok(ManagedResponse::new(response, lease, None));
             }
 
             // 失败响应
@@ -411,11 +594,17 @@ impl KiroProvider {
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
+        let request_id = options
+            .request_id
+            .clone()
+            .unwrap_or_else(|| format!("kirors-{}", Uuid::new_v4().simple()));
+        let overall_started_at = Instant::now();
 
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
 
         for attempt in 0..max_retries {
+            let attempt_started_at = Instant::now();
             // 获取调用上下文（绑定 index、credentials、token）
             let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
                 Ok(c) => c,
@@ -443,6 +632,9 @@ impl KiroProvider {
                 "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
                 config.system_version, config.node_version, config.kiro_version, machine_id
             );
+            let region = credentials.effective_api_region(config).to_string();
+            let acquire_context_ms = attempt_started_at.elapsed().as_millis();
+            let invocation_id = Uuid::new_v4().to_string();
 
             // 注入实际凭据的 profile_arn 到请求体
             let body = Self::inject_profile_arn(request_body, &credentials.profile_arn);
@@ -457,7 +649,7 @@ impl KiroProvider {
                 .header("x-amz-user-agent", &x_amz_user_agent)
                 .header("user-agent", &user_agent)
                 .header("host", &self.base_domain_for(&credentials))
-                .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
+                .header("amz-sdk-invocation-id", &invocation_id)
                 .header("amz-sdk-request", "attempt=1; max=3")
                 .header("Authorization", format!("Bearer {}", token));
 
@@ -465,14 +657,38 @@ impl KiroProvider {
                 request = request.header("x-amzn-kiro-agent-mode", "vibe");
             }
 
+            tracing::info!(
+                request_id = %request_id,
+                api_type,
+                model = model.as_deref().unwrap_or("unknown"),
+                credential_id = ctx_id,
+                attempt = attempt + 1,
+                max_retries,
+                region = %region,
+                stream = is_stream,
+                acquire_context_ms,
+                omit_agent_mode_header = options.omit_agent_mode_header,
+                invocation_id = %invocation_id,
+                "开始调用上游 Kiro API"
+            );
+
+            let upstream_request_started_at = Instant::now();
             let response = match request.send().await {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::warn!(
-                        "API 请求发送失败（尝试 {}/{}）: {}",
-                        attempt + 1,
+                        request_id = %request_id,
+                        api_type,
+                        model = model.as_deref().unwrap_or("unknown"),
+                        credential_id = ctx_id,
+                        attempt = attempt + 1,
                         max_retries,
-                        e
+                        region = %region,
+                        stream = is_stream,
+                        acquire_context_ms,
+                        upstream_wait_ms = upstream_request_started_at.elapsed().as_millis(),
+                        error = %e,
+                        "API 请求发送失败"
                     );
                     // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
                     // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
@@ -485,11 +701,63 @@ impl KiroProvider {
             };
 
             let status = response.status();
+            let response_headers_at = Instant::now();
+            let upstream_headers_ms = response_headers_at
+                .duration_since(upstream_request_started_at)
+                .as_millis();
+            let total_elapsed_ms = overall_started_at.elapsed().as_millis();
+
+            if upstream_headers_ms >= SLOW_UPSTREAM_HEADERS_MS {
+                tracing::warn!(
+                    request_id = %request_id,
+                    api_type,
+                    model = model.as_deref().unwrap_or("unknown"),
+                    credential_id = ctx_id,
+                    attempt = attempt + 1,
+                    max_retries,
+                    region = %region,
+                    stream = is_stream,
+                    status_code = status.as_u16(),
+                    acquire_context_ms,
+                    upstream_headers_ms,
+                    total_elapsed_ms,
+                    "上游响应头返回偏慢"
+                );
+            } else {
+                tracing::info!(
+                    request_id = %request_id,
+                    api_type,
+                    model = model.as_deref().unwrap_or("unknown"),
+                    credential_id = ctx_id,
+                    attempt = attempt + 1,
+                    max_retries,
+                    region = %region,
+                    stream = is_stream,
+                    status_code = status.as_u16(),
+                    acquire_context_ms,
+                    upstream_headers_ms,
+                    total_elapsed_ms,
+                    "已收到上游响应头"
+                );
+            }
 
             // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx_id);
-                return Ok(ManagedResponse::new(response, lease));
+                let trace = ResponseTrace {
+                    request_id: request_id.clone(),
+                    api_type,
+                    model: model.clone(),
+                    credential_id: ctx_id,
+                    attempt: attempt + 1,
+                    max_retries,
+                    region,
+                    status_code: status.as_u16(),
+                    overall_started_at,
+                    upstream_request_started_at,
+                    response_headers_at,
+                };
+                return Ok(ManagedResponse::new(response, lease, Some(trace)));
             }
 
             // 失败响应：读取 body 用于日志/错误信息
