@@ -15,11 +15,114 @@ import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
-import { extractErrorMessage } from '@/lib/utils'
-import type { BalanceResponse } from '@/types/api'
+import { cn, extractErrorMessage } from '@/lib/utils'
+import type { BalanceResponse, CredentialStatusItem } from '@/types/api'
 
 interface DashboardProps {
   onLogout: () => void
+}
+
+const ALL_LEVELS = '__all_levels__'
+const UNKNOWN_LEVEL = '__unknown_level__'
+
+type EnabledFilter = 'all' | 'enabled' | 'disabled'
+type AccountStatusFilter = 'all' | 'normal' | 'rate-limited' | 'abnormal'
+type QuickFilter = 'all' | 'dispatchable'
+type SortField = 'importedAt' | 'priority' | 'successCount' | 'lastUsedAt'
+type SortDirection = 'asc' | 'desc'
+
+interface SegmentedOption {
+  value: string
+  label: string
+}
+
+interface SegmentedTabsProps {
+  label: string
+  options: SegmentedOption[]
+  value: string
+  onChange: (value: string) => void
+}
+
+function SegmentedTabs({ label, options, value, onChange }: SegmentedTabsProps) {
+  return (
+    <div className="space-y-2">
+      <div className="text-sm font-medium">{label}</div>
+      <div className="flex flex-wrap gap-2">
+        {options.map((option) => {
+          const active = option.value === value
+
+          return (
+            <Button
+              key={option.value}
+              type="button"
+              size="sm"
+              variant={active ? 'default' : 'outline'}
+              className={cn('h-8 rounded-full px-3', !active && 'text-muted-foreground')}
+              onClick={() => onChange(option.value)}
+            >
+              {option.label}
+            </Button>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+function normalizeSubscriptionTitle(credential: CredentialStatusItem): string | null {
+  const title = credential.subscriptionTitle?.trim()
+  return title ? title : null
+}
+
+function isRateLimitedCredential(credential: CredentialStatusItem): boolean {
+  return (
+    (credential.cooldownRemainingMs ?? 0) > 0 ||
+    credential.rateLimitHitStreak > 0 ||
+    (credential.nextReadyInMs ?? 0) > 0
+  )
+}
+
+function isAbnormalCredential(credential: CredentialStatusItem): boolean {
+  return (
+    credential.failureCount > 0 ||
+    credential.refreshFailureCount > 0 ||
+    (credential.disabledReason !== undefined &&
+      credential.disabledReason !== null &&
+      credential.disabledReason !== 'Manual')
+  )
+}
+
+function isDispatchableCredential(credential: CredentialStatusItem): boolean {
+  const hasCapacity =
+    credential.maxConcurrency === undefined ||
+    credential.maxConcurrency === null ||
+    credential.inFlight < credential.maxConcurrency
+
+  return !credential.disabled && !isRateLimitedCredential(credential) && hasCapacity
+}
+
+function getImportedAtSortValue(credential: CredentialStatusItem): number {
+  if (credential.importedAt) {
+    const timestamp = Date.parse(credential.importedAt)
+    if (!Number.isNaN(timestamp)) {
+      return timestamp
+    }
+  }
+
+  return credential.id
+}
+
+function getLastUsedSortValue(credential: CredentialStatusItem): number {
+  if (!credential.lastUsedAt) {
+    return -1
+  }
+
+  const timestamp = Date.parse(credential.lastUsedAt)
+  return Number.isNaN(timestamp) ? -1 : timestamp
+}
+
+function getDefaultSortDirection(field: SortField): SortDirection {
+  return field === 'priority' ? 'asc' : 'desc'
 }
 
 export function Dashboard({ onLogout }: DashboardProps) {
@@ -50,6 +153,13 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [rateLimitRefillBackoffFactorInput, setRateLimitRefillBackoffFactorInput] = useState('0.5')
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
+  const [levelFilter, setLevelFilter] = useState<string>(ALL_LEVELS)
+  const [enabledFilter, setEnabledFilter] = useState<EnabledFilter>('all')
+  const [accountStatusFilter, setAccountStatusFilter] = useState<AccountStatusFilter>('all')
+  const [quickFilter, setQuickFilter] = useState<QuickFilter>('all')
+  const [searchKeyword, setSearchKeyword] = useState('')
+  const [sortField, setSortField] = useState<SortField>('importedAt')
+  const [sortDirection, setSortDirection] = useState<SortDirection>('desc')
   const itemsPerPage = 12
   const [darkMode, setDarkMode] = useState(() => {
     if (typeof window !== 'undefined') {
@@ -65,21 +175,141 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
 
+  const credentials = data?.credentials || []
+  const levelOptions = [
+    { value: ALL_LEVELS, label: '全部' },
+    ...Array.from(new Set(credentials.map(credential => normalizeSubscriptionTitle(credential) ?? UNKNOWN_LEVEL)))
+      .sort((a, b) => {
+        if (a === UNKNOWN_LEVEL) return 1
+        if (b === UNKNOWN_LEVEL) return -1
+        return a.localeCompare(b, 'zh-CN')
+      })
+      .map(level => ({
+        value: level,
+        label: level === UNKNOWN_LEVEL ? '未知' : level,
+      })),
+  ]
+
+  const enabledOptions: SegmentedOption[] = [
+    { value: 'all', label: '全部' },
+    { value: 'enabled', label: '启用中' },
+    { value: 'disabled', label: '已禁用' },
+  ]
+
+  const accountStatusOptions: SegmentedOption[] = [
+    { value: 'all', label: '全部' },
+    { value: 'normal', label: '正常' },
+    { value: 'rate-limited', label: '限速' },
+    { value: 'abnormal', label: '异常' },
+  ]
+
+  const sortOptions: SegmentedOption[] = [
+    { value: 'importedAt', label: '导入时间' },
+    { value: 'priority', label: '优先级' },
+    { value: 'successCount', label: '调用次数' },
+    { value: 'lastUsedAt', label: '最后调用' },
+  ]
+
+  const keyword = searchKeyword.trim().toLowerCase()
+  const filteredCredentials = [...credentials]
+    .filter((credential) => {
+      const normalizedLevel = normalizeSubscriptionTitle(credential)
+
+      if (levelFilter === UNKNOWN_LEVEL && normalizedLevel !== null) {
+        return false
+      }
+      if (levelFilter !== ALL_LEVELS && levelFilter !== UNKNOWN_LEVEL && normalizedLevel !== levelFilter) {
+        return false
+      }
+
+      if (enabledFilter === 'enabled' && credential.disabled) {
+        return false
+      }
+      if (enabledFilter === 'disabled' && !credential.disabled) {
+        return false
+      }
+
+      if (accountStatusFilter === 'normal' && (isRateLimitedCredential(credential) || isAbnormalCredential(credential))) {
+        return false
+      }
+      if (accountStatusFilter === 'rate-limited' && !isRateLimitedCredential(credential)) {
+        return false
+      }
+      if (accountStatusFilter === 'abnormal' && !isAbnormalCredential(credential)) {
+        return false
+      }
+
+      if (quickFilter === 'dispatchable' && !isDispatchableCredential(credential)) {
+        return false
+      }
+
+      if (keyword) {
+        const searchableText = [
+          credential.email,
+          credential.id.toString(),
+          normalizeSubscriptionTitle(credential),
+          credential.proxyUrl,
+          credential.disabledReason,
+        ]
+          .filter(Boolean)
+          .join(' ')
+          .toLowerCase()
+
+        if (!searchableText.includes(keyword)) {
+          return false
+        }
+      }
+
+      return true
+    })
+    .sort((a, b) => {
+      let comparison = 0
+
+      if (sortField === 'importedAt') {
+        comparison = getImportedAtSortValue(a) - getImportedAtSortValue(b)
+      } else if (sortField === 'priority') {
+        comparison = a.priority - b.priority
+      } else if (sortField === 'successCount') {
+        comparison = a.successCount - b.successCount
+      } else if (sortField === 'lastUsedAt') {
+        comparison = getLastUsedSortValue(a) - getLastUsedSortValue(b)
+      }
+
+      if (comparison === 0) {
+        return b.id - a.id
+      }
+
+      return sortDirection === 'asc' ? comparison : -comparison
+    })
+
   // 计算分页
-  const totalPages = Math.ceil((data?.credentials.length || 0) / itemsPerPage)
-  const startIndex = (currentPage - 1) * itemsPerPage
+  const totalPages = filteredCredentials.length === 0 ? 0 : Math.ceil(filteredCredentials.length / itemsPerPage)
+  const effectiveCurrentPage = totalPages === 0 ? 1 : Math.min(currentPage, totalPages)
+  const startIndex = (effectiveCurrentPage - 1) * itemsPerPage
   const endIndex = startIndex + itemsPerPage
-  const currentCredentials = data?.credentials.slice(startIndex, endIndex) || []
-  const disabledCredentialCount = data?.credentials.filter(credential => credential.disabled).length || 0
+  const currentCredentials = filteredCredentials.slice(startIndex, endIndex)
+  const disabledCredentialCount = credentials.filter(credential => credential.disabled).length
   const selectedDisabledCount = Array.from(selectedIds).filter(id => {
-    const credential = data?.credentials.find(c => c.id === id)
+    const credential = credentials.find(c => c.id === id)
     return Boolean(credential?.disabled)
   }).length
 
-  // 当凭据列表变化时重置到第一页
+  // 当筛选或排序变化时重置到第一页
   useEffect(() => {
     setCurrentPage(1)
-  }, [data?.credentials.length])
+  }, [data?.credentials.length, levelFilter, enabledFilter, accountStatusFilter, quickFilter, searchKeyword, sortField, sortDirection])
+
+  // 过滤结果变少时自动修正页码
+  useEffect(() => {
+    if (totalPages === 0 && currentPage !== 1) {
+      setCurrentPage(1)
+      return
+    }
+
+    if (totalPages > 0 && currentPage > totalPages) {
+      setCurrentPage(totalPages)
+    }
+  }, [currentPage, totalPages])
 
   useEffect(() => {
     if (!loadBalancingData) {
@@ -145,14 +375,51 @@ export function Dashboard({ onLogout }: DashboardProps) {
     document.documentElement.classList.toggle('dark')
   }
 
-  const handleViewBalance = (id: number) => {
+  const handleViewBalance = async (id: number) => {
     setSelectedCredentialId(id)
     setBalanceDialogOpen(true)
+
+    if (balanceMap.has(id) || loadingBalanceIds.has(id)) {
+      return
+    }
+
+    setLoadingBalanceIds(prev => {
+      const next = new Set(prev)
+      next.add(id)
+      return next
+    })
+
+    try {
+      const balance = await getCredentialBalance(id)
+      setBalanceMap(prev => {
+        const next = new Map(prev)
+        next.set(id, balance)
+        return next
+      })
+    } catch {
+      // 弹窗会展示独立查询错误，这里静默跳过卡片回填失败
+    } finally {
+      setLoadingBalanceIds(prev => {
+        const next = new Set(prev)
+        next.delete(id)
+        return next
+      })
+    }
   }
 
   const handleRefresh = () => {
     refetch()
     toast.success('已刷新凭据列表')
+  }
+
+  const resetFilters = () => {
+    setLevelFilter(ALL_LEVELS)
+    setEnabledFilter('all')
+    setAccountStatusFilter('all')
+    setQuickFilter('all')
+    setSearchKeyword('')
+    setSortField('importedAt')
+    setSortDirection('desc')
   }
 
   const handleLogout = () => {
@@ -540,6 +807,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
         toast.error(`切换失败: ${extractErrorMessage(error)}`)
       }
     })
+  }
+
+  const handleSortFieldChange = (value: string) => {
+    const nextField = value as SortField
+    setSortField(nextField)
+    setSortDirection(getDefaultSortDirection(nextField))
   }
 
   const handleSaveQueueSettings = () => {
@@ -947,18 +1220,19 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   验活中... {verifyProgress.current}/{verifyProgress.total}
                 </Button>
               )}
-              {data?.credentials && data.credentials.length > 0 && (
+              {credentials.length > 0 && (
                 <Button
                   onClick={handleQueryCurrentPageInfo}
                   size="sm"
                   variant="outline"
-                  disabled={queryingInfo}
+                  disabled={queryingInfo || currentCredentials.length === 0}
+                  title={currentCredentials.length === 0 ? '当前筛选页没有可查询的账号' : undefined}
                 >
                   <RefreshCw className={`h-4 w-4 mr-2 ${queryingInfo ? 'animate-spin' : ''}`} />
                   {queryingInfo ? `查询中... ${queryInfoProgress.current}/${queryInfoProgress.total}` : '查询信息'}
                 </Button>
               )}
-              {data?.credentials && data.credentials.length > 0 && (
+              {credentials.length > 0 && (
                 <Button
                   onClick={handleClearAll}
                   size="sm"
@@ -985,10 +1259,102 @@ export function Dashboard({ onLogout }: DashboardProps) {
               </Button>
             </div>
           </div>
-          {data?.credentials.length === 0 ? (
+          <Card>
+            <CardContent className="space-y-4 pt-6">
+              <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_auto]">
+                <div className="space-y-2">
+                  <label className="text-sm font-medium" htmlFor="credential-search">
+                    关键词搜索
+                  </label>
+                  <Input
+                    id="credential-search"
+                    value={searchKeyword}
+                    onChange={(e) => setSearchKeyword(e.target.value)}
+                    placeholder="搜索邮箱 / ID / 订阅等级 / 代理 / 禁用原因"
+                  />
+                </div>
+                <div className="flex flex-wrap items-end gap-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={quickFilter === 'dispatchable' ? 'default' : 'outline'}
+                    onClick={() => setQuickFilter(prev => prev === 'dispatchable' ? 'all' : 'dispatchable')}
+                  >
+                    只看当前可调度
+                  </Button>
+                  <Button type="button" size="sm" variant="outline" onClick={resetFilters}>
+                    重置筛选
+                  </Button>
+                </div>
+              </div>
+
+              <SegmentedTabs
+                label="账号层级"
+                options={levelOptions}
+                value={levelFilter}
+                onChange={setLevelFilter}
+              />
+
+              <SegmentedTabs
+                label="启用状态"
+                options={enabledOptions}
+                value={enabledFilter}
+                onChange={(value) => setEnabledFilter(value as EnabledFilter)}
+              />
+
+              <SegmentedTabs
+                label="账号状态"
+                options={accountStatusOptions}
+                value={accountStatusFilter}
+                onChange={(value) => setAccountStatusFilter(value as AccountStatusFilter)}
+              />
+
+              <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-end">
+                <SegmentedTabs
+                  label="排序方式"
+                  options={sortOptions}
+                  value={sortField}
+                  onChange={handleSortFieldChange}
+                />
+                <div className="space-y-2">
+                  <div className="text-sm font-medium">排序方向</div>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    onClick={() => setSortDirection(prev => prev === 'asc' ? 'desc' : 'asc')}
+                  >
+                    {sortDirection === 'asc' ? '升序' : '降序'}
+                  </Button>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-2 border-t pt-4 text-sm text-muted-foreground">
+                <span>
+                  筛选后 {filteredCredentials.length} / {credentials.length} 个账号
+                </span>
+                <div className="flex flex-wrap gap-2">
+                  <Badge variant="secondary">补充筛选：关键词搜索</Badge>
+                  <Badge variant="secondary">补充筛选：只看当前可调度</Badge>
+                  <Badge variant="secondary">补充排序：最后调用</Badge>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+
+          {credentials.length === 0 ? (
             <Card>
               <CardContent className="py-8 text-center text-muted-foreground">
                 暂无凭据
+              </CardContent>
+            </Card>
+          ) : filteredCredentials.length === 0 ? (
+            <Card>
+              <CardContent className="py-8 text-center text-muted-foreground space-y-3">
+                <div>当前筛选条件下没有匹配的账号</div>
+                <Button type="button" variant="outline" size="sm" onClick={resetFilters}>
+                  清空筛选条件
+                </Button>
               </CardContent>
             </Card>
           ) : (
@@ -1014,18 +1380,18 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     variant="outline"
                     size="sm"
                     onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
-                    disabled={currentPage === 1}
+                    disabled={effectiveCurrentPage === 1}
                   >
                     上一页
                   </Button>
                   <span className="text-sm text-muted-foreground">
-                    第 {currentPage} / {totalPages} 页（共 {data?.credentials.length} 个凭据）
+                    第 {effectiveCurrentPage} / {totalPages} 页（共 {filteredCredentials.length} 个账号）
                   </span>
                   <Button
                     variant="outline"
                     size="sm"
                     onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
-                    disabled={currentPage === totalPages}
+                    disabled={effectiveCurrentPage === totalPages}
                   >
                     下一页
                   </Button>

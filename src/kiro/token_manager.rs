@@ -552,6 +552,12 @@ pub struct CredentialEntrySnapshot {
     pub refresh_token_hash: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
+    /// 订阅等级（KIRO PRO+ / KIRO FREE 等）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription_title: Option<String>,
+    /// 导入时间（RFC3339 格式）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub imported_at: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -665,9 +671,7 @@ impl DispatchConfig {
             queue_max_size: config.queue_max_size,
             queue_max_wait_ms: config.queue_max_wait_ms,
             rate_limit_cooldown_ms: config.rate_limit_cooldown_ms,
-            default_max_concurrency: config
-                .default_max_concurrency
-                .filter(|limit| *limit > 0),
+            default_max_concurrency: config.default_max_concurrency.filter(|limit| *limit > 0),
             rate_limit_bucket_capacity: normalize_non_negative(
                 config.rate_limit_bucket_capacity,
                 3.0,
@@ -1441,14 +1445,13 @@ impl MultiTokenManager {
                 Err(e) => {
                     drop(lease);
                     // refreshToken 永久失效 → 立即禁用，不累计重试
-                    let has_available =
-                        if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
-                            tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
-                            self.report_refresh_token_invalid(id)
-                        } else {
-                            tracing::warn!("凭据 #{} Token 刷新失败: {}", id, e);
-                            self.report_refresh_failure(id)
-                        };
+                    let has_available = if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
+                        tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
+                        self.report_refresh_token_invalid(id)
+                    } else {
+                        tracing::warn!("凭据 #{} Token 刷新失败: {}", id, e);
+                        self.report_refresh_failure(id)
+                    };
                     attempt_count += 1;
                     if !has_available {
                         anyhow::bail!("所有凭据均已禁用（0/{}）", total);
@@ -2082,6 +2085,8 @@ impl MultiTokenManager {
                     expires_at: e.credentials.expires_at.clone(),
                     refresh_token_hash: e.credentials.refresh_token.as_deref().map(sha256_hex),
                     email: e.credentials.email.clone(),
+                    subscription_title: e.credentials.subscription_title.clone(),
+                    imported_at: e.credentials.imported_at.clone(),
                     success_count: e.success_count,
                     last_used_at: e.last_used_at.clone(),
                     active_requests: e.active_requests,
@@ -2092,13 +2097,16 @@ impl MultiTokenManager {
                     has_proxy: e.credentials.proxy_url.is_some(),
                     proxy_url: e.credentials.proxy_url.clone(),
                     refresh_failure_count: e.refresh_failure_count,
-                    disabled_reason: e.disabled_reason.map(|r| match r {
-                        DisabledReason::Manual => "Manual",
-                        DisabledReason::TooManyFailures => "TooManyFailures",
-                        DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
-                        DisabledReason::QuotaExceeded => "QuotaExceeded",
-                        DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
-                    }.to_string()),
+                    disabled_reason: e.disabled_reason.map(|r| {
+                        match r {
+                            DisabledReason::Manual => "Manual",
+                            DisabledReason::TooManyFailures => "TooManyFailures",
+                            DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
+                            DisabledReason::QuotaExceeded => "QuotaExceeded",
+                            DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
+                        }
+                        .to_string()
+                    }),
                     cooldown_remaining_ms: e
                         .rate_limit_cooldown_until
                         .and_then(|until| until.checked_duration_since(now))
@@ -2426,6 +2434,9 @@ impl MultiTokenManager {
         validated_cred.api_region = new_cred.api_region;
         validated_cred.machine_id = new_cred.machine_id;
         validated_cred.email = new_cred.email;
+        validated_cred.imported_at = new_cred
+            .imported_at
+            .or_else(|| Some(Utc::now().to_rfc3339()));
         validated_cred.max_concurrency = new_cred.max_concurrency;
         validated_cred.rate_limit_bucket_capacity = new_cred.rate_limit_bucket_capacity;
         validated_cred.rate_limit_refill_per_second = new_cred.rate_limit_refill_per_second;
@@ -2687,8 +2698,7 @@ impl MultiTokenManager {
             next.rate_limit_cooldown_ms = rate_limit_cooldown_ms;
         }
         if let Some(default_max_concurrency) = default_max_concurrency {
-            next.default_max_concurrency =
-                Some(default_max_concurrency).filter(|limit| *limit > 0);
+            next.default_max_concurrency = Some(default_max_concurrency).filter(|limit| *limit > 0);
         }
         if let Some(rate_limit_bucket_capacity) = rate_limit_bucket_capacity {
             next.rate_limit_bucket_capacity = rate_limit_bucket_capacity;

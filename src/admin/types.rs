@@ -44,6 +44,12 @@ pub struct CredentialStatusItem {
     pub refresh_token_hash: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
+    /// 订阅等级（KIRO PRO+ / KIRO FREE 等）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription_title: Option<String>,
+    /// 导入时间（RFC3339 格式）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub imported_at: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）

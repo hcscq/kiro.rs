@@ -75,6 +75,8 @@ impl AdminService {
                 has_profile_arn: entry.has_profile_arn,
                 refresh_token_hash: entry.refresh_token_hash,
                 email: entry.email,
+                subscription_title: entry.subscription_title,
+                imported_at: entry.imported_at,
                 success_count: entry.success_count,
                 last_used_at: entry.last_used_at.clone(),
                 in_flight: entry.active_requests,
@@ -248,6 +250,7 @@ impl AdminService {
             machine_id: req.machine_id,
             email: req.email,
             subscription_title: None, // 将在首次获取使用额度时自动更新
+            imported_at: None,
             proxy_url: req.proxy_url,
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,

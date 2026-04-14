@@ -18,6 +18,8 @@ export interface CredentialStatusItem {
   authMethod: string | null
   hasProfileArn: boolean
   email?: string
+  subscriptionTitle?: string | null
+  importedAt?: string | null
   refreshTokenHash?: string
   successCount: number
   lastUsedAt: string | null

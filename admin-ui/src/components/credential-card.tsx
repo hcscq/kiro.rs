@@ -447,7 +447,7 @@ export function CredentialCard({
             <div>
               <span className="text-muted-foreground">订阅等级：</span>
               <span className="font-medium">
-                {loadingBalance ? (
+                {credential.subscriptionTitle ? credential.subscriptionTitle : loadingBalance ? (
                   <Loader2 className="inline w-3 h-3 animate-spin" />
                 ) : balance?.subscriptionTitle || '未知'}
               </span>

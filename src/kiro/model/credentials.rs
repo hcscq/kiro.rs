@@ -93,6 +93,11 @@ pub struct KiroCredentials {
     #[serde(default)]
     pub subscription_title: Option<String>,
 
+    /// 导入时间（RFC3339 格式）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub imported_at: Option<String>,
+
     /// 凭据级代理 URL（可选）
     /// 支持 http/https/socks5 协议
     /// 特殊值 "direct" 表示显式不使用代理（即使全局配置了代理）
@@ -367,6 +372,7 @@ mod tests {
             machine_id: None,
             email: None,
             subscription_title: None,
+            imported_at: None,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
@@ -504,6 +510,7 @@ mod tests {
             machine_id: None,
             email: None,
             subscription_title: None,
+            imported_at: None,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
@@ -537,6 +544,7 @@ mod tests {
             machine_id: None,
             email: None,
             subscription_title: None,
+            imported_at: None,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
@@ -652,6 +660,7 @@ mod tests {
             machine_id: Some("c".repeat(64)),
             email: None,
             subscription_title: None,
+            imported_at: Some("2025-01-01T00:00:00Z".to_string()),
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
@@ -667,6 +676,7 @@ mod tests {
         assert_eq!(parsed.priority, original.priority);
         assert_eq!(parsed.region, original.region);
         assert_eq!(parsed.machine_id, original.machine_id);
+        assert_eq!(parsed.imported_at, original.imported_at);
     }
 
     // ============ auth_region / api_region 字段测试 ============
