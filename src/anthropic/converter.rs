@@ -35,14 +35,26 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     };
 
     // type（必须是字符串）
-    if !obj.get("type").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
-        obj.insert("type".to_string(), serde_json::Value::String("object".to_string()));
+    if !obj
+        .get("type")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty())
+    {
+        obj.insert(
+            "type".to_string(),
+            serde_json::Value::String("object".to_string()),
+        );
     }
 
     // properties（必须是 object）
     match obj.get("properties") {
         Some(serde_json::Value::Object(_)) => {}
-        _ => { obj.insert("properties".to_string(), serde_json::Value::Object(serde_json::Map::new())); }
+        _ => {
+            obj.insert(
+                "properties".to_string(),
+                serde_json::Value::Object(serde_json::Map::new()),
+            );
+        }
     }
 
     // required（必须是 string 数组）
@@ -59,7 +71,12 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     // additionalProperties（允许 bool 或 object，其他按 true 处理）
     match obj.get("additionalProperties") {
         Some(serde_json::Value::Bool(_)) | Some(serde_json::Value::Object(_)) => {}
-        _ => { obj.insert("additionalProperties".to_string(), serde_json::Value::Bool(true)); }
+        _ => {
+            obj.insert(
+                "additionalProperties".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
     }
 
     serde_json::Value::Object(obj)
@@ -371,10 +388,7 @@ pub fn convert_request_with_probe(
     }
 
     if !tool_name_map.is_empty() {
-        tracing::info!(
-            "工具名称映射: {} 个超长名称已缩短",
-            tool_name_map.len()
-        );
+        tracing::info!("工具名称映射: {} 个超长名称已缩短", tool_name_map.len());
     }
 
     Ok(ConversionResult {
@@ -646,7 +660,10 @@ fn map_tool_name(name: &str, tool_name_map: &mut HashMap<String, String>) -> Str
 }
 
 /// 转换工具定义
-fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut HashMap<String, String>) -> Vec<Tool> {
+fn convert_tools(
+    tools: &Option<Vec<super::types::Tool>>,
+    tool_name_map: &mut HashMap<String, String>,
+) -> Vec<Tool> {
     let Some(tools) = tools else {
         return Vec::new();
     };
@@ -682,7 +699,9 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut Ha
                 tool_specification: ToolSpecification {
                     name: map_tool_name(&t.name, tool_name_map),
                     description,
-                    input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(t.input_schema))),
+                    input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(
+                        t.input_schema
+                    ))),
                 },
             }
         })
@@ -1073,7 +1092,8 @@ fn convert_assistant_message(
                             if let (Some(id), Some(name)) = (block.id, block.name) {
                                 let input = block.input.unwrap_or(serde_json::json!({}));
                                 let mapped_name = map_tool_name(&name, tool_name_map);
-                                tool_uses.push(ToolUseEntry::new(id, mapped_name).with_input(input));
+                                tool_uses
+                                    .push(ToolUseEntry::new(id, mapped_name).with_input(input));
                             }
                         }
                         _ => {}
@@ -1468,13 +1488,18 @@ mod tests {
 
     #[test]
     fn test_shorten_tool_name_deterministic() {
-        let long_name = "mcp__some_very_long_server_name__some_very_long_tool_name_that_exceeds_limit";
+        let long_name =
+            "mcp__some_very_long_server_name__some_very_long_tool_name_that_exceeds_limit";
         assert!(long_name.len() > TOOL_NAME_MAX_LEN);
 
         let short1 = shorten_tool_name(long_name);
         let short2 = shorten_tool_name(long_name);
         assert_eq!(short1, short2, "相同输入应产生相同的短名称");
-        assert!(short1.len() <= TOOL_NAME_MAX_LEN, "短名称长度应 <= 63，实际 {}", short1.len());
+        assert!(
+            short1.len() <= TOOL_NAME_MAX_LEN,
+            "短名称长度应 <= 63，实际 {}",
+            short1.len()
+        );
     }
 
     #[test]
@@ -1507,7 +1532,8 @@ mod tests {
     fn test_tool_name_mapping_in_convert_request() {
         use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
 
-        let long_tool_name = "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
+        let long_tool_name =
+            "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
         assert!(long_tool_name.len() > TOOL_NAME_MAX_LEN);
 
         let mut schema = std::collections::HashMap::new();
@@ -1517,12 +1543,10 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
-            messages: vec![
-                AnthropicMessage {
-                    role: "user".to_string(),
-                    content: serde_json::json!("test"),
-                },
-            ],
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("test"),
+            }],
             system: None,
             stream: false,
             tools: Some(vec![AnthropicTool {
@@ -1549,8 +1573,12 @@ mod tests {
         assert!(short.len() <= TOOL_NAME_MAX_LEN);
 
         // Kiro 请求中的工具名应该是短名称
-        let tools = &result.conversation_state.current_message.user_input_message
-            .user_input_message_context.tools;
+        let tools = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools;
         assert_eq!(tools[0].tool_specification.name, *short);
     }
 
@@ -1558,7 +1586,8 @@ mod tests {
     fn test_tool_name_mapping_in_history() {
         use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
 
-        let long_tool_name = "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
+        let long_tool_name =
+            "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
 
         let mut schema = std::collections::HashMap::new();
         schema.insert("type".to_string(), serde_json::json!("object"));
@@ -2153,9 +2182,15 @@ mod tests {
 
         let content = &result.assistant_response_message.content;
         assert!(content.contains("<thinking>"), "应包含 thinking 标签");
-        assert!(content.contains("Let me read that file"), "应包含第二条消息的 text 内容");
+        assert!(
+            content.contains("Let me read that file"),
+            "应包含第二条消息的 text 内容"
+        );
 
-        let tool_uses = result.assistant_response_message.tool_uses.expect("应有 tool_uses");
+        let tool_uses = result
+            .assistant_response_message
+            .tool_uses
+            .expect("应有 tool_uses");
         assert_eq!(tool_uses.len(), 1);
         assert_eq!(tool_uses[0].tool_use_id, "toolu_01ABC");
     }
@@ -2205,7 +2240,11 @@ mod tests {
         };
 
         let result = convert_request(&req);
-        assert!(result.is_ok(), "连续 assistant 消息场景不应报错: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "连续 assistant 消息场景不应报错: {:?}",
+            result.err()
+        );
 
         let state = result.unwrap().conversation_state;
         let mut found_tool_use = false;
@@ -2286,8 +2325,8 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req)
-            .expect("尾部连续 user tool_result 应合并为同一 current message");
+        let result =
+            convert_request(&req).expect("尾部连续 user tool_result 应合并为同一 current message");
         let state = result.conversation_state;
 
         assert_eq!(
@@ -2373,7 +2412,8 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req).expect("tool_result-only current message should convert");
+        let result =
+            convert_request(&req).expect("tool_result-only current message should convert");
         let state = result.conversation_state;
         let current = &state.current_message.user_input_message;
 
@@ -2446,11 +2486,22 @@ mod tests {
             .expect("mixed current user message should be split for kiro compatibility")
             .conversation_state;
 
-        assert_eq!(state.history.len(), 4, "history should include a synthetic tool_result turn");
+        assert_eq!(
+            state.history.len(),
+            4,
+            "history should include a synthetic tool_result turn"
+        );
 
         let current = &state.current_message.user_input_message;
-        assert_eq!(current.content, "Use the screenshot to finish the comparison.");
-        assert_eq!(current.images.len(), 1, "current message should keep the image");
+        assert_eq!(
+            current.content,
+            "Use the screenshot to finish the comparison."
+        );
+        assert_eq!(
+            current.images.len(),
+            1,
+            "current message should keep the image"
+        );
         assert!(
             current.user_input_message_context.tool_results.is_empty(),
             "current message should no longer carry tool_results when it also has images"
@@ -2460,20 +2511,35 @@ mod tests {
             Message::User(user) => {
                 assert_eq!(user.user_input_message.content, "");
                 assert!(user.user_input_message.images.is_empty());
-                assert_eq!(user.user_input_message.user_input_message_context.tool_results.len(), 1);
                 assert_eq!(
-                    user.user_input_message.user_input_message_context.tool_results[0].tool_use_id,
+                    user.user_input_message
+                        .user_input_message_context
+                        .tool_results
+                        .len(),
+                    1
+                );
+                assert_eq!(
+                    user.user_input_message
+                        .user_input_message_context
+                        .tool_results[0]
+                        .tool_use_id,
                     "toolu_img_01"
                 );
             }
-            other => panic!("history[2] should be synthetic tool_result user, got {:?}", other),
+            other => panic!(
+                "history[2] should be synthetic tool_result user, got {:?}",
+                other
+            ),
         }
 
         match &state.history[3] {
             Message::Assistant(assistant) => {
                 assert_eq!(assistant.assistant_response_message.content, "OK");
             }
-            other => panic!("history[3] should be synthetic assistant ack, got {:?}", other),
+            other => panic!(
+                "history[3] should be synthetic assistant ack, got {:?}",
+                other
+            ),
         }
     }
 
@@ -2545,8 +2611,15 @@ mod tests {
             .expect("mixed history user message should be split for kiro compatibility")
             .conversation_state;
 
-        assert_eq!(state.current_message.user_input_message.content, "Summarize the outcome.");
-        assert_eq!(state.history.len(), 6, "history should insert a synthetic split turn");
+        assert_eq!(
+            state.current_message.user_input_message.content,
+            "Summarize the outcome."
+        );
+        assert_eq!(
+            state.history.len(),
+            6,
+            "history should insert a synthetic split turn"
+        );
 
         for (idx, msg) in state.history.iter().enumerate() {
             if let Message::User(user) = msg {
@@ -2567,7 +2640,10 @@ mod tests {
             Message::Assistant(assistant) => {
                 assert_eq!(assistant.assistant_response_message.content, "OK");
             }
-            other => panic!("history[3] should be synthetic assistant ack, got {:?}", other),
+            other => panic!(
+                "history[3] should be synthetic assistant ack, got {:?}",
+                other
+            ),
         }
     }
 
@@ -2632,14 +2708,20 @@ mod tests {
                         .is_empty()
                 );
             }
-            other => panic!("history[0] should be synthetic image chunk user, got {:?}", other),
+            other => panic!(
+                "history[0] should be synthetic image chunk user, got {:?}",
+                other
+            ),
         }
 
         match &state.history[1] {
             Message::Assistant(assistant) => {
                 assert_eq!(assistant.assistant_response_message.content, "OK");
             }
-            other => panic!("history[1] should be synthetic assistant ack, got {:?}", other),
+            other => panic!(
+                "history[1] should be synthetic assistant ack, got {:?}",
+                other
+            ),
         }
 
         let current = &state.current_message.user_input_message;
@@ -2753,7 +2835,10 @@ mod tests {
             .expect("history image-heavy user message should be split for kiro compatibility")
             .conversation_state;
 
-        assert_eq!(state.current_message.user_input_message.content, "Summarize the outcome.");
+        assert_eq!(
+            state.current_message.user_input_message.content,
+            "Summarize the outcome."
+        );
         assert_eq!(state.history.len(), 4);
 
         match &state.history[0] {
@@ -2761,14 +2846,20 @@ mod tests {
                 assert_eq!(user.user_input_message.content, "");
                 assert_eq!(user.user_input_message.images.len(), 10);
             }
-            other => panic!("history[0] should be synthetic image chunk user, got {:?}", other),
+            other => panic!(
+                "history[0] should be synthetic image chunk user, got {:?}",
+                other
+            ),
         }
 
         match &state.history[1] {
             Message::Assistant(assistant) => {
                 assert_eq!(assistant.assistant_response_message.content, "OK");
             }
-            other => panic!("history[1] should be synthetic assistant ack, got {:?}", other),
+            other => panic!(
+                "history[1] should be synthetic assistant ack, got {:?}",
+                other
+            ),
         }
 
         match &state.history[2] {
@@ -2779,12 +2870,18 @@ mod tests {
                 );
                 assert_eq!(user.user_input_message.images.len(), 1);
             }
-            other => panic!("history[2] should be final split image user, got {:?}", other),
+            other => panic!(
+                "history[2] should be final split image user, got {:?}",
+                other
+            ),
         }
 
         match &state.history[3] {
             Message::Assistant(assistant) => {
-                assert_eq!(assistant.assistant_response_message.content, "I can continue now.");
+                assert_eq!(
+                    assistant.assistant_response_message.content,
+                    "I can continue now."
+                );
             }
             other => panic!("history[3] should be original assistant, got {:?}", other),
         }
@@ -2827,10 +2924,15 @@ mod tests {
         };
 
         let state = convert_request(&req)
-            .expect("history multi-image user message should stay unchanged under the kiro turn limit")
+            .expect(
+                "history multi-image user message should stay unchanged under the kiro turn limit",
+            )
             .conversation_state;
 
-        assert_eq!(state.current_message.user_input_message.content, "Summarize the outcome.");
+        assert_eq!(
+            state.current_message.user_input_message.content,
+            "Summarize the outcome."
+        );
 
         assert_eq!(state.history.len(), 2);
 
@@ -2842,12 +2944,18 @@ mod tests {
                 );
                 assert_eq!(user.user_input_message.images.len(), 4);
             }
-            other => panic!("history[0] should be original multi-image user, got {:?}", other),
+            other => panic!(
+                "history[0] should be original multi-image user, got {:?}",
+                other
+            ),
         }
 
         match &state.history[1] {
             Message::Assistant(assistant) => {
-                assert_eq!(assistant.assistant_response_message.content, "I can continue now.");
+                assert_eq!(
+                    assistant.assistant_response_message.content,
+                    "I can continue now."
+                );
             }
             other => panic!("history[1] should be original assistant, got {:?}", other),
         }
@@ -2912,9 +3020,18 @@ mod tests {
             Message::User(user) => {
                 assert_eq!(user.user_input_message.content, "");
                 assert!(user.user_input_message.images.is_empty());
-                assert_eq!(user.user_input_message.user_input_message_context.tool_results.len(), 1);
+                assert_eq!(
+                    user.user_input_message
+                        .user_input_message_context
+                        .tool_results
+                        .len(),
+                    1
+                );
             }
-            other => panic!("history[2] should be synthetic tool_result user, got {:?}", other),
+            other => panic!(
+                "history[2] should be synthetic tool_result user, got {:?}",
+                other
+            ),
         }
 
         match &state.history[4] {
@@ -2928,7 +3045,10 @@ mod tests {
                         .is_empty()
                 );
             }
-            other => panic!("history[4] should be synthetic image chunk user, got {:?}", other),
+            other => panic!(
+                "history[4] should be synthetic image chunk user, got {:?}",
+                other
+            ),
         }
 
         let current = &state.current_message.user_input_message;

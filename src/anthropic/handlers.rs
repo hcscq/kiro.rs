@@ -650,11 +650,7 @@ async fn handle_non_stream_request(
 
     if !text_content.is_empty() {
         if let Some((thinking, remaining_text)) = extract_thinking_and_text(&text_content) {
-            let signature = build_synthetic_thinking_signature(
-                &response_id,
-                0,
-                &thinking,
-            );
+            let signature = build_synthetic_thinking_signature(&response_id, 0, &thinking);
             content.push(json!({
                 "type": "thinking",
                 "thinking": thinking,

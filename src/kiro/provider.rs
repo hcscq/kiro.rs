@@ -142,7 +142,14 @@ impl ManagedResponse {
                         }
                         Some((
                             Err(err),
-                            (body_stream, lease, trace, seen_first_chunk, total_bytes, true),
+                            (
+                                body_stream,
+                                lease,
+                                trace,
+                                seen_first_chunk,
+                                total_bytes,
+                                true,
+                            ),
                         ))
                     }
                     None => {
@@ -184,9 +191,8 @@ impl ResponseTrace {
         let total_elapsed_ms = self.overall_started_at.elapsed().as_millis();
         let first_chunk_wait_ms = self.upstream_request_started_at.elapsed().as_millis();
         let headers_to_first_chunk_ms = self.response_headers_at.elapsed().as_millis();
-        let log_slow =
-            first_chunk_wait_ms >= SLOW_FIRST_CHUNK_MS
-                || headers_to_first_chunk_ms >= SLOW_HEADERS_TO_FIRST_CHUNK_MS;
+        let log_slow = first_chunk_wait_ms >= SLOW_FIRST_CHUNK_MS
+            || headers_to_first_chunk_ms >= SLOW_HEADERS_TO_FIRST_CHUNK_MS;
 
         let request_id = &self.request_id;
         let api_type = self.api_type;
@@ -526,7 +532,12 @@ impl KiroProvider {
                 if Self::is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx_id) {
                     force_refreshed.insert(ctx_id);
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx_id);
-                    if self.token_manager.force_refresh_token_for(ctx_id).await.is_ok() {
+                    if self
+                        .token_manager
+                        .force_refresh_token_for(ctx_id)
+                        .await
+                        .is_ok()
+                    {
                         tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx_id);
                         continue;
                     }
@@ -811,7 +822,12 @@ impl KiroProvider {
                 if Self::is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx_id) {
                     force_refreshed.insert(ctx_id);
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx_id);
-                    if self.token_manager.force_refresh_token_for(ctx_id).await.is_ok() {
+                    if self
+                        .token_manager
+                        .force_refresh_token_for(ctx_id)
+                        .await
+                        .is_ok()
+                    {
                         tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx_id);
                         continue;
                     }
