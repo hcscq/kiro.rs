@@ -189,7 +189,7 @@ async fn main() {
         let sync_interval = std::time::Duration::from_secs(config.state_redis_heartbeat_interval_secs);
         tracing::info!(
             sync_interval_secs = sync_interval.as_secs(),
-            "已启用外部状态热同步（凭据与调度配置）"
+            "已启用外部状态热同步（凭据、调度配置与统计信息）"
         );
 
         let token_manager = Arc::clone(&token_manager);
@@ -204,6 +204,9 @@ async fn main() {
                     Ok(report) => {
                         if report.dispatch_config_reloaded {
                             tracing::info!("外部状态热同步: 已应用最新调度配置");
+                        }
+                        if report.stats_reloaded {
+                            tracing::info!("外部状态热同步: 已应用最新统计信息");
                         }
                     }
                     Err(err) => {
@@ -241,6 +244,23 @@ async fn main() {
         } else {
             let admin_service = admin::AdminService::new(token_manager.clone());
             let admin_state = admin::AdminState::new(admin_key, admin_service);
+            if state_store.is_external() {
+                let sync_interval =
+                    std::time::Duration::from_secs(config.state_redis_heartbeat_interval_secs);
+                let admin_service = admin_state.service.clone();
+                tokio::spawn(async move {
+                    let mut ticker = tokio::time::interval(sync_interval);
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    ticker.tick().await;
+
+                    loop {
+                        ticker.tick().await;
+                        if let Err(err) = admin_service.sync_balance_cache_from_state() {
+                            tracing::error!("Admin 余额缓存热同步失败: {}", err);
+                        }
+                    }
+                });
+            }
             let admin_app = admin::create_admin_router(admin_state);
 
             // 创建 Admin UI 路由

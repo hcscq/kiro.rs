@@ -59,6 +59,33 @@ fn sha256_hex(input: &str) -> String {
     format!("{:x}", result)
 }
 
+fn newer_timestamp(current: Option<String>, candidate: Option<String>) -> Option<String> {
+    match (current, candidate) {
+        (None, other) | (other, None) => other,
+        (Some(current), Some(candidate)) => {
+            let current_parsed = DateTime::parse_from_rfc3339(&current).ok();
+            let candidate_parsed = DateTime::parse_from_rfc3339(&candidate).ok();
+
+            match (current_parsed, candidate_parsed) {
+                (Some(current_parsed), Some(candidate_parsed)) => {
+                    if candidate_parsed > current_parsed {
+                        Some(candidate)
+                    } else {
+                        Some(current)
+                    }
+                }
+                _ => {
+                    if candidate > current {
+                        Some(candidate)
+                    } else {
+                        Some(current)
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// 验证 refreshToken 的基本有效性
 pub(crate) fn validate_refresh_token(credentials: &KiroCredentials) -> anyhow::Result<()> {
     let refresh_token = credentials
@@ -666,6 +693,7 @@ pub struct LoadBalancingConfigSnapshot {
 pub struct ExternalStateSyncReport {
     pub credentials_reloaded: bool,
     pub dispatch_config_reloaded: bool,
+    pub stats_reloaded: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1712,10 +1740,12 @@ impl MultiTokenManager {
 
         let dispatch_config_reloaded = self.reload_dispatch_config_from_state()?;
         self.reload_credentials_from_state()?;
+        let stats_reloaded = self.reload_stats_from_state()?;
 
         Ok(ExternalStateSyncReport {
             credentials_reloaded: true,
             dispatch_config_reloaded,
+            stats_reloaded,
         })
     }
 
@@ -1893,6 +1923,44 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    fn reload_stats_from_state(&self) -> anyhow::Result<bool> {
+        let stats = self.state_store.load_stats()?;
+        let changed = self.apply_stats_from_state(&stats);
+
+        if changed {
+            tracing::info!("已从外部状态热加载 {} 条统计数据", stats.len());
+        }
+
+        Ok(changed)
+    }
+
+    fn apply_stats_from_state(&self, stats: &HashMap<String, StatsEntryRecord>) -> bool {
+        let mut changed = false;
+        let mut entries = self.entries.lock();
+
+        for entry in entries.iter_mut() {
+            let Some(persisted) = stats.get(&entry.id.to_string()) else {
+                continue;
+            };
+
+            let next_success_count = persisted
+                .success_count
+                .saturating_add(entry.pending_success_count_delta);
+            let next_last_used_at =
+                newer_timestamp(entry.last_used_at.clone(), persisted.last_used_at.clone());
+
+            if entry.success_count != next_success_count || entry.last_used_at != next_last_used_at
+            {
+                changed = true;
+            }
+
+            entry.success_count = next_success_count;
+            entry.last_used_at = next_last_used_at;
+        }
+
+        changed
+    }
+
     /// 从磁盘加载统计数据并应用到当前条目
     fn load_stats(&self) {
         let stats = match self.state_store.load_stats() {
@@ -1903,18 +1971,7 @@ impl MultiTokenManager {
             }
         };
 
-        let mut entries = self.entries.lock();
-        for entry in entries.iter_mut() {
-            if let Some(s) = stats.get(&entry.id.to_string()) {
-                entry.success_count = s
-                    .success_count
-                    .saturating_add(entry.pending_success_count_delta);
-                entry.last_used_at = s
-                    .last_used_at
-                    .clone()
-                    .or_else(|| entry.last_used_at.clone());
-            }
-        }
+        self.apply_stats_from_state(&stats);
         *self.last_stats_save_at.lock() = Some(Instant::now());
         self.stats_dirty.store(false, Ordering::Relaxed);
         tracing::info!("已从缓存加载 {} 条统计数据", stats.len());
@@ -3601,6 +3658,52 @@ mod tests {
         let store = StateStore::file(None, Some(credentials_path.clone()));
         let stats = store.load_stats().unwrap();
         assert_eq!(stats.get("1").unwrap().success_count, 2);
+
+        let stats_path = credentials_path.parent().unwrap().join("kiro_stats.json");
+        std::fs::remove_file(stats_path).unwrap();
+    }
+
+    #[test]
+    fn test_reload_stats_from_state_preserves_pending_local_deltas() {
+        let credentials_path = temp_credentials_path("reload-stats-preserve-local");
+        let mut credential = available_credential(0);
+        credential.id = Some(1);
+        credential.machine_id = Some("machine-1".to_string());
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![credential],
+            None,
+            Some(credentials_path.clone()),
+            false,
+        )
+        .unwrap();
+
+        {
+            let mut entries = manager.entries.lock();
+            let entry = entries.iter_mut().find(|entry| entry.id == 1).unwrap();
+            entry.success_count = 2;
+            entry.pending_success_count_delta = 2;
+            entry.last_used_at = Some("2026-04-15T02:00:00Z".to_string());
+        }
+
+        let store = StateStore::file(None, Some(credentials_path.clone()));
+        let mut persisted = HashMap::new();
+        persisted.insert(
+            "1".to_string(),
+            StatsEntryRecord {
+                success_count: 5,
+                last_used_at: Some("2026-04-15T01:00:00Z".to_string()),
+            },
+        );
+        store.save_stats(&persisted).unwrap();
+
+        assert!(manager.reload_stats_from_state().unwrap());
+
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert_eq!(entry.success_count, 7);
+        assert_eq!(entry.last_used_at.as_deref(), Some("2026-04-15T02:00:00Z"));
 
         let stats_path = credentials_path.parent().unwrap().join("kiro_stats.json");
         std::fs::remove_file(stats_path).unwrap();

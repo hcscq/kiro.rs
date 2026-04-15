@@ -30,17 +30,8 @@ pub struct AdminService {
 impl AdminService {
     pub fn new(token_manager: Arc<MultiTokenManager>) -> Self {
         let state_store = token_manager.state_store();
-        let balance_cache = match state_store.load_balance_cache() {
-            Ok(cache) => {
-                let original_len = cache.len();
-                let pruned = Self::prune_expired_balance_cache(cache);
-                if pruned.len() != original_len {
-                    if let Err(e) = state_store.save_balance_cache(&pruned) {
-                        tracing::warn!("清理过期余额缓存回写失败: {}", e);
-                    }
-                }
-                pruned
-            }
+        let balance_cache = match Self::load_pruned_balance_cache(&state_store) {
+            Ok(cache) => cache,
             Err(e) => {
                 tracing::warn!("解析余额缓存失败，将忽略: {}", e);
                 HashMap::new()
@@ -175,16 +166,16 @@ impl AdminService {
 
     /// 获取凭据余额（带缓存）
     pub async fn get_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
-        // 先查缓存
-        {
-            let cache = self.balance_cache.lock();
-            if let Some(cached) = cache.get(&id) {
-                let now = Utc::now().timestamp() as f64;
-                if (now - cached.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
-                    tracing::debug!("凭据 #{} 余额命中缓存", id);
-                    return Ok(cached.data.clone());
-                }
-            }
+        if let Some(cached) = self.cached_balance(id) {
+            tracing::debug!("凭据 #{} 余额命中本地缓存", id);
+            return Ok(cached);
+        }
+
+        if let Err(e) = self.sync_balance_cache_from_state() {
+            tracing::warn!("同步共享余额缓存失败，将直接回源查询: {}", e);
+        } else if let Some(cached) = self.cached_balance(id) {
+            tracing::debug!("凭据 #{} 余额命中共享缓存", id);
+            return Ok(cached);
         }
 
         // 缓存未命中或已过期，从上游获取
@@ -384,15 +375,55 @@ impl AdminService {
 
     // ============ 余额缓存持久化 ============
 
+    pub fn sync_balance_cache_from_state(&self) -> anyhow::Result<()> {
+        let state_store = self.token_manager.state_store();
+        let shared_cache = Self::load_pruned_balance_cache(&state_store)?;
+        let mut local_cache = self.balance_cache.lock();
+        local_cache.retain(|_, entry| Self::is_balance_cache_fresh(entry));
+        for (id, shared_entry) in shared_cache {
+            let should_replace = local_cache
+                .get(&id)
+                .map(|local_entry| local_entry.cached_at < shared_entry.cached_at)
+                .unwrap_or(true);
+            if should_replace {
+                local_cache.insert(id, shared_entry);
+            }
+        }
+        Ok(())
+    }
+
+    fn load_pruned_balance_cache(
+        state_store: &crate::state::StateStore,
+    ) -> anyhow::Result<HashMap<u64, CachedBalanceRecord>> {
+        let cache = state_store.load_balance_cache()?;
+        let original_len = cache.len();
+        let pruned = Self::prune_expired_balance_cache(cache);
+        if pruned.len() != original_len {
+            state_store.save_balance_cache(&pruned)?;
+        }
+        Ok(pruned)
+    }
+
+    fn cached_balance(&self, id: u64) -> Option<BalanceResponse> {
+        let cache = self.balance_cache.lock();
+        cache.get(&id)
+            .filter(|cached| Self::is_balance_cache_fresh(cached))
+            .map(|cached| cached.data.clone())
+    }
+
+    fn is_balance_cache_fresh(cached: &CachedBalanceRecord) -> bool {
+        let now = Utc::now().timestamp() as f64;
+        (now - cached.cached_at) < BALANCE_CACHE_TTL_SECS as f64
+    }
+
     fn prune_expired_balance_cache(
         cache: HashMap<u64, CachedBalanceRecord>,
     ) -> HashMap<u64, CachedBalanceRecord> {
-        let now = Utc::now().timestamp() as f64;
         cache
             .into_iter()
             .filter_map(|(id, entry)| {
                 // 丢弃超过 TTL 的条目
-                if (now - entry.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
+                if Self::is_balance_cache_fresh(&entry) {
                     Some((id, entry))
                 } else {
                     None
@@ -519,5 +550,88 @@ impl AdminService {
         } else {
             AdminServiceError::InternalError(msg)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+
+    use crate::admin::types::BalanceResponse;
+    use crate::kiro::model::credentials::KiroCredentials;
+    use crate::model::config::Config;
+
+    fn temp_credentials_path(test_name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "kiro-admin-service-{test_name}-{}.json",
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    fn available_credential() -> KiroCredentials {
+        let mut credentials = KiroCredentials::default();
+        credentials.id = Some(1);
+        credentials.machine_id = Some("machine-1".to_string());
+        credentials.access_token = Some("token-1".to_string());
+        credentials.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        credentials
+    }
+
+    #[tokio::test]
+    async fn test_get_balance_syncs_shared_cache_before_fetching_upstream() {
+        let credentials_path = temp_credentials_path("shared-balance-cache");
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![available_credential()],
+                None,
+                Some(credentials_path.clone()),
+                false,
+            )
+            .unwrap(),
+        );
+        let service = AdminService::new(manager.clone());
+
+        let shared_balance = BalanceResponse {
+            id: 1,
+            subscription_title: Some("KIRO PRO+".to_string()),
+            current_usage: 12.5,
+            usage_limit: 100.0,
+            remaining: 87.5,
+            usage_percentage: 12.5,
+            next_reset_at: Some(1_744_739_200.0),
+        };
+        let mut shared_cache = HashMap::new();
+        shared_cache.insert(
+            1,
+            CachedBalanceRecord {
+                cached_at: Utc::now().timestamp() as f64,
+                data: shared_balance.clone(),
+            },
+        );
+        manager
+            .state_store()
+            .save_balance_cache(&shared_cache)
+            .unwrap();
+
+        let balance = service.get_balance(1).await.unwrap();
+        assert_eq!(balance.id, shared_balance.id);
+        assert_eq!(
+            balance.subscription_title.as_deref(),
+            shared_balance.subscription_title.as_deref()
+        );
+        assert_eq!(balance.current_usage, shared_balance.current_usage);
+        assert_eq!(balance.usage_limit, shared_balance.usage_limit);
+        assert_eq!(balance.remaining, shared_balance.remaining);
+        assert_eq!(balance.usage_percentage, shared_balance.usage_percentage);
+        assert_eq!(balance.next_reset_at, shared_balance.next_reset_at);
+        assert!(service.balance_cache.lock().contains_key(&1));
+
+        let balance_cache_path = credentials_path
+            .parent()
+            .unwrap()
+            .join("kiro_balance_cache.json");
+        std::fs::remove_file(balance_cache_path).unwrap();
     }
 }
