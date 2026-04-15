@@ -201,6 +201,7 @@ GitHub Actions 镜像构建：
 | `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
 | `stateBackend` | string | `file` | 状态存储后端：`file` 或 `postgres` |
 | `statePostgresUrl` | string | - | PostgreSQL 连接串；当 `stateBackend=postgres` 时必填 |
+| `stateRedisUrl` | string | - | Redis 连接串；配置后余额缓存等短生命周期状态优先使用 Redis |
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
 | `defaultMaxConcurrency` | number | - | 全局默认单账号并发上限；仅在凭据未单独配置 `maxConcurrency` 时生效，留空或 <= 0 表示不限制 |
 | `queueMaxSize` | number | `0` | 等待队列最大长度；`0` 表示禁用等待队列 |
@@ -235,6 +236,7 @@ GitHub Actions 镜像构建：
    "proxyPassword": "pass",
    "adminApiKey": "sk-admin-your-secret-key",
    "stateBackend": "file",
+   "stateRedisUrl": "redis://127.0.0.1:6379/0",
    "loadBalancingMode": "balanced",
    "defaultMaxConcurrency": 3,
    "queueMaxSize": 16,
@@ -250,11 +252,14 @@ GitHub Actions 镜像构建：
 
 ### 外部状态存储
 
-当 `stateBackend` 设为 `postgres` 时，`kiro-rs` 会将以下状态写入 PostgreSQL：
+当 `stateBackend` 设为 `postgres` 时，`kiro-rs` 会将以下持久化状态写入 PostgreSQL：
 
 - 凭据列表
 - Admin API 修改后的调度配置
 - 统计缓存
+
+当同时配置 `stateRedisUrl` 时，以下短生命周期状态会优先写入 Redis：
+
 - 余额缓存
 
 启动行为如下：
@@ -262,6 +267,7 @@ GitHub Actions 镜像构建：
 - 优先从 PostgreSQL 加载调度配置和凭据
 - 如果 PostgreSQL 中还没有调度配置，会用当前 `config.json` 初始化
 - 如果 PostgreSQL 中还没有凭据，会用本地 `credentials.json` 做一次种子导入
+- 如果配置了 Redis，Admin API 启动时会优先从 Redis 读取余额缓存
 
 示例：
 
@@ -269,7 +275,8 @@ GitHub Actions 镜像构建：
 {
    "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
    "stateBackend": "postgres",
-   "statePostgresUrl": "postgres://postgres:postgres@postgres.default.svc.cluster.local:5432/kiro?sslmode=disable"
+   "statePostgresUrl": "postgres://postgres:postgres@postgres.default.svc.cluster.local:5432/kiro?sslmode=disable",
+   "stateRedisUrl": "redis://redis.default.svc.cluster.local:6379/0"
 }
 ```
 

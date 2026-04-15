@@ -5,6 +5,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use parking_lot::Mutex;
 use postgres::{Client, NoTls};
+use redis::{Client as RedisClient, Commands};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::RuntimeFlavor;
@@ -20,6 +21,8 @@ const POSTGRES_CREDENTIALS_KEY: &str = "credentials";
 const POSTGRES_STATS_KEY: &str = "stats";
 const POSTGRES_BALANCE_CACHE_KEY: &str = "balance_cache";
 const POSTGRES_DISPATCH_CONFIG_KEY: &str = "dispatch_config";
+const REDIS_BALANCE_CACHE_KEY: &str = "kiro:runtime:balance_cache";
+const REDIS_BALANCE_CACHE_TTL_SECS: u64 = 86_400;
 
 #[derive(Debug, Clone)]
 pub struct PersistedCredentials {
@@ -95,8 +98,34 @@ impl PersistedDispatchConfig {
 }
 
 #[derive(Clone)]
+enum BalanceCacheStore {
+    Primary(Arc<dyn StateBackend>),
+    Redis(Arc<RedisBalanceCacheBackend>),
+}
+
+impl BalanceCacheStore {
+    fn load_balance_cache(&self) -> anyhow::Result<HashMap<u64, CachedBalanceRecord>> {
+        match self {
+            Self::Primary(backend) => backend.load_balance_cache(),
+            Self::Redis(backend) => backend.load_balance_cache(),
+        }
+    }
+
+    fn save_balance_cache(
+        &self,
+        cache: &HashMap<u64, CachedBalanceRecord>,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::Primary(backend) => backend.save_balance_cache(cache),
+            Self::Redis(backend) => backend.save_balance_cache(cache),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct StateStore {
-    backend: Arc<dyn StateBackend>,
+    primary_backend: Arc<dyn StateBackend>,
+    balance_cache_backend: BalanceCacheStore,
 }
 
 impl std::fmt::Debug for StateStore {
@@ -123,46 +152,61 @@ trait StateBackend: Send + Sync {
 
 impl StateStore {
     pub fn from_config(config: &Config, credentials_path: Option<PathBuf>) -> anyhow::Result<Self> {
-        match config.state_backend {
-            StateBackendKind::File => Ok(Self::file(
-                config.config_path().map(|path| path.to_path_buf()),
+        let primary_backend: Arc<dyn StateBackend> = match config.state_backend {
+            StateBackendKind::File => Arc::new(FileStateBackend {
+                config_path: config.config_path().map(|path| path.to_path_buf()),
                 credentials_path,
-            )),
+            }),
             StateBackendKind::Postgres => {
                 let postgres_url = config
                     .state_postgres_url
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("stateBackend=postgres 时必须配置 statePostgresUrl"))?;
-                Self::postgres(postgres_url)
+                Arc::new(PostgresStateBackend::connect(postgres_url)?)
             }
-        }
+        };
+
+        Self::with_balance_cache_backend(primary_backend, config.state_redis_url.as_deref())
     }
 
     pub fn file(config_path: Option<PathBuf>, credentials_path: Option<PathBuf>) -> Self {
+        let primary_backend: Arc<dyn StateBackend> = Arc::new(FileStateBackend {
+            config_path,
+            credentials_path,
+        });
         Self {
-            backend: Arc::new(FileStateBackend {
-                config_path,
-                credentials_path,
-            }),
+            primary_backend: primary_backend.clone(),
+            balance_cache_backend: BalanceCacheStore::Primary(primary_backend),
         }
     }
 
-    pub fn postgres(postgres_url: &str) -> anyhow::Result<Self> {
+    fn with_balance_cache_backend(
+        primary_backend: Arc<dyn StateBackend>,
+        redis_url: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        let balance_cache_backend = match redis_url {
+            Some(redis_url) => BalanceCacheStore::Redis(Arc::new(
+                RedisBalanceCacheBackend::connect(redis_url, REDIS_BALANCE_CACHE_KEY)?,
+            )),
+            None => BalanceCacheStore::Primary(primary_backend.clone()),
+        };
+
         Ok(Self {
-            backend: Arc::new(PostgresStateBackend::connect(postgres_url)?),
+            primary_backend,
+            balance_cache_backend,
         })
     }
 
     pub fn is_external(&self) -> bool {
-        self.backend.is_external()
+        self.primary_backend.is_external()
     }
 
     pub fn load_credentials(&self) -> anyhow::Result<PersistedCredentials> {
-        self.backend.load_credentials()
+        self.primary_backend.load_credentials()
     }
 
     pub fn load_dispatch_config(&self) -> anyhow::Result<Option<PersistedDispatchConfig>> {
-        self.backend.load_dispatch_config()
+        self.primary_backend.load_dispatch_config()
     }
 
     pub fn persist_credentials(
@@ -170,34 +214,34 @@ impl StateStore {
         credentials: &[KiroCredentials],
         is_multiple_format: bool,
     ) -> anyhow::Result<bool> {
-        self.backend
+        self.primary_backend
             .persist_credentials(credentials, is_multiple_format)
     }
 
     pub fn load_stats(&self) -> anyhow::Result<HashMap<String, StatsEntryRecord>> {
-        self.backend.load_stats()
+        self.primary_backend.load_stats()
     }
 
     pub fn save_stats(&self, stats: &HashMap<String, StatsEntryRecord>) -> anyhow::Result<()> {
-        self.backend.save_stats(stats)
+        self.primary_backend.save_stats(stats)
     }
 
     pub fn load_balance_cache(&self) -> anyhow::Result<HashMap<u64, CachedBalanceRecord>> {
-        self.backend.load_balance_cache()
+        self.balance_cache_backend.load_balance_cache()
     }
 
     pub fn save_balance_cache(
         &self,
         cache: &HashMap<u64, CachedBalanceRecord>,
     ) -> anyhow::Result<()> {
-        self.backend.save_balance_cache(cache)
+        self.balance_cache_backend.save_balance_cache(cache)
     }
 
     pub fn persist_dispatch_config(
         &self,
         dispatch: &PersistedDispatchConfig,
     ) -> anyhow::Result<()> {
-        self.backend.persist_dispatch_config(dispatch)
+        self.primary_backend.persist_dispatch_config(dispatch)
     }
 }
 
@@ -521,6 +565,61 @@ impl StateBackend for PostgresStateBackend {
     }
 }
 
+#[derive(Debug)]
+struct RedisBalanceCacheBackend {
+    client: RedisClient,
+    key: String,
+}
+
+impl RedisBalanceCacheBackend {
+    fn connect(redis_url: &str, key: &str) -> anyhow::Result<Self> {
+        let client = RedisClient::open(redis_url).context("初始化 Redis 余额缓存客户端失败")?;
+        Ok(Self {
+            client,
+            key: key.to_string(),
+        })
+    }
+
+    fn load_balance_cache(&self) -> anyhow::Result<HashMap<u64, CachedBalanceRecord>> {
+        let client = self.client.clone();
+        let key = self.key.clone();
+
+        run_blocking_state_op(move || -> anyhow::Result<HashMap<u64, CachedBalanceRecord>> {
+            let mut connection = client.get_connection().context("连接 Redis 余额缓存失败")?;
+            let payload: Option<String> = connection
+                .get(&key)
+                .with_context(|| format!("从 Redis 读取余额缓存失败: {key}"))?;
+
+            let Some(payload) = payload else {
+                return Ok(HashMap::new());
+            };
+
+            let cache: HashMap<String, CachedBalanceRecord> = serde_json::from_str(&payload)
+                .with_context(|| format!("解析 Redis 余额缓存失败: {key}"))?;
+            Ok(cache
+                .into_iter()
+                .filter_map(|(raw_key, value)| raw_key.parse::<u64>().ok().map(|id| (id, value)))
+                .collect())
+        })
+    }
+
+    fn save_balance_cache(&self, cache: &HashMap<u64, CachedBalanceRecord>) -> anyhow::Result<()> {
+        let serializable: HashMap<String, &CachedBalanceRecord> =
+            cache.iter().map(|(key, value)| (key.to_string(), value)).collect();
+        let payload = serde_json::to_string(&serializable).context("序列化 Redis 余额缓存失败")?;
+        let client = self.client.clone();
+        let key = self.key.clone();
+
+        run_blocking_state_op(move || -> anyhow::Result<()> {
+            let mut connection = client.get_connection().context("连接 Redis 余额缓存失败")?;
+            let _: () = connection
+                .set_ex(&key, payload, REDIS_BALANCE_CACHE_TTL_SECS)
+                .with_context(|| format!("写入 Redis 余额缓存失败: {key}"))?;
+            Ok(())
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -642,5 +741,60 @@ mod tests {
         let err = StateStore::from_config(&config, None).unwrap_err().to_string();
 
         assert!(err.contains("statePostgresUrl"));
+    }
+
+    #[test]
+    fn state_store_from_config_rejects_invalid_redis_url() {
+        let mut config = Config::default();
+        config.state_redis_url = Some("not-a-valid-redis-url".to_string());
+
+        let err = StateStore::from_config(&config, None).unwrap_err().to_string();
+
+        assert!(err.contains("Redis"));
+    }
+
+    #[test]
+    fn redis_balance_cache_round_trips_when_test_url_is_set() {
+        let Ok(redis_url) = std::env::var("TEST_REDIS_URL") else {
+            return;
+        };
+
+        let key = format!("kiro:test:balance-cache:{}", Uuid::new_v4());
+        let backend = RedisBalanceCacheBackend::connect(&redis_url, &key).unwrap();
+
+        let mut cache = HashMap::new();
+        cache.insert(
+            9,
+            CachedBalanceRecord {
+                cached_at: 2345.0,
+                data: BalanceResponse {
+                    id: 9,
+                    subscription_title: Some("KIRO MAX".to_string()),
+                    current_usage: 2.0,
+                    usage_limit: 20.0,
+                    remaining: 18.0,
+                    usage_percentage: 10.0,
+                    next_reset_at: Some(6789.0),
+                },
+            },
+        );
+
+        backend.save_balance_cache(&cache).unwrap();
+        let loaded = backend.load_balance_cache().unwrap();
+        assert_eq!(
+            loaded.get(&9).unwrap().data.subscription_title,
+            Some("KIRO MAX".to_string())
+        );
+
+        let client = backend.client.clone();
+        run_blocking_state_op(move || -> anyhow::Result<()> {
+            let mut connection = client.get_connection().context("连接 Redis 测试清理失败")?;
+            let _: usize = redis::cmd("DEL")
+                .arg(&key)
+                .query(&mut connection)
+                .context("删除 Redis 测试键失败")?;
+            Ok(())
+        })
+        .unwrap();
     }
 }

@@ -108,6 +108,11 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state_postgres_url: Option<String>,
 
+    /// Redis 连接串（可选）。配置后，短生命周期缓存会优先存入 Redis。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_redis_url: Option<String>,
+
     /// 负载均衡模式（"priority" 或 "balanced"）
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
@@ -243,6 +248,7 @@ impl Default for Config {
             admin_api_key: None,
             state_backend: default_state_backend(),
             state_postgres_url: None,
+            state_redis_url: None,
             load_balancing_mode: default_load_balancing_mode(),
             default_max_concurrency: None,
             queue_max_size: 0,
