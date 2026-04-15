@@ -1077,15 +1077,20 @@ impl StreamContext {
             self.thinking_buffer.clear();
         }
 
-        // 如果整个流中只产生了 thinking 块，没有 text 也没有 tool_use，
-        // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上），
-        // 并补发一套完整的 text 事件（内容为一个空格），确保 content 数组中有 text 块
-        if self.thinking_enabled
-            && self.thinking_block_index.is_some()
-            && !self.state_manager.has_non_thinking_blocks()
-        {
-            self.state_manager.set_stop_reason("max_tokens");
-            events.extend(self.create_text_delta_events(" "));
+        // thinking 模式下，若最终没有任何非 thinking 内容块，需要补一个最小 text 块，
+        // 避免输出成为仅有 message_* 的 Anthropic SSE，导致兼容性问题。
+        let missing_non_thinking_blocks =
+            self.thinking_enabled && !self.state_manager.has_non_thinking_blocks();
+        if missing_non_thinking_blocks {
+            // 只有真的出现过 thinking-only 时，才把 stop_reason 视为 max_tokens。
+            if self.thinking_block_index.is_some() {
+                self.state_manager.set_stop_reason("max_tokens");
+            }
+
+            // 空语义完成或 thinking-only 都补一个空格文本块，确保至少存在一组 text content_block 事件。
+            if self.text_block_index.is_none() {
+                events.extend(self.create_text_delta_events(" "));
+            }
         }
 
         // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
@@ -1932,6 +1937,45 @@ mod tests {
                     && e.data["index"].as_i64() == Some(text_block_index)
             }),
             "text block should be stopped"
+        );
+    }
+
+    #[test]
+    fn test_empty_semantic_completion_with_thinking_emits_blank_text_block() {
+        // thinking 模式下，即使上游没有返回任何 thinking/text/tool_use 内容，
+        // 也应补一套最小 text 事件，避免只剩 message_* 事件。
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut all_events = ctx.generate_initial_events();
+        all_events.extend(ctx.generate_final_events());
+
+        let message_delta = all_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("should have message_delta event");
+
+        assert_eq!(
+            message_delta.data["delta"]["stop_reason"], "end_turn",
+            "semantic empty completion should keep end_turn stop_reason"
+        );
+        assert!(
+            all_events.iter().any(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "text"
+            }),
+            "should emit text content_block_start for semantic empty completion"
+        );
+        assert!(
+            all_events.iter().any(|e| {
+                e.event == "content_block_delta"
+                    && e.data["delta"]["type"] == "text_delta"
+                    && e.data["delta"]["text"] == " "
+            }),
+            "should emit text_delta with a single space for semantic empty completion"
+        );
+        assert!(
+            all_events
+                .iter()
+                .any(|e| e.event == "message_stop"),
+            "should end with message_stop"
         );
     }
 
