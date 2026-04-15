@@ -16,6 +16,7 @@ use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
 use model::arg::Args;
 use model::config::Config;
+use state::{PersistedCredentials, PersistedDispatchConfig, StateStore};
 
 #[tokio::main]
 async fn main() {
@@ -34,25 +35,74 @@ async fn main() {
     let config_path = args
         .config
         .unwrap_or_else(|| Config::default_config_path().to_string());
-    let config = Config::load(&config_path).unwrap_or_else(|e| {
+    let mut config = Config::load(&config_path).unwrap_or_else(|e| {
         tracing::error!("加载配置失败: {}", e);
         std::process::exit(1);
     });
 
-    // 加载凭证（支持单对象或数组格式）
+    // 解析凭据文件路径。file backend 直接读取该文件；external backend 仅将其用作首次导入种子。
     let credentials_path = args
         .credentials
         .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
-    let credentials_config = CredentialsConfig::load(&credentials_path).unwrap_or_else(|e| {
-        tracing::error!("加载凭证失败: {}", e);
+    let credentials_path_buf: std::path::PathBuf = credentials_path.clone().into();
+
+    let state_store =
+        StateStore::from_config(&config, Some(credentials_path_buf.clone())).unwrap_or_else(|e| {
+            tracing::error!("初始化状态存储失败: {}", e);
+            std::process::exit(1);
+        });
+
+    if let Some(dispatch) = state_store.load_dispatch_config().unwrap_or_else(|e| {
+        tracing::error!("加载外部调度配置失败: {}", e);
+        std::process::exit(1);
+    }) {
+        dispatch.apply_to_config(&mut config);
+        tracing::info!("已从状态后端加载调度配置");
+    } else if state_store.is_external() {
+        let dispatch = PersistedDispatchConfig::from_config(&config);
+        state_store
+            .persist_dispatch_config(&dispatch)
+            .unwrap_or_else(|e| {
+                tracing::error!("将初始调度配置写入外部状态后端失败: {}", e);
+                std::process::exit(1);
+            });
+        tracing::info!("外部状态后端尚无调度配置，已使用本地配置初始化");
+    }
+
+    let mut persisted_credentials = state_store.load_credentials().unwrap_or_else(|e| {
+        tracing::error!("加载凭据失败: {}", e);
         std::process::exit(1);
     });
 
-    // 判断是否为多凭据格式（用于刷新后回写）
-    let is_multiple_format = credentials_config.is_multiple();
+    if state_store.is_external() && persisted_credentials.credentials.is_empty() {
+        let credentials_config = CredentialsConfig::load(&credentials_path).unwrap_or_else(|e| {
+            tracing::error!("从本地凭据文件导入种子数据失败: {}", e);
+            std::process::exit(1);
+        });
+        let is_multiple_format = credentials_config.is_multiple();
+        let credentials = credentials_config.into_sorted_credentials();
 
-    // 转换为按优先级排序的凭据列表
-    let credentials_list = credentials_config.into_sorted_credentials();
+        if !credentials.is_empty() {
+            state_store
+                .persist_credentials(&credentials, is_multiple_format)
+                .unwrap_or_else(|e| {
+                    tracing::error!("将本地凭据导入外部状态后端失败: {}", e);
+                    std::process::exit(1);
+                });
+            tracing::info!(
+                "外部状态后端尚无凭据，已从本地文件导入 {} 个凭据",
+                credentials.len()
+            );
+        }
+
+        persisted_credentials = PersistedCredentials {
+            credentials,
+            is_multiple_format,
+        };
+    }
+
+    let is_multiple_format = persisted_credentials.is_multiple_format;
+    let credentials_list = persisted_credentials.credentials;
     tracing::info!("已加载 {} 个凭据配置", credentials_list.len());
 
     // 获取第一个凭据用于日志显示
@@ -83,7 +133,7 @@ async fn main() {
         config.clone(),
         credentials_list,
         proxy_config.clone(),
-        Some(credentials_path.into()),
+        Some(credentials_path_buf),
         is_multiple_format,
     )
     .unwrap_or_else(|e| {

@@ -16,6 +16,19 @@ impl Default for TlsBackend {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum StateBackendKind {
+    File,
+    Postgres,
+}
+
+impl Default for StateBackendKind {
+    fn default() -> Self {
+        Self::File
+    }
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -85,6 +98,15 @@ pub struct Config {
     /// Admin API 密钥（可选，启用 Admin API 功能）
     #[serde(default)]
     pub admin_api_key: Option<String>,
+
+    /// 状态存储后端：`file` 或 `postgres`
+    #[serde(default = "default_state_backend")]
+    pub state_backend: StateBackendKind,
+
+    /// PostgreSQL 连接串（state_backend=postgres 时必填）
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_postgres_url: Option<String>,
 
     /// 负载均衡模式（"priority" 或 "balanced"）
     #[serde(default = "default_load_balancing_mode")]
@@ -170,6 +192,10 @@ fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
 
+fn default_state_backend() -> StateBackendKind {
+    StateBackendKind::File
+}
+
 fn default_rate_limit_cooldown_ms() -> u64 {
     2_000
 }
@@ -215,6 +241,8 @@ impl Default for Config {
             proxy_username: None,
             proxy_password: None,
             admin_api_key: None,
+            state_backend: default_state_backend(),
+            state_postgres_url: None,
             load_balancing_mode: default_load_balancing_mode(),
             default_max_concurrency: None,
             queue_max_size: 0,

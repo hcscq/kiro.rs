@@ -856,10 +856,7 @@ impl MultiTokenManager {
         credentials_path: Option<PathBuf>,
         is_multiple_format: bool,
     ) -> anyhow::Result<Self> {
-        let state_store = StateStore::file(
-            config.config_path().map(|path| path.to_path_buf()),
-            credentials_path.clone(),
-        );
+        let state_store = StateStore::from_config(&config, credentials_path.clone())?;
         let dispatch_config = DispatchConfig::from_config(&config);
         let now = Instant::now();
 

@@ -3,14 +3,38 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
+use parking_lot::Mutex;
+use postgres::{Client, NoTls};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use tokio::runtime::RuntimeFlavor;
 
 use crate::admin::types::BalanceResponse;
-use crate::kiro::model::credentials::KiroCredentials;
-use crate::model::config::Config;
+use crate::kiro::model::credentials::{CredentialsConfig, KiroCredentials};
+use crate::model::config::{Config, StateBackendKind};
 
 const STATS_FILE_NAME: &str = "kiro_stats.json";
 const BALANCE_CACHE_FILE_NAME: &str = "kiro_balance_cache.json";
+const POSTGRES_NAMESPACE: &str = "runtime";
+const POSTGRES_CREDENTIALS_KEY: &str = "credentials";
+const POSTGRES_STATS_KEY: &str = "stats";
+const POSTGRES_BALANCE_CACHE_KEY: &str = "balance_cache";
+const POSTGRES_DISPATCH_CONFIG_KEY: &str = "dispatch_config";
+
+#[derive(Debug, Clone)]
+pub struct PersistedCredentials {
+    pub credentials: Vec<KiroCredentials>,
+    pub is_multiple_format: bool,
+}
+
+impl PersistedCredentials {
+    fn empty(is_multiple_format: bool) -> Self {
+        Self {
+            credentials: Vec::new(),
+            is_multiple_format,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatsEntryRecord {
@@ -24,7 +48,7 @@ pub struct CachedBalanceRecord {
     pub data: BalanceResponse,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PersistedDispatchConfig {
     pub mode: String,
     pub queue_max_size: usize,
@@ -38,13 +62,53 @@ pub struct PersistedDispatchConfig {
     pub rate_limit_refill_backoff_factor: f64,
 }
 
+impl PersistedDispatchConfig {
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            mode: config.load_balancing_mode.clone(),
+            queue_max_size: config.queue_max_size,
+            queue_max_wait_ms: config.queue_max_wait_ms,
+            rate_limit_cooldown_ms: config.rate_limit_cooldown_ms,
+            default_max_concurrency: config.default_max_concurrency,
+            rate_limit_bucket_capacity: config.rate_limit_bucket_capacity,
+            rate_limit_refill_per_second: config.rate_limit_refill_per_second,
+            rate_limit_refill_min_per_second: config.rate_limit_refill_min_per_second,
+            rate_limit_refill_recovery_step_per_success: config
+                .rate_limit_refill_recovery_step_per_success,
+            rate_limit_refill_backoff_factor: config.rate_limit_refill_backoff_factor,
+        }
+    }
+
+    pub fn apply_to_config(&self, config: &mut Config) {
+        config.load_balancing_mode = self.mode.clone();
+        config.queue_max_size = self.queue_max_size;
+        config.queue_max_wait_ms = self.queue_max_wait_ms;
+        config.rate_limit_cooldown_ms = self.rate_limit_cooldown_ms;
+        config.default_max_concurrency = self.default_max_concurrency;
+        config.rate_limit_bucket_capacity = self.rate_limit_bucket_capacity;
+        config.rate_limit_refill_per_second = self.rate_limit_refill_per_second;
+        config.rate_limit_refill_min_per_second = self.rate_limit_refill_min_per_second;
+        config.rate_limit_refill_recovery_step_per_success =
+            self.rate_limit_refill_recovery_step_per_success;
+        config.rate_limit_refill_backoff_factor = self.rate_limit_refill_backoff_factor;
+    }
+}
+
 #[derive(Clone)]
 pub struct StateStore {
     backend: Arc<dyn StateBackend>,
 }
 
+impl std::fmt::Debug for StateStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StateStore").finish_non_exhaustive()
+    }
+}
+
 trait StateBackend: Send + Sync {
-    fn cache_dir(&self) -> Option<PathBuf>;
+    fn is_external(&self) -> bool;
+    fn load_credentials(&self) -> anyhow::Result<PersistedCredentials>;
+    fn load_dispatch_config(&self) -> anyhow::Result<Option<PersistedDispatchConfig>>;
     fn persist_credentials(
         &self,
         credentials: &[KiroCredentials],
@@ -58,6 +122,22 @@ trait StateBackend: Send + Sync {
 }
 
 impl StateStore {
+    pub fn from_config(config: &Config, credentials_path: Option<PathBuf>) -> anyhow::Result<Self> {
+        match config.state_backend {
+            StateBackendKind::File => Ok(Self::file(
+                config.config_path().map(|path| path.to_path_buf()),
+                credentials_path,
+            )),
+            StateBackendKind::Postgres => {
+                let postgres_url = config
+                    .state_postgres_url
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("stateBackend=postgres 时必须配置 statePostgresUrl"))?;
+                Self::postgres(postgres_url)
+            }
+        }
+    }
+
     pub fn file(config_path: Option<PathBuf>, credentials_path: Option<PathBuf>) -> Self {
         Self {
             backend: Arc::new(FileStateBackend {
@@ -65,6 +145,24 @@ impl StateStore {
                 credentials_path,
             }),
         }
+    }
+
+    pub fn postgres(postgres_url: &str) -> anyhow::Result<Self> {
+        Ok(Self {
+            backend: Arc::new(PostgresStateBackend::connect(postgres_url)?),
+        })
+    }
+
+    pub fn is_external(&self) -> bool {
+        self.backend.is_external()
+    }
+
+    pub fn load_credentials(&self) -> anyhow::Result<PersistedCredentials> {
+        self.backend.load_credentials()
+    }
+
+    pub fn load_dispatch_config(&self) -> anyhow::Result<Option<PersistedDispatchConfig>> {
+        self.backend.load_dispatch_config()
     }
 
     pub fn persist_credentials(
@@ -103,6 +201,25 @@ impl StateStore {
     }
 }
 
+fn run_blocking_state_op<R, F>(operation: F) -> R
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => match handle.runtime_flavor() {
+            RuntimeFlavor::MultiThread => tokio::task::block_in_place(operation),
+            RuntimeFlavor::CurrentThread => std::thread::spawn(operation)
+                .join()
+                .expect("state blocking operation thread panicked"),
+            _ => std::thread::spawn(operation)
+                .join()
+                .expect("state blocking operation thread panicked"),
+        },
+        Err(_) => operation(),
+    }
+}
+
 #[derive(Debug)]
 struct FileStateBackend {
     config_path: Option<PathBuf>,
@@ -110,6 +227,12 @@ struct FileStateBackend {
 }
 
 impl FileStateBackend {
+    fn cache_dir(&self) -> Option<PathBuf> {
+        self.credentials_path
+            .as_ref()
+            .and_then(|path| path.parent().map(|dir| dir.to_path_buf()))
+    }
+
     fn stats_path(&self) -> Option<PathBuf> {
         self.cache_dir().map(|dir| dir.join(STATS_FILE_NAME))
     }
@@ -126,10 +249,27 @@ impl FileStateBackend {
 }
 
 impl StateBackend for FileStateBackend {
-    fn cache_dir(&self) -> Option<PathBuf> {
-        self.credentials_path
-            .as_ref()
-            .and_then(|path| path.parent().map(|dir| dir.to_path_buf()))
+    fn is_external(&self) -> bool {
+        false
+    }
+
+    fn load_credentials(&self) -> anyhow::Result<PersistedCredentials> {
+        let path = match &self.credentials_path {
+            Some(path) => path,
+            None => return Ok(PersistedCredentials::empty(false)),
+        };
+
+        let credentials = CredentialsConfig::load(path)
+            .with_context(|| format!("加载凭据文件失败: {}", path.display()))?;
+        let is_multiple_format = credentials.is_multiple();
+        Ok(PersistedCredentials {
+            credentials: credentials.into_sorted_credentials(),
+            is_multiple_format,
+        })
+    }
+
+    fn load_dispatch_config(&self) -> anyhow::Result<Option<PersistedDispatchConfig>> {
+        Ok(None)
     }
 
     fn persist_credentials(
@@ -236,21 +376,148 @@ impl StateBackend for FileStateBackend {
 
         let mut config = Config::load(config_path)
             .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
-        config.load_balancing_mode = dispatch.mode.clone();
-        config.queue_max_size = dispatch.queue_max_size;
-        config.queue_max_wait_ms = dispatch.queue_max_wait_ms;
-        config.rate_limit_cooldown_ms = dispatch.rate_limit_cooldown_ms;
-        config.default_max_concurrency = dispatch.default_max_concurrency;
-        config.rate_limit_bucket_capacity = dispatch.rate_limit_bucket_capacity;
-        config.rate_limit_refill_per_second = dispatch.rate_limit_refill_per_second;
-        config.rate_limit_refill_min_per_second = dispatch.rate_limit_refill_min_per_second;
-        config.rate_limit_refill_recovery_step_per_success =
-            dispatch.rate_limit_refill_recovery_step_per_success;
-        config.rate_limit_refill_backoff_factor = dispatch.rate_limit_refill_backoff_factor;
+        dispatch.apply_to_config(&mut config);
         config
             .save()
             .with_context(|| format!("持久化调度配置失败: {}", config_path.display()))?;
         Ok(())
+    }
+}
+
+struct PostgresStateBackend {
+    client: Arc<Mutex<Client>>,
+}
+
+impl std::fmt::Debug for PostgresStateBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostgresStateBackend").finish_non_exhaustive()
+    }
+}
+
+impl PostgresStateBackend {
+    fn connect(postgres_url: &str) -> anyhow::Result<Self> {
+        let postgres_url = postgres_url.to_string();
+        let client = run_blocking_state_op(move || -> anyhow::Result<Client> {
+            let mut client =
+                Client::connect(&postgres_url, NoTls).context("连接 PostgreSQL 状态存储失败")?;
+            client
+                .batch_execute(
+                    r#"
+                    CREATE TABLE IF NOT EXISTS kiro_state_store (
+                        namespace TEXT NOT NULL,
+                        key TEXT NOT NULL,
+                        value TEXT NOT NULL,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        PRIMARY KEY (namespace, key)
+                    )
+                    "#,
+                )
+                .context("初始化 PostgreSQL 状态存储表失败")?;
+            Ok(client)
+        })?;
+        Ok(Self {
+            client: Arc::new(Mutex::new(client)),
+        })
+    }
+
+    fn load_json<T: DeserializeOwned + Send + 'static>(
+        &self,
+        key: &str,
+        label: &str,
+    ) -> anyhow::Result<Option<T>> {
+        let client = Arc::clone(&self.client);
+        let key = key.to_string();
+        let label = label.to_string();
+
+        run_blocking_state_op(move || {
+            let mut client = client.lock();
+            let row = client
+                .query_opt(
+                    "SELECT value FROM kiro_state_store WHERE namespace = $1 AND key = $2",
+                    &[&POSTGRES_NAMESPACE, &key],
+                )
+                .with_context(|| format!("从 PostgreSQL 读取{label}失败"))?;
+
+            row.map(|row| {
+                let payload: String = row.get(0);
+                serde_json::from_str(&payload)
+                    .with_context(|| format!("解析 PostgreSQL {label}失败"))
+            })
+            .transpose()
+        })
+    }
+
+    fn save_json<T: Serialize>(&self, key: &str, value: &T, label: &str) -> anyhow::Result<()> {
+        let payload = serde_json::to_string(value).with_context(|| format!("序列化{label}失败"))?;
+        let client = Arc::clone(&self.client);
+        let key = key.to_string();
+        let label = label.to_string();
+
+        run_blocking_state_op(move || {
+            let mut client = client.lock();
+            client
+                .execute(
+                    r#"
+                    INSERT INTO kiro_state_store (namespace, key, value, updated_at)
+                    VALUES ($1, $2, $3, NOW())
+                    ON CONFLICT (namespace, key)
+                    DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+                    "#,
+                    &[&POSTGRES_NAMESPACE, &key, &payload],
+                )
+                .with_context(|| format!("保存{label}到 PostgreSQL 失败"))?;
+            Ok(())
+        })
+    }
+}
+
+impl StateBackend for PostgresStateBackend {
+    fn is_external(&self) -> bool {
+        true
+    }
+
+    fn load_credentials(&self) -> anyhow::Result<PersistedCredentials> {
+        Ok(PersistedCredentials {
+            credentials: self
+                .load_json(POSTGRES_CREDENTIALS_KEY, "凭据列表")?
+                .unwrap_or_default(),
+            is_multiple_format: true,
+        })
+    }
+
+    fn load_dispatch_config(&self) -> anyhow::Result<Option<PersistedDispatchConfig>> {
+        self.load_json(POSTGRES_DISPATCH_CONFIG_KEY, "调度配置")
+    }
+
+    fn persist_credentials(
+        &self,
+        credentials: &[KiroCredentials],
+        _is_multiple_format: bool,
+    ) -> anyhow::Result<bool> {
+        self.save_json(POSTGRES_CREDENTIALS_KEY, &credentials, "凭据列表")?;
+        Ok(true)
+    }
+
+    fn load_stats(&self) -> anyhow::Result<HashMap<String, StatsEntryRecord>> {
+        Ok(self.load_json(POSTGRES_STATS_KEY, "统计缓存")?.unwrap_or_default())
+    }
+
+    fn save_stats(&self, stats: &HashMap<String, StatsEntryRecord>) -> anyhow::Result<()> {
+        self.save_json(POSTGRES_STATS_KEY, stats, "统计缓存")
+    }
+
+    fn load_balance_cache(&self) -> anyhow::Result<HashMap<u64, CachedBalanceRecord>> {
+        Ok(self
+            .load_json(POSTGRES_BALANCE_CACHE_KEY, "余额缓存")?
+            .unwrap_or_default())
+    }
+
+    fn save_balance_cache(&self, cache: &HashMap<u64, CachedBalanceRecord>) -> anyhow::Result<()> {
+        self.save_json(POSTGRES_BALANCE_CACHE_KEY, cache, "余额缓存")
+    }
+
+    fn persist_dispatch_config(&self, dispatch: &PersistedDispatchConfig) -> anyhow::Result<()> {
+        self.save_json(POSTGRES_DISPATCH_CONFIG_KEY, dispatch, "调度配置")
     }
 }
 
@@ -282,11 +549,11 @@ mod tests {
         }];
         assert!(store.persist_credentials(&credentials, true).unwrap());
 
-        let persisted_credentials: Vec<KiroCredentials> =
-            serde_json::from_str(&fs::read_to_string(&credentials_path).unwrap()).unwrap();
-        assert_eq!(persisted_credentials.len(), 1);
-        assert_eq!(persisted_credentials[0].id, Some(7));
-        assert!(persisted_credentials[0].disabled);
+        let boot = store.load_credentials().unwrap();
+        assert!(boot.is_multiple_format);
+        assert_eq!(boot.credentials.len(), 1);
+        assert_eq!(boot.credentials[0].id, Some(7));
+        assert!(boot.credentials[0].disabled);
 
         let mut stats = HashMap::new();
         stats.insert(
@@ -346,33 +613,34 @@ mod tests {
         let config_path = dir.join("config.json");
         let store = StateStore::file(Some(config_path.clone()), None);
 
-        store
-            .persist_dispatch_config(&PersistedDispatchConfig {
-                mode: "balanced".to_string(),
-                queue_max_size: 16,
-                queue_max_wait_ms: 2000,
-                rate_limit_cooldown_ms: 5000,
-                default_max_concurrency: Some(4),
-                rate_limit_bucket_capacity: 6.0,
-                rate_limit_refill_per_second: 1.5,
-                rate_limit_refill_min_per_second: 0.4,
-                rate_limit_refill_recovery_step_per_success: 0.2,
-                rate_limit_refill_backoff_factor: 0.7,
-            })
-            .unwrap();
+        let dispatch = PersistedDispatchConfig {
+            mode: "balanced".to_string(),
+            queue_max_size: 16,
+            queue_max_wait_ms: 2000,
+            rate_limit_cooldown_ms: 5000,
+            default_max_concurrency: Some(4),
+            rate_limit_bucket_capacity: 6.0,
+            rate_limit_refill_per_second: 1.5,
+            rate_limit_refill_min_per_second: 0.4,
+            rate_limit_refill_recovery_step_per_success: 0.2,
+            rate_limit_refill_backoff_factor: 0.7,
+        };
+
+        store.persist_dispatch_config(&dispatch).unwrap();
 
         let persisted = Config::load(&config_path).unwrap();
-        assert_eq!(persisted.load_balancing_mode, "balanced");
-        assert_eq!(persisted.queue_max_size, 16);
-        assert_eq!(persisted.queue_max_wait_ms, 2000);
-        assert_eq!(persisted.rate_limit_cooldown_ms, 5000);
-        assert_eq!(persisted.default_max_concurrency, Some(4));
-        assert_eq!(persisted.rate_limit_bucket_capacity, 6.0);
-        assert_eq!(persisted.rate_limit_refill_per_second, 1.5);
-        assert_eq!(persisted.rate_limit_refill_min_per_second, 0.4);
-        assert_eq!(persisted.rate_limit_refill_recovery_step_per_success, 0.2);
-        assert_eq!(persisted.rate_limit_refill_backoff_factor, 0.7);
+        assert_eq!(PersistedDispatchConfig::from_config(&persisted), dispatch);
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn state_store_from_config_rejects_postgres_without_url() {
+        let mut config = Config::default();
+        config.state_backend = StateBackendKind::Postgres;
+
+        let err = StateStore::from_config(&config, None).unwrap_err().to_string();
+
+        assert!(err.contains("statePostgresUrl"));
     }
 }
