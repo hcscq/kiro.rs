@@ -659,6 +659,12 @@ pub struct LoadBalancingConfigSnapshot {
     pub waiting_requests: usize,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExternalStateSyncReport {
+    pub credentials_reloaded: bool,
+    pub dispatch_config_reloaded: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct DispatchConfig {
     mode: String,
@@ -1695,6 +1701,20 @@ impl MultiTokenManager {
         self.state_store.clone()
     }
 
+    pub fn sync_from_state(&self) -> anyhow::Result<ExternalStateSyncReport> {
+        if !self.state_store.is_external() {
+            return Ok(ExternalStateSyncReport::default());
+        }
+
+        let dispatch_config_reloaded = self.reload_dispatch_config_from_state()?;
+        self.reload_credentials_from_state()?;
+
+        Ok(ExternalStateSyncReport {
+            credentials_reloaded: true,
+            dispatch_config_reloaded,
+        })
+    }
+
     fn current_credentials(&self, id: u64) -> anyhow::Result<KiroCredentials> {
         let entries = self.entries.lock();
         entries
@@ -1712,6 +1732,55 @@ impl MultiTokenManager {
         }
 
         self.state_store.runtime_coordination_status()
+    }
+
+    fn reload_dispatch_config_from_state(&self) -> anyhow::Result<bool> {
+        let Some(persisted) = self.state_store.load_dispatch_config()? else {
+            return Ok(false);
+        };
+
+        let mut config = self.config.clone();
+        persisted.apply_to_config(&mut config);
+        let next = DispatchConfig::from_config(&config);
+        let previous = self.dispatch_config();
+
+        if previous == next {
+            return Ok(false);
+        }
+
+        *self.dispatch_config.lock() = next.clone();
+
+        if previous.rate_limit_cooldown_ms != next.rate_limit_cooldown_ms
+            && next.rate_limit_cooldown_ms == 0
+        {
+            self.clear_all_rate_limit_cooldowns();
+        }
+        if previous.rate_limit_bucket_capacity != next.rate_limit_bucket_capacity
+            || previous.rate_limit_refill_per_second != next.rate_limit_refill_per_second
+            || previous.rate_limit_refill_min_per_second != next.rate_limit_refill_min_per_second
+            || previous.rate_limit_refill_recovery_step_per_success
+                != next.rate_limit_refill_recovery_step_per_success
+            || previous.rate_limit_refill_backoff_factor != next.rate_limit_refill_backoff_factor
+        {
+            self.reconfigure_rate_limit_runtime(&next);
+        }
+
+        self.availability_notify.notify_waiters();
+        tracing::info!(
+            "已从外部状态热加载调度配置: mode={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, defaultMaxConcurrency={:?}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}",
+            next.mode,
+            next.queue_max_size,
+            next.queue_max_wait_ms,
+            next.rate_limit_cooldown_ms,
+            next.default_max_concurrency,
+            next.rate_limit_bucket_capacity,
+            next.rate_limit_refill_per_second,
+            next.rate_limit_refill_min_per_second,
+            next.rate_limit_refill_recovery_step_per_success,
+            next.rate_limit_refill_backoff_factor
+        );
+
+        Ok(true)
     }
 
     fn reload_credentials_from_state(&self) -> anyhow::Result<()> {
@@ -3403,6 +3472,58 @@ mod tests {
         assert!(snapshot.entries.iter().all(|entry| entry.id != 2));
 
         std::fs::remove_file(credentials_path).unwrap();
+    }
+
+    #[test]
+    fn test_reload_dispatch_config_from_state_updates_runtime_config() {
+        let config_path = std::env::temp_dir().join(format!(
+            "kiro-dispatch-sync-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &config_path,
+            r#"{"loadBalancingMode":"priority","queueMaxSize":0,"queueMaxWaitMs":0,"rateLimitCooldownMs":2000,"defaultMaxConcurrency":2}"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![available_credential(0)], None, None, false)
+                .unwrap();
+
+        manager
+            .state_store()
+            .persist_dispatch_config(&PersistedDispatchConfig {
+                mode: "balanced".to_string(),
+                queue_max_size: 8,
+                queue_max_wait_ms: 1500,
+                rate_limit_cooldown_ms: 4500,
+                default_max_concurrency: Some(3),
+                rate_limit_bucket_capacity: 4.0,
+                rate_limit_refill_per_second: 1.2,
+                rate_limit_refill_min_per_second: 0.3,
+                rate_limit_refill_recovery_step_per_success: 0.15,
+                rate_limit_refill_backoff_factor: 0.6,
+            })
+            .unwrap();
+
+        assert!(manager.reload_dispatch_config_from_state().unwrap());
+
+        let snapshot = manager.load_balancing_config_snapshot();
+        assert_eq!(snapshot.mode, "balanced");
+        assert_eq!(snapshot.queue_max_size, 8);
+        assert_eq!(snapshot.queue_max_wait_ms, 1500);
+        assert_eq!(snapshot.rate_limit_cooldown_ms, 4500);
+        assert_eq!(snapshot.default_max_concurrency, Some(3));
+        assert_eq!(snapshot.rate_limit_bucket_capacity, 4.0);
+        assert_eq!(snapshot.rate_limit_refill_per_second, 1.2);
+        assert_eq!(snapshot.rate_limit_refill_min_per_second, 0.3);
+        assert_eq!(snapshot.rate_limit_refill_recovery_step_per_success, 0.15);
+        assert_eq!(snapshot.rate_limit_refill_backoff_factor, 0.6);
+
+        assert!(!manager.reload_dispatch_config_from_state().unwrap());
+
+        std::fs::remove_file(config_path).unwrap();
     }
 
     #[test]

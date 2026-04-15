@@ -185,6 +185,35 @@ async fn main() {
     let token_manager = Arc::new(token_manager);
     let kiro_provider = KiroProvider::with_proxy(token_manager.clone(), proxy_config.clone());
 
+    if state_store.is_external() {
+        let sync_interval = std::time::Duration::from_secs(config.state_redis_heartbeat_interval_secs);
+        tracing::info!(
+            sync_interval_secs = sync_interval.as_secs(),
+            "已启用外部状态热同步（凭据与调度配置）"
+        );
+
+        let token_manager = Arc::clone(&token_manager);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(sync_interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+
+            loop {
+                ticker.tick().await;
+                match token_manager.sync_from_state() {
+                    Ok(report) => {
+                        if report.dispatch_config_reloaded {
+                            tracing::info!("外部状态热同步: 已应用最新调度配置");
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!("外部状态热同步失败: {}", err);
+                    }
+                }
+            }
+        });
+    }
+
     // 初始化 count_tokens 配置
     token::init_config(token::CountTokensConfig {
         api_url: config.count_tokens_api_url.clone(),
