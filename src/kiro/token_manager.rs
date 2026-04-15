@@ -399,6 +399,8 @@ struct CredentialEntry {
     rate_limit_bucket: Option<AdaptiveTokenBucket>,
     /// 连续 429 次数，用于放大冷却时间
     rate_limit_hit_streak: u32,
+    /// 凭据级刷新锁，避免不同账号刷新 token 时互相串行阻塞
+    refresh_lock: Arc<TokioMutex<()>>,
 }
 
 /// 禁用原因
@@ -757,8 +759,6 @@ pub struct MultiTokenManager {
     entries: Arc<Mutex<Vec<CredentialEntry>>>,
     /// 当前活动凭据 ID
     current_id: Mutex<u64>,
-    /// Token 刷新锁，确保同一时间只有一个刷新操作
-    refresh_lock: TokioMutex<()>,
     /// 凭据文件路径（用于回写）
     credentials_path: Option<PathBuf>,
     /// 是否为多凭据格式（数组格式才回写）
@@ -910,6 +910,7 @@ impl MultiTokenManager {
                         .bucket_policy_for(&cred)
                         .map(|policy| AdaptiveTokenBucket::new(policy, now)),
                     rate_limit_hit_streak: 0,
+                    refresh_lock: Arc::new(TokioMutex::new(())),
                 }
             })
             .collect();
@@ -938,7 +939,6 @@ impl MultiTokenManager {
             proxy,
             entries: Arc::new(Mutex::new(entries)),
             current_id: Mutex::new(initial_id),
-            refresh_lock: TokioMutex::new(()),
             credentials_path,
             is_multiple_format,
             dispatch_config: Mutex::new(dispatch_config),
@@ -986,12 +986,14 @@ impl MultiTokenManager {
         self.waiting_requests.load(Ordering::SeqCst)
     }
 
-    fn is_model_supported(credentials: &KiroCredentials, model: Option<&str>) -> bool {
-        let is_opus = model
-            .map(|m| m.to_lowercase().contains("opus"))
-            .unwrap_or(false);
+    fn model_requires_paid_tier(model: Option<&str>) -> bool {
+        model
+            .map(|name| name.to_ascii_lowercase().contains("opus"))
+            .unwrap_or(false)
+    }
 
-        !is_opus || credentials.supports_opus()
+    fn is_model_supported(credentials: &KiroCredentials, requires_paid_tier: bool) -> bool {
+        !requires_paid_tier || credentials.supports_opus()
     }
 
     fn has_capacity(
@@ -1007,15 +1009,19 @@ impl MultiTokenManager {
 
     fn refresh_runtime_state(entries: &mut [CredentialEntry], now: Instant) {
         for entry in entries {
-            if entry
-                .rate_limit_cooldown_until
-                .is_some_and(|until| until <= now)
-            {
-                entry.rate_limit_cooldown_until = None;
-            }
-            if let Some(bucket) = entry.rate_limit_bucket.as_mut() {
-                bucket.refill(now);
-            }
+            Self::refresh_entry_runtime(entry, now);
+        }
+    }
+
+    fn refresh_entry_runtime(entry: &mut CredentialEntry, now: Instant) {
+        if entry
+            .rate_limit_cooldown_until
+            .is_some_and(|until| until <= now)
+        {
+            entry.rate_limit_cooldown_until = None;
+        }
+        if let Some(bucket) = entry.rate_limit_bucket.as_mut() {
+            bucket.refill(now);
         }
     }
 
@@ -1056,16 +1062,40 @@ impl MultiTokenManager {
         }
     }
 
+    fn update_min_ready_at(
+        current: &mut Option<Instant>,
+        entry: &mut CredentialEntry,
+        now: Instant,
+    ) {
+        if let Some(ready_at) = Self::combined_ready_at(entry, now) {
+            *current = Some(match *current {
+                Some(existing) => existing.min(ready_at),
+                None => ready_at,
+            });
+        }
+    }
+
     fn next_ready_at(
         entries: &mut [CredentialEntry],
-        model: Option<&str>,
+        requires_paid_tier: bool,
         now: Instant,
     ) -> Option<Instant> {
         entries
             .iter_mut()
-            .filter(|entry| !entry.disabled && Self::is_model_supported(&entry.credentials, model))
+            .filter(|entry| {
+                !entry.disabled && Self::is_model_supported(&entry.credentials, requires_paid_tier)
+            })
             .filter_map(|entry| Self::combined_ready_at(entry, now))
             .min()
+    }
+
+    fn refresh_lock_for(&self, id: u64) -> anyhow::Result<Arc<TokioMutex<()>>> {
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| Arc::clone(&entry.refresh_lock))
+            .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))
     }
 
     fn sync_rate_limit_bucket_runtime(
@@ -1245,96 +1275,98 @@ impl MultiTokenManager {
         let mode = dispatch.mode;
         let mut entries = self.entries.lock();
         let now = Instant::now();
+        let requires_paid_tier = Self::model_requires_paid_tier(model);
 
         if entries.is_empty() {
             return Err(ReservationFailure::NoCredentials);
         }
 
-        Self::refresh_runtime_state(&mut entries, now);
+        let mut current_id = self.current_id.lock();
+        let current_id_value = *current_id;
+        let is_balanced = mode == "balanced";
+        let mut has_enabled = false;
+        let mut has_supported = false;
+        let mut selected_index: Option<usize> = None;
+        let mut priority_fallback_index: Option<usize> = None;
+        let mut priority_fallback_key: Option<(u32, usize, u64)> = None;
+        let mut balanced_key: Option<(usize, u64, u32, u64)> = None;
+        let mut next_ready_at: Option<Instant> = None;
 
-        let enabled_count = entries.iter().filter(|e| !e.disabled).count();
-        if enabled_count == 0 {
-            return Err(ReservationFailure::AllDisabled);
+        for (index, entry) in entries.iter_mut().enumerate() {
+            Self::refresh_entry_runtime(entry, now);
+
+            if entry.disabled {
+                continue;
+            }
+            has_enabled = true;
+
+            if !Self::is_model_supported(&entry.credentials, requires_paid_tier) {
+                continue;
+            }
+            has_supported = true;
+
+            let is_dispatchable = !Self::is_rate_limited(entry, now)
+                && Self::bucket_is_ready(entry)
+                && Self::has_capacity(
+                    &entry.credentials,
+                    entry.active_requests,
+                    dispatch.default_max_concurrency,
+                );
+
+            if !is_dispatchable {
+                Self::update_min_ready_at(&mut next_ready_at, entry, now);
+                continue;
+            }
+
+            if is_balanced {
+                let candidate_key = (
+                    entry.active_requests,
+                    entry.success_count,
+                    entry.credentials.priority,
+                    entry.id,
+                );
+                let should_select = balanced_key
+                    .as_ref()
+                    .map(|best_key| candidate_key < *best_key)
+                    .unwrap_or(true);
+                if should_select {
+                    balanced_key = Some(candidate_key);
+                    selected_index = Some(index);
+                }
+                continue;
+            }
+
+            if entry.id == current_id_value {
+                selected_index = Some(index);
+                break;
+            }
+
+            let candidate_key = (entry.credentials.priority, entry.active_requests, entry.id);
+            let should_select = priority_fallback_key
+                .as_ref()
+                .map(|best_key| candidate_key < *best_key)
+                .unwrap_or(true);
+            if should_select {
+                priority_fallback_key = Some(candidate_key);
+                priority_fallback_index = Some(index);
+            }
         }
 
-        let supported_count = entries
-            .iter()
-            .filter(|e| !e.disabled && Self::is_model_supported(&e.credentials, model))
-            .count();
-        if supported_count == 0 {
+        if !has_enabled {
+            return Err(ReservationFailure::AllDisabled);
+        }
+        if !has_supported {
             return Err(ReservationFailure::NoModelSupport);
         }
 
-        let mut current_id = self.current_id.lock();
-
-        let selected_id = if mode == "balanced" {
-            entries
-                .iter()
-                .filter(|e| {
-                    !e.disabled
-                        && Self::is_model_supported(&e.credentials, model)
-                        && !Self::is_rate_limited(e, now)
-                        && Self::bucket_is_ready(e)
-                        && Self::has_capacity(
-                            &e.credentials,
-                            e.active_requests,
-                            dispatch.default_max_concurrency,
-                        )
-                })
-                .min_by_key(|e| {
-                    (
-                        e.active_requests,
-                        e.success_count,
-                        e.credentials.priority,
-                        e.id,
-                    )
-                })
-                .map(|e| e.id)
-        } else {
-            let current_candidate = entries.iter().find(|e| {
-                e.id == *current_id
-                    && !e.disabled
-                    && Self::is_model_supported(&e.credentials, model)
-                    && !Self::is_rate_limited(e, now)
-                    && Self::bucket_is_ready(e)
-                    && Self::has_capacity(
-                        &e.credentials,
-                        e.active_requests,
-                        dispatch.default_max_concurrency,
-                    )
-            });
-
-            current_candidate.map(|e| e.id).or_else(|| {
-                entries
-                    .iter()
-                    .filter(|e| {
-                        !e.disabled
-                            && Self::is_model_supported(&e.credentials, model)
-                            && !Self::is_rate_limited(e, now)
-                            && Self::bucket_is_ready(e)
-                            && Self::has_capacity(
-                                &e.credentials,
-                                e.active_requests,
-                                dispatch.default_max_concurrency,
-                            )
-                    })
-                    .min_by_key(|e| (e.credentials.priority, e.active_requests, e.id))
-                    .map(|e| e.id)
-            })
-        };
-
-        let selected_id = match selected_id {
-            Some(id) => id,
+        let entry_index = match selected_index.or(priority_fallback_index) {
+            Some(index) => index,
             None => {
-                let next_ready_at = Self::next_ready_at(&mut entries, model, now);
                 return Err(ReservationFailure::AllTemporarilyUnavailable { next_ready_at });
             }
         };
 
-        let entry_index = entries
-            .iter()
-            .position(|e| e.id == selected_id)
-            .expect("selected credential should exist");
+        let selected_id = entries[entry_index].id;
         let token_consumed = {
             let entry = &mut entries[entry_index];
             entry
@@ -1343,7 +1375,7 @@ impl MultiTokenManager {
                 .map_or(true, |bucket| bucket.consume(now))
         };
         if !token_consumed {
-            let next_ready_at = Self::next_ready_at(&mut entries, model, now);
+            let next_ready_at = Self::next_ready_at(&mut entries, requires_paid_tier, now);
             return Err(ReservationFailure::AllTemporarilyUnavailable { next_ready_at });
         }
         let entry = &mut entries[entry_index];
@@ -1488,7 +1520,7 @@ impl MultiTokenManager {
 
     /// 尝试使用指定凭据获取有效 Token
     ///
-    /// 使用双重检查锁定模式，确保同一时间只有一个刷新操作
+    /// 使用双重检查锁定模式，确保同一凭据同一时间只有一个刷新操作
     ///
     /// # Arguments
     /// * `id` - 凭据 ID，用于更新正确的条目
@@ -1502,8 +1534,9 @@ impl MultiTokenManager {
         let needs_refresh = is_token_expired(credentials) || is_token_expiring_soon(credentials);
 
         let creds = if needs_refresh {
-            // 获取刷新锁，确保同一时间只有一个刷新操作
-            let _guard = self.refresh_lock.lock().await;
+            // 获取凭据级刷新锁，仅串行同一账号的刷新流程
+            let refresh_lock = self.refresh_lock_for(id)?;
+            let _guard = refresh_lock.lock().await;
 
             // 第二次检查：获取锁后重新读取凭据，因为其他请求可能已经完成刷新
             let current_creds = {
@@ -2283,7 +2316,8 @@ impl MultiTokenManager {
         let needs_refresh = is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
 
         let token = if needs_refresh {
-            let _guard = self.refresh_lock.lock().await;
+            let refresh_lock = self.refresh_lock_for(id)?;
+            let _guard = refresh_lock.lock().await;
             let current_creds = {
                 let entries = self.entries.lock();
                 entries
@@ -2464,6 +2498,7 @@ impl MultiTokenManager {
                 rate_limit_cooldown_until: None,
                 rate_limit_bucket,
                 rate_limit_hit_streak: 0,
+                refresh_lock: Arc::new(TokioMutex::new(())),
             });
         }
 
@@ -2555,8 +2590,9 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
 
-        // 获取刷新锁防止并发刷新
-        let _guard = self.refresh_lock.lock().await;
+        // 获取凭据级刷新锁，避免跨账号刷新串行阻塞
+        let refresh_lock = self.refresh_lock_for(id)?;
+        let _guard = refresh_lock.lock().await;
 
         // 无条件调用 refresh_token
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
@@ -3001,6 +3037,20 @@ mod tests {
         let second_entry = snapshot.entries.iter().find(|e| e.id == 2).unwrap();
         assert_eq!(first_entry.active_requests, 1);
         assert_eq!(second_entry.active_requests, 1);
+    }
+
+    #[tokio::test]
+    async fn test_priority_mode_skips_free_tier_for_opus_models_case_insensitively() {
+        let config = Config::default();
+        let mut free = available_credential(0);
+        free.subscription_title = Some("KIRO FREE".to_string());
+        let mut paid = available_credential(1);
+        paid.subscription_title = Some("KIRO PRO+".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![free, paid], None, None, false).unwrap();
+
+        let ctx = manager.acquire_context(Some("claude-OPUS-4")).await.unwrap();
+        assert_eq!(ctx.id, 2);
     }
 
     #[tokio::test]
