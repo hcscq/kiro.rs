@@ -3060,10 +3060,12 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     fn temp_credentials_path(test_name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "kiro-token-manager-{test_name}-{}.json",
+        let dir = std::env::temp_dir().join(format!(
+            "kiro-token-manager-{test_name}-{}",
             uuid::Uuid::new_v4()
-        ))
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("credentials.json")
     }
 
     fn write_credentials_file(path: &Path, credentials: &[KiroCredentials]) {

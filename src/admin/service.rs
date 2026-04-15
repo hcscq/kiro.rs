@@ -563,10 +563,12 @@ mod tests {
     use crate::model::config::Config;
 
     fn temp_credentials_path(test_name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "kiro-admin-service-{test_name}-{}.json",
+        let dir = std::env::temp_dir().join(format!(
+            "kiro-admin-service-{test_name}-{}",
             uuid::Uuid::new_v4()
-        ))
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("credentials.json")
     }
 
     fn available_credential() -> KiroCredentials {
