@@ -277,6 +277,7 @@ GitHub Actions 镜像构建：
 - 如果 PostgreSQL 中还没有凭据，会用本地 `credentials.json` 做一次种子导入
 - 如果配置了 Redis，Admin API 启动时会优先从 Redis 读取余额缓存
 - 如果配置了 Redis，启动时会先完成一次实例注册和 Leader 租约续约；失败会直接终止启动，避免多实例状态不一致
+- 如果配置了 Redis，Admin API 的写操作只允许由当前 leader 实例执行；命中 follower 会返回 `409` 或 `503`
 
 示例：
 

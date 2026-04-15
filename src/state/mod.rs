@@ -295,6 +295,13 @@ impl StateStore {
             .map(|coordinator| coordinator.heartbeat_interval())
     }
 
+    pub fn runtime_coordination_status(&self) -> anyhow::Result<Option<RuntimeCoordinationStatus>> {
+        self.runtime_coordinator
+            .as_ref()
+            .map(|coordinator| coordinator.current_status())
+            .transpose()
+    }
+
     pub fn runtime_coordination_tick(&self) -> anyhow::Result<Option<RuntimeCoordinationStatus>> {
         self.runtime_coordinator
             .as_ref()
@@ -726,6 +733,27 @@ impl RedisRuntimeCoordinator {
         self.acquire_or_renew_leader()
     }
 
+    fn current_status(&self) -> anyhow::Result<RuntimeCoordinationStatus> {
+        let client = self.client.clone();
+        let leader_key = self.leader_key();
+        let instance_id = self.instance_id.clone();
+
+        run_blocking_state_op(move || -> anyhow::Result<RuntimeCoordinationStatus> {
+            let mut connection = client
+                .get_connection()
+                .context("连接 Redis 运行时协调失败")?;
+            let leader_id: Option<String> = connection
+                .get(&leader_key)
+                .with_context(|| format!("读取 Redis Leader 状态失败: {leader_key}"))?;
+
+            Ok(RuntimeCoordinationStatus {
+                is_leader: leader_id.as_deref() == Some(instance_id.as_str()),
+                leader_id,
+                instance_id,
+            })
+        })
+    }
+
     fn publish_heartbeat(&self) -> anyhow::Result<()> {
         let client = self.client.clone();
         let instance_key = self.instance_key();
@@ -1052,6 +1080,18 @@ mod tests {
         };
         assert!(renewed.is_leader);
         assert_eq!(renewed.leader_id.as_deref(), Some(leader_id.as_str()));
+
+        let observer = RedisRuntimeCoordinator::connect(
+            &redis_url,
+            &namespace,
+            "instance-c".to_string(),
+            Duration::from_secs(1),
+            Duration::from_secs(3),
+        )
+        .unwrap();
+        let observed = observer.current_status().unwrap();
+        assert!(!observed.is_leader);
+        assert_eq!(observed.leader_id.as_deref(), Some(leader_id.as_str()));
 
         let cleanup_keys = vec![
             coordinator_a.leader_key(),

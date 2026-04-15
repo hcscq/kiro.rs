@@ -111,6 +111,8 @@ impl AdminService {
 
     /// 设置凭据禁用状态
     pub fn set_disabled(&self, id: u64, disabled: bool) -> Result<(), AdminServiceError> {
+        self.ensure_runtime_write_leader()?;
+
         // 先获取当前凭据 ID，用于判断是否需要切换
         let snapshot = self.token_manager.snapshot();
         let current_id = snapshot.current_id;
@@ -128,6 +130,8 @@ impl AdminService {
 
     /// 设置凭据优先级
     pub fn set_priority(&self, id: u64, priority: u32) -> Result<(), AdminServiceError> {
+        self.ensure_runtime_write_leader()?;
+
         self.token_manager
             .set_priority(id, priority)
             .map_err(|e| self.classify_error(e, id))
@@ -139,6 +143,8 @@ impl AdminService {
         id: u64,
         max_concurrency: Option<u32>,
     ) -> Result<(), AdminServiceError> {
+        self.ensure_runtime_write_leader()?;
+
         self.token_manager
             .set_max_concurrency(id, max_concurrency)
             .map_err(|e| self.classify_error(e, id))
@@ -151,6 +157,8 @@ impl AdminService {
         rate_limit_bucket_capacity: Option<Option<f64>>,
         rate_limit_refill_per_second: Option<Option<f64>>,
     ) -> Result<(), AdminServiceError> {
+        self.ensure_runtime_write_leader()?;
+
         self.token_manager
             .set_rate_limit_config(id, rate_limit_bucket_capacity, rate_limit_refill_per_second)
             .map_err(|e| self.classify_error(e, id))
@@ -158,6 +166,8 @@ impl AdminService {
 
     /// 重置失败计数并重新启用
     pub fn reset_and_enable(&self, id: u64) -> Result<(), AdminServiceError> {
+        self.ensure_runtime_write_leader()?;
+
         self.token_manager
             .reset_and_enable(id)
             .map_err(|e| self.classify_error(e, id))
@@ -229,6 +239,8 @@ impl AdminService {
         &self,
         req: AddCredentialRequest,
     ) -> Result<AddCredentialResponse, AdminServiceError> {
+        self.ensure_runtime_write_leader()?;
+
         // 构建凭据对象
         let email = req.email.clone();
         let new_cred = KiroCredentials {
@@ -279,6 +291,8 @@ impl AdminService {
 
     /// 删除凭据
     pub fn delete_credential(&self, id: u64) -> Result<(), AdminServiceError> {
+        self.ensure_runtime_write_leader()?;
+
         self.token_manager
             .delete_credential(id)
             .map_err(|e| self.classify_delete_error(e, id))?;
@@ -317,6 +331,8 @@ impl AdminService {
         &self,
         req: SetLoadBalancingModeRequest,
     ) -> Result<LoadBalancingModeResponse, AdminServiceError> {
+        self.ensure_runtime_write_leader()?;
+
         if req.mode.is_none()
             && req.queue_max_size.is_none()
             && req.queue_max_wait_ms.is_none()
@@ -358,6 +374,8 @@ impl AdminService {
 
     /// 强制刷新指定凭据的 Token
     pub async fn force_refresh_token(&self, id: u64) -> Result<(), AdminServiceError> {
+        self.ensure_runtime_write_leader()?;
+
         self.token_manager
             .force_refresh_token_for(id)
             .await
@@ -388,6 +406,26 @@ impl AdminService {
         if let Err(e) = self.token_manager.state_store().save_balance_cache(&cache) {
             tracing::warn!("保存余额缓存失败: {}", e);
         }
+    }
+
+    fn ensure_runtime_write_leader(&self) -> Result<(), AdminServiceError> {
+        let Some(status) = self
+            .token_manager
+            .state_store()
+            .runtime_coordination_status()
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?
+        else {
+            return Ok(());
+        };
+
+        if status.is_leader {
+            return Ok(());
+        }
+
+        Err(AdminServiceError::NotLeader {
+            instance_id: status.instance_id,
+            leader_id: status.leader_id,
+        })
     }
 
     // ============ 错误分类 ============
