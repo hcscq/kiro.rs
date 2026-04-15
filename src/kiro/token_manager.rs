@@ -27,6 +27,7 @@ use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
 use crate::state::{
     PersistedDispatchConfig, RuntimeCoordinationStatus, StateStore, StatsEntryRecord,
+    StatsMergeRecord,
 };
 
 /// 检查 Token 是否在指定时间内过期
@@ -417,6 +418,8 @@ struct CredentialEntry {
     disabled_reason: Option<DisabledReason>,
     /// API 调用成功次数
     success_count: u64,
+    /// 自上次成功落盘后的新增成功次数，用于跨实例合并统计
+    pending_success_count_delta: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
     /// 当前运行中的请求数
@@ -931,6 +934,7 @@ impl MultiTokenManager {
                         None
                     },
                     success_count: 0,
+                    pending_success_count_delta: 0,
                     last_used_at: None,
                     active_requests: 0,
                     rate_limit_cooldown_until: None,
@@ -1862,6 +1866,7 @@ impl MultiTokenManager {
                     failure_count: 0,
                     refresh_failure_count: 0,
                     success_count: 0,
+                    pending_success_count_delta: 0,
                     last_used_at: None,
                     active_requests: 0,
                     rate_limit_cooldown_until: None,
@@ -1901,8 +1906,13 @@ impl MultiTokenManager {
         let mut entries = self.entries.lock();
         for entry in entries.iter_mut() {
             if let Some(s) = stats.get(&entry.id.to_string()) {
-                entry.success_count = s.success_count;
-                entry.last_used_at = s.last_used_at.clone();
+                entry.success_count = s
+                    .success_count
+                    .saturating_add(entry.pending_success_count_delta);
+                entry.last_used_at = s
+                    .last_used_at
+                    .clone()
+                    .or_else(|| entry.last_used_at.clone());
             }
         }
         *self.last_stats_save_at.lock() = Some(Instant::now());
@@ -1912,6 +1922,43 @@ impl MultiTokenManager {
 
     /// 将当前统计数据持久化到磁盘
     fn save_stats(&self) {
+        let updates: HashMap<String, StatsMergeRecord> = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .map(|e| {
+                    (
+                        e.id.to_string(),
+                        StatsMergeRecord {
+                            success_count_delta: e.pending_success_count_delta,
+                            last_used_at: e.last_used_at.clone(),
+                        },
+                    )
+                })
+                .collect()
+        };
+
+        match self.state_store.merge_stats(&updates) {
+            Ok(merged_stats) => {
+                let mut entries = self.entries.lock();
+                for entry in entries.iter_mut() {
+                    if let Some(merged) = merged_stats.get(&entry.id.to_string()) {
+                        entry.success_count = merged.success_count;
+                        entry.last_used_at = merged.last_used_at.clone();
+                    }
+                    entry.pending_success_count_delta = 0;
+                }
+                *self.last_stats_save_at.lock() = Some(Instant::now());
+                self.stats_dirty.store(false, Ordering::Relaxed);
+            }
+            Err(e) => tracing::warn!("保存统计缓存失败: {}", e),
+        }
+    }
+
+    /// 使用当前内存快照全量覆盖统计缓存。
+    ///
+    /// 仅用于需要裁剪已删除凭据残留统计的场景。
+    fn rewrite_stats_snapshot(&self) {
         let stats: HashMap<String, StatsEntryRecord> = {
             let entries = self.entries.lock();
             entries
@@ -1930,10 +1977,14 @@ impl MultiTokenManager {
 
         match self.state_store.save_stats(&stats) {
             Ok(()) => {
+                let mut entries = self.entries.lock();
+                for entry in entries.iter_mut() {
+                    entry.pending_success_count_delta = 0;
+                }
                 *self.last_stats_save_at.lock() = Some(Instant::now());
                 self.stats_dirty.store(false, Ordering::Relaxed);
             }
-            Err(e) => tracing::warn!("保存统计缓存失败: {}", e),
+            Err(e) => tracing::warn!("全量重写统计缓存失败: {}", e),
         }
     }
 
@@ -1978,6 +2029,7 @@ impl MultiTokenManager {
                 }
                 entry.rate_limit_hit_streak = 0;
                 entry.success_count += 1;
+                entry.pending_success_count_delta += 1;
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
                 tracing::debug!(
                     "凭据 #{} API 调用成功（累计 {} 次）",
@@ -2643,6 +2695,7 @@ impl MultiTokenManager {
                 disabled: false,
                 disabled_reason: None,
                 success_count: 0,
+                pending_success_count_delta: 0,
                 last_used_at: None,
                 active_requests: 0,
                 rate_limit_cooldown_until: None,
@@ -2720,7 +2773,7 @@ impl MultiTokenManager {
         self.persist_credentials()?;
 
         // 立即回写统计数据，清除已删除凭据的残留条目
-        self.save_stats();
+        self.rewrite_stats_snapshot();
 
         tracing::info!("已删除凭据 #{}", id);
         Ok(())
@@ -3513,6 +3566,44 @@ mod tests {
         assert_eq!(snapshot.rate_limit_refill_backoff_factor, 0.6);
 
         assert!(!manager.apply_dispatch_config_from_state(&persisted));
+    }
+
+    #[test]
+    fn test_save_stats_merges_success_counts_across_managers() {
+        let credentials_path = temp_credentials_path("merge-success-counts");
+        let mut credential = available_credential(0);
+        credential.id = Some(1);
+        credential.machine_id = Some("machine-1".to_string());
+
+        let manager_a = MultiTokenManager::new(
+            Config::default(),
+            vec![credential.clone()],
+            None,
+            Some(credentials_path.clone()),
+            false,
+        )
+        .unwrap();
+        let manager_b = MultiTokenManager::new(
+            Config::default(),
+            vec![credential],
+            None,
+            Some(credentials_path.clone()),
+            false,
+        )
+        .unwrap();
+
+        manager_a.report_success(1);
+        manager_b.report_success(1);
+
+        drop(manager_a);
+        drop(manager_b);
+
+        let store = StateStore::file(None, Some(credentials_path.clone()));
+        let stats = store.load_stats().unwrap();
+        assert_eq!(stats.get("1").unwrap().success_count, 2);
+
+        let stats_path = credentials_path.parent().unwrap().join("kiro_stats.json");
+        std::fs::remove_file(stats_path).unwrap();
     }
 
     #[test]

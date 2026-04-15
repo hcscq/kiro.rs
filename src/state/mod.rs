@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
+use chrono::DateTime;
 use parking_lot::Mutex;
 use postgres::{Client, NoTls};
 use redis::{Client as RedisClient, Commands, Script};
@@ -58,6 +59,12 @@ impl PersistedCredentials {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatsEntryRecord {
     pub success_count: u64,
+    pub last_used_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StatsMergeRecord {
+    pub success_count_delta: u64,
     pub last_used_at: Option<String>,
 }
 
@@ -172,6 +179,10 @@ trait StateBackend: Send + Sync {
     ) -> anyhow::Result<bool>;
     fn load_stats(&self) -> anyhow::Result<HashMap<String, StatsEntryRecord>>;
     fn save_stats(&self, stats: &HashMap<String, StatsEntryRecord>) -> anyhow::Result<()>;
+    fn merge_stats(
+        &self,
+        updates: &HashMap<String, StatsMergeRecord>,
+    ) -> anyhow::Result<HashMap<String, StatsEntryRecord>>;
     fn load_balance_cache(&self) -> anyhow::Result<HashMap<u64, CachedBalanceRecord>>;
     fn save_balance_cache(&self, cache: &HashMap<u64, CachedBalanceRecord>) -> anyhow::Result<()>;
     fn persist_dispatch_config(&self, dispatch: &PersistedDispatchConfig) -> anyhow::Result<()>;
@@ -267,6 +278,13 @@ impl StateStore {
         self.primary_backend.save_stats(stats)
     }
 
+    pub fn merge_stats(
+        &self,
+        updates: &HashMap<String, StatsMergeRecord>,
+    ) -> anyhow::Result<HashMap<String, StatsEntryRecord>> {
+        self.primary_backend.merge_stats(updates)
+    }
+
     pub fn load_balance_cache(&self) -> anyhow::Result<HashMap<u64, CachedBalanceRecord>> {
         self.balance_cache_backend.load_balance_cache()
     }
@@ -308,6 +326,51 @@ impl StateStore {
             .map(|coordinator| coordinator.tick())
             .transpose()
     }
+}
+
+fn newer_timestamp(current: Option<String>, candidate: Option<String>) -> Option<String> {
+    match (current, candidate) {
+        (None, other) | (other, None) => other,
+        (Some(current), Some(candidate)) => {
+            let current_parsed = DateTime::parse_from_rfc3339(&current).ok();
+            let candidate_parsed = DateTime::parse_from_rfc3339(&candidate).ok();
+
+            match (current_parsed, candidate_parsed) {
+                (Some(current_parsed), Some(candidate_parsed)) => {
+                    if candidate_parsed > current_parsed {
+                        Some(candidate)
+                    } else {
+                        Some(current)
+                    }
+                }
+                _ => {
+                    if candidate > current {
+                        Some(candidate)
+                    } else {
+                        Some(current)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn merge_stats_records(
+    mut stats: HashMap<String, StatsEntryRecord>,
+    updates: &HashMap<String, StatsMergeRecord>,
+) -> HashMap<String, StatsEntryRecord> {
+    for (key, update) in updates {
+        let entry = stats.entry(key.clone()).or_insert_with(|| StatsEntryRecord {
+            success_count: 0,
+            last_used_at: None,
+        });
+        entry.success_count = entry
+            .success_count
+            .saturating_add(update.success_count_delta);
+        entry.last_used_at = newer_timestamp(entry.last_used_at.take(), update.last_used_at.clone());
+    }
+
+    stats
 }
 
 fn run_blocking_state_op<R, F>(operation: F) -> R
@@ -427,6 +490,15 @@ impl StateBackend for FileStateBackend {
 
         let json = serde_json::to_vec_pretty(stats).context("序列化统计缓存失败")?;
         Self::write_bytes(&path, json)
+    }
+
+    fn merge_stats(
+        &self,
+        updates: &HashMap<String, StatsMergeRecord>,
+    ) -> anyhow::Result<HashMap<String, StatsEntryRecord>> {
+        let merged = merge_stats_records(self.load_stats()?, updates);
+        self.save_stats(&merged)?;
+        Ok(merged)
     }
 
     fn load_balance_cache(&self) -> anyhow::Result<HashMap<u64, CachedBalanceRecord>> {
@@ -619,6 +691,58 @@ impl StateBackend for PostgresStateBackend {
 
     fn save_stats(&self, stats: &HashMap<String, StatsEntryRecord>) -> anyhow::Result<()> {
         self.save_json(POSTGRES_STATS_KEY, stats, "统计缓存")
+    }
+
+    fn merge_stats(
+        &self,
+        updates: &HashMap<String, StatsMergeRecord>,
+    ) -> anyhow::Result<HashMap<String, StatsEntryRecord>> {
+        let client = Arc::clone(&self.client);
+        let updates = updates.clone();
+
+        run_blocking_state_op(move || {
+            let mut client = client.lock();
+            let mut transaction = client.transaction().context("开启 PostgreSQL 统计事务失败")?;
+            let empty_payload = "{}".to_string();
+
+            transaction
+                .execute(
+                    r#"
+                    INSERT INTO kiro_state_store (namespace, key, value, updated_at)
+                    VALUES ($1, $2, $3, NOW())
+                    ON CONFLICT (namespace, key) DO NOTHING
+                    "#,
+                    &[&POSTGRES_NAMESPACE, &POSTGRES_STATS_KEY, &empty_payload],
+                )
+                .context("初始化 PostgreSQL 统计缓存行失败")?;
+
+            let row = transaction
+                .query_one(
+                    "SELECT value FROM kiro_state_store WHERE namespace = $1 AND key = $2 FOR UPDATE",
+                    &[&POSTGRES_NAMESPACE, &POSTGRES_STATS_KEY],
+                )
+                .context("锁定 PostgreSQL 统计缓存失败")?;
+            let payload: String = row.get(0);
+            let stats: HashMap<String, StatsEntryRecord> = serde_json::from_str(&payload)
+                .context("解析 PostgreSQL 统计缓存失败")?;
+            let merged = merge_stats_records(stats, &updates);
+            let merged_payload =
+                serde_json::to_string(&merged).context("序列化 PostgreSQL 合并统计失败")?;
+
+            transaction
+                .execute(
+                    r#"
+                    UPDATE kiro_state_store
+                    SET value = $3, updated_at = NOW()
+                    WHERE namespace = $1 AND key = $2
+                    "#,
+                    &[&POSTGRES_NAMESPACE, &POSTGRES_STATS_KEY, &merged_payload],
+                )
+                .context("写回 PostgreSQL 合并统计失败")?;
+
+            transaction.commit().context("提交 PostgreSQL 统计事务失败")?;
+            Ok(merged)
+        })
     }
 
     fn load_balance_cache(&self) -> anyhow::Result<HashMap<u64, CachedBalanceRecord>> {
@@ -922,6 +1046,56 @@ mod tests {
 
         assert!(!persisted);
         assert!(!credentials_path.exists());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn file_state_store_merges_stats_deltas() {
+        let dir = temp_test_dir("merge-stats");
+        let credentials_path = dir.join("credentials.json");
+        let store = StateStore::file(None, Some(credentials_path));
+
+        let mut initial = HashMap::new();
+        initial.insert(
+            "7".to_string(),
+            StatsEntryRecord {
+                success_count: 11,
+                last_used_at: Some("2026-04-15T00:00:00Z".to_string()),
+            },
+        );
+        store.save_stats(&initial).unwrap();
+
+        let mut updates = HashMap::new();
+        updates.insert(
+            "7".to_string(),
+            StatsMergeRecord {
+                success_count_delta: 2,
+                last_used_at: Some("2026-04-15T01:00:00Z".to_string()),
+            },
+        );
+        updates.insert(
+            "8".to_string(),
+            StatsMergeRecord {
+                success_count_delta: 1,
+                last_used_at: Some("2026-04-15T00:30:00Z".to_string()),
+            },
+        );
+
+        let merged = store.merge_stats(&updates).unwrap();
+        assert_eq!(merged.get("7").unwrap().success_count, 13);
+        assert_eq!(
+            merged.get("7").unwrap().last_used_at.as_deref(),
+            Some("2026-04-15T01:00:00Z")
+        );
+        assert_eq!(merged.get("8").unwrap().success_count, 1);
+
+        let reloaded = store.load_stats().unwrap();
+        assert_eq!(reloaded.get("7").unwrap().success_count, 13);
+        assert_eq!(
+            reloaded.get("7").unwrap().last_used_at.as_deref(),
+            Some("2026-04-15T01:00:00Z")
+        );
 
         fs::remove_dir_all(&dir).unwrap();
     }
