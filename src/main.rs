@@ -5,6 +5,7 @@ mod common;
 mod http_client;
 mod kiro;
 mod model;
+mod state;
 pub mod token;
 
 use std::sync::Arc;

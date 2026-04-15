@@ -1,15 +1,14 @@
 //! Admin API 业务逻辑服务
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::Utc;
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
 
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
+use crate::state::CachedBalanceRecord;
 
 use super::error::AdminServiceError;
 use super::types::{
@@ -20,36 +19,37 @@ use super::types::{
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
 
-/// 缓存的余额条目（含时间戳）
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CachedBalance {
-    /// 缓存时间（Unix 秒）
-    cached_at: f64,
-    /// 缓存的余额数据
-    data: BalanceResponse,
-}
-
 /// Admin 服务
 ///
 /// 封装所有 Admin API 的业务逻辑
 pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
-    balance_cache: Mutex<HashMap<u64, CachedBalance>>,
-    cache_path: Option<PathBuf>,
+    balance_cache: Mutex<HashMap<u64, CachedBalanceRecord>>,
 }
 
 impl AdminService {
     pub fn new(token_manager: Arc<MultiTokenManager>) -> Self {
-        let cache_path = token_manager
-            .cache_dir()
-            .map(|d| d.join("kiro_balance_cache.json"));
-
-        let balance_cache = Self::load_balance_cache_from(&cache_path);
+        let state_store = token_manager.state_store();
+        let balance_cache = match state_store.load_balance_cache() {
+            Ok(cache) => {
+                let original_len = cache.len();
+                let pruned = Self::prune_expired_balance_cache(cache);
+                if pruned.len() != original_len {
+                    if let Err(e) = state_store.save_balance_cache(&pruned) {
+                        tracing::warn!("清理过期余额缓存回写失败: {}", e);
+                    }
+                }
+                pruned
+            }
+            Err(e) => {
+                tracing::warn!("解析余额缓存失败，将忽略: {}", e);
+                HashMap::new()
+            }
+        };
 
         Self {
             token_manager,
             balance_cache: Mutex::new(balance_cache),
-            cache_path,
         }
     }
 
@@ -185,7 +185,7 @@ impl AdminService {
             let mut cache = self.balance_cache.lock();
             cache.insert(
                 id,
-                CachedBalance {
+                CachedBalanceRecord {
                     cached_at: Utc::now().timestamp() as f64,
                     data: balance.clone(),
                 },
@@ -366,33 +366,16 @@ impl AdminService {
 
     // ============ 余额缓存持久化 ============
 
-    fn load_balance_cache_from(cache_path: &Option<PathBuf>) -> HashMap<u64, CachedBalance> {
-        let path = match cache_path {
-            Some(p) => p,
-            None => return HashMap::new(),
-        };
-
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(_) => return HashMap::new(),
-        };
-
-        // 文件中使用字符串 key 以兼容 JSON 格式
-        let map: HashMap<String, CachedBalance> = match serde_json::from_str(&content) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!("解析余额缓存失败，将忽略: {}", e);
-                return HashMap::new();
-            }
-        };
-
+    fn prune_expired_balance_cache(
+        cache: HashMap<u64, CachedBalanceRecord>,
+    ) -> HashMap<u64, CachedBalanceRecord> {
         let now = Utc::now().timestamp() as f64;
-        map.into_iter()
-            .filter_map(|(k, v)| {
-                let id = k.parse::<u64>().ok()?;
+        cache
+            .into_iter()
+            .filter_map(|(id, entry)| {
                 // 丢弃超过 TTL 的条目
-                if (now - v.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
-                    Some((id, v))
+                if (now - entry.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
+                    Some((id, entry))
                 } else {
                     None
                 }
@@ -401,23 +384,9 @@ impl AdminService {
     }
 
     fn save_balance_cache(&self) {
-        let path = match &self.cache_path {
-            Some(p) => p,
-            None => return,
-        };
-
-        // 持有锁期间完成序列化和写入，防止并发损坏
-        let cache = self.balance_cache.lock();
-        let map: HashMap<String, &CachedBalance> =
-            cache.iter().map(|(k, v)| (k.to_string(), v)).collect();
-
-        match serde_json::to_string_pretty(&map) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(path, json) {
-                    tracing::warn!("保存余额缓存失败: {}", e);
-                }
-            }
-            Err(e) => tracing::warn!("序列化余额缓存失败: {}", e),
+        let cache = self.balance_cache.lock().clone();
+        if let Err(e) = self.token_manager.state_store().save_balance_cache(&cache) {
+            tracing::warn!("保存余额缓存失败: {}", e);
         }
     }
 

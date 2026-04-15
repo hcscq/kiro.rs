@@ -6,7 +6,7 @@
 use anyhow::bail;
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as TokioMutex, Notify};
 
@@ -25,6 +25,7 @@ use crate::kiro::model::token_refresh::{
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
+use crate::state::{PersistedDispatchConfig, StateStore, StatsEntryRecord};
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -419,12 +420,6 @@ enum DisabledReason {
 }
 
 /// 统计数据持久化条目
-#[derive(Serialize, Deserialize)]
-struct StatsEntry {
-    success_count: u64,
-    last_used_at: Option<String>,
-}
-
 #[derive(Debug, Clone, Copy)]
 struct TokenBucketPolicy {
     capacity: f64,
@@ -755,12 +750,11 @@ impl DispatchConfig {
 pub struct MultiTokenManager {
     config: Config,
     proxy: Option<ProxyConfig>,
+    state_store: StateStore,
     /// 凭据条目列表
     entries: Arc<Mutex<Vec<CredentialEntry>>>,
     /// 当前活动凭据 ID
     current_id: Mutex<u64>,
-    /// 凭据文件路径（用于回写）
-    credentials_path: Option<PathBuf>,
     /// 是否为多凭据格式（数组格式才回写）
     is_multiple_format: bool,
     /// 调度配置（负载均衡模式、排队参数）
@@ -862,6 +856,10 @@ impl MultiTokenManager {
         credentials_path: Option<PathBuf>,
         is_multiple_format: bool,
     ) -> anyhow::Result<Self> {
+        let state_store = StateStore::file(
+            config.config_path().map(|path| path.to_path_buf()),
+            credentials_path.clone(),
+        );
         let dispatch_config = DispatchConfig::from_config(&config);
         let now = Instant::now();
 
@@ -937,9 +935,9 @@ impl MultiTokenManager {
         let manager = Self {
             config,
             proxy,
+            state_store,
             entries: Arc::new(Mutex::new(entries)),
             current_id: Mutex::new(initial_id),
-            credentials_path,
             is_multiple_format,
             dispatch_config: Mutex::new(dispatch_config),
             availability_notify: Arc::new(Notify::new()),
@@ -1607,19 +1605,6 @@ impl MultiTokenManager {
     /// - `Ok(false)` - 跳过写入（非多凭据格式或无路径配置）
     /// - `Err(_)` - 写入失败
     fn persist_credentials(&self) -> anyhow::Result<bool> {
-        use anyhow::Context;
-
-        // 仅多凭据格式才回写
-        if !self.is_multiple_format {
-            return Ok(false);
-        }
-
-        let path = match &self.credentials_path {
-            Some(p) => p,
-            None => return Ok(false),
-        };
-
-        // 收集所有凭据
         let credentials: Vec<KiroCredentials> = {
             let entries = self.entries.lock();
             entries
@@ -1634,49 +1619,20 @@ impl MultiTokenManager {
                 .collect()
         };
 
-        // 序列化为 pretty JSON
-        let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
-
-        // 写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| std::fs::write(path, &json))
-                .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
-        } else {
-            std::fs::write(path, &json).with_context(|| format!("回写凭据文件失败: {:?}", path))?;
-        }
-
-        tracing::debug!("已回写凭据到文件: {:?}", path);
-        Ok(true)
+        self.state_store
+            .persist_credentials(&credentials, self.is_multiple_format)
     }
 
-    /// 获取缓存目录（凭据文件所在目录）
-    pub fn cache_dir(&self) -> Option<PathBuf> {
-        self.credentials_path
-            .as_ref()
-            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-    }
-
-    /// 统计数据文件路径
-    fn stats_path(&self) -> Option<PathBuf> {
-        self.cache_dir().map(|d| d.join("kiro_stats.json"))
+    pub fn state_store(&self) -> StateStore {
+        self.state_store.clone()
     }
 
     /// 从磁盘加载统计数据并应用到当前条目
     fn load_stats(&self) {
-        let path = match self.stats_path() {
-            Some(p) => p,
-            None => return,
-        };
-
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => return, // 首次运行时文件不存在
-        };
-
-        let stats: HashMap<String, StatsEntry> = match serde_json::from_str(&content) {
-            Ok(s) => s,
+        let stats = match self.state_store.load_stats() {
+            Ok(stats) => stats,
             Err(e) => {
-                tracing::warn!("解析统计缓存失败，将忽略: {}", e);
+                tracing::warn!("加载统计缓存失败，将忽略: {}", e);
                 return;
             }
         };
@@ -1695,19 +1651,14 @@ impl MultiTokenManager {
 
     /// 将当前统计数据持久化到磁盘
     fn save_stats(&self) {
-        let path = match self.stats_path() {
-            Some(p) => p,
-            None => return,
-        };
-
-        let stats: HashMap<String, StatsEntry> = {
+        let stats: HashMap<String, StatsEntryRecord> = {
             let entries = self.entries.lock();
             entries
                 .iter()
                 .map(|e| {
                     (
                         e.id.to_string(),
-                        StatsEntry {
+                        StatsEntryRecord {
                             success_count: e.success_count,
                             last_used_at: e.last_used_at.clone(),
                         },
@@ -1716,16 +1667,12 @@ impl MultiTokenManager {
                 .collect()
         };
 
-        match serde_json::to_string_pretty(&stats) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
-                    tracing::warn!("保存统计缓存失败: {}", e);
-                } else {
-                    *self.last_stats_save_at.lock() = Some(Instant::now());
-                    self.stats_dirty.store(false, Ordering::Relaxed);
-                }
+        match self.state_store.save_stats(&stats) {
+            Ok(()) => {
+                *self.last_stats_save_at.lock() = Some(Instant::now());
+                self.stats_dirty.store(false, Ordering::Relaxed);
             }
-            Err(e) => tracing::warn!("序列化统计数据失败: {}", e),
+            Err(e) => tracing::warn!("保存统计缓存失败: {}", e),
         }
     }
 
@@ -2641,46 +2588,20 @@ impl MultiTokenManager {
     }
 
     fn persist_dispatch_config(&self, dispatch: &DispatchConfig) -> anyhow::Result<()> {
-        use anyhow::Context;
-
-        let config_path = match self.config.config_path() {
-            Some(path) => path.to_path_buf(),
-            None => {
-                tracing::warn!(
-                    "配置文件路径未知，调度配置仅在当前进程生效: mode={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, defaultMaxConcurrency={:?}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}",
-                    dispatch.mode,
-                    dispatch.queue_max_size,
-                    dispatch.queue_max_wait_ms,
-                    dispatch.rate_limit_cooldown_ms,
-                    dispatch.default_max_concurrency,
-                    dispatch.rate_limit_bucket_capacity,
-                    dispatch.rate_limit_refill_per_second,
-                    dispatch.rate_limit_refill_min_per_second,
-                    dispatch.rate_limit_refill_recovery_step_per_success,
-                    dispatch.rate_limit_refill_backoff_factor
-                );
-                return Ok(());
-            }
-        };
-
-        let mut config = Config::load(&config_path)
-            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
-        config.load_balancing_mode = dispatch.mode.clone();
-        config.queue_max_size = dispatch.queue_max_size;
-        config.queue_max_wait_ms = dispatch.queue_max_wait_ms;
-        config.rate_limit_cooldown_ms = dispatch.rate_limit_cooldown_ms;
-        config.default_max_concurrency = dispatch.default_max_concurrency;
-        config.rate_limit_bucket_capacity = dispatch.rate_limit_bucket_capacity;
-        config.rate_limit_refill_per_second = dispatch.rate_limit_refill_per_second;
-        config.rate_limit_refill_min_per_second = dispatch.rate_limit_refill_min_per_second;
-        config.rate_limit_refill_recovery_step_per_success =
-            dispatch.rate_limit_refill_recovery_step_per_success;
-        config.rate_limit_refill_backoff_factor = dispatch.rate_limit_refill_backoff_factor;
-        config
-            .save()
-            .with_context(|| format!("持久化调度配置失败: {}", config_path.display()))?;
-
-        Ok(())
+        self.state_store
+            .persist_dispatch_config(&PersistedDispatchConfig {
+                mode: dispatch.mode.clone(),
+                queue_max_size: dispatch.queue_max_size,
+                queue_max_wait_ms: dispatch.queue_max_wait_ms,
+                rate_limit_cooldown_ms: dispatch.rate_limit_cooldown_ms,
+                default_max_concurrency: dispatch.default_max_concurrency,
+                rate_limit_bucket_capacity: dispatch.rate_limit_bucket_capacity,
+                rate_limit_refill_per_second: dispatch.rate_limit_refill_per_second,
+                rate_limit_refill_min_per_second: dispatch.rate_limit_refill_min_per_second,
+                rate_limit_refill_recovery_step_per_success: dispatch
+                    .rate_limit_refill_recovery_step_per_success,
+                rate_limit_refill_backoff_factor: dispatch.rate_limit_refill_backoff_factor,
+            })
     }
 
     /// 设置负载均衡模式（Admin API）
