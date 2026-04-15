@@ -16,7 +16,7 @@ use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
 use model::arg::Args;
 use model::config::Config;
-use state::{PersistedCredentials, PersistedDispatchConfig, StateStore};
+use state::{PersistedCredentials, PersistedDispatchConfig, RuntimeCoordinationStatus, StateStore};
 
 #[tokio::main]
 async fn main() {
@@ -46,8 +46,8 @@ async fn main() {
         .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
     let credentials_path_buf: std::path::PathBuf = credentials_path.clone().into();
 
-    let state_store =
-        StateStore::from_config(&config, Some(credentials_path_buf.clone())).unwrap_or_else(|e| {
+    let state_store = StateStore::from_config(&config, Some(credentials_path_buf.clone()))
+        .unwrap_or_else(|e| {
             tracing::error!("初始化状态存储失败: {}", e);
             std::process::exit(1);
         });
@@ -104,6 +104,48 @@ async fn main() {
     let is_multiple_format = persisted_credentials.is_multiple_format;
     let credentials_list = persisted_credentials.credentials;
     tracing::info!("已加载 {} 个凭据配置", credentials_list.len());
+
+    if state_store.runtime_coordination_enabled() {
+        let initial_status = state_store
+            .runtime_coordination_tick()
+            .unwrap_or_else(|e| {
+                tracing::error!("初始化 Redis 运行时协调失败: {}", e);
+                std::process::exit(1);
+            })
+            .expect("runtime coordination tick should return status when enabled");
+        tracing::info!(
+            instance_id = %initial_status.instance_id,
+            heartbeat_interval_secs = config.state_redis_heartbeat_interval_secs,
+            leader_lease_ttl_secs = config.state_redis_leader_lease_ttl_secs,
+            "已启用 Redis 运行时协调"
+        );
+        log_runtime_coordination_status(&initial_status, None);
+
+        let heartbeat_interval = state_store
+            .runtime_coordination_interval()
+            .expect("runtime coordination interval should exist");
+        let state_store = state_store.clone();
+        tokio::spawn(async move {
+            let mut previous_status = initial_status;
+            loop {
+                tokio::time::sleep(heartbeat_interval).await;
+                match state_store.runtime_coordination_tick() {
+                    Ok(Some(status)) => {
+                        log_runtime_coordination_status(&status, Some(&previous_status));
+                        previous_status = status;
+                    }
+                    Ok(None) => break,
+                    Err(err) => {
+                        tracing::error!(
+                            instance_id = %previous_status.instance_id,
+                            "Redis 运行时协调续租失败: {}",
+                            err
+                        );
+                    }
+                }
+            }
+        });
+    }
 
     // 获取第一个凭据用于日志显示
     let first_credentials = credentials_list.first().cloned().unwrap_or_default();
@@ -206,4 +248,37 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+fn log_runtime_coordination_status(
+    status: &RuntimeCoordinationStatus,
+    previous: Option<&RuntimeCoordinationStatus>,
+) {
+    if previous.is_some_and(|current| {
+        current.is_leader == status.is_leader && current.leader_id == status.leader_id
+    }) {
+        return;
+    }
+
+    if status.is_leader {
+        tracing::info!(
+            instance_id = %status.instance_id,
+            "Redis 运行时协调: 当前实例持有 leader 租约"
+        );
+        return;
+    }
+
+    if let Some(leader_id) = &status.leader_id {
+        tracing::info!(
+            instance_id = %status.instance_id,
+            leader_id = %leader_id,
+            "Redis 运行时协调: 当前实例处于 follower"
+        );
+        return;
+    }
+
+    tracing::warn!(
+        instance_id = %status.instance_id,
+        "Redis 运行时协调: 当前未观察到 leader"
+    );
 }

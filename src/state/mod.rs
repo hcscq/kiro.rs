@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use parking_lot::Mutex;
 use postgres::{Client, NoTls};
-use redis::{Client as RedisClient, Commands};
+use redis::{Client as RedisClient, Commands, Script};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::RuntimeFlavor;
@@ -23,6 +24,21 @@ const POSTGRES_BALANCE_CACHE_KEY: &str = "balance_cache";
 const POSTGRES_DISPATCH_CONFIG_KEY: &str = "dispatch_config";
 const REDIS_BALANCE_CACHE_KEY: &str = "kiro:runtime:balance_cache";
 const REDIS_BALANCE_CACHE_TTL_SECS: u64 = 86_400;
+const REDIS_RUNTIME_COORDINATION_NAMESPACE: &str = "kiro:runtime:coordination";
+const REDIS_RUNTIME_INSTANCE_KEY_PREFIX: &str = "instances";
+const REDIS_RUNTIME_LEADER_KEY: &str = "leader";
+const REDIS_RUNTIME_LEADER_SCRIPT: &str = r#"
+local current = redis.call('GET', KEYS[1])
+if not current then
+  redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2], 'NX')
+  return {'acquired', ARGV[1]}
+end
+if current == ARGV[1] then
+  redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2], 'XX')
+  return {'renewed', ARGV[1]}
+end
+return {'held', current}
+"#;
 
 #[derive(Debug, Clone)]
 pub struct PersistedCredentials {
@@ -111,10 +127,7 @@ impl BalanceCacheStore {
         }
     }
 
-    fn save_balance_cache(
-        &self,
-        cache: &HashMap<u64, CachedBalanceRecord>,
-    ) -> anyhow::Result<()> {
+    fn save_balance_cache(&self, cache: &HashMap<u64, CachedBalanceRecord>) -> anyhow::Result<()> {
         match self {
             Self::Primary(backend) => backend.save_balance_cache(cache),
             Self::Redis(backend) => backend.save_balance_cache(cache),
@@ -122,10 +135,24 @@ impl BalanceCacheStore {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeCoordinationStatus {
+    pub instance_id: String,
+    pub leader_id: Option<String>,
+    pub is_leader: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RuntimeInstanceHeartbeat {
+    instance_id: String,
+    observed_at_epoch_secs: u64,
+}
+
 #[derive(Clone)]
 pub struct StateStore {
     primary_backend: Arc<dyn StateBackend>,
     balance_cache_backend: BalanceCacheStore,
+    runtime_coordinator: Option<Arc<RedisRuntimeCoordinator>>,
 }
 
 impl std::fmt::Debug for StateStore {
@@ -152,21 +179,22 @@ trait StateBackend: Send + Sync {
 
 impl StateStore {
     pub fn from_config(config: &Config, credentials_path: Option<PathBuf>) -> anyhow::Result<Self> {
+        config.validate()?;
+
         let primary_backend: Arc<dyn StateBackend> = match config.state_backend {
             StateBackendKind::File => Arc::new(FileStateBackend {
                 config_path: config.config_path().map(|path| path.to_path_buf()),
                 credentials_path,
             }),
             StateBackendKind::Postgres => {
-                let postgres_url = config
-                    .state_postgres_url
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("stateBackend=postgres 时必须配置 statePostgresUrl"))?;
+                let postgres_url = config.state_postgres_url.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("stateBackend=postgres 时必须配置 statePostgresUrl")
+                })?;
                 Arc::new(PostgresStateBackend::connect(postgres_url)?)
             }
         };
 
-        Self::with_balance_cache_backend(primary_backend, config.state_redis_url.as_deref())
+        Self::with_redis_support(primary_backend, config)
     }
 
     pub fn file(config_path: Option<PathBuf>, credentials_path: Option<PathBuf>) -> Self {
@@ -177,23 +205,36 @@ impl StateStore {
         Self {
             primary_backend: primary_backend.clone(),
             balance_cache_backend: BalanceCacheStore::Primary(primary_backend),
+            runtime_coordinator: None,
         }
     }
 
-    fn with_balance_cache_backend(
+    fn with_redis_support(
         primary_backend: Arc<dyn StateBackend>,
-        redis_url: Option<&str>,
+        config: &Config,
     ) -> anyhow::Result<Self> {
-        let balance_cache_backend = match redis_url {
+        let balance_cache_backend = match config.state_redis_url.as_deref() {
             Some(redis_url) => BalanceCacheStore::Redis(Arc::new(
                 RedisBalanceCacheBackend::connect(redis_url, REDIS_BALANCE_CACHE_KEY)?,
             )),
             None => BalanceCacheStore::Primary(primary_backend.clone()),
         };
 
+        let runtime_coordinator = match config.state_redis_url.as_deref() {
+            Some(redis_url) => Some(Arc::new(RedisRuntimeCoordinator::connect(
+                redis_url,
+                REDIS_RUNTIME_COORDINATION_NAMESPACE,
+                config.resolved_instance_id(),
+                Duration::from_secs(config.state_redis_heartbeat_interval_secs),
+                Duration::from_secs(config.state_redis_leader_lease_ttl_secs),
+            )?)),
+            None => None,
+        };
+
         Ok(Self {
             primary_backend,
             balance_cache_backend,
+            runtime_coordinator,
         })
     }
 
@@ -243,6 +284,23 @@ impl StateStore {
     ) -> anyhow::Result<()> {
         self.primary_backend.persist_dispatch_config(dispatch)
     }
+
+    pub fn runtime_coordination_enabled(&self) -> bool {
+        self.runtime_coordinator.is_some()
+    }
+
+    pub fn runtime_coordination_interval(&self) -> Option<Duration> {
+        self.runtime_coordinator
+            .as_ref()
+            .map(|coordinator| coordinator.heartbeat_interval())
+    }
+
+    pub fn runtime_coordination_tick(&self) -> anyhow::Result<Option<RuntimeCoordinationStatus>> {
+        self.runtime_coordinator
+            .as_ref()
+            .map(|coordinator| coordinator.tick())
+            .transpose()
+    }
 }
 
 fn run_blocking_state_op<R, F>(operation: F) -> R
@@ -282,7 +340,8 @@ impl FileStateBackend {
     }
 
     fn balance_cache_path(&self) -> Option<PathBuf> {
-        self.cache_dir().map(|dir| dir.join(BALANCE_CACHE_FILE_NAME))
+        self.cache_dir()
+            .map(|dir| dir.join(BALANCE_CACHE_FILE_NAME))
     }
 
     fn write_bytes(path: &Path, bytes: Vec<u8>) -> anyhow::Result<()> {
@@ -345,7 +404,7 @@ impl StateBackend for FileStateBackend {
             Ok(content) => content,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
             Err(err) => {
-                return Err(err).with_context(|| format!("读取统计缓存失败: {}", path.display()))
+                return Err(err).with_context(|| format!("读取统计缓存失败: {}", path.display()));
             }
         };
 
@@ -373,7 +432,7 @@ impl StateBackend for FileStateBackend {
             Ok(content) => content,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
             Err(err) => {
-                return Err(err).with_context(|| format!("读取余额缓存失败: {}", path.display()))
+                return Err(err).with_context(|| format!("读取余额缓存失败: {}", path.display()));
             }
         };
 
@@ -391,8 +450,10 @@ impl StateBackend for FileStateBackend {
             None => return Ok(()),
         };
 
-        let serializable: HashMap<String, &CachedBalanceRecord> =
-            cache.iter().map(|(key, value)| (key.to_string(), value)).collect();
+        let serializable: HashMap<String, &CachedBalanceRecord> = cache
+            .iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect();
         let json = serde_json::to_vec_pretty(&serializable).context("序列化余额缓存失败")?;
         Self::write_bytes(&path, json)
     }
@@ -434,7 +495,8 @@ struct PostgresStateBackend {
 
 impl std::fmt::Debug for PostgresStateBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PostgresStateBackend").finish_non_exhaustive()
+        f.debug_struct("PostgresStateBackend")
+            .finish_non_exhaustive()
     }
 }
 
@@ -543,7 +605,9 @@ impl StateBackend for PostgresStateBackend {
     }
 
     fn load_stats(&self) -> anyhow::Result<HashMap<String, StatsEntryRecord>> {
-        Ok(self.load_json(POSTGRES_STATS_KEY, "统计缓存")?.unwrap_or_default())
+        Ok(self
+            .load_json(POSTGRES_STATS_KEY, "统计缓存")?
+            .unwrap_or_default())
     }
 
     fn save_stats(&self, stats: &HashMap<String, StatsEntryRecord>) -> anyhow::Result<()> {
@@ -584,28 +648,34 @@ impl RedisBalanceCacheBackend {
         let client = self.client.clone();
         let key = self.key.clone();
 
-        run_blocking_state_op(move || -> anyhow::Result<HashMap<u64, CachedBalanceRecord>> {
-            let mut connection = client.get_connection().context("连接 Redis 余额缓存失败")?;
-            let payload: Option<String> = connection
-                .get(&key)
-                .with_context(|| format!("从 Redis 读取余额缓存失败: {key}"))?;
+        run_blocking_state_op(
+            move || -> anyhow::Result<HashMap<u64, CachedBalanceRecord>> {
+                let mut connection = client.get_connection().context("连接 Redis 余额缓存失败")?;
+                let payload: Option<String> = connection
+                    .get(&key)
+                    .with_context(|| format!("从 Redis 读取余额缓存失败: {key}"))?;
 
-            let Some(payload) = payload else {
-                return Ok(HashMap::new());
-            };
+                let Some(payload) = payload else {
+                    return Ok(HashMap::new());
+                };
 
-            let cache: HashMap<String, CachedBalanceRecord> = serde_json::from_str(&payload)
-                .with_context(|| format!("解析 Redis 余额缓存失败: {key}"))?;
-            Ok(cache
-                .into_iter()
-                .filter_map(|(raw_key, value)| raw_key.parse::<u64>().ok().map(|id| (id, value)))
-                .collect())
-        })
+                let cache: HashMap<String, CachedBalanceRecord> = serde_json::from_str(&payload)
+                    .with_context(|| format!("解析 Redis 余额缓存失败: {key}"))?;
+                Ok(cache
+                    .into_iter()
+                    .filter_map(|(raw_key, value)| {
+                        raw_key.parse::<u64>().ok().map(|id| (id, value))
+                    })
+                    .collect())
+            },
+        )
     }
 
     fn save_balance_cache(&self, cache: &HashMap<u64, CachedBalanceRecord>) -> anyhow::Result<()> {
-        let serializable: HashMap<String, &CachedBalanceRecord> =
-            cache.iter().map(|(key, value)| (key.to_string(), value)).collect();
+        let serializable: HashMap<String, &CachedBalanceRecord> = cache
+            .iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect();
         let payload = serde_json::to_string(&serializable).context("序列化 Redis 余额缓存失败")?;
         let client = self.client.clone();
         let key = self.key.clone();
@@ -618,6 +688,119 @@ impl RedisBalanceCacheBackend {
             Ok(())
         })
     }
+}
+
+#[derive(Debug)]
+struct RedisRuntimeCoordinator {
+    client: RedisClient,
+    namespace: String,
+    instance_id: String,
+    heartbeat_interval: Duration,
+    leader_lease_ttl: Duration,
+}
+
+impl RedisRuntimeCoordinator {
+    fn connect(
+        redis_url: &str,
+        namespace: &str,
+        instance_id: String,
+        heartbeat_interval: Duration,
+        leader_lease_ttl: Duration,
+    ) -> anyhow::Result<Self> {
+        let client = RedisClient::open(redis_url).context("初始化 Redis 运行时协调客户端失败")?;
+        Ok(Self {
+            client,
+            namespace: namespace.to_string(),
+            instance_id,
+            heartbeat_interval,
+            leader_lease_ttl,
+        })
+    }
+
+    fn heartbeat_interval(&self) -> Duration {
+        self.heartbeat_interval
+    }
+
+    fn tick(&self) -> anyhow::Result<RuntimeCoordinationStatus> {
+        self.publish_heartbeat()?;
+        self.acquire_or_renew_leader()
+    }
+
+    fn publish_heartbeat(&self) -> anyhow::Result<()> {
+        let client = self.client.clone();
+        let instance_key = self.instance_key();
+        let ttl_secs = self
+            .leader_lease_ttl_secs()
+            .max(self.heartbeat_interval_secs().saturating_mul(3));
+        let payload = serde_json::to_string(&RuntimeInstanceHeartbeat {
+            instance_id: self.instance_id.clone(),
+            observed_at_epoch_secs: current_epoch_secs(),
+        })
+        .context("序列化 Redis 运行时心跳失败")?;
+
+        run_blocking_state_op(move || -> anyhow::Result<()> {
+            let mut connection = client
+                .get_connection()
+                .context("连接 Redis 运行时协调失败")?;
+            let _: () = connection
+                .set_ex(&instance_key, payload, ttl_secs)
+                .with_context(|| format!("写入 Redis 实例心跳失败: {instance_key}"))?;
+            Ok(())
+        })
+    }
+
+    fn acquire_or_renew_leader(&self) -> anyhow::Result<RuntimeCoordinationStatus> {
+        let client = self.client.clone();
+        let leader_key = self.leader_key();
+        let instance_id = self.instance_id.clone();
+        let lease_ttl_secs = self.leader_lease_ttl_secs();
+
+        run_blocking_state_op(move || -> anyhow::Result<RuntimeCoordinationStatus> {
+            let mut connection = client
+                .get_connection()
+                .context("连接 Redis 运行时协调失败")?;
+            let response: Vec<String> = Script::new(REDIS_RUNTIME_LEADER_SCRIPT)
+                .key(&leader_key)
+                .arg(&instance_id)
+                .arg(lease_ttl_secs)
+                .invoke(&mut connection)
+                .with_context(|| format!("更新 Redis Leader 租约失败: {leader_key}"))?;
+
+            let status = response.first().map(String::as_str).unwrap_or_default();
+            let leader_id = response.get(1).cloned();
+            Ok(RuntimeCoordinationStatus {
+                instance_id: instance_id.clone(),
+                is_leader: matches!(status, "acquired" | "renewed"),
+                leader_id,
+            })
+        })
+    }
+
+    fn heartbeat_interval_secs(&self) -> u64 {
+        self.heartbeat_interval.as_secs()
+    }
+
+    fn leader_lease_ttl_secs(&self) -> u64 {
+        self.leader_lease_ttl.as_secs()
+    }
+
+    fn leader_key(&self) -> String {
+        format!("{}:{REDIS_RUNTIME_LEADER_KEY}", self.namespace)
+    }
+
+    fn instance_key(&self) -> String {
+        format!(
+            "{}:{REDIS_RUNTIME_INSTANCE_KEY_PREFIX}:{}",
+            self.namespace, self.instance_id
+        )
+    }
+}
+
+fn current_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]
@@ -663,7 +846,10 @@ mod tests {
             },
         );
         store.save_stats(&stats).unwrap();
-        assert_eq!(store.load_stats().unwrap().get("7").unwrap().success_count, 11);
+        assert_eq!(
+            store.load_stats().unwrap().get("7").unwrap().success_count,
+            11
+        );
 
         let mut balance_cache = HashMap::new();
         balance_cache.insert(
@@ -683,7 +869,13 @@ mod tests {
         );
         store.save_balance_cache(&balance_cache).unwrap();
         assert_eq!(
-            store.load_balance_cache().unwrap().get(&7).unwrap().data.subscription_title,
+            store
+                .load_balance_cache()
+                .unwrap()
+                .get(&7)
+                .unwrap()
+                .data
+                .subscription_title,
             Some("KIRO PRO+".to_string())
         );
 
@@ -738,7 +930,9 @@ mod tests {
         let mut config = Config::default();
         config.state_backend = StateBackendKind::Postgres;
 
-        let err = StateStore::from_config(&config, None).unwrap_err().to_string();
+        let err = StateStore::from_config(&config, None)
+            .unwrap_err()
+            .to_string();
 
         assert!(err.contains("statePostgresUrl"));
     }
@@ -748,9 +942,24 @@ mod tests {
         let mut config = Config::default();
         config.state_redis_url = Some("not-a-valid-redis-url".to_string());
 
-        let err = StateStore::from_config(&config, None).unwrap_err().to_string();
+        let err = StateStore::from_config(&config, None)
+            .unwrap_err()
+            .to_string();
 
         assert!(err.contains("Redis"));
+    }
+
+    #[test]
+    fn state_store_from_config_rejects_invalid_runtime_coordination_timing() {
+        let mut config = Config::default();
+        config.state_redis_heartbeat_interval_secs = 30;
+        config.state_redis_leader_lease_ttl_secs = 30;
+
+        let err = StateStore::from_config(&config, None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("stateRedisHeartbeatIntervalSecs"));
     }
 
     #[test]
@@ -793,6 +1002,69 @@ mod tests {
                 .arg(&key)
                 .query(&mut connection)
                 .context("删除 Redis 测试键失败")?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn redis_runtime_coordinator_elects_single_leader_when_test_url_is_set() {
+        let Ok(redis_url) = std::env::var("TEST_REDIS_URL") else {
+            return;
+        };
+
+        let namespace = format!("kiro:test:runtime-coordination:{}", Uuid::new_v4());
+        let coordinator_a = RedisRuntimeCoordinator::connect(
+            &redis_url,
+            &namespace,
+            "instance-a".to_string(),
+            Duration::from_secs(1),
+            Duration::from_secs(3),
+        )
+        .unwrap();
+        let coordinator_b = RedisRuntimeCoordinator::connect(
+            &redis_url,
+            &namespace,
+            "instance-b".to_string(),
+            Duration::from_secs(1),
+            Duration::from_secs(3),
+        )
+        .unwrap();
+
+        let status_a = coordinator_a.tick().unwrap();
+        let status_b = coordinator_b.tick().unwrap();
+
+        assert_ne!(status_a.is_leader, status_b.is_leader);
+
+        let leader_id = if status_a.is_leader {
+            status_a.instance_id.clone()
+        } else {
+            status_b.instance_id.clone()
+        };
+
+        assert_eq!(status_a.leader_id.as_deref(), Some(leader_id.as_str()));
+        assert_eq!(status_b.leader_id.as_deref(), Some(leader_id.as_str()));
+
+        let renewed = if status_a.is_leader {
+            coordinator_a.tick().unwrap()
+        } else {
+            coordinator_b.tick().unwrap()
+        };
+        assert!(renewed.is_leader);
+        assert_eq!(renewed.leader_id.as_deref(), Some(leader_id.as_str()));
+
+        let cleanup_keys = vec![
+            coordinator_a.leader_key(),
+            coordinator_a.instance_key(),
+            coordinator_b.instance_key(),
+        ];
+        let client = coordinator_a.client.clone();
+        run_blocking_state_op(move || -> anyhow::Result<()> {
+            let mut connection = client.get_connection().context("连接 Redis 测试清理失败")?;
+            let _: usize = redis::cmd("DEL")
+                .arg(cleanup_keys)
+                .query(&mut connection)
+                .context("删除 Redis 运行时协调测试键失败")?;
             Ok(())
         })
         .unwrap();

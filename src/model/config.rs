@@ -113,6 +113,19 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state_redis_url: Option<String>,
 
+    /// 运行时实例标识（可选）。未配置时会在启动时自动推导。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+
+    /// Redis 运行时协调心跳间隔（秒）
+    #[serde(default = "default_state_redis_heartbeat_interval_secs")]
+    pub state_redis_heartbeat_interval_secs: u64,
+
+    /// Redis Leader 租约 TTL（秒）
+    #[serde(default = "default_state_redis_leader_lease_ttl_secs")]
+    pub state_redis_leader_lease_ttl_secs: u64,
+
     /// 负载均衡模式（"priority" 或 "balanced"）
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
@@ -225,6 +238,14 @@ fn default_rate_limit_refill_backoff_factor() -> f64 {
     0.5
 }
 
+fn default_state_redis_heartbeat_interval_secs() -> u64 {
+    10
+}
+
+fn default_state_redis_leader_lease_ttl_secs() -> u64 {
+    30
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -249,6 +270,9 @@ impl Default for Config {
             state_backend: default_state_backend(),
             state_postgres_url: None,
             state_redis_url: None,
+            instance_id: None,
+            state_redis_heartbeat_interval_secs: default_state_redis_heartbeat_interval_secs(),
+            state_redis_leader_lease_ttl_secs: default_state_redis_leader_lease_ttl_secs(),
             load_balancing_mode: default_load_balancing_mode(),
             default_max_concurrency: None,
             queue_max_size: 0,
@@ -290,18 +314,62 @@ impl Config {
             // 配置文件不存在，返回默认配置
             let mut config = Self::default();
             config.config_path = Some(path.to_path_buf());
+            config.validate()?;
             return Ok(config);
         }
 
         let content = fs::read_to_string(path)?;
         let mut config: Config = serde_json::from_str(&content)?;
         config.config_path = Some(path.to_path_buf());
+        config.validate()?;
         Ok(config)
     }
 
     /// 获取配置文件路径（如果有）
     pub fn config_path(&self) -> Option<&Path> {
         self.config_path.as_deref()
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self
+            .instance_id
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            anyhow::bail!("instanceId 不能为空字符串");
+        }
+
+        if self.state_redis_heartbeat_interval_secs == 0 {
+            anyhow::bail!("stateRedisHeartbeatIntervalSecs 必须大于 0");
+        }
+
+        if self.state_redis_leader_lease_ttl_secs == 0 {
+            anyhow::bail!("stateRedisLeaderLeaseTtlSecs 必须大于 0");
+        }
+
+        if self.state_redis_heartbeat_interval_secs >= self.state_redis_leader_lease_ttl_secs {
+            anyhow::bail!("stateRedisHeartbeatIntervalSecs 必须小于 stateRedisLeaderLeaseTtlSecs");
+        }
+
+        Ok(())
+    }
+
+    pub fn resolved_instance_id(&self) -> String {
+        if let Some(instance_id) = self
+            .instance_id
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
+            return instance_id.to_string();
+        }
+
+        let host = std::env::var("HOSTNAME")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| self.host.clone());
+
+        format!("{host}:{}:{}", self.port, std::process::id())
     }
 
     /// 将当前配置写回原始配置文件
@@ -315,5 +383,29 @@ impl Config {
         fs::write(path, content)
             .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn validate_rejects_invalid_redis_runtime_coordination_timing() {
+        let mut config = Config::default();
+        config.state_redis_heartbeat_interval_secs = 30;
+        config.state_redis_leader_lease_ttl_secs = 30;
+
+        let err = config.validate().unwrap_err().to_string();
+
+        assert!(err.contains("stateRedisHeartbeatIntervalSecs"));
+    }
+
+    #[test]
+    fn resolved_instance_id_prefers_explicit_value() {
+        let mut config = Config::default();
+        config.instance_id = Some("kiro-a".to_string());
+
+        assert_eq!(config.resolved_instance_id(), "kiro-a");
     }
 }
