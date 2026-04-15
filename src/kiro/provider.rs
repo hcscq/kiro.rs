@@ -17,7 +17,9 @@ use uuid::Uuid;
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::{CallLease, MultiTokenManager};
+use crate::kiro::token_manager::{
+    CallLease, MultiTokenManager, RuntimeRefreshLeaderRequiredError,
+};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
@@ -532,16 +534,30 @@ impl KiroProvider {
                 if Self::is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx_id) {
                     force_refreshed.insert(ctx_id);
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx_id);
-                    if self
-                        .token_manager
-                        .force_refresh_token_for(ctx_id)
-                        .await
-                        .is_ok()
-                    {
-                        tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx_id);
-                        continue;
+                    match self.token_manager.force_refresh_token_for(ctx_id).await {
+                        Ok(_) => {
+                            tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx_id);
+                            continue;
+                        }
+                        Err(err) => {
+                            if err
+                                .downcast_ref::<RuntimeRefreshLeaderRequiredError>()
+                                .is_some()
+                            {
+                                tracing::warn!(
+                                    "凭据 #{} 需要由 leader 刷新 token，当前请求稍后重试: {}",
+                                    ctx_id,
+                                    err
+                                );
+                                last_error = Some(err);
+                                if attempt + 1 < max_retries {
+                                    sleep(Self::retry_delay(attempt)).await;
+                                }
+                                continue;
+                            }
+                            tracing::warn!("凭据 #{} token 强制刷新失败，计入失败: {}", ctx_id, err);
+                        }
                     }
-                    tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx_id);
                 }
 
                 let has_available = self.token_manager.report_failure(ctx_id);
@@ -822,16 +838,30 @@ impl KiroProvider {
                 if Self::is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx_id) {
                     force_refreshed.insert(ctx_id);
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx_id);
-                    if self
-                        .token_manager
-                        .force_refresh_token_for(ctx_id)
-                        .await
-                        .is_ok()
-                    {
-                        tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx_id);
-                        continue;
+                    match self.token_manager.force_refresh_token_for(ctx_id).await {
+                        Ok(_) => {
+                            tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx_id);
+                            continue;
+                        }
+                        Err(err) => {
+                            if err
+                                .downcast_ref::<RuntimeRefreshLeaderRequiredError>()
+                                .is_some()
+                            {
+                                tracing::warn!(
+                                    "凭据 #{} 需要由 leader 刷新 token，当前请求稍后重试: {}",
+                                    ctx_id,
+                                    err
+                                );
+                                last_error = Some(err);
+                                if attempt + 1 < max_retries {
+                                    sleep(Self::retry_delay(attempt)).await;
+                                }
+                                continue;
+                            }
+                            tracing::warn!("凭据 #{} token 强制刷新失败，计入失败: {}", ctx_id, err);
+                        }
                     }
-                    tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx_id);
                 }
 
                 let has_available = self.token_manager.report_failure(ctx_id);

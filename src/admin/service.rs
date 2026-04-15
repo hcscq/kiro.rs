@@ -442,6 +442,15 @@ impl AdminService {
 
     /// 分类余额查询错误（可能涉及上游 API 调用）
     fn classify_balance_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
+        if let Some(coordination_err) =
+            e.downcast_ref::<crate::kiro::token_manager::RuntimeRefreshLeaderRequiredError>()
+        {
+            return AdminServiceError::NotLeader {
+                instance_id: coordination_err.instance_id.clone(),
+                leader_id: coordination_err.leader_id.clone(),
+            };
+        }
+
         let msg = e.to_string();
 
         // 1. 凭据不存在
