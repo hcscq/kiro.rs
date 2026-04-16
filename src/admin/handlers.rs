@@ -1,9 +1,9 @@
 //! Admin API HTTP 处理器
 
 use axum::{
-    Json,
     extract::{Path, State},
     response::IntoResponse,
+    Json,
 };
 
 use super::{
@@ -17,8 +17,10 @@ use super::{
 /// GET /api/admin/credentials
 /// 获取所有凭据状态
 pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoResponse {
-    let response = state.service.get_all_credentials();
-    Json(response)
+    match state.service.get_all_credentials() {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
 }
 
 /// POST /api/admin/credentials/:id/disabled
@@ -171,8 +173,10 @@ pub async fn force_refresh_token(
 /// GET /api/admin/config/load-balancing
 /// 获取负载均衡与等待队列配置
 pub async fn get_load_balancing_mode(State(state): State<AdminState>) -> impl IntoResponse {
-    let response = state.service.get_load_balancing_mode();
-    Json(response)
+    match state.service.get_load_balancing_mode() {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
 }
 
 /// PUT /api/admin/config/load-balancing

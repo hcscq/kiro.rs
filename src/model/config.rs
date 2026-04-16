@@ -16,6 +16,19 @@ impl Default for TlsBackend {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum StateBackendKind {
+    File,
+    Postgres,
+}
+
+impl Default for StateBackendKind {
+    fn default() -> Self {
+        Self::File
+    }
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -85,6 +98,37 @@ pub struct Config {
     /// Admin API 密钥（可选，启用 Admin API 功能）
     #[serde(default)]
     pub admin_api_key: Option<String>,
+
+    /// 状态存储后端：`file` 或 `postgres`
+    #[serde(default = "default_state_backend")]
+    pub state_backend: StateBackendKind,
+
+    /// PostgreSQL 连接串（state_backend=postgres 时必填）
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_postgres_url: Option<String>,
+
+    /// Redis 连接串（可选）。配置后，短生命周期缓存会优先存入 Redis。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_redis_url: Option<String>,
+
+    /// 运行时实例标识（可选）。未配置时会在启动时自动推导。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+
+    /// Redis 运行时协调心跳间隔（秒）
+    #[serde(default = "default_state_redis_heartbeat_interval_secs")]
+    pub state_redis_heartbeat_interval_secs: u64,
+
+    /// Redis Leader 租约 TTL（秒）
+    #[serde(default = "default_state_redis_leader_lease_ttl_secs")]
+    pub state_redis_leader_lease_ttl_secs: u64,
+
+    /// 数据面热路径检查共享状态修订号的最小间隔（毫秒，0 表示每次请求都检查）
+    #[serde(default = "default_state_hot_path_sync_min_interval_ms")]
+    pub state_hot_path_sync_min_interval_ms: u64,
 
     /// 负载均衡模式（"priority" 或 "balanced"）
     #[serde(default = "default_load_balancing_mode")]
@@ -170,6 +214,10 @@ fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
 
+fn default_state_backend() -> StateBackendKind {
+    StateBackendKind::File
+}
+
 fn default_rate_limit_cooldown_ms() -> u64 {
     2_000
 }
@@ -194,6 +242,18 @@ fn default_rate_limit_refill_backoff_factor() -> f64 {
     0.5
 }
 
+fn default_state_redis_heartbeat_interval_secs() -> u64 {
+    3
+}
+
+fn default_state_redis_leader_lease_ttl_secs() -> u64 {
+    9
+}
+
+fn default_state_hot_path_sync_min_interval_ms() -> u64 {
+    25
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -215,6 +275,13 @@ impl Default for Config {
             proxy_username: None,
             proxy_password: None,
             admin_api_key: None,
+            state_backend: default_state_backend(),
+            state_postgres_url: None,
+            state_redis_url: None,
+            instance_id: None,
+            state_redis_heartbeat_interval_secs: default_state_redis_heartbeat_interval_secs(),
+            state_redis_leader_lease_ttl_secs: default_state_redis_leader_lease_ttl_secs(),
+            state_hot_path_sync_min_interval_ms: default_state_hot_path_sync_min_interval_ms(),
             load_balancing_mode: default_load_balancing_mode(),
             default_max_concurrency: None,
             queue_max_size: 0,
@@ -256,18 +323,91 @@ impl Config {
             // 配置文件不存在，返回默认配置
             let mut config = Self::default();
             config.config_path = Some(path.to_path_buf());
+            config.validate()?;
             return Ok(config);
         }
 
         let content = fs::read_to_string(path)?;
         let mut config: Config = serde_json::from_str(&content)?;
         config.config_path = Some(path.to_path_buf());
+        config.validate()?;
         Ok(config)
     }
 
     /// 获取配置文件路径（如果有）
     pub fn config_path(&self) -> Option<&Path> {
         self.config_path.as_deref()
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self
+            .instance_id
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            anyhow::bail!("instanceId 不能为空字符串");
+        }
+
+        if self.state_redis_heartbeat_interval_secs == 0 {
+            anyhow::bail!("stateRedisHeartbeatIntervalSecs 必须大于 0");
+        }
+
+        if self.state_redis_leader_lease_ttl_secs == 0 {
+            anyhow::bail!("stateRedisLeaderLeaseTtlSecs 必须大于 0");
+        }
+
+        if self.state_redis_heartbeat_interval_secs >= self.state_redis_leader_lease_ttl_secs {
+            anyhow::bail!("stateRedisHeartbeatIntervalSecs 必须小于 stateRedisLeaderLeaseTtlSecs");
+        }
+
+        Ok(())
+    }
+
+    pub fn resolved_instance_id(&self) -> String {
+        if let Some(instance_id) = self
+            .instance_id
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
+            return instance_id.to_string();
+        }
+
+        let host = std::env::var("HOSTNAME")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| self.host.clone());
+
+        format!("{host}:{}:{}", self.port, std::process::id())
+    }
+
+    pub fn resolved_advertise_http_base_url(&self) -> Option<String> {
+        let advertise_host = std::env::var("KIRO_ADVERTISE_HOST")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                std::env::var("POD_IP")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .or_else(|| {
+                let host = self.host.trim();
+                if host.is_empty()
+                    || matches!(host, "0.0.0.0" | "::" | "127.0.0.1" | "::1" | "localhost")
+                {
+                    None
+                } else {
+                    Some(host.to_string())
+                }
+            })?;
+
+        let advertise_host = if advertise_host.contains(':') && !advertise_host.starts_with('[') {
+            format!("[{advertise_host}]")
+        } else {
+            advertise_host
+        };
+
+        Some(format!("http://{advertise_host}:{}", self.port))
     }
 
     /// 将当前配置写回原始配置文件
@@ -281,5 +421,29 @@ impl Config {
         fs::write(path, content)
             .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn validate_rejects_invalid_redis_runtime_coordination_timing() {
+        let mut config = Config::default();
+        config.state_redis_heartbeat_interval_secs = 30;
+        config.state_redis_leader_lease_ttl_secs = 30;
+
+        let err = config.validate().unwrap_err().to_string();
+
+        assert!(err.contains("stateRedisHeartbeatIntervalSecs"));
+    }
+
+    #[test]
+    fn resolved_instance_id_prefers_explicit_value() {
+        let mut config = Config::default();
+        config.instance_id = Some("kiro-a".to_string());
+
+        assert_eq!(config.resolved_instance_id(), "kiro-a");
     }
 }

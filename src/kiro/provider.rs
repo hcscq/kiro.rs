@@ -6,7 +6,7 @@
 
 use bytes::Bytes;
 use futures::stream::BoxStream;
-use futures::{StreamExt, stream};
+use futures::{stream, StreamExt};
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -14,10 +14,10 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use uuid::Uuid;
 
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::{build_client, ProxyConfig};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::{CallLease, MultiTokenManager};
+use crate::kiro::token_manager::{CallLease, MultiTokenManager, RuntimeRefreshLeaderRequiredError};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
@@ -437,8 +437,15 @@ impl KiroProvider {
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
             let ctx = match self.token_manager.acquire_context(None).await {
                 Ok(c) => c,
-                Err(e) => {
-                    return Err(e);
+                Err(err) => {
+                    if self
+                        .retry_after_leader_refresh_handoff(attempt, max_retries, &err)
+                        .await
+                    {
+                        last_error = Some(err);
+                        continue;
+                    }
+                    return Err(err);
                 }
             };
             let (ctx_id, credentials, token, lease) = ctx.into_parts();
@@ -532,16 +539,44 @@ impl KiroProvider {
                 if Self::is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx_id) {
                     force_refreshed.insert(ctx_id);
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx_id);
-                    if self
-                        .token_manager
-                        .force_refresh_token_for(ctx_id)
-                        .await
-                        .is_ok()
-                    {
-                        tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx_id);
-                        continue;
+                    match self.token_manager.force_refresh_token_for(ctx_id).await {
+                        Ok(_) => {
+                            tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx_id);
+                            continue;
+                        }
+                        Err(err) => {
+                            if err
+                                .downcast_ref::<RuntimeRefreshLeaderRequiredError>()
+                                .is_some()
+                            {
+                                if let Err(sync_err) =
+                                    self.token_manager.sync_external_state_if_changed()
+                                {
+                                    tracing::warn!(
+                                        "凭据 #{} 需由 leader 刷新 token，主动同步外部状态失败: {}",
+                                        ctx_id,
+                                        sync_err
+                                    );
+                                }
+                                self.token_manager.defer_shared_refresh_credential(
+                                    ctx_id,
+                                    Self::retry_delay(attempt),
+                                );
+                                tracing::warn!(
+                                    "凭据 #{} 需要由 leader 刷新 token，当前请求稍后重试: {}",
+                                    ctx_id,
+                                    err
+                                );
+                                last_error = Some(err);
+                                continue;
+                            }
+                            tracing::warn!(
+                                "凭据 #{} token 强制刷新失败，计入失败: {}",
+                                ctx_id,
+                                err
+                            );
+                        }
                     }
-                    tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx_id);
                 }
 
                 let has_available = self.token_manager.report_failure(ctx_id);
@@ -619,8 +654,15 @@ impl KiroProvider {
             // 获取调用上下文（绑定 index、credentials、token）
             let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
                 Ok(c) => c,
-                Err(e) => {
-                    return Err(e);
+                Err(err) => {
+                    if self
+                        .retry_after_leader_refresh_handoff(attempt, max_retries, &err)
+                        .await
+                    {
+                        last_error = Some(err);
+                        continue;
+                    }
+                    return Err(err);
                 }
             };
             let (ctx_id, credentials, token, lease) = ctx.into_parts();
@@ -822,16 +864,44 @@ impl KiroProvider {
                 if Self::is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx_id) {
                     force_refreshed.insert(ctx_id);
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx_id);
-                    if self
-                        .token_manager
-                        .force_refresh_token_for(ctx_id)
-                        .await
-                        .is_ok()
-                    {
-                        tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx_id);
-                        continue;
+                    match self.token_manager.force_refresh_token_for(ctx_id).await {
+                        Ok(_) => {
+                            tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx_id);
+                            continue;
+                        }
+                        Err(err) => {
+                            if err
+                                .downcast_ref::<RuntimeRefreshLeaderRequiredError>()
+                                .is_some()
+                            {
+                                if let Err(sync_err) =
+                                    self.token_manager.sync_external_state_if_changed()
+                                {
+                                    tracing::warn!(
+                                        "凭据 #{} 需由 leader 刷新 token，主动同步外部状态失败: {}",
+                                        ctx_id,
+                                        sync_err
+                                    );
+                                }
+                                self.token_manager.defer_shared_refresh_credential(
+                                    ctx_id,
+                                    Self::retry_delay(attempt),
+                                );
+                                tracing::warn!(
+                                    "凭据 #{} 需要由 leader 刷新 token，当前请求稍后重试: {}",
+                                    ctx_id,
+                                    err
+                                );
+                                last_error = Some(err);
+                                continue;
+                            }
+                            tracing::warn!(
+                                "凭据 #{} token 强制刷新失败，计入失败: {}",
+                                ctx_id,
+                                err
+                            );
+                        }
                     }
-                    tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx_id);
                 }
 
                 let has_available = self.token_manager.report_failure(ctx_id);
@@ -910,6 +980,37 @@ impl KiroProvider {
                 max_retries
             )
         }))
+    }
+
+    async fn retry_after_leader_refresh_handoff(
+        &self,
+        attempt: usize,
+        max_retries: usize,
+        err: &anyhow::Error,
+    ) -> bool {
+        if err
+            .downcast_ref::<RuntimeRefreshLeaderRequiredError>()
+            .is_none()
+        {
+            return false;
+        }
+
+        if let Err(sync_err) = self.token_manager.sync_external_state_if_changed() {
+            tracing::warn!("leader 刷新交接重试前同步外部状态失败: {}", sync_err);
+        }
+
+        if attempt + 1 >= max_retries {
+            return false;
+        }
+
+        let delay = Self::retry_delay(attempt);
+        tracing::warn!(
+            "当前实例需等待运行时 leader 刷新共享凭据，{}ms 后重试: {}",
+            delay.as_millis(),
+            err
+        );
+        sleep(delay).await;
+        true
     }
 
     fn retry_delay(attempt: usize) -> Duration {

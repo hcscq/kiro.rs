@@ -6,18 +6,18 @@
 use anyhow::bail;
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as TokioMutex, Notify};
 
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::{build_client, ProxyConfig};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
@@ -25,6 +25,10 @@ use crate::kiro::model::token_refresh::{
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
+use crate::state::{
+    PersistedDispatchConfig, RuntimeCoordinationStatus, StateChangeKind, StateChangeRevisions,
+    StateStore, StatsEntryRecord, StatsMergeRecord,
+};
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -53,6 +57,33 @@ fn sha256_hex(input: &str) -> String {
     hasher.update(input.as_bytes());
     let result = hasher.finalize();
     format!("{:x}", result)
+}
+
+fn newer_timestamp(current: Option<String>, candidate: Option<String>) -> Option<String> {
+    match (current, candidate) {
+        (None, other) | (other, None) => other,
+        (Some(current), Some(candidate)) => {
+            let current_parsed = DateTime::parse_from_rfc3339(&current).ok();
+            let candidate_parsed = DateTime::parse_from_rfc3339(&candidate).ok();
+
+            match (current_parsed, candidate_parsed) {
+                (Some(current_parsed), Some(candidate_parsed)) => {
+                    if candidate_parsed > current_parsed {
+                        Some(candidate)
+                    } else {
+                        Some(current)
+                    }
+                }
+                _ => {
+                    if candidate > current {
+                        Some(candidate)
+                    } else {
+                        Some(current)
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// 验证 refreshToken 的基本有效性
@@ -94,6 +125,31 @@ impl fmt::Display for RefreshTokenInvalidError {
 }
 
 impl std::error::Error for RefreshTokenInvalidError {}
+
+#[derive(Debug)]
+pub(crate) struct RuntimeRefreshLeaderRequiredError {
+    pub instance_id: String,
+    pub leader_id: Option<String>,
+}
+
+impl fmt::Display for RuntimeRefreshLeaderRequiredError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.leader_id {
+            Some(leader_id) => write!(
+                f,
+                "当前实例不是运行时 leader，无法刷新共享凭据（instanceId={}, leaderId={}）",
+                self.instance_id, leader_id
+            ),
+            None => write!(
+                f,
+                "当前未观察到运行时 leader，无法刷新共享凭据（instanceId={}）",
+                self.instance_id
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RuntimeRefreshLeaderRequiredError {}
 
 /// 刷新 Token
 pub(crate) async fn refresh_token(
@@ -389,6 +445,8 @@ struct CredentialEntry {
     disabled_reason: Option<DisabledReason>,
     /// API 调用成功次数
     success_count: u64,
+    /// 自上次成功落盘后的新增成功次数，用于跨实例合并统计
+    pending_success_count_delta: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
     /// 当前运行中的请求数
@@ -419,12 +477,6 @@ enum DisabledReason {
 }
 
 /// 统计数据持久化条目
-#[derive(Serialize, Deserialize)]
-struct StatsEntry {
-    success_count: u64,
-    last_used_at: Option<String>,
-}
-
 #[derive(Debug, Clone, Copy)]
 struct TokenBucketPolicy {
     capacity: f64,
@@ -637,6 +689,13 @@ pub struct LoadBalancingConfigSnapshot {
     pub waiting_requests: usize,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExternalStateSyncReport {
+    pub credentials_reloaded: bool,
+    pub dispatch_config_reloaded: bool,
+    pub stats_reloaded: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct DispatchConfig {
     mode: String,
@@ -755,12 +814,11 @@ impl DispatchConfig {
 pub struct MultiTokenManager {
     config: Config,
     proxy: Option<ProxyConfig>,
+    state_store: StateStore,
     /// 凭据条目列表
     entries: Arc<Mutex<Vec<CredentialEntry>>>,
     /// 当前活动凭据 ID
     current_id: Mutex<u64>,
-    /// 凭据文件路径（用于回写）
-    credentials_path: Option<PathBuf>,
     /// 是否为多凭据格式（数组格式才回写）
     is_multiple_format: bool,
     /// 调度配置（负载均衡模式、排队参数）
@@ -769,6 +827,14 @@ pub struct MultiTokenManager {
     availability_notify: Arc<Notify>,
     /// 当前正在等待可用槽位的请求数
     waiting_requests: Arc<std::sync::atomic::AtomicUsize>,
+    /// 串行化本实例内所有会写入共享凭据/调度状态的操作，避免快照覆盖。
+    state_write_lock: Mutex<()>,
+    /// 最近一次已观察到的共享状态修订号。
+    last_state_change_revisions: Mutex<StateChangeRevisions>,
+    /// 热路径共享状态检查的单调时钟原点。
+    hot_path_state_sync_origin: Instant,
+    /// 最近一次热路径 revision 检查时间戳（相对 origin 的毫秒数）。
+    last_hot_path_state_sync_check_ms: AtomicU64,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -777,6 +843,8 @@ pub struct MultiTokenManager {
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
+/// follower 观察到共享凭据需要由 leader 刷新时，临时避让该凭据的冷却时间
+const SHARED_REFRESH_DEFER_COOLDOWN: StdDuration = StdDuration::from_secs(2);
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 
@@ -862,6 +930,8 @@ impl MultiTokenManager {
         credentials_path: Option<PathBuf>,
         is_multiple_format: bool,
     ) -> anyhow::Result<Self> {
+        let state_store = StateStore::from_config(&config, credentials_path.clone())?;
+        let initial_state_change_revisions = state_store.state_change_revisions()?;
         let dispatch_config = DispatchConfig::from_config(&config);
         let now = Instant::now();
 
@@ -903,6 +973,7 @@ impl MultiTokenManager {
                         None
                     },
                     success_count: 0,
+                    pending_success_count_delta: 0,
                     last_used_at: None,
                     active_requests: 0,
                     rate_limit_cooldown_until: None,
@@ -937,13 +1008,17 @@ impl MultiTokenManager {
         let manager = Self {
             config,
             proxy,
+            state_store,
             entries: Arc::new(Mutex::new(entries)),
             current_id: Mutex::new(initial_id),
-            credentials_path,
             is_multiple_format,
             dispatch_config: Mutex::new(dispatch_config),
             availability_notify: Arc::new(Notify::new()),
             waiting_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            state_write_lock: Mutex::new(()),
+            last_state_change_revisions: Mutex::new(initial_state_change_revisions),
+            hot_path_state_sync_origin: Instant::now(),
+            last_hot_path_state_sync_check_ms: AtomicU64::new(u64::MAX),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
         };
@@ -1287,8 +1362,7 @@ impl MultiTokenManager {
         let mut has_enabled = false;
         let mut has_supported = false;
         let mut selected_index: Option<usize> = None;
-        let mut priority_fallback_index: Option<usize> = None;
-        let mut priority_fallback_key: Option<(u32, usize, u64)> = None;
+        let mut priority_key: Option<(u32, usize, u8, u64)> = None;
         let mut balanced_key: Option<(usize, u64, u32, u64)> = None;
         let mut next_ready_at: Option<Instant> = None;
 
@@ -1336,19 +1410,19 @@ impl MultiTokenManager {
                 continue;
             }
 
-            if entry.id == current_id_value {
-                selected_index = Some(index);
-                break;
-            }
-
-            let candidate_key = (entry.credentials.priority, entry.active_requests, entry.id);
-            let should_select = priority_fallback_key
+            let candidate_key = (
+                entry.credentials.priority,
+                entry.active_requests,
+                u8::from(entry.id != current_id_value),
+                entry.id,
+            );
+            let should_select = priority_key
                 .as_ref()
                 .map(|best_key| candidate_key < *best_key)
                 .unwrap_or(true);
             if should_select {
-                priority_fallback_key = Some(candidate_key);
-                priority_fallback_index = Some(index);
+                priority_key = Some(candidate_key);
+                selected_index = Some(index);
             }
         }
 
@@ -1359,7 +1433,7 @@ impl MultiTokenManager {
             return Err(ReservationFailure::NoModelSupport);
         }
 
-        let entry_index = match selected_index.or(priority_fallback_index) {
+        let entry_index = match selected_index {
             Some(index) => index,
             None => {
                 return Err(ReservationFailure::AllTemporarilyUnavailable { next_ready_at });
@@ -1416,9 +1490,19 @@ impl MultiTokenManager {
         let mut attempt_count = 0;
         let mut wait_queue_guard: Option<WaitQueueGuard> = None;
         let mut wait_deadline: Option<Instant> = None;
+        let mut last_runtime_coordination_error: Option<anyhow::Error> = None;
 
         loop {
+            if self.state_store.is_external() {
+                if let Err(err) = self.maybe_sync_external_state_on_hot_path() {
+                    tracing::warn!("按需同步外部状态失败，将继续使用本地状态: {}", err);
+                }
+            }
+
             if attempt_count >= max_attempts {
+                if let Some(err) = last_runtime_coordination_error {
+                    return Err(err);
+                }
                 anyhow::bail!(
                     "所有凭据均无法获取有效 Token（可用: {}/{}）",
                     self.available_count(),
@@ -1476,6 +1560,22 @@ impl MultiTokenManager {
                 }
                 Err(e) => {
                     drop(lease);
+                    if e.downcast_ref::<RuntimeRefreshLeaderRequiredError>()
+                        .is_some()
+                    {
+                        tracing::warn!("凭据 #{} 需要由 leader 刷新 Token: {}", id, e);
+                        last_runtime_coordination_error = Some(e);
+                        attempt_count += 1;
+                        let has_available =
+                            self.defer_shared_refresh_credential(id, SHARED_REFRESH_DEFER_COOLDOWN);
+
+                        if !has_available {
+                            return Err(last_runtime_coordination_error
+                                .take()
+                                .expect("runtime coordination error should exist"));
+                        }
+                        continue;
+                    }
                     // refreshToken 永久失效 → 立即禁用，不累计重试
                     let has_available = if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
                         tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
@@ -1539,39 +1639,54 @@ impl MultiTokenManager {
             let _guard = refresh_lock.lock().await;
 
             // 第二次检查：获取锁后重新读取凭据，因为其他请求可能已经完成刷新
-            let current_creds = {
-                let entries = self.entries.lock();
-                entries
-                    .iter()
-                    .find(|e| e.id == id)
-                    .map(|e| e.credentials.clone())
-                    .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))?
-            };
+            let mut current_creds = self.current_credentials(id)?;
 
             if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
-                // 确实需要刷新
-                let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
-                let new_creds =
-                    refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
-
-                if is_token_expired(&new_creds) {
-                    anyhow::bail!("刷新后的 Token 仍然无效或已过期");
-                }
-
-                // 更新凭据
-                {
-                    let mut entries = self.entries.lock();
-                    if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                        entry.credentials = new_creds.clone();
+                if self.state_store.is_external() {
+                    if let Err(err) = self.sync_external_state_if_changed() {
+                        tracing::warn!("按需同步共享凭据状态失败，将继续使用本地状态: {}", err);
                     }
+                    current_creds = self.current_credentials(id)?;
                 }
 
-                // 回写凭据到文件（仅多凭据格式），失败只记录警告
-                if let Err(e) = self.persist_credentials() {
-                    tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
-                }
+                if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
+                    if let Some(status) = self.runtime_refresh_coordination_status()? {
+                        if !status.is_leader {
+                            return Err(anyhow::Error::new(RuntimeRefreshLeaderRequiredError {
+                                instance_id: status.instance_id,
+                                leader_id: status.leader_id,
+                            }));
+                        }
+                    }
 
-                new_creds
+                    // 确实需要刷新
+                    let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
+                    let new_creds =
+                        refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
+                            .await?;
+
+                    if is_token_expired(&new_creds) {
+                        anyhow::bail!("刷新后的 Token 仍然无效或已过期");
+                    }
+
+                    let _state_write_guard = self.state_write_lock.lock();
+                    {
+                        let mut entries = self.entries.lock();
+                        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                            entry.credentials = new_creds.clone();
+                        }
+                    }
+
+                    let credentials = self.persisted_credentials_snapshot();
+                    if let Err(e) = self.persist_credentials_snapshot(&credentials) {
+                        tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
+                    }
+
+                    new_creds
+                } else {
+                    tracing::debug!("Token 已从外部状态更新，跳过本地刷新");
+                    current_creds
+                }
             } else {
                 // 其他请求已经完成刷新，直接使用新凭据
                 tracing::debug!("Token 已被其他请求刷新，跳过刷新");
@@ -1607,87 +1722,394 @@ impl MultiTokenManager {
     /// - `Ok(false)` - 跳过写入（非多凭据格式或无路径配置）
     /// - `Err(_)` - 写入失败
     fn persist_credentials(&self) -> anyhow::Result<bool> {
-        use anyhow::Context;
+        let _guard = self.state_write_lock.lock();
+        let credentials = self.persisted_credentials_snapshot();
+        self.persist_credentials_snapshot(&credentials)
+    }
 
-        // 仅多凭据格式才回写
-        if !self.is_multiple_format {
+    fn persisted_credentials_snapshot(&self) -> Vec<KiroCredentials> {
+        let entries = self.entries.lock();
+        Self::persisted_credentials_from_entries(&entries)
+    }
+
+    fn persisted_credentials_from_entries(entries: &[CredentialEntry]) -> Vec<KiroCredentials> {
+        entries
+            .iter()
+            .map(|entry| {
+                let mut credential = entry.credentials.clone();
+                credential.canonicalize_auth_method();
+                credential.disabled = entry.disabled;
+                credential
+            })
+            .collect()
+    }
+
+    fn persist_credentials_snapshot(
+        &self,
+        credentials: &[KiroCredentials],
+    ) -> anyhow::Result<bool> {
+        let mut normalized = credentials.to_vec();
+        for credential in &mut normalized {
+            credential.canonicalize_auth_method();
+        }
+
+        let persisted = self
+            .state_store
+            .persist_credentials(&normalized, self.is_multiple_format)?;
+        if persisted {
+            self.try_bump_state_change_revision(StateChangeKind::Credentials);
+        }
+        Ok(persisted)
+    }
+
+    fn record_state_change_revisions(&self, revisions: StateChangeRevisions) {
+        *self.last_state_change_revisions.lock() = revisions;
+    }
+
+    fn record_state_change_revision(&self, kind: StateChangeKind, revision: u64) {
+        if revision == 0 {
+            return;
+        }
+
+        let mut revisions = self.last_state_change_revisions.lock();
+        match kind {
+            StateChangeKind::Credentials => {
+                revisions.credentials = revisions.credentials.max(revision)
+            }
+            StateChangeKind::DispatchConfig => {
+                revisions.dispatch_config = revisions.dispatch_config.max(revision)
+            }
+            StateChangeKind::BalanceCache => {
+                revisions.balance_cache = revisions.balance_cache.max(revision)
+            }
+        }
+    }
+
+    fn try_bump_state_change_revision(&self, kind: StateChangeKind) {
+        match self.state_store.bump_state_change_revision(kind) {
+            Ok(revision) => self.record_state_change_revision(kind, revision),
+            Err(err) => tracing::warn!("更新共享状态修订号失败: {}", err),
+        }
+    }
+
+    fn try_begin_hot_path_state_sync(&self) -> bool {
+        let min_interval_ms = self.config.state_hot_path_sync_min_interval_ms;
+        if min_interval_ms == 0 {
+            return true;
+        }
+
+        let now_ms = self.hot_path_state_sync_origin.elapsed().as_millis() as u64;
+        loop {
+            let previous = self
+                .last_hot_path_state_sync_check_ms
+                .load(Ordering::Acquire);
+            if previous != u64::MAX && now_ms.saturating_sub(previous) < min_interval_ms {
+                return false;
+            }
+            match self.last_hot_path_state_sync_check_ms.compare_exchange(
+                previous,
+                now_ms,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(_) => continue,
+            }
+        }
+    }
+
+    fn maybe_sync_external_state_on_hot_path(&self) -> anyhow::Result<ExternalStateSyncReport> {
+        if !self.state_store.is_external() {
+            return Ok(ExternalStateSyncReport::default());
+        }
+        if !self.try_begin_hot_path_state_sync() {
+            return Ok(ExternalStateSyncReport::default());
+        }
+        self.sync_external_state_if_changed()
+    }
+
+    pub fn state_store(&self) -> StateStore {
+        self.state_store.clone()
+    }
+
+    pub fn sync_from_state(&self) -> anyhow::Result<ExternalStateSyncReport> {
+        if !self.state_store.is_external() {
+            return Ok(ExternalStateSyncReport::default());
+        }
+
+        let dispatch_config_reloaded = self.reload_dispatch_config_from_state()?;
+        self.reload_credentials_from_state()?;
+        let stats_reloaded = self.reload_stats_from_state()?;
+        match self.state_store.state_change_revisions() {
+            Ok(revisions) => self.record_state_change_revisions(revisions),
+            Err(err) => tracing::warn!("刷新共享状态修订号缓存失败: {}", err),
+        }
+
+        Ok(ExternalStateSyncReport {
+            credentials_reloaded: true,
+            dispatch_config_reloaded,
+            stats_reloaded,
+        })
+    }
+
+    pub fn sync_external_state_if_changed(&self) -> anyhow::Result<ExternalStateSyncReport> {
+        if !self.state_store.is_external() {
+            return Ok(ExternalStateSyncReport::default());
+        }
+
+        let revisions = self.state_store.state_change_revisions()?;
+        let previous = *self.last_state_change_revisions.lock();
+        if revisions == previous {
+            return Ok(ExternalStateSyncReport::default());
+        }
+
+        let mut report = ExternalStateSyncReport::default();
+
+        if revisions.dispatch_config > previous.dispatch_config {
+            report.dispatch_config_reloaded = self.reload_dispatch_config_from_state()?;
+        }
+        if revisions.credentials > previous.credentials {
+            self.reload_credentials_from_state()?;
+            report.credentials_reloaded = true;
+        }
+
+        self.record_state_change_revisions(revisions);
+        Ok(report)
+    }
+
+    fn current_credentials(&self, id: u64) -> anyhow::Result<KiroCredentials> {
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.credentials.clone())
+            .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))
+    }
+
+    fn persisted_credential_mut<'a>(
+        credentials: &'a mut [KiroCredentials],
+        id: u64,
+    ) -> anyhow::Result<&'a mut KiroCredentials> {
+        credentials
+            .iter_mut()
+            .find(|credential| credential.id == Some(id))
+            .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))
+    }
+
+    fn runtime_refresh_coordination_status(
+        &self,
+    ) -> anyhow::Result<Option<RuntimeCoordinationStatus>> {
+        if !self.state_store.is_external() || !self.state_store.runtime_coordination_enabled() {
+            return Ok(None);
+        }
+
+        self.state_store.runtime_coordination_status()
+    }
+
+    fn reload_dispatch_config_from_state(&self) -> anyhow::Result<bool> {
+        let Some(persisted) = self.state_store.load_dispatch_config()? else {
             return Ok(false);
-        }
-
-        let path = match &self.credentials_path {
-            Some(p) => p,
-            None => return Ok(false),
         };
 
-        // 收集所有凭据
-        let credentials: Vec<KiroCredentials> = {
+        Ok(self.apply_dispatch_config_from_state(&persisted))
+    }
+
+    fn apply_dispatch_config_from_state(&self, persisted: &PersistedDispatchConfig) -> bool {
+        let mut config = self.config.clone();
+        persisted.apply_to_config(&mut config);
+        let next = DispatchConfig::from_config(&config);
+        let previous = self.dispatch_config();
+
+        if previous == next {
+            return false;
+        }
+
+        *self.dispatch_config.lock() = next.clone();
+
+        if previous.rate_limit_cooldown_ms != next.rate_limit_cooldown_ms
+            && next.rate_limit_cooldown_ms == 0
+        {
+            self.clear_all_rate_limit_cooldowns();
+        }
+        if previous.rate_limit_bucket_capacity != next.rate_limit_bucket_capacity
+            || previous.rate_limit_refill_per_second != next.rate_limit_refill_per_second
+            || previous.rate_limit_refill_min_per_second != next.rate_limit_refill_min_per_second
+            || previous.rate_limit_refill_recovery_step_per_success
+                != next.rate_limit_refill_recovery_step_per_success
+            || previous.rate_limit_refill_backoff_factor != next.rate_limit_refill_backoff_factor
+        {
+            self.reconfigure_rate_limit_runtime(&next);
+        }
+
+        self.availability_notify.notify_waiters();
+        tracing::info!(
+            "已从外部状态热加载调度配置: mode={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, defaultMaxConcurrency={:?}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}",
+            next.mode,
+            next.queue_max_size,
+            next.queue_max_wait_ms,
+            next.rate_limit_cooldown_ms,
+            next.default_max_concurrency,
+            next.rate_limit_bucket_capacity,
+            next.rate_limit_refill_per_second,
+            next.rate_limit_refill_min_per_second,
+            next.rate_limit_refill_recovery_step_per_success,
+            next.rate_limit_refill_backoff_factor
+        );
+
+        true
+    }
+
+    fn reload_credentials_from_state(&self) -> anyhow::Result<()> {
+        let persisted = self.state_store.load_credentials()?;
+        let dispatch = self.dispatch_config();
+        let now = Instant::now();
+        let mut persisted_by_id = HashMap::new();
+        let mut persisted_ids = std::collections::HashSet::new();
+
+        for mut credential in persisted.credentials {
+            credential.canonicalize_auth_method();
+            let Some(id) = credential.id else {
+                tracing::warn!("外部状态中的凭据缺少 ID，已跳过热重载");
+                continue;
+            };
+
+            if credential.machine_id.is_none() {
+                if let Some(machine_id) =
+                    machine_id::generate_from_credentials(&credential, &self.config)
+                {
+                    credential.machine_id = Some(machine_id);
+                }
+            }
+
+            if !persisted_ids.insert(id) {
+                tracing::warn!("外部状态中的凭据 ID 重复，后写入项将覆盖前一项: {}", id);
+            }
+            persisted_by_id.insert(id, credential);
+        }
+
+        {
+            let mut entries = self.entries.lock();
+
+            for entry in entries.iter_mut() {
+                let Some(persisted) = persisted_by_id.remove(&entry.id) else {
+                    if entry.active_requests == 0 {
+                        continue;
+                    }
+
+                    entry.disabled = true;
+                    if entry.disabled_reason.is_none() {
+                        entry.disabled_reason = Some(DisabledReason::Manual);
+                    }
+                    continue;
+                };
+
+                let was_disabled = entry.disabled;
+                entry.credentials = persisted.clone();
+                entry.disabled = persisted.disabled;
+
+                if persisted.disabled {
+                    if entry.disabled_reason.is_none() {
+                        entry.disabled_reason = Some(DisabledReason::Manual);
+                    }
+                } else {
+                    entry.disabled_reason = None;
+                    if was_disabled {
+                        entry.failure_count = 0;
+                        entry.refresh_failure_count = 0;
+                        Self::reset_rate_limit_runtime(entry, &dispatch, now);
+                    } else {
+                        Self::sync_rate_limit_bucket_runtime(entry, &dispatch, now);
+                    }
+                }
+            }
+
+            entries.retain(|entry| persisted_ids.contains(&entry.id) || entry.active_requests > 0);
+
+            for (_, credential) in persisted_by_id {
+                entries.push(CredentialEntry {
+                    id: credential.id.expect("persisted credential id must exist"),
+                    disabled: credential.disabled,
+                    disabled_reason: credential.disabled.then_some(DisabledReason::Manual),
+                    credentials: credential.clone(),
+                    failure_count: 0,
+                    refresh_failure_count: 0,
+                    success_count: 0,
+                    pending_success_count_delta: 0,
+                    last_used_at: None,
+                    active_requests: 0,
+                    rate_limit_cooldown_until: None,
+                    rate_limit_bucket: dispatch
+                        .bucket_policy_for(&credential)
+                        .map(|policy| AdaptiveTokenBucket::new(policy, now)),
+                    rate_limit_hit_streak: 0,
+                    refresh_lock: Arc::new(TokioMutex::new(())),
+                });
+            }
+        }
+
+        {
             let entries = self.entries.lock();
-            entries
-                .iter()
-                .map(|e| {
-                    let mut cred = e.credentials.clone();
-                    cred.canonicalize_auth_method();
-                    // 同步 disabled 状态到凭据对象
-                    cred.disabled = e.disabled;
-                    cred
-                })
-                .collect()
-        };
-
-        // 序列化为 pretty JSON
-        let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
-
-        // 写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| std::fs::write(path, &json))
-                .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
-        } else {
-            std::fs::write(path, &json).with_context(|| format!("回写凭据文件失败: {:?}", path))?;
+            if entries.is_empty() {
+                *self.current_id.lock() = 0;
+            }
         }
 
-        tracing::debug!("已回写凭据到文件: {:?}", path);
-        Ok(true)
+        if self.total_count() > 0 {
+            self.select_highest_priority();
+        }
+        self.availability_notify.notify_waiters();
+        Ok(())
     }
 
-    /// 获取缓存目录（凭据文件所在目录）
-    pub fn cache_dir(&self) -> Option<PathBuf> {
-        self.credentials_path
-            .as_ref()
-            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    fn reload_stats_from_state(&self) -> anyhow::Result<bool> {
+        let stats = self.state_store.load_stats()?;
+        let changed = self.apply_stats_from_state(&stats);
+
+        if changed {
+            tracing::info!("已从外部状态热加载 {} 条统计数据", stats.len());
+        }
+
+        Ok(changed)
     }
 
-    /// 统计数据文件路径
-    fn stats_path(&self) -> Option<PathBuf> {
-        self.cache_dir().map(|d| d.join("kiro_stats.json"))
+    fn apply_stats_from_state(&self, stats: &HashMap<String, StatsEntryRecord>) -> bool {
+        let mut changed = false;
+        let mut entries = self.entries.lock();
+
+        for entry in entries.iter_mut() {
+            let Some(persisted) = stats.get(&entry.id.to_string()) else {
+                continue;
+            };
+
+            let next_success_count = persisted
+                .success_count
+                .saturating_add(entry.pending_success_count_delta);
+            let next_last_used_at =
+                newer_timestamp(entry.last_used_at.clone(), persisted.last_used_at.clone());
+
+            if entry.success_count != next_success_count || entry.last_used_at != next_last_used_at
+            {
+                changed = true;
+            }
+
+            entry.success_count = next_success_count;
+            entry.last_used_at = next_last_used_at;
+        }
+
+        changed
     }
 
     /// 从磁盘加载统计数据并应用到当前条目
     fn load_stats(&self) {
-        let path = match self.stats_path() {
-            Some(p) => p,
-            None => return,
-        };
-
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => return, // 首次运行时文件不存在
-        };
-
-        let stats: HashMap<String, StatsEntry> = match serde_json::from_str(&content) {
-            Ok(s) => s,
+        let stats = match self.state_store.load_stats() {
+            Ok(stats) => stats,
             Err(e) => {
-                tracing::warn!("解析统计缓存失败，将忽略: {}", e);
+                tracing::warn!("加载统计缓存失败，将忽略: {}", e);
                 return;
             }
         };
 
-        let mut entries = self.entries.lock();
-        for entry in entries.iter_mut() {
-            if let Some(s) = stats.get(&entry.id.to_string()) {
-                entry.success_count = s.success_count;
-                entry.last_used_at = s.last_used_at.clone();
-            }
-        }
+        self.apply_stats_from_state(&stats);
         *self.last_stats_save_at.lock() = Some(Instant::now());
         self.stats_dirty.store(false, Ordering::Relaxed);
         tracing::info!("已从缓存加载 {} 条统计数据", stats.len());
@@ -1695,19 +2117,51 @@ impl MultiTokenManager {
 
     /// 将当前统计数据持久化到磁盘
     fn save_stats(&self) {
-        let path = match self.stats_path() {
-            Some(p) => p,
-            None => return,
-        };
-
-        let stats: HashMap<String, StatsEntry> = {
+        let updates: HashMap<String, StatsMergeRecord> = {
             let entries = self.entries.lock();
             entries
                 .iter()
                 .map(|e| {
                     (
                         e.id.to_string(),
-                        StatsEntry {
+                        StatsMergeRecord {
+                            success_count_delta: e.pending_success_count_delta,
+                            last_used_at: e.last_used_at.clone(),
+                        },
+                    )
+                })
+                .collect()
+        };
+
+        match self.state_store.merge_stats(&updates) {
+            Ok(merged_stats) => {
+                let mut entries = self.entries.lock();
+                for entry in entries.iter_mut() {
+                    if let Some(merged) = merged_stats.get(&entry.id.to_string()) {
+                        entry.success_count = merged.success_count;
+                        entry.last_used_at = merged.last_used_at.clone();
+                    }
+                    entry.pending_success_count_delta = 0;
+                }
+                *self.last_stats_save_at.lock() = Some(Instant::now());
+                self.stats_dirty.store(false, Ordering::Relaxed);
+            }
+            Err(e) => tracing::warn!("保存统计缓存失败: {}", e),
+        }
+    }
+
+    /// 使用当前内存快照全量覆盖统计缓存。
+    ///
+    /// 仅用于需要裁剪已删除凭据残留统计的场景。
+    fn rewrite_stats_snapshot(&self) {
+        let stats: HashMap<String, StatsEntryRecord> = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .map(|e| {
+                    (
+                        e.id.to_string(),
+                        StatsEntryRecord {
                             success_count: e.success_count,
                             last_used_at: e.last_used_at.clone(),
                         },
@@ -1716,16 +2170,16 @@ impl MultiTokenManager {
                 .collect()
         };
 
-        match serde_json::to_string_pretty(&stats) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
-                    tracing::warn!("保存统计缓存失败: {}", e);
-                } else {
-                    *self.last_stats_save_at.lock() = Some(Instant::now());
-                    self.stats_dirty.store(false, Ordering::Relaxed);
+        match self.state_store.save_stats(&stats) {
+            Ok(()) => {
+                let mut entries = self.entries.lock();
+                for entry in entries.iter_mut() {
+                    entry.pending_success_count_delta = 0;
                 }
+                *self.last_stats_save_at.lock() = Some(Instant::now());
+                self.stats_dirty.store(false, Ordering::Relaxed);
             }
-            Err(e) => tracing::warn!("序列化统计数据失败: {}", e),
+            Err(e) => tracing::warn!("全量重写统计缓存失败: {}", e),
         }
     }
 
@@ -1770,6 +2224,7 @@ impl MultiTokenManager {
                 }
                 entry.rate_limit_hit_streak = 0;
                 entry.success_count += 1;
+                entry.pending_success_count_delta += 1;
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
                 tracing::debug!(
                     "凭据 #{} API 调用成功（累计 {} 次）",
@@ -1826,6 +2281,66 @@ impl MultiTokenManager {
         self.save_stats_debounced();
     }
 
+    /// 当 follower 观察到某个凭据需要由 leader 刷新 token 时，临时冷却该凭据，
+    /// 让当前请求优先切换到其他可用凭据，避免在同一张共享凭据上反复重试。
+    pub fn defer_shared_refresh_credential(&self, id: u64, cooldown: StdDuration) -> bool {
+        let now = Instant::now();
+        let deferred_until = now + cooldown;
+        let result = {
+            let mut entries = self.entries.lock();
+            let mut current_id = self.current_id.lock();
+
+            let entry = match entries.iter_mut().find(|e| e.id == id) {
+                Some(e) => e,
+                None => return entries.iter().any(|e| !e.disabled),
+            };
+
+            if entry.disabled {
+                return entries.iter().any(|e| !e.disabled);
+            }
+
+            entry.rate_limit_cooldown_until = Some(
+                entry
+                    .rate_limit_cooldown_until
+                    .map(|until| until.max(deferred_until))
+                    .unwrap_or(deferred_until),
+            );
+            entry.last_used_at = Some(Utc::now().to_rfc3339());
+
+            if *current_id == id {
+                if let Some(next) = entries
+                    .iter()
+                    .filter(|e| !e.disabled && e.id != id)
+                    .min_by_key(|e| e.credentials.priority)
+                {
+                    *current_id = next.id;
+                    tracing::info!(
+                        "凭据 #{} 需由 leader 刷新 token，已临时冷却 {}ms 并切换到凭据 #{}",
+                        id,
+                        cooldown.as_millis(),
+                        next.id
+                    );
+                } else {
+                    tracing::warn!(
+                        "凭据 #{} 需由 leader 刷新 token，已临时冷却 {}ms，当前无其他可切换凭据",
+                        id,
+                        cooldown.as_millis()
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    "凭据 #{} 需由 leader 刷新 token，已临时冷却 {}ms",
+                    id,
+                    cooldown.as_millis()
+                );
+            }
+
+            entries.iter().any(|e| !e.disabled)
+        };
+        self.save_stats_debounced();
+        result
+    }
+
     /// 报告指定凭据 API 调用失败
     ///
     /// 增加失败计数，达到阈值时禁用凭据并切换到优先级最高的可用凭据
@@ -1835,6 +2350,7 @@ impl MultiTokenManager {
     /// * `id` - 凭据 ID（来自 CallContext）
     pub fn report_failure(&self, id: u64) -> bool {
         let result = {
+            let _state_write_guard = self.state_write_lock.lock();
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
 
@@ -1894,6 +2410,7 @@ impl MultiTokenManager {
     /// - 返回是否还有可用凭据
     pub fn report_quota_exhausted(&self, id: u64) -> bool {
         let result = {
+            let _state_write_guard = self.state_write_lock.lock();
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
 
@@ -1942,6 +2459,7 @@ impl MultiTokenManager {
     /// 与 API 401/403 的累计失败策略保持一致。
     pub fn report_refresh_failure(&self, id: u64) -> bool {
         let result = {
+            let _state_write_guard = self.state_write_lock.lock();
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
 
@@ -2005,6 +2523,7 @@ impl MultiTokenManager {
     /// 返回是否还有可用凭据。
     pub fn report_refresh_token_invalid(&self, id: u64) -> bool {
         let result = {
+            let _state_write_guard = self.state_write_lock.lock();
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
 
@@ -2183,6 +2702,12 @@ impl MultiTokenManager {
     pub fn set_disabled(&self, id: u64, disabled: bool) -> anyhow::Result<()> {
         let dispatch = self.dispatch_config();
         let now = Instant::now();
+        let _state_write_guard = self.state_write_lock.lock();
+
+        let mut persisted = self.persisted_credentials_snapshot();
+        Self::persisted_credential_mut(&mut persisted, id)?.disabled = disabled;
+        self.persist_credentials_snapshot(&persisted)?;
+
         {
             let mut entries = self.entries.lock();
             let entry = entries
@@ -2200,8 +2725,6 @@ impl MultiTokenManager {
                 entry.disabled_reason = Some(DisabledReason::Manual);
             }
         }
-        // 持久化更改
-        self.persist_credentials()?;
         if !disabled {
             self.availability_notify.notify_waiters();
         }
@@ -2211,8 +2734,12 @@ impl MultiTokenManager {
     /// 设置凭据优先级（Admin API）
     ///
     /// 修改优先级后会立即按新优先级重新选择当前凭据。
-    /// 即使持久化失败，内存中的优先级和当前凭据选择也会生效。
     pub fn set_priority(&self, id: u64, priority: u32) -> anyhow::Result<()> {
+        let _state_write_guard = self.state_write_lock.lock();
+        let mut persisted = self.persisted_credentials_snapshot();
+        Self::persisted_credential_mut(&mut persisted, id)?.priority = priority;
+        self.persist_credentials_snapshot(&persisted)?;
+
         {
             let mut entries = self.entries.lock();
             let entry = entries
@@ -2221,24 +2748,26 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
             entry.credentials.priority = priority;
         }
-        // 立即按新优先级重新选择当前凭据（无论持久化是否成功）
         self.select_highest_priority();
-        // 持久化更改
-        self.persist_credentials()?;
         Ok(())
     }
 
     /// 设置凭据并发上限（Admin API）
     pub fn set_max_concurrency(&self, id: u64, max_concurrency: Option<u32>) -> anyhow::Result<()> {
+        let normalized = max_concurrency.filter(|limit| *limit > 0);
+        let _state_write_guard = self.state_write_lock.lock();
+        let mut persisted = self.persisted_credentials_snapshot();
+        Self::persisted_credential_mut(&mut persisted, id)?.max_concurrency = normalized;
+        self.persist_credentials_snapshot(&persisted)?;
+
         {
             let mut entries = self.entries.lock();
             let entry = entries
                 .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            entry.credentials.max_concurrency = max_concurrency.filter(|limit| *limit > 0);
+            entry.credentials.max_concurrency = normalized;
         }
-        self.persist_credentials()?;
         self.availability_notify.notify_waiters();
         Ok(())
     }
@@ -2259,6 +2788,17 @@ impl MultiTokenManager {
 
         let dispatch = self.dispatch_config();
         let now = Instant::now();
+        let _state_write_guard = self.state_write_lock.lock();
+        let mut persisted = self.persisted_credentials_snapshot();
+        let credential = Self::persisted_credential_mut(&mut persisted, id)?;
+        if let Some(rate_limit_bucket_capacity) = rate_limit_bucket_capacity {
+            credential.rate_limit_bucket_capacity = rate_limit_bucket_capacity;
+        }
+        if let Some(rate_limit_refill_per_second) = rate_limit_refill_per_second {
+            credential.rate_limit_refill_per_second = rate_limit_refill_per_second;
+        }
+        self.persist_credentials_snapshot(&persisted)?;
+
         {
             let mut entries = self.entries.lock();
             let entry = entries
@@ -2274,7 +2814,6 @@ impl MultiTokenManager {
             Self::sync_rate_limit_bucket_runtime(entry, &dispatch, now);
         }
 
-        self.persist_credentials()?;
         self.availability_notify.notify_waiters();
         Ok(())
     }
@@ -2283,6 +2822,11 @@ impl MultiTokenManager {
     pub fn reset_and_enable(&self, id: u64) -> anyhow::Result<()> {
         let dispatch = self.dispatch_config();
         let now = Instant::now();
+        let _state_write_guard = self.state_write_lock.lock();
+        let mut persisted = self.persisted_credentials_snapshot();
+        Self::persisted_credential_mut(&mut persisted, id)?.disabled = false;
+        self.persist_credentials_snapshot(&persisted)?;
+
         {
             let mut entries = self.entries.lock();
             let entry = entries
@@ -2295,74 +2839,14 @@ impl MultiTokenManager {
             entry.disabled_reason = None;
             Self::reset_rate_limit_runtime(entry, &dispatch, now);
         }
-        // 持久化更改
-        self.persist_credentials()?;
         self.availability_notify.notify_waiters();
         Ok(())
     }
 
     /// 获取指定凭据的使用额度（Admin API）
     pub async fn get_usage_limits_for(&self, id: u64) -> anyhow::Result<UsageLimitsResponse> {
-        let credentials = {
-            let entries = self.entries.lock();
-            entries
-                .iter()
-                .find(|e| e.id == id)
-                .map(|e| e.credentials.clone())
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
-        };
-
-        // 检查是否需要刷新 token
-        let needs_refresh = is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
-
-        let token = if needs_refresh {
-            let refresh_lock = self.refresh_lock_for(id)?;
-            let _guard = refresh_lock.lock().await;
-            let current_creds = {
-                let entries = self.entries.lock();
-                entries
-                    .iter()
-                    .find(|e| e.id == id)
-                    .map(|e| e.credentials.clone())
-                    .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
-            };
-
-            if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
-                let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
-                let new_creds =
-                    refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
-                {
-                    let mut entries = self.entries.lock();
-                    if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                        entry.credentials = new_creds.clone();
-                    }
-                }
-                // 持久化失败只记录警告，不影响本次请求
-                if let Err(e) = self.persist_credentials() {
-                    tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
-                }
-                new_creds
-                    .access_token
-                    .ok_or_else(|| anyhow::anyhow!("刷新后无 access_token"))?
-            } else {
-                current_creds
-                    .access_token
-                    .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
-            }
-        } else {
-            credentials
-                .access_token
-                .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
-        };
-
-        let credentials = {
-            let entries = self.entries.lock();
-            entries
-                .iter()
-                .find(|e| e.id == id)
-                .map(|e| e.credentials.clone())
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
-        };
+        let credentials = self.current_credentials(id)?;
+        let (credentials, token) = self.try_ensure_token(id, &credentials).await?;
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
         let usage_limits =
@@ -2370,7 +2854,8 @@ impl MultiTokenManager {
 
         // 更新订阅等级到凭据（仅在发生变化时持久化）
         if let Some(subscription_title) = usage_limits.subscription_title() {
-            let changed = {
+            {
+                let _state_write_guard = self.state_write_lock.lock();
                 let mut entries = self.entries.lock();
                 if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                     let old_title = entry.credentials.subscription_title.clone();
@@ -2382,18 +2867,11 @@ impl MultiTokenManager {
                             old_title,
                             subscription_title
                         );
-                        true
-                    } else {
-                        false
+                        let credentials = Self::persisted_credentials_from_entries(&entries);
+                        if let Err(e) = self.persist_credentials_snapshot(&credentials) {
+                            tracing::warn!("订阅等级更新后持久化失败（不影响本次请求）: {}", e);
+                        }
                     }
-                } else {
-                    false
-                }
-            };
-
-            if changed {
-                if let Err(e) = self.persist_credentials() {
-                    tracing::warn!("订阅等级更新后持久化失败（不影响本次请求）: {}", e);
                 }
             }
         }
@@ -2424,34 +2902,33 @@ impl MultiTokenManager {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("缺少 refreshToken"))?;
         let new_refresh_token_hash = sha256_hex(new_refresh_token);
-        let duplicate_exists = {
-            let entries = self.entries.lock();
-            entries.iter().any(|entry| {
-                entry
-                    .credentials
-                    .refresh_token
-                    .as_deref()
-                    .map(sha256_hex)
-                    .as_deref()
-                    == Some(new_refresh_token_hash.as_str())
-            })
-        };
-        if duplicate_exists {
-            anyhow::bail!("凭据已存在（refreshToken 重复）");
-        }
 
         // 3. 尝试刷新 Token 验证凭据有效性
         let effective_proxy = new_cred.effective_proxy(self.proxy.as_ref());
         let mut validated_cred =
             refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?;
 
-        // 4. 分配新 ID
-        let new_id = {
-            let entries = self.entries.lock();
-            entries.iter().map(|e| e.id).max().unwrap_or(0) + 1
-        };
+        let _state_write_guard = self.state_write_lock.lock();
+        let mut persisted = self.persisted_credentials_snapshot();
+        let duplicate_exists = persisted.iter().any(|credential| {
+            credential
+                .refresh_token
+                .as_deref()
+                .map(sha256_hex)
+                .as_deref()
+                == Some(new_refresh_token_hash.as_str())
+        });
+        if duplicate_exists {
+            anyhow::bail!("凭据已存在（refreshToken 重复）");
+        }
 
-        // 5. 设置 ID 并保留用户输入的元数据
+        let new_id = persisted
+            .iter()
+            .filter_map(|credential| credential.id)
+            .max()
+            .unwrap_or(0)
+            + 1;
+
         validated_cred.id = Some(new_id);
         validated_cred.priority = new_cred.priority;
         validated_cred.auth_method = new_cred.auth_method.map(|m| {
@@ -2477,6 +2954,10 @@ impl MultiTokenManager {
         validated_cred.proxy_url = new_cred.proxy_url;
         validated_cred.proxy_username = new_cred.proxy_username;
         validated_cred.proxy_password = new_cred.proxy_password;
+        validated_cred.disabled = false;
+
+        persisted.push(validated_cred.clone());
+        self.persist_credentials_snapshot(&persisted)?;
 
         let dispatch = self.dispatch_config();
         let now = Instant::now();
@@ -2493,6 +2974,7 @@ impl MultiTokenManager {
                 disabled: false,
                 disabled_reason: None,
                 success_count: 0,
+                pending_success_count_delta: 0,
                 last_used_at: None,
                 active_requests: 0,
                 rate_limit_cooldown_until: None,
@@ -2502,8 +2984,6 @@ impl MultiTokenManager {
             });
         }
 
-        // 6. 持久化
-        self.persist_credentials()?;
         self.availability_notify.notify_waiters();
 
         tracing::info!("成功添加凭据 #{}", new_id);
@@ -2527,6 +3007,18 @@ impl MultiTokenManager {
     /// - `Ok(())` - 删除成功
     /// - `Err(_)` - 凭据不存在、未禁用或持久化失败
     pub fn delete_credential(&self, id: u64) -> anyhow::Result<()> {
+        let _state_write_guard = self.state_write_lock.lock();
+        let mut persisted = self.persisted_credentials_snapshot();
+        let credential = persisted
+            .iter()
+            .find(|credential| credential.id == Some(id))
+            .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+        if !credential.disabled {
+            anyhow::bail!("只能删除已禁用的凭据（请先禁用凭据 #{}）", id);
+        }
+        persisted.retain(|credential| credential.id != Some(id));
+        self.persist_credentials_snapshot(&persisted)?;
+
         let was_current = {
             let mut entries = self.entries.lock();
 
@@ -2566,11 +3058,8 @@ impl MultiTokenManager {
             }
         }
 
-        // 持久化更改
-        self.persist_credentials()?;
-
         // 立即回写统计数据，清除已删除凭据的残留条目
-        self.save_stats();
+        self.rewrite_stats_snapshot();
 
         tracing::info!("已删除凭据 #{}", id);
         Ok(())
@@ -2581,24 +3070,40 @@ impl MultiTokenManager {
     /// 无条件调用上游 API 重新获取 access token，不检查是否过期。
     /// 适用于排查问题、Token 异常但未过期、主动更新凭据状态等场景。
     pub async fn force_refresh_token_for(&self, id: u64) -> anyhow::Result<()> {
-        let credentials = {
-            let entries = self.entries.lock();
-            entries
-                .iter()
-                .find(|e| e.id == id)
-                .map(|e| e.credentials.clone())
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
-        };
-
         // 获取凭据级刷新锁，避免跨账号刷新串行阻塞
         let refresh_lock = self.refresh_lock_for(id)?;
         let _guard = refresh_lock.lock().await;
+
+        if self.state_store.is_external() {
+            if let Err(err) = self.sync_external_state_if_changed() {
+                tracing::warn!("按需同步共享凭据状态失败，将继续使用本地状态: {}", err);
+            }
+        }
+
+        let credentials = self.current_credentials(id)?;
+
+        if let Some(status) = self.runtime_refresh_coordination_status()? {
+            if !status.is_leader {
+                if credentials.access_token.is_some() && !is_token_expired(&credentials) {
+                    tracing::debug!(
+                        "凭据 #{} 已从外部状态同步到有效 Token，跳过本地强制刷新",
+                        id
+                    );
+                    return Ok(());
+                }
+
+                return Err(anyhow::Error::new(RuntimeRefreshLeaderRequiredError {
+                    instance_id: status.instance_id,
+                    leader_id: status.leader_id,
+                }));
+            }
+        }
 
         // 无条件调用 refresh_token
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
         let new_creds = refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?;
 
-        // 更新 entries 中对应凭据
+        let _state_write_guard = self.state_write_lock.lock();
         {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
@@ -2607,8 +3112,8 @@ impl MultiTokenManager {
             }
         }
 
-        // 持久化
-        if let Err(e) = self.persist_credentials() {
+        let credentials = self.persisted_credentials_snapshot();
+        if let Err(e) = self.persist_credentials_snapshot(&credentials) {
             tracing::warn!("强制刷新 Token 后持久化失败: {}", e);
         }
 
@@ -2641,45 +3146,21 @@ impl MultiTokenManager {
     }
 
     fn persist_dispatch_config(&self, dispatch: &DispatchConfig) -> anyhow::Result<()> {
-        use anyhow::Context;
-
-        let config_path = match self.config.config_path() {
-            Some(path) => path.to_path_buf(),
-            None => {
-                tracing::warn!(
-                    "配置文件路径未知，调度配置仅在当前进程生效: mode={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, defaultMaxConcurrency={:?}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}",
-                    dispatch.mode,
-                    dispatch.queue_max_size,
-                    dispatch.queue_max_wait_ms,
-                    dispatch.rate_limit_cooldown_ms,
-                    dispatch.default_max_concurrency,
-                    dispatch.rate_limit_bucket_capacity,
-                    dispatch.rate_limit_refill_per_second,
-                    dispatch.rate_limit_refill_min_per_second,
-                    dispatch.rate_limit_refill_recovery_step_per_success,
-                    dispatch.rate_limit_refill_backoff_factor
-                );
-                return Ok(());
-            }
-        };
-
-        let mut config = Config::load(&config_path)
-            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
-        config.load_balancing_mode = dispatch.mode.clone();
-        config.queue_max_size = dispatch.queue_max_size;
-        config.queue_max_wait_ms = dispatch.queue_max_wait_ms;
-        config.rate_limit_cooldown_ms = dispatch.rate_limit_cooldown_ms;
-        config.default_max_concurrency = dispatch.default_max_concurrency;
-        config.rate_limit_bucket_capacity = dispatch.rate_limit_bucket_capacity;
-        config.rate_limit_refill_per_second = dispatch.rate_limit_refill_per_second;
-        config.rate_limit_refill_min_per_second = dispatch.rate_limit_refill_min_per_second;
-        config.rate_limit_refill_recovery_step_per_success =
-            dispatch.rate_limit_refill_recovery_step_per_success;
-        config.rate_limit_refill_backoff_factor = dispatch.rate_limit_refill_backoff_factor;
-        config
-            .save()
-            .with_context(|| format!("持久化调度配置失败: {}", config_path.display()))?;
-
+        self.state_store
+            .persist_dispatch_config(&PersistedDispatchConfig {
+                mode: dispatch.mode.clone(),
+                queue_max_size: dispatch.queue_max_size,
+                queue_max_wait_ms: dispatch.queue_max_wait_ms,
+                rate_limit_cooldown_ms: dispatch.rate_limit_cooldown_ms,
+                default_max_concurrency: dispatch.default_max_concurrency,
+                rate_limit_bucket_capacity: dispatch.rate_limit_bucket_capacity,
+                rate_limit_refill_per_second: dispatch.rate_limit_refill_per_second,
+                rate_limit_refill_min_per_second: dispatch.rate_limit_refill_min_per_second,
+                rate_limit_refill_recovery_step_per_success: dispatch
+                    .rate_limit_refill_recovery_step_per_success,
+                rate_limit_refill_backoff_factor: dispatch.rate_limit_refill_backoff_factor,
+            })?;
+        self.try_bump_state_change_revision(StateChangeKind::DispatchConfig);
         Ok(())
     }
 
@@ -2761,6 +3242,7 @@ impl MultiTokenManager {
             return Ok(());
         }
 
+        let _state_write_guard = self.state_write_lock.lock();
         *self.dispatch_config.lock() = next.clone();
 
         if let Err(err) = self.persist_dispatch_config(&next) {
@@ -2812,6 +3294,20 @@ impl Drop for MultiTokenManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
+
+    fn temp_credentials_path(test_name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kiro-token-manager-{test_name}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("credentials.json")
+    }
+
+    fn write_credentials_file(path: &Path, credentials: &[KiroCredentials]) {
+        std::fs::write(path, serde_json::to_vec_pretty(credentials).unwrap()).unwrap();
+    }
 
     fn available_credential(priority: u32) -> KiroCredentials {
         let mut credentials = KiroCredentials::default();
@@ -3016,6 +3512,24 @@ mod tests {
         assert_ne!(manager.snapshot().current_id, initial_id);
     }
 
+    #[test]
+    fn test_hot_path_state_sync_slot_throttles_rapid_checks() {
+        let mut config = Config::default();
+        config.state_hot_path_sync_min_interval_ms = 20;
+        let manager =
+            MultiTokenManager::new(config, vec![available_credential(0)], None, None, false)
+                .unwrap();
+
+        assert!(manager.try_begin_hot_path_state_sync());
+        assert!(
+            !manager.try_begin_hot_path_state_sync(),
+            "连续热路径检查应命中最小间隔限频"
+        );
+
+        std::thread::sleep(StdDuration::from_millis(25));
+        assert!(manager.try_begin_hot_path_state_sync());
+    }
+
     #[tokio::test]
     async fn test_priority_mode_respects_per_account_concurrency_limit() {
         let config = Config::default();
@@ -3040,6 +3554,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_priority_mode_returns_to_highest_priority_after_fallback_recovers() {
+        let config = Config::default();
+        let mut primary = available_credential(0);
+        primary.max_concurrency = Some(1);
+        let secondary = available_credential(1);
+
+        let manager =
+            MultiTokenManager::new(config, vec![primary, secondary], None, None, false).unwrap();
+
+        let first = manager.acquire_context(None).await.unwrap();
+        assert_eq!(first.id, 1);
+
+        let second = manager.acquire_context(None).await.unwrap();
+        assert_eq!(second.id, 2);
+
+        drop(first);
+
+        let third = manager.acquire_context(None).await.unwrap();
+        assert_eq!(
+            third.id, 1,
+            "高优先级账号恢复可调度后，应重新优先分配高优先级账号"
+        );
+
+        drop(second);
+        drop(third);
+    }
+
+    #[tokio::test]
     async fn test_priority_mode_skips_free_tier_for_opus_models_case_insensitively() {
         let config = Config::default();
         let mut free = available_credential(0);
@@ -3049,7 +3591,10 @@ mod tests {
 
         let manager = MultiTokenManager::new(config, vec![free, paid], None, None, false).unwrap();
 
-        let ctx = manager.acquire_context(Some("claude-OPUS-4")).await.unwrap();
+        let ctx = manager
+            .acquire_context(Some("claude-OPUS-4"))
+            .await
+            .unwrap();
         assert_eq!(ctx.id, 2);
     }
 
@@ -3242,6 +3787,253 @@ mod tests {
     }
 
     #[test]
+    fn test_set_disabled_does_not_mutate_memory_when_persist_fails() {
+        let credentials_dir = std::env::temp_dir().join(format!(
+            "kiro-set-disabled-persist-fail-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&credentials_dir).unwrap();
+
+        let mut credential = available_credential(0);
+        credential.id = Some(1);
+        credential.machine_id = Some("machine-1".to_string());
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![credential],
+            None,
+            Some(credentials_dir.clone()),
+            true,
+        )
+        .unwrap();
+
+        let err = manager.set_disabled(1, true).unwrap_err().to_string();
+        assert!(
+            err.contains("写入状态文件失败"),
+            "错误应来自持久化失败，实际: {}",
+            err
+        );
+
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert!(!entry.disabled, "持久化失败后内存状态不应提前变为 disabled");
+
+        std::fs::remove_dir_all(credentials_dir).unwrap();
+    }
+
+    #[test]
+    fn test_reload_credentials_from_state_merges_updates_and_preserves_active_entries() {
+        let credentials_path = temp_credentials_path("reload-state-merge");
+
+        let mut primary = available_credential(0);
+        primary.id = Some(1);
+        primary.machine_id = Some("machine-1".to_string());
+        primary.priority = 5;
+
+        let mut in_flight = available_credential(1);
+        in_flight.id = Some(2);
+        in_flight.machine_id = Some("machine-2".to_string());
+        in_flight.priority = 9;
+
+        write_credentials_file(&credentials_path, &[primary.clone(), in_flight.clone()]);
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![primary.clone(), in_flight.clone()],
+            None,
+            Some(credentials_path.clone()),
+            true,
+        )
+        .unwrap();
+
+        {
+            let mut entries = manager.entries.lock();
+            let retained = entries.iter_mut().find(|entry| entry.id == 2).unwrap();
+            retained.active_requests = 1;
+            retained.failure_count = 2;
+        }
+
+        let mut updated_primary = primary.clone();
+        updated_primary.priority = 3;
+        updated_primary.access_token = Some("token-updated".to_string());
+        updated_primary.expires_at = Some((Utc::now() + Duration::hours(2)).to_rfc3339());
+        updated_primary.disabled = true;
+
+        let mut added = available_credential(0);
+        added.id = Some(3);
+        added.machine_id = Some("machine-3".to_string());
+        added.priority = 1;
+
+        write_credentials_file(&credentials_path, &[updated_primary.clone(), added.clone()]);
+
+        manager.reload_credentials_from_state().unwrap();
+
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.entries.len(), 3);
+        assert_eq!(snapshot.current_id, 3);
+
+        let primary_entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert_eq!(primary_entry.priority, 3);
+        assert_eq!(primary_entry.expires_at, updated_primary.expires_at);
+        assert!(primary_entry.disabled);
+        assert_eq!(primary_entry.disabled_reason.as_deref(), Some("Manual"));
+        assert_eq!(
+            manager
+                .current_credentials(1)
+                .unwrap()
+                .access_token
+                .as_deref(),
+            Some("token-updated")
+        );
+
+        let retained_entry = snapshot.entries.iter().find(|entry| entry.id == 2).unwrap();
+        assert!(retained_entry.disabled);
+        assert_eq!(retained_entry.disabled_reason.as_deref(), Some("Manual"));
+        assert_eq!(retained_entry.active_requests, 1);
+        assert_eq!(retained_entry.failure_count, 2);
+
+        let added_entry = snapshot.entries.iter().find(|entry| entry.id == 3).unwrap();
+        assert_eq!(added_entry.priority, 1);
+        assert!(!added_entry.disabled);
+        assert_eq!(added_entry.expires_at, added.expires_at);
+
+        {
+            let mut entries = manager.entries.lock();
+            let retained = entries.iter_mut().find(|entry| entry.id == 2).unwrap();
+            retained.active_requests = 0;
+        }
+
+        manager.reload_credentials_from_state().unwrap();
+
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.entries.len(), 2);
+        assert!(snapshot.entries.iter().all(|entry| entry.id != 2));
+
+        std::fs::remove_file(credentials_path).unwrap();
+    }
+
+    #[test]
+    fn test_reload_dispatch_config_from_state_updates_runtime_config() {
+        let config = Config::default();
+        let manager =
+            MultiTokenManager::new(config, vec![available_credential(0)], None, None, false)
+                .unwrap();
+
+        let persisted = PersistedDispatchConfig {
+            mode: "balanced".to_string(),
+            queue_max_size: 8,
+            queue_max_wait_ms: 1500,
+            rate_limit_cooldown_ms: 4500,
+            default_max_concurrency: Some(3),
+            rate_limit_bucket_capacity: 4.0,
+            rate_limit_refill_per_second: 1.2,
+            rate_limit_refill_min_per_second: 0.3,
+            rate_limit_refill_recovery_step_per_success: 0.15,
+            rate_limit_refill_backoff_factor: 0.6,
+        };
+
+        assert!(manager.apply_dispatch_config_from_state(&persisted));
+
+        let snapshot = manager.load_balancing_config_snapshot();
+        assert_eq!(snapshot.mode, "balanced");
+        assert_eq!(snapshot.queue_max_size, 8);
+        assert_eq!(snapshot.queue_max_wait_ms, 1500);
+        assert_eq!(snapshot.rate_limit_cooldown_ms, 4500);
+        assert_eq!(snapshot.default_max_concurrency, Some(3));
+        assert_eq!(snapshot.rate_limit_bucket_capacity, 4.0);
+        assert_eq!(snapshot.rate_limit_refill_per_second, 1.2);
+        assert_eq!(snapshot.rate_limit_refill_min_per_second, 0.3);
+        assert_eq!(snapshot.rate_limit_refill_recovery_step_per_success, 0.15);
+        assert_eq!(snapshot.rate_limit_refill_backoff_factor, 0.6);
+
+        assert!(!manager.apply_dispatch_config_from_state(&persisted));
+    }
+
+    #[test]
+    fn test_save_stats_merges_success_counts_across_managers() {
+        let credentials_path = temp_credentials_path("merge-success-counts");
+        let mut credential = available_credential(0);
+        credential.id = Some(1);
+        credential.machine_id = Some("machine-1".to_string());
+
+        let manager_a = MultiTokenManager::new(
+            Config::default(),
+            vec![credential.clone()],
+            None,
+            Some(credentials_path.clone()),
+            false,
+        )
+        .unwrap();
+        let manager_b = MultiTokenManager::new(
+            Config::default(),
+            vec![credential],
+            None,
+            Some(credentials_path.clone()),
+            false,
+        )
+        .unwrap();
+
+        manager_a.report_success(1);
+        manager_b.report_success(1);
+
+        drop(manager_a);
+        drop(manager_b);
+
+        let store = StateStore::file(None, Some(credentials_path.clone()));
+        let stats = store.load_stats().unwrap();
+        assert_eq!(stats.get("1").unwrap().success_count, 2);
+
+        let stats_path = credentials_path.parent().unwrap().join("kiro_stats.json");
+        std::fs::remove_file(stats_path).unwrap();
+    }
+
+    #[test]
+    fn test_reload_stats_from_state_preserves_pending_local_deltas() {
+        let credentials_path = temp_credentials_path("reload-stats-preserve-local");
+        let mut credential = available_credential(0);
+        credential.id = Some(1);
+        credential.machine_id = Some("machine-1".to_string());
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![credential],
+            None,
+            Some(credentials_path.clone()),
+            false,
+        )
+        .unwrap();
+
+        {
+            let mut entries = manager.entries.lock();
+            let entry = entries.iter_mut().find(|entry| entry.id == 1).unwrap();
+            entry.success_count = 2;
+            entry.pending_success_count_delta = 2;
+            entry.last_used_at = Some("2026-04-15T02:00:00Z".to_string());
+        }
+
+        let store = StateStore::file(None, Some(credentials_path.clone()));
+        let mut persisted = HashMap::new();
+        persisted.insert(
+            "1".to_string(),
+            StatsEntryRecord {
+                success_count: 5,
+                last_used_at: Some("2026-04-15T01:00:00Z".to_string()),
+            },
+        );
+        store.save_stats(&persisted).unwrap();
+
+        assert!(manager.reload_stats_from_state().unwrap());
+
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert_eq!(entry.success_count, 7);
+        assert_eq!(entry.last_used_at.as_deref(), Some("2026-04-15T02:00:00Z"));
+
+        let stats_path = credentials_path.parent().unwrap().join("kiro_stats.json");
+        std::fs::remove_file(stats_path).unwrap();
+    }
+
+    #[test]
     fn test_set_load_balancing_config_rejects_min_refill_above_base_refill() {
         let manager = MultiTokenManager::new(
             Config::default(),
@@ -3375,8 +4167,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_multi_token_manager_acquire_context_balanced_retries_until_bad_credential_disabled()
-     {
+    async fn test_multi_token_manager_acquire_context_balanced_retries_until_bad_credential_disabled(
+    ) {
         let mut config = Config::default();
         config.load_balancing_mode = "balanced".to_string();
 

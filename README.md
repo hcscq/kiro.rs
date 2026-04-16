@@ -199,6 +199,12 @@ GitHub Actions 镜像构建：
 | `proxyUsername` | string | - | 代理用户名 |
 | `proxyPassword` | string | - | 代理密码 |
 | `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
+| `stateBackend` | string | `file` | 状态存储后端：`file` 或 `postgres` |
+| `statePostgresUrl` | string | - | PostgreSQL 连接串；当 `stateBackend=postgres` 时必填 |
+| `stateRedisUrl` | string | - | Redis 连接串；配置后余额缓存等短生命周期状态优先使用 Redis |
+| `instanceId` | string | 自动推导 | 当前运行实例标识；未配置时使用 `HOSTNAME:port:pid` 推导 |
+| `stateRedisHeartbeatIntervalSecs` | number | `10` | Redis 运行时协调心跳间隔（秒） |
+| `stateRedisLeaderLeaseTtlSecs` | number | `30` | Redis leader 租约 TTL（秒），必须大于心跳间隔 |
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
 | `defaultMaxConcurrency` | number | - | 全局默认单账号并发上限；仅在凭据未单独配置 `maxConcurrency` 时生效，留空或 <= 0 表示不限制 |
 | `queueMaxSize` | number | `0` | 等待队列最大长度；`0` 表示禁用等待队列 |
@@ -232,6 +238,11 @@ GitHub Actions 镜像构建：
    "proxyUsername": "user",
    "proxyPassword": "pass",
    "adminApiKey": "sk-admin-your-secret-key",
+   "stateBackend": "file",
+   "stateRedisUrl": "redis://127.0.0.1:6379/0",
+   "instanceId": "kiro-rs-a",
+   "stateRedisHeartbeatIntervalSecs": 10,
+   "stateRedisLeaderLeaseTtlSecs": 30,
    "loadBalancingMode": "balanced",
    "defaultMaxConcurrency": 3,
    "queueMaxSize": 16,
@@ -242,6 +253,43 @@ GitHub Actions 镜像构建：
    "rateLimitRefillMinPerSecond": 0.2,
    "rateLimitRefillRecoveryStepPerSuccess": 0.1,
    "rateLimitRefillBackoffFactor": 0.5
+}
+```
+
+### 外部状态存储
+
+当 `stateBackend` 设为 `postgres` 时，`kiro-rs` 会将以下持久化状态写入 PostgreSQL：
+
+- 凭据列表
+- Admin API 修改后的调度配置
+- 统计缓存
+
+当同时配置 `stateRedisUrl` 时，以下短生命周期状态会优先写入 Redis：
+
+- 余额缓存
+- 运行实例心跳
+- Leader 租约（仅用于运行时协调基础能力，当前尚不改变调度选择逻辑）
+
+启动行为如下：
+
+- 优先从 PostgreSQL 加载调度配置和凭据
+- 如果 PostgreSQL 中还没有调度配置，会用当前 `config.json` 初始化
+- 如果 PostgreSQL 中还没有凭据，会用本地 `credentials.json` 做一次种子导入
+- 如果配置了 Redis，Admin API 启动时会优先从 Redis 读取余额缓存
+- 如果配置了 Redis，启动时会先完成一次实例注册和 Leader 租约续约；失败会直接终止启动，避免多实例状态不一致
+- 如果配置了 Redis，Admin API 的写操作只允许由当前 leader 实例执行；命中 follower 会返回 `409` 或 `503`
+
+示例：
+
+```json
+{
+   "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
+   "stateBackend": "postgres",
+   "statePostgresUrl": "postgres://postgres:postgres@postgres.default.svc.cluster.local:5432/kiro?sslmode=disable",
+   "stateRedisUrl": "redis://redis.default.svc.cluster.local:6379/0",
+   "instanceId": "kiro-rs-a",
+   "stateRedisHeartbeatIntervalSecs": 10,
+   "stateRedisLeaderLeaseTtlSecs": 30
 }
 ```
 
