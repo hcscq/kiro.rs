@@ -5,6 +5,7 @@ on:
     branches:
       - master
       - main
+      - build/*
     tags:
       - 'v*'
   workflow_dispatch:
@@ -126,9 +127,4 @@ jobs:
                 ${IMAGE}:${VERSION}-arm64
               docker manifest push ${IMAGE}:${ALIAS_TAG}
             done
-          else
-            docker manifest create ${IMAGE}:latest \
-              ${IMAGE}:${VERSION}-amd64 \
-              ${IMAGE}:${VERSION}-arm64
-            docker manifest push ${IMAGE}:latest
           fi
