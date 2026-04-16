@@ -9,8 +9,10 @@ mod state;
 pub mod token;
 
 use std::{
+    collections::HashMap,
+    fs,
     future::Future,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -18,15 +20,21 @@ use std::{
 };
 
 use axum::{http::StatusCode, routing::get, Json, Router};
+use anyhow::Context;
+use chrono::Utc;
 use clap::Parser;
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
-use model::arg::Args;
-use model::config::Config;
+use model::arg::{Args, Command as CliCommand, ExportFileStateArgs};
+use model::config::{Config, StateBackendKind};
 use parking_lot::Mutex;
+use serde::Serialize;
 use serde_json::json;
-use state::{PersistedCredentials, PersistedDispatchConfig, RuntimeCoordinationStatus, StateStore};
+use state::{
+    CachedBalanceRecord, PersistedCredentials, PersistedDispatchConfig, RuntimeCoordinationStatus,
+    StateStore,
+};
 use tokio::{
     sync::watch,
     task::JoinHandle,
@@ -36,6 +44,36 @@ use tokio::{
 const READINESS_DRAIN_FILE: &str = "/tmp/kiro-rs-drain";
 const SHUTDOWN_DRAIN_DELAY: Duration = Duration::from_secs(5);
 const BACKGROUND_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Serialize)]
+struct FileRollbackExportFiles {
+    credentials: String,
+    dispatch_config: String,
+    rollback_config: String,
+    stats: String,
+    balance_cache: String,
+    manifest: String,
+}
+
+#[derive(Debug, Serialize)]
+struct FileRollbackExportManifest {
+    exported_at: String,
+    source_config_path: String,
+    source_credentials_seed_path: String,
+    source_state_backend: String,
+    source_postgres_url_configured: bool,
+    source_redis_url_configured: bool,
+    credentials_count: usize,
+    stats_count: usize,
+    balance_cache_entries: usize,
+    balance_cache_source: String,
+    dispatch_mode: String,
+    output_dir: String,
+    files: FileRollbackExportFiles,
+    recommended_start_command: String,
+    omitted_runtime_state: Vec<String>,
+    notes: Vec<String>,
+}
 
 #[derive(Default)]
 struct RuntimeHealth {
@@ -156,6 +194,209 @@ async fn tick_until_shutdown_or_elapsed(
     }
 }
 
+fn export_target_path(output_dir: &Path, file_name: &str) -> PathBuf {
+    output_dir.join(file_name)
+}
+
+fn ensure_export_target_writable(path: &Path, overwrite: bool) -> anyhow::Result<()> {
+    if path.exists() && !overwrite {
+        anyhow::bail!(
+            "导出目标已存在: {}。如需覆盖请追加 --overwrite",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn write_json_pretty<T: Serialize>(path: &Path, value: &T, overwrite: bool) -> anyhow::Result<()> {
+    ensure_export_target_writable(path, overwrite)?;
+    let bytes = serde_json::to_vec_pretty(value)
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("序列化导出文件失败: {}", path.display()))?;
+    fs::write(path, bytes).with_context(|| format!("写入导出文件失败: {}", path.display()))?;
+    Ok(())
+}
+
+fn normalize_exported_credentials(mut credentials: Vec<KiroCredentials>) -> Vec<KiroCredentials> {
+    credentials.sort_by_key(|credential| (credential.priority, credential.id.unwrap_or(u64::MAX)));
+    for credential in &mut credentials {
+        credential.canonicalize_auth_method();
+    }
+    credentials
+}
+
+fn build_file_rollback_config(
+    source_config: &Config,
+    dispatch: &PersistedDispatchConfig,
+) -> Config {
+    let mut rollback_config = source_config.clone();
+    dispatch.apply_to_config(&mut rollback_config);
+    rollback_config.state_backend = StateBackendKind::File;
+    rollback_config.state_postgres_url = None;
+    rollback_config.state_redis_url = None;
+    rollback_config
+}
+
+fn config_for_primary_state_export(source_config: &Config) -> Config {
+    let mut config = source_config.clone();
+    config.state_redis_url = None;
+    config
+}
+
+fn load_balance_cache_for_export(
+    source_config: &Config,
+    credentials_path: &Path,
+    primary_state_store: &StateStore,
+) -> anyhow::Result<(HashMap<u64, CachedBalanceRecord>, String)> {
+    if source_config.state_redis_url.is_some() {
+        match StateStore::from_config(source_config, Some(credentials_path.to_path_buf())) {
+            Ok(state_store) => match state_store.load_balance_cache() {
+                Ok(cache) => return Ok((cache, "redis".to_string())),
+                Err(err) => {
+                    tracing::warn!("从 Redis 导出余额缓存失败，将回退到主状态后端: {}", err);
+                }
+            },
+            Err(err) => {
+                tracing::warn!("初始化 Redis 余额缓存导出失败，将回退到主状态后端: {}", err);
+            }
+        }
+    }
+
+    Ok((
+        primary_state_store.load_balance_cache()?,
+        "primary-backend".to_string(),
+    ))
+}
+
+fn display_path(path: &Path) -> String {
+    path.canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
+}
+
+fn export_file_state(
+    config_path: &str,
+    credentials_path: &str,
+    export_args: &ExportFileStateArgs,
+) -> anyhow::Result<()> {
+    let source_config =
+        Config::load(config_path).with_context(|| format!("加载配置失败: {}", config_path))?;
+    if source_config.state_backend != StateBackendKind::Postgres {
+        anyhow::bail!("export-file-state 仅支持 stateBackend=postgres 的配置");
+    }
+
+    let primary_config = config_for_primary_state_export(&source_config);
+    let credentials_path_buf = PathBuf::from(credentials_path);
+    let primary_state_store = StateStore::from_config(&primary_config, Some(credentials_path_buf.clone()))
+        .context("初始化 PostgreSQL 状态存储失败")?;
+
+    let persisted_credentials = primary_state_store.load_credentials()?;
+    if persisted_credentials.credentials.is_empty() {
+        anyhow::bail!("外部状态后端中没有凭据，无法导出 file backend 回滚文件");
+    }
+    let credentials = normalize_exported_credentials(persisted_credentials.credentials);
+
+    let dispatch = primary_state_store
+        .load_dispatch_config()?
+        .ok_or_else(|| anyhow::anyhow!("外部状态后端中没有调度配置，无法导出回滚配置"))?;
+
+    let stats = primary_state_store.load_stats()?;
+    let (balance_cache, balance_cache_source) =
+        load_balance_cache_for_export(&source_config, &credentials_path_buf, &primary_state_store)?;
+
+    let output_dir = PathBuf::from(&export_args.output_dir);
+    if output_dir.exists() && !output_dir.is_dir() {
+        anyhow::bail!("导出目录不是文件夹: {}", output_dir.display());
+    }
+    fs::create_dir_all(&output_dir)
+        .with_context(|| format!("创建导出目录失败: {}", output_dir.display()))?;
+
+    let credentials_output_path = export_target_path(&output_dir, "credentials.json");
+    let dispatch_output_path = export_target_path(&output_dir, "dispatch-config.json");
+    let rollback_config_path = export_target_path(&output_dir, "config.rollback.json");
+    let stats_output_path = export_target_path(&output_dir, "kiro_stats.json");
+    let balance_cache_output_path = export_target_path(&output_dir, "kiro_balance_cache.json");
+    let manifest_output_path = export_target_path(&output_dir, "rollback-manifest.json");
+
+    for path in [
+        &credentials_output_path,
+        &dispatch_output_path,
+        &rollback_config_path,
+        &stats_output_path,
+        &balance_cache_output_path,
+        &manifest_output_path,
+    ] {
+        ensure_export_target_writable(path, export_args.overwrite)?;
+    }
+
+    let rollback_config = build_file_rollback_config(&source_config, &dispatch);
+    write_json_pretty(&rollback_config_path, &rollback_config, export_args.overwrite)?;
+
+    let file_state_store =
+        StateStore::file(Some(rollback_config_path.clone()), Some(credentials_output_path.clone()));
+    if !file_state_store.persist_credentials(&credentials, true)? {
+        anyhow::bail!("写入导出凭据失败");
+    }
+    file_state_store.save_stats(&stats)?;
+    file_state_store.save_balance_cache(&balance_cache)?;
+    write_json_pretty(&dispatch_output_path, &dispatch, export_args.overwrite)?;
+
+    let rollback_config_display = display_path(&rollback_config_path);
+    let credentials_output_display = display_path(&credentials_output_path);
+
+    let files = FileRollbackExportFiles {
+        credentials: credentials_output_display.clone(),
+        dispatch_config: display_path(&dispatch_output_path),
+        rollback_config: rollback_config_display.clone(),
+        stats: display_path(&stats_output_path),
+        balance_cache: display_path(&balance_cache_output_path),
+        manifest: display_path(&manifest_output_path),
+    };
+
+    let manifest = FileRollbackExportManifest {
+        exported_at: Utc::now().to_rfc3339(),
+        source_config_path: display_path(Path::new(config_path)),
+        source_credentials_seed_path: credentials_path_buf.display().to_string(),
+        source_state_backend: "postgres".to_string(),
+        source_postgres_url_configured: source_config.state_postgres_url.is_some(),
+        source_redis_url_configured: source_config.state_redis_url.is_some(),
+        credentials_count: credentials.len(),
+        stats_count: stats.len(),
+        balance_cache_entries: balance_cache.len(),
+        balance_cache_source,
+        dispatch_mode: dispatch.mode.clone(),
+        output_dir: display_path(&output_dir),
+        files,
+        recommended_start_command: format!(
+            "kiro-rs --config {} --credentials {}",
+            rollback_config_display,
+            credentials_output_display
+        ),
+        omitted_runtime_state: vec![
+            "dispatch leases".to_string(),
+            "rate limit cooldown runtime windows".to_string(),
+            "shared token bucket runtime tokens".to_string(),
+        ],
+        notes: vec![
+            "该导出面向 external -> file 回滚，已将 stateBackend 切回 file，并清空 statePostgresUrl/stateRedisUrl。".to_string(),
+            "调度热态属于瞬时运行态，不应作为 file backend 持久状态导出。".to_string(),
+            "如 source config 配置了 Redis，但导出时 Redis 不可达，余额缓存会自动回退到主状态后端视图。".to_string(),
+        ],
+    };
+    write_json_pretty(&manifest_output_path, &manifest, export_args.overwrite)?;
+
+    tracing::info!(
+        credentials = credentials.len(),
+        stats = stats.len(),
+        balance_cache_entries = balance_cache.len(),
+        output_dir = %display_path(&output_dir),
+        "已导出 file backend 回滚文件"
+    );
+
+    Ok(())
+}
+
 fn drain_file_present() -> bool {
     Path::new(READINESS_DRAIN_FILE).exists()
 }
@@ -269,6 +510,23 @@ async fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    if let Some(CliCommand::ExportFileState(command)) = &args.command {
+        let config_path = args
+            .config
+            .clone()
+            .unwrap_or_else(|| Config::default_config_path().to_string());
+        let credentials_path = args
+            .credentials
+            .clone()
+            .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
+
+        export_file_state(&config_path, &credentials_path, command).unwrap_or_else(|err| {
+            tracing::error!("导出 file backend 回滚文件失败: {}", err);
+            std::process::exit(1);
+        });
+        return;
+    }
 
     // 加载配置
     let config_path = args
@@ -615,4 +873,50 @@ fn log_runtime_coordination_status(
         instance_id = %status.instance_id,
         "Redis 运行时协调: 当前未观察到 leader"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_file_rollback_config_switches_to_file_backend() {
+        let mut config = Config::default();
+        config.state_backend = StateBackendKind::Postgres;
+        config.state_postgres_url = Some("postgres://postgres:postgres@localhost:5432/kiro".into());
+        config.state_redis_url = Some("redis://127.0.0.1:6379/0".into());
+        config.load_balancing_mode = "priority".into();
+        config.queue_max_size = 0;
+        config.queue_max_wait_ms = 0;
+        config.rate_limit_cooldown_ms = 2000;
+
+        let dispatch = PersistedDispatchConfig {
+            mode: "balanced".into(),
+            queue_max_size: 16,
+            queue_max_wait_ms: 1500,
+            rate_limit_cooldown_ms: 5000,
+            default_max_concurrency: Some(3),
+            rate_limit_bucket_capacity: 5.0,
+            rate_limit_refill_per_second: 1.5,
+            rate_limit_refill_min_per_second: 0.3,
+            rate_limit_refill_recovery_step_per_success: 0.2,
+            rate_limit_refill_backoff_factor: 0.4,
+        };
+
+        let rollback = build_file_rollback_config(&config, &dispatch);
+
+        assert_eq!(rollback.state_backend, StateBackendKind::File);
+        assert!(rollback.state_postgres_url.is_none());
+        assert!(rollback.state_redis_url.is_none());
+        assert_eq!(rollback.load_balancing_mode, "balanced");
+        assert_eq!(rollback.queue_max_size, 16);
+        assert_eq!(rollback.queue_max_wait_ms, 1500);
+        assert_eq!(rollback.rate_limit_cooldown_ms, 5000);
+        assert_eq!(rollback.default_max_concurrency, Some(3));
+        assert_eq!(rollback.rate_limit_bucket_capacity, 5.0);
+        assert_eq!(rollback.rate_limit_refill_per_second, 1.5);
+        assert_eq!(rollback.rate_limit_refill_min_per_second, 0.3);
+        assert_eq!(rollback.rate_limit_refill_recovery_step_per_success, 0.2);
+        assert_eq!(rollback.rate_limit_refill_backoff_factor, 0.4);
+    }
 }

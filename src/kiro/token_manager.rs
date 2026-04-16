@@ -8,7 +8,7 @@ use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex as TokioMutex, Notify};
+use tokio::sync::{oneshot, Mutex as TokioMutex, Notify};
 
 use std::collections::HashMap;
 use std::fmt;
@@ -26,8 +26,10 @@ use crate::kiro::model::token_refresh::{
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
 use crate::state::{
-    PersistedDispatchConfig, RuntimeCoordinationStatus, StateChangeKind, StateChangeRevisions,
-    StateStore, StatsEntryRecord, StatsMergeRecord,
+    current_epoch_ms, DispatchLeaseReservationStatus, DispatchRuntimeBucketPolicy,
+    DispatchRuntimeCredential, DispatchRuntimeSnapshot, PersistedDispatchConfig,
+    RuntimeCoordinationStatus, StateChangeKind, StateChangeRevisions, StateStore,
+    StatsEntryRecord, StatsMergeRecord,
 };
 
 /// 检查 Token 是否在指定时间内过期
@@ -805,6 +807,20 @@ impl DispatchConfig {
             backoff_factor,
         })
     }
+
+    fn shared_bucket_policy_for(
+        &self,
+        credentials: &KiroCredentials,
+    ) -> Option<DispatchRuntimeBucketPolicy> {
+        self.bucket_policy_for(credentials)
+            .map(|policy| DispatchRuntimeBucketPolicy {
+                capacity: policy.capacity,
+                refill_per_second: policy.refill_per_second,
+                min_refill_per_second: policy.min_refill_per_second,
+                recovery_step_per_success: policy.recovery_step_per_success,
+                backoff_factor: policy.backoff_factor,
+            })
+    }
 }
 
 /// 多凭据 Token 管理器
@@ -845,6 +861,12 @@ pub struct MultiTokenManager {
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 /// follower 观察到共享凭据需要由 leader 刷新时，临时避让该凭据的冷却时间
 const SHARED_REFRESH_DEFER_COOLDOWN: StdDuration = StdDuration::from_secs(2);
+/// 共享调度占位 TTL。请求异常退出时依赖该 TTL 自动回收全局并发占位。
+const SHARED_DISPATCH_LEASE_TTL_MS: u64 = 120_000;
+/// 共享调度占位续租心跳间隔。
+const SHARED_DISPATCH_LEASE_HEARTBEAT_INTERVAL_MS: u64 = 30_000;
+/// 共享调度运行态下，等待队列需要短周期轮询 Redis 以观察跨副本释放。
+const SHARED_DISPATCH_WAIT_POLL_INTERVAL_MS: u64 = 200;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 
@@ -879,10 +901,35 @@ struct CallLeaseState {
     entries: Arc<Mutex<Vec<CredentialEntry>>>,
     availability_notify: Arc<Notify>,
     id: u64,
+    shared_dispatch: Option<SharedDispatchLease>,
+}
+
+struct SharedDispatchLease {
+    state_store: StateStore,
+    lease_id: String,
+    renew_shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
 }
 
 impl Drop for CallLeaseState {
     fn drop(&mut self) {
+        if let Some(shared_dispatch) = &self.shared_dispatch {
+            if let Some(shutdown_tx) = shared_dispatch.renew_shutdown_tx.lock().take() {
+                let _ = shutdown_tx.send(());
+            }
+            if let Err(err) = shared_dispatch.state_store.release_dispatch_lease(
+                self.id,
+                &shared_dispatch.lease_id,
+                current_epoch_ms(),
+            ) {
+                tracing::warn!(
+                    "释放共享调度占位失败（credentialId={}, leaseId={}）: {}",
+                    self.id,
+                    shared_dispatch.lease_id,
+                    err
+                );
+            }
+        }
+
         let mut entries = self.entries.lock();
         if let Some(entry) = entries.iter_mut().find(|e| e.id == self.id) {
             entry.active_requests = entry.active_requests.saturating_sub(1);
@@ -1101,6 +1148,16 @@ impl MultiTokenManager {
     }
 
     fn clear_all_rate_limit_cooldowns(&self) {
+        if self.shared_dispatch_runtime_enabled() {
+            let ids: Vec<u64> = {
+                let entries = self.entries.lock();
+                entries.iter().map(|entry| entry.id).collect()
+            };
+            if let Err(err) = self.state_store.clear_dispatch_cooldowns(&ids) {
+                tracing::warn!("清理共享调度冷却失败: {}", err);
+            }
+        }
+
         let mut entries = self.entries.lock();
         for entry in entries.iter_mut() {
             entry.rate_limit_cooldown_until = None;
@@ -1260,12 +1317,89 @@ impl MultiTokenManager {
         Ok(())
     }
 
-    fn reserve_call_lease(&self, id: u64) -> CallLease {
+    fn shared_dispatch_runtime_enabled(&self) -> bool {
+        self.state_store.dispatch_runtime_enabled()
+    }
+
+    fn load_shared_dispatch_runtime_snapshots(
+        &self,
+        dispatch: &DispatchConfig,
+        now_epoch_ms: u64,
+    ) -> anyhow::Result<HashMap<u64, DispatchRuntimeSnapshot>> {
+        let credentials: Vec<DispatchRuntimeCredential> = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .map(|entry| DispatchRuntimeCredential {
+                    id: entry.id,
+                    bucket_policy: dispatch.shared_bucket_policy_for(&entry.credentials),
+                })
+                .collect()
+        };
+
+        self.state_store
+            .load_dispatch_runtime_snapshots(&credentials, now_epoch_ms)
+    }
+
+    fn reserve_call_lease(&self, id: u64, shared_lease_id: Option<String>) -> CallLease {
+        let shared_dispatch = shared_lease_id.map(|lease_id| {
+            let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+            let state_store = self.state_store.clone();
+            let task_state_store = state_store.clone();
+            let task_lease_id = lease_id.clone();
+
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(StdDuration::from_millis(
+                    SHARED_DISPATCH_LEASE_HEARTBEAT_INTERVAL_MS,
+                ));
+                ticker.tick().await;
+
+                loop {
+                    tokio::select! {
+                        _ = &mut shutdown_rx => break,
+                        _ = ticker.tick() => {
+                            match task_state_store.renew_dispatch_lease(
+                                id,
+                                &task_lease_id,
+                                SHARED_DISPATCH_LEASE_TTL_MS,
+                            ) {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    tracing::warn!(
+                                        "共享调度占位续租失败：占位已丢失（credentialId={}, leaseId={}）",
+                                        id,
+                                        task_lease_id
+                                    );
+                                    break;
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        "共享调度占位续租失败（credentialId={}, leaseId={}）: {}",
+                                        id,
+                                        task_lease_id,
+                                        err
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
+            SharedDispatchLease {
+                state_store,
+                lease_id,
+                renew_shutdown_tx: Mutex::new(Some(shutdown_tx)),
+            }
+        });
+
         CallLease {
             _state: Arc::new(CallLeaseState {
                 entries: Arc::clone(&self.entries),
                 availability_notify: Arc::clone(&self.availability_notify),
                 id,
+                shared_dispatch,
             }),
         }
     }
@@ -1300,9 +1434,17 @@ impl MultiTokenManager {
             return false;
         }
 
-        let wake_at = next_ready_at
-            .map(|next| next.min(deadline))
-            .unwrap_or(deadline);
+        let wake_at = if self.shared_dispatch_runtime_enabled() {
+            let poll_deadline =
+                now + StdDuration::from_millis(SHARED_DISPATCH_WAIT_POLL_INTERVAL_MS);
+            next_ready_at
+                .map(|next| next.min(deadline).min(poll_deadline))
+                .unwrap_or_else(|| deadline.min(poll_deadline))
+        } else {
+            next_ready_at
+                .map(|next| next.min(deadline))
+                .unwrap_or(deadline)
+        };
         if wake_at <= now {
             return true;
         }
@@ -1316,20 +1458,41 @@ impl MultiTokenManager {
     fn recover_auto_disabled_credentials(&self) -> bool {
         let dispatch = self.dispatch_config();
         let now = Instant::now();
-        let mut entries = self.entries.lock();
         let mut recovered = false;
+        let mut recovered_ids = Vec::new();
 
-        for entry in entries.iter_mut() {
-            if entry.disabled_reason == Some(DisabledReason::TooManyFailures) {
-                entry.disabled = false;
-                entry.disabled_reason = None;
-                entry.failure_count = 0;
-                Self::reset_rate_limit_runtime(entry, &dispatch, now);
-                recovered = true;
+        {
+            let mut entries = self.entries.lock();
+            for entry in entries.iter_mut() {
+                if entry.disabled_reason == Some(DisabledReason::TooManyFailures) {
+                    entry.disabled = false;
+                    entry.disabled_reason = None;
+                    entry.failure_count = 0;
+                    Self::reset_rate_limit_runtime(entry, &dispatch, now);
+                    recovered = true;
+                    recovered_ids.push(entry.id);
+                }
             }
         }
 
         if recovered {
+            if self.shared_dispatch_runtime_enabled() {
+                for id in &recovered_ids {
+                    let bucket_policy = {
+                        let entries = self.entries.lock();
+                        entries
+                            .iter()
+                            .find(|entry| entry.id == *id)
+                            .and_then(|entry| dispatch.shared_bucket_policy_for(&entry.credentials))
+                    };
+                    if let Err(err) =
+                        self.state_store
+                            .reset_dispatch_runtime(*id, bucket_policy, current_epoch_ms())
+                    {
+                        tracing::warn!("重置共享调度运行态失败（credentialId={}）: {}", id, err);
+                    }
+                }
+            }
             tracing::warn!(
                 "所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用（等价于重启）"
             );
@@ -1470,8 +1633,245 @@ impl MultiTokenManager {
         Ok((
             selected_id,
             entry.credentials.clone(),
-            self.reserve_call_lease(selected_id),
+            self.reserve_call_lease(selected_id, None),
         ))
+    }
+
+    fn shared_dispatch_snapshot_for_entry(
+        entry: &CredentialEntry,
+        dispatch: &DispatchConfig,
+        snapshots: &HashMap<u64, DispatchRuntimeSnapshot>,
+    ) -> DispatchRuntimeSnapshot {
+        snapshots.get(&entry.id).cloned().unwrap_or_else(|| {
+            let bucket_policy = dispatch.shared_bucket_policy_for(&entry.credentials);
+            DispatchRuntimeSnapshot {
+                active_requests: entry.active_requests,
+                cooldown_until_epoch_ms: None,
+                rate_limit_hit_streak: entry.rate_limit_hit_streak,
+                bucket_tokens: bucket_policy.map(|policy| policy.capacity),
+                bucket_capacity: bucket_policy.map(|policy| policy.capacity),
+                bucket_current_refill_per_second: bucket_policy
+                    .map(|policy| policy.refill_per_second),
+                bucket_base_refill_per_second: bucket_policy.map(|policy| policy.refill_per_second),
+                next_ready_at_epoch_ms: None,
+            }
+        })
+    }
+
+    fn shared_snapshot_ready_at(
+        snapshot: &DispatchRuntimeSnapshot,
+        now: Instant,
+        now_epoch_ms: u64,
+    ) -> Option<Instant> {
+        snapshot.next_ready_at_epoch_ms.map(|ready_at_epoch_ms| {
+            now + StdDuration::from_millis(ready_at_epoch_ms.saturating_sub(now_epoch_ms))
+        })
+    }
+
+    fn reserve_next_credential_shared(
+        &self,
+        model: Option<&str>,
+    ) -> Result<(u64, KiroCredentials, CallLease), ReservationFailure> {
+        let dispatch = self.dispatch_config();
+        let requires_paid_tier = Self::model_requires_paid_tier(model);
+        let mode = dispatch.mode.clone();
+        let is_balanced = mode == "balanced";
+        let retry_budget = self.total_count().max(1).saturating_mul(2);
+        let mut fallback_next_ready_at: Option<Instant> = None;
+
+        for _ in 0..retry_budget {
+            let now = Instant::now();
+            let now_epoch_ms = current_epoch_ms();
+            let snapshots = self
+                .load_shared_dispatch_runtime_snapshots(&dispatch, now_epoch_ms)
+                .map_err(|err| {
+                    tracing::warn!("读取共享调度热态失败: {}", err);
+                    ReservationFailure::AllTemporarilyUnavailable { next_ready_at: None }
+                })?;
+
+            let selection = {
+                let entries = self.entries.lock();
+                if entries.is_empty() {
+                    return Err(ReservationFailure::NoCredentials);
+                }
+
+                let current_id_value = *self.current_id.lock();
+                let mut has_enabled = false;
+                let mut has_supported = false;
+                let mut selected_id: Option<u64> = None;
+                let mut selected_credentials: Option<KiroCredentials> = None;
+                let mut selected_max_concurrency: Option<usize> = None;
+                let mut selected_bucket_policy: Option<DispatchRuntimeBucketPolicy> = None;
+                let mut priority_key: Option<(u32, usize, u8, u64)> = None;
+                let mut balanced_key: Option<(usize, u64, u32, u64)> = None;
+                let mut next_ready_at: Option<Instant> = fallback_next_ready_at;
+
+                for entry in entries.iter() {
+                    if entry.disabled {
+                        continue;
+                    }
+                    has_enabled = true;
+
+                    if !Self::is_model_supported(&entry.credentials, requires_paid_tier) {
+                        continue;
+                    }
+                    has_supported = true;
+
+                    let runtime =
+                        Self::shared_dispatch_snapshot_for_entry(entry, &dispatch, &snapshots);
+                    let is_dispatchable = runtime
+                        .cooldown_until_epoch_ms
+                        .map_or(true, |until| until <= now_epoch_ms)
+                        && runtime.bucket_tokens.map_or(true, |tokens| tokens >= 1.0)
+                        && Self::has_capacity(
+                            &entry.credentials,
+                            runtime.active_requests,
+                            dispatch.default_max_concurrency,
+                        );
+
+                    if !is_dispatchable {
+                        if let Some(ready_at) =
+                            Self::shared_snapshot_ready_at(&runtime, now, now_epoch_ms)
+                        {
+                            next_ready_at = Some(match next_ready_at {
+                                Some(existing) => existing.min(ready_at),
+                                None => ready_at,
+                            });
+                        }
+                        continue;
+                    }
+
+                    if is_balanced {
+                        let candidate_key = (
+                            runtime.active_requests,
+                            entry.success_count,
+                            entry.credentials.priority,
+                            entry.id,
+                        );
+                        let should_select = balanced_key
+                            .as_ref()
+                            .map(|best_key| candidate_key < *best_key)
+                            .unwrap_or(true);
+                        if should_select {
+                            balanced_key = Some(candidate_key);
+                            selected_id = Some(entry.id);
+                            selected_credentials = Some(entry.credentials.clone());
+                            selected_max_concurrency = entry
+                                .credentials
+                                .effective_max_concurrency_with_default(
+                                    dispatch.default_max_concurrency,
+                                );
+                            selected_bucket_policy =
+                                dispatch.shared_bucket_policy_for(&entry.credentials);
+                        }
+                        continue;
+                    }
+
+                    let candidate_key = (
+                        entry.credentials.priority,
+                        runtime.active_requests,
+                        u8::from(entry.id != current_id_value),
+                        entry.id,
+                    );
+                    let should_select = priority_key
+                        .as_ref()
+                        .map(|best_key| candidate_key < *best_key)
+                        .unwrap_or(true);
+                    if should_select {
+                        priority_key = Some(candidate_key);
+                        selected_id = Some(entry.id);
+                        selected_credentials = Some(entry.credentials.clone());
+                        selected_max_concurrency = entry
+                            .credentials
+                            .effective_max_concurrency_with_default(dispatch.default_max_concurrency);
+                        selected_bucket_policy =
+                            dispatch.shared_bucket_policy_for(&entry.credentials);
+                    }
+                }
+
+                if !has_enabled {
+                    return Err(ReservationFailure::AllDisabled);
+                }
+                if !has_supported {
+                    return Err(ReservationFailure::NoModelSupport);
+                }
+
+                match (selected_id, selected_credentials) {
+                    (Some(id), Some(credentials)) => Ok((
+                        id,
+                        credentials,
+                        selected_max_concurrency,
+                        selected_bucket_policy,
+                    )),
+                    _ => Err(ReservationFailure::AllTemporarilyUnavailable { next_ready_at }),
+                }
+            };
+
+            let (selected_id, selected_credentials, selected_max_concurrency, selected_bucket_policy) =
+                match selection {
+                    Ok(selection) => selection,
+                    Err(err) => return Err(err),
+                };
+
+            let shared_lease_id = uuid::Uuid::new_v4().to_string();
+            let reservation = self
+                .state_store
+                .try_reserve_dispatch_lease(
+                    selected_id,
+                    &shared_lease_id,
+                    selected_max_concurrency,
+                    selected_bucket_policy,
+                    current_epoch_ms(),
+                    SHARED_DISPATCH_LEASE_TTL_MS,
+                )
+                .map_err(|err| {
+                    tracing::warn!("申请共享调度占位失败: {}", err);
+                    ReservationFailure::AllTemporarilyUnavailable { next_ready_at: None }
+                })?;
+
+            let Some(reservation) = reservation else {
+                return Err(ReservationFailure::AllTemporarilyUnavailable { next_ready_at: None });
+            };
+
+            if reservation.status == DispatchLeaseReservationStatus::Reserved {
+                {
+                    let mut entries = self.entries.lock();
+                    if let Some(entry) = entries.iter_mut().find(|entry| entry.id == selected_id) {
+                        entry.active_requests += 1;
+                    }
+                }
+                *self.current_id.lock() = selected_id;
+
+                tracing::debug!(
+                    "通过共享调度热态分配凭据 #{}，全局运行中请求数: {}{}",
+                    selected_id,
+                    reservation.snapshot.active_requests,
+                    selected_credentials
+                        .effective_max_concurrency_with_default(dispatch.default_max_concurrency)
+                        .map(|limit| format!("/{}", limit))
+                        .unwrap_or_default()
+                );
+
+                return Ok((
+                    selected_id,
+                    selected_credentials,
+                    self.reserve_call_lease(selected_id, Some(shared_lease_id)),
+                ));
+            }
+
+            if let Some(ready_at) =
+                Self::shared_snapshot_ready_at(&reservation.snapshot, now, now_epoch_ms)
+            {
+                fallback_next_ready_at = Some(match fallback_next_ready_at {
+                    Some(existing) => existing.min(ready_at),
+                    None => ready_at,
+                });
+            }
+        }
+
+        Err(ReservationFailure::AllTemporarilyUnavailable {
+            next_ready_at: fallback_next_ready_at,
+        })
     }
 
     /// 获取 API 调用上下文
@@ -1510,7 +1910,11 @@ impl MultiTokenManager {
                 );
             }
 
-            let (id, credentials, lease) = match self.reserve_next_credential(model) {
+            let (id, credentials, lease) = match if self.shared_dispatch_runtime_enabled() {
+                self.reserve_next_credential_shared(model)
+            } else {
+                self.reserve_next_credential(model)
+            } {
                 Ok(selection) => {
                     wait_queue_guard = None;
                     wait_deadline = None;
@@ -2208,6 +2612,8 @@ impl MultiTokenManager {
     /// * `id` - 凭据 ID（来自 CallContext）
     pub fn report_success(&self, id: u64) {
         let now = Instant::now();
+        let dispatch = self.dispatch_config();
+        let mut shared_bucket_policy = None;
         {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
@@ -2226,11 +2632,21 @@ impl MultiTokenManager {
                 entry.success_count += 1;
                 entry.pending_success_count_delta += 1;
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
+                shared_bucket_policy = dispatch.shared_bucket_policy_for(&entry.credentials);
                 tracing::debug!(
                     "凭据 #{} API 调用成功（累计 {} 次）",
                     id,
                     entry.success_count
                 );
+            }
+        }
+        if self.shared_dispatch_runtime_enabled() {
+            if let Err(err) = self.state_store.record_dispatch_success(
+                id,
+                shared_bucket_policy,
+                current_epoch_ms(),
+            ) {
+                tracing::warn!("更新共享调度成功态失败（credentialId={}）: {}", id, err);
             }
         }
         self.save_stats_debounced();
@@ -2242,6 +2658,7 @@ impl MultiTokenManager {
     pub fn report_rate_limited(&self, id: u64) {
         let dispatch = self.dispatch_config();
         let now = Instant::now();
+        let mut shared_bucket_policy = None;
         {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
@@ -2253,6 +2670,7 @@ impl MultiTokenManager {
                 if let Some(bucket) = entry.rate_limit_bucket.as_mut() {
                     bucket.on_rate_limited(now);
                 }
+                shared_bucket_policy = dispatch.shared_bucket_policy_for(&entry.credentials);
 
                 let cooldown_ms = dispatch.rate_limit_cooldown_ms;
                 entry.rate_limit_cooldown_until =
@@ -2276,6 +2694,16 @@ impl MultiTokenManager {
                         entry.rate_limit_hit_streak
                     );
                 }
+            }
+        }
+        if self.shared_dispatch_runtime_enabled() {
+            if let Err(err) = self.state_store.record_dispatch_rate_limited(
+                id,
+                shared_bucket_policy,
+                dispatch.rate_limit_cooldown_ms,
+                current_epoch_ms(),
+            ) {
+                tracing::warn!("更新共享调度限流态失败（credentialId={}）: {}", id, err);
             }
         }
         self.save_stats_debounced();
@@ -2337,6 +2765,15 @@ impl MultiTokenManager {
 
             entries.iter().any(|e| !e.disabled)
         };
+        if self.shared_dispatch_runtime_enabled() {
+            let cooldown_ms = cooldown.as_millis().min(u128::from(u64::MAX)) as u64;
+            if let Err(err) =
+                self.state_store
+                    .defer_dispatch_credential(id, cooldown_ms, current_epoch_ms())
+            {
+                tracing::warn!("更新共享调度临时冷却失败（credentialId={}）: {}", id, err);
+            }
+        }
         self.save_stats_debounced();
         result
     }
@@ -2600,6 +3037,18 @@ impl MultiTokenManager {
     pub fn snapshot(&self) -> ManagerSnapshot {
         let dispatch = self.dispatch_config();
         let now = Instant::now();
+        let now_epoch_ms = current_epoch_ms();
+        let shared_snapshots = if self.shared_dispatch_runtime_enabled() {
+            match self.load_shared_dispatch_runtime_snapshots(&dispatch, now_epoch_ms) {
+                Ok(snapshots) => Some(snapshots),
+                Err(err) => {
+                    tracing::warn!("读取共享调度热态快照失败，将回退到本地视图: {}", err);
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let mut entries = self.entries.lock();
         Self::refresh_runtime_state(&mut entries, now);
         let current_id = *self.current_id.lock();
@@ -2607,88 +3056,144 @@ impl MultiTokenManager {
         let dispatchable = entries
             .iter()
             .filter(|e| !e.disabled)
-            .filter(|e| !Self::is_rate_limited(e, now))
-            .filter(|e| Self::bucket_is_ready(e))
             .filter(|e| {
-                Self::has_capacity(
-                    &e.credentials,
-                    e.active_requests,
-                    dispatch.default_max_concurrency,
-                )
+                if let Some(shared_snapshots) = shared_snapshots.as_ref() {
+                    let runtime =
+                        Self::shared_dispatch_snapshot_for_entry(e, &dispatch, shared_snapshots);
+                    runtime
+                        .cooldown_until_epoch_ms
+                        .map_or(true, |until| until <= now_epoch_ms)
+                        && runtime.bucket_tokens.map_or(true, |tokens| tokens >= 1.0)
+                        && Self::has_capacity(
+                            &e.credentials,
+                            runtime.active_requests,
+                            dispatch.default_max_concurrency,
+                        )
+                } else {
+                    !Self::is_rate_limited(e, now)
+                        && Self::bucket_is_ready(e)
+                        && Self::has_capacity(
+                            &e.credentials,
+                            e.active_requests,
+                            dispatch.default_max_concurrency,
+                        )
+                }
             })
             .count();
 
         ManagerSnapshot {
             entries: entries
                 .iter_mut()
-                .map(|e| CredentialEntrySnapshot {
-                    id: e.id,
-                    priority: e.credentials.priority,
-                    disabled: e.disabled,
-                    failure_count: e.failure_count,
-                    auth_method: e.credentials.auth_method.as_deref().map(|m| {
-                        if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam") {
-                            "idc".to_string()
-                        } else {
-                            m.to_string()
-                        }
-                    }),
-                    has_profile_arn: e.credentials.profile_arn.is_some(),
-                    expires_at: e.credentials.expires_at.clone(),
-                    refresh_token_hash: e.credentials.refresh_token.as_deref().map(sha256_hex),
-                    email: e.credentials.email.clone(),
-                    subscription_title: e.credentials.subscription_title.clone(),
-                    imported_at: e.credentials.imported_at.clone(),
-                    success_count: e.success_count,
-                    last_used_at: e.last_used_at.clone(),
-                    active_requests: e.active_requests,
-                    max_concurrency: e
-                        .credentials
-                        .effective_max_concurrency_with_default(dispatch.default_max_concurrency)
-                        .and_then(|limit| u32::try_from(limit).ok()),
-                    has_proxy: e.credentials.proxy_url.is_some(),
-                    proxy_url: e.credentials.proxy_url.clone(),
-                    refresh_failure_count: e.refresh_failure_count,
-                    disabled_reason: e.disabled_reason.map(|r| {
-                        match r {
-                            DisabledReason::Manual => "Manual",
-                            DisabledReason::TooManyFailures => "TooManyFailures",
-                            DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
-                            DisabledReason::QuotaExceeded => "QuotaExceeded",
-                            DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
-                        }
-                        .to_string()
-                    }),
-                    cooldown_remaining_ms: e
-                        .rate_limit_cooldown_until
-                        .and_then(|until| until.checked_duration_since(now))
-                        .map(|remaining| remaining.as_millis().min(u128::from(u64::MAX)) as u64),
-                    rate_limit_bucket_tokens: e
-                        .rate_limit_bucket
+                .map(|e| {
+                    let shared_runtime = shared_snapshots.as_ref().map(|snapshots| {
+                        Self::shared_dispatch_snapshot_for_entry(e, &dispatch, snapshots)
+                    });
+                    let active_requests = shared_runtime
                         .as_ref()
-                        .map(|bucket| (bucket.tokens * 100.0).round() / 100.0),
-                    rate_limit_bucket_capacity: e
-                        .rate_limit_bucket
+                        .map(|runtime| runtime.active_requests)
+                        .unwrap_or(e.active_requests);
+                    let cooldown_remaining_ms = shared_runtime
                         .as_ref()
-                        .map(|bucket| bucket.policy.capacity),
-                    rate_limit_bucket_capacity_override: e
-                        .credentials
-                        .rate_limit_bucket_capacity_override(),
-                    rate_limit_refill_per_second: e
-                        .rate_limit_bucket
+                        .and_then(|runtime| runtime.cooldown_until_epoch_ms)
+                        .map(|until| until.saturating_sub(now_epoch_ms))
+                        .filter(|remaining| *remaining > 0)
+                        .or_else(|| {
+                            e.rate_limit_cooldown_until
+                                .and_then(|until| until.checked_duration_since(now))
+                                .map(|remaining| {
+                                    remaining.as_millis().min(u128::from(u64::MAX)) as u64
+                                })
+                        });
+                    let next_ready_in_ms = shared_runtime
                         .as_ref()
-                        .map(|bucket| (bucket.current_refill_per_second * 100.0).round() / 100.0),
-                    rate_limit_refill_per_second_override: e
-                        .credentials
-                        .rate_limit_refill_per_second_override(),
-                    rate_limit_refill_base_per_second: e
-                        .rate_limit_bucket
-                        .as_ref()
-                        .map(|bucket| bucket.policy.refill_per_second),
-                    rate_limit_hit_streak: e.rate_limit_hit_streak,
-                    next_ready_in_ms: Self::combined_ready_at(e, now)
-                        .and_then(|ready_at| ready_at.checked_duration_since(now))
-                        .map(|remaining| remaining.as_millis().min(u128::from(u64::MAX)) as u64),
+                        .and_then(|runtime| runtime.next_ready_at_epoch_ms)
+                        .map(|ready_at| ready_at.saturating_sub(now_epoch_ms))
+                        .filter(|remaining| *remaining > 0)
+                        .or_else(|| {
+                            Self::combined_ready_at(e, now)
+                                .and_then(|ready_at| ready_at.checked_duration_since(now))
+                                .map(|remaining| {
+                                    remaining.as_millis().min(u128::from(u64::MAX)) as u64
+                                })
+                        });
+
+                    CredentialEntrySnapshot {
+                        id: e.id,
+                        priority: e.credentials.priority,
+                        disabled: e.disabled,
+                        failure_count: e.failure_count,
+                        auth_method: e.credentials.auth_method.as_deref().map(|m| {
+                            if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam") {
+                                "idc".to_string()
+                            } else {
+                                m.to_string()
+                            }
+                        }),
+                        has_profile_arn: e.credentials.profile_arn.is_some(),
+                        expires_at: e.credentials.expires_at.clone(),
+                        refresh_token_hash: e.credentials.refresh_token.as_deref().map(sha256_hex),
+                        email: e.credentials.email.clone(),
+                        subscription_title: e.credentials.subscription_title.clone(),
+                        imported_at: e.credentials.imported_at.clone(),
+                        success_count: e.success_count,
+                        last_used_at: e.last_used_at.clone(),
+                        active_requests,
+                        max_concurrency: e
+                            .credentials
+                            .effective_max_concurrency_with_default(dispatch.default_max_concurrency)
+                            .and_then(|limit| u32::try_from(limit).ok()),
+                        has_proxy: e.credentials.proxy_url.is_some(),
+                        proxy_url: e.credentials.proxy_url.clone(),
+                        refresh_failure_count: e.refresh_failure_count,
+                        disabled_reason: e.disabled_reason.map(|r| {
+                            match r {
+                                DisabledReason::Manual => "Manual",
+                                DisabledReason::TooManyFailures => "TooManyFailures",
+                                DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
+                                DisabledReason::QuotaExceeded => "QuotaExceeded",
+                                DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
+                            }
+                            .to_string()
+                        }),
+                        cooldown_remaining_ms,
+                        rate_limit_bucket_tokens: shared_runtime
+                            .as_ref()
+                            .and_then(|runtime| runtime.bucket_tokens)
+                            .or_else(|| e.rate_limit_bucket.as_ref().map(|bucket| bucket.tokens))
+                            .map(|tokens| (tokens * 100.0).round() / 100.0),
+                        rate_limit_bucket_capacity: shared_runtime
+                            .as_ref()
+                            .and_then(|runtime| runtime.bucket_capacity)
+                            .or_else(|| e.rate_limit_bucket.as_ref().map(|bucket| bucket.policy.capacity)),
+                        rate_limit_bucket_capacity_override: e
+                            .credentials
+                            .rate_limit_bucket_capacity_override(),
+                        rate_limit_refill_per_second: shared_runtime
+                            .as_ref()
+                            .and_then(|runtime| runtime.bucket_current_refill_per_second)
+                            .or_else(|| {
+                                e.rate_limit_bucket
+                                    .as_ref()
+                                    .map(|bucket| bucket.current_refill_per_second)
+                            })
+                            .map(|value| (value * 100.0).round() / 100.0),
+                        rate_limit_refill_per_second_override: e
+                            .credentials
+                            .rate_limit_refill_per_second_override(),
+                        rate_limit_refill_base_per_second: shared_runtime
+                            .as_ref()
+                            .and_then(|runtime| runtime.bucket_base_refill_per_second)
+                            .or_else(|| {
+                                e.rate_limit_bucket
+                                    .as_ref()
+                                    .map(|bucket| bucket.policy.refill_per_second)
+                            }),
+                        rate_limit_hit_streak: shared_runtime
+                            .as_ref()
+                            .map(|runtime| runtime.rate_limit_hit_streak)
+                            .unwrap_or(e.rate_limit_hit_streak),
+                        next_ready_in_ms,
+                    }
                 })
                 .collect(),
             current_id,
@@ -2726,6 +3231,21 @@ impl MultiTokenManager {
             }
         }
         if !disabled {
+            if self.shared_dispatch_runtime_enabled() {
+                let bucket_policy = {
+                    let entries = self.entries.lock();
+                    entries
+                        .iter()
+                        .find(|entry| entry.id == id)
+                        .and_then(|entry| dispatch.shared_bucket_policy_for(&entry.credentials))
+                };
+                if let Err(err) =
+                    self.state_store
+                        .reset_dispatch_runtime(id, bucket_policy, current_epoch_ms())
+                {
+                    tracing::warn!("重置共享调度运行态失败（credentialId={}）: {}", id, err);
+                }
+            }
             self.availability_notify.notify_waiters();
         }
         Ok(())
@@ -2838,6 +3358,21 @@ impl MultiTokenManager {
             entry.disabled = false;
             entry.disabled_reason = None;
             Self::reset_rate_limit_runtime(entry, &dispatch, now);
+        }
+        if self.shared_dispatch_runtime_enabled() {
+            let bucket_policy = {
+                let entries = self.entries.lock();
+                entries
+                    .iter()
+                    .find(|entry| entry.id == id)
+                    .and_then(|entry| dispatch.shared_bucket_policy_for(&entry.credentials))
+            };
+            if let Err(err) =
+                self.state_store
+                    .reset_dispatch_runtime(id, bucket_policy, current_epoch_ms())
+            {
+                tracing::warn!("重置共享调度运行态失败（credentialId={}）: {}", id, err);
+            }
         }
         self.availability_notify.notify_waiters();
         Ok(())
@@ -3317,6 +3852,18 @@ mod tests {
         credentials
     }
 
+    fn shared_runtime_test_config() -> Option<Config> {
+        let redis_url = std::env::var("TEST_REDIS_URL").ok()?;
+        let mut config = Config::default();
+        config.state_redis_url = Some(redis_url);
+        Some(config)
+    }
+
+    fn unique_credential_id() -> u64 {
+        let bytes = *uuid::Uuid::new_v4().as_bytes();
+        u64::from_be_bytes(bytes[..8].try_into().unwrap())
+    }
+
     #[test]
     fn test_is_token_expired_with_expired_token() {
         let mut credentials = KiroCredentials::default();
@@ -3641,6 +4188,150 @@ mod tests {
             err.contains("并发上限"),
             "错误应提示并发上限，实际: {}",
             err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shared_dispatch_runtime_enforces_global_max_concurrency_when_test_redis_is_set() {
+        let Some(config) = shared_runtime_test_config() else {
+            return;
+        };
+
+        let credential_id = unique_credential_id();
+        let mut credential = available_credential(0);
+        credential.id = Some(credential_id);
+        credential.max_concurrency = Some(1);
+
+        let manager_a =
+            MultiTokenManager::new(config.clone(), vec![credential.clone()], None, None, false)
+                .unwrap();
+        let manager_b =
+            MultiTokenManager::new(config, vec![credential], None, None, false).unwrap();
+
+        let first = manager_a.acquire_context(None).await.unwrap();
+        assert_eq!(first.id, credential_id);
+
+        let err = manager_b
+            .acquire_context(None)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("并发上限"),
+            "共享调度热态应阻止跨 manager 超出全局并发上限，实际: {}",
+            err
+        );
+
+        let snapshot = manager_b.snapshot();
+        let entry = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.id == credential_id)
+            .unwrap();
+        assert_eq!(entry.active_requests, 1);
+
+        drop(first);
+
+        let second = manager_b.acquire_context(None).await.unwrap();
+        assert_eq!(second.id, credential_id);
+    }
+
+    #[tokio::test]
+    async fn test_shared_dispatch_runtime_shares_rate_limit_bucket_when_test_redis_is_set() {
+        let Some(mut config) = shared_runtime_test_config() else {
+            return;
+        };
+        config.rate_limit_cooldown_ms = 0;
+        config.rate_limit_bucket_capacity = 1.0;
+        config.rate_limit_refill_per_second = 0.2;
+        config.rate_limit_refill_min_per_second = 0.2;
+        config.rate_limit_refill_recovery_step_per_success = 0.0;
+        config.rate_limit_refill_backoff_factor = 0.5;
+
+        let credential_id = unique_credential_id();
+        let mut credential = available_credential(0);
+        credential.id = Some(credential_id);
+
+        let manager_a =
+            MultiTokenManager::new(config.clone(), vec![credential.clone()], None, None, false)
+                .unwrap();
+        let manager_b =
+            MultiTokenManager::new(config, vec![credential], None, None, false).unwrap();
+
+        let first = manager_a.acquire_context(None).await.unwrap();
+        assert_eq!(first.id, credential_id);
+        drop(first);
+
+        let err = manager_b
+            .acquire_context(None)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("token bucket") || err.contains("等待可用凭据"),
+            "跨 manager 应共享 bucket 消耗，实际: {}",
+            err
+        );
+
+        let snapshot = manager_b.snapshot();
+        let entry = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.id == credential_id)
+            .unwrap();
+        assert!(
+            entry.rate_limit_bucket_tokens.unwrap_or_default() < 1.0,
+            "共享 bucket 应在其他 manager 中可见"
+        );
+        assert!(
+            entry.next_ready_in_ms.unwrap_or_default() > 0,
+            "共享 bucket 不可用时应暴露下次可调度时间"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shared_dispatch_runtime_shares_rate_limit_cooldown_when_test_redis_is_set() {
+        let Some(mut config) = shared_runtime_test_config() else {
+            return;
+        };
+        config.rate_limit_cooldown_ms = 2_000;
+
+        let primary_id = unique_credential_id();
+        let secondary_id = unique_credential_id();
+
+        let mut primary = available_credential(0);
+        primary.id = Some(primary_id);
+        let mut secondary = available_credential(1);
+        secondary.id = Some(secondary_id);
+
+        let manager_a = MultiTokenManager::new(
+            config.clone(),
+            vec![primary.clone(), secondary.clone()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let manager_b =
+            MultiTokenManager::new(config, vec![primary, secondary], None, None, false).unwrap();
+
+        manager_a.report_rate_limited(primary_id);
+
+        let fallback = manager_b.acquire_context(None).await.unwrap();
+        assert_eq!(fallback.id, secondary_id);
+
+        let snapshot = manager_b.snapshot();
+        let primary_entry = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.id == primary_id)
+            .unwrap();
+        assert_eq!(primary_entry.rate_limit_hit_streak, 1);
+        assert!(
+            primary_entry.cooldown_remaining_ms.unwrap_or_default() > 0,
+            "共享 429 冷却应反映到其他 manager 的快照"
         );
     }
 

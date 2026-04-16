@@ -38,7 +38,7 @@
 - **负载均衡**: 支持 `priority`（按优先级）和 `balanced`（按实时并发 + 成功次数均衡）两种模式
 - **等待队列**: 支持在账号瞬时打满时按 `queueMaxSize` / `queueMaxWaitMs` 做有界等待
 - **429 冷却**: 单账号触发上游 `429` 后会按 `rateLimitCooldownMs` 做固定短冷却，避免重试继续打到同一账号
-- **Token Bucket 限速**: 支持为每个账号设置本地 token bucket，平滑瞬时流量，避免弱账号被短时间打爆
+- **Token Bucket 限速**: 支持为每个账号设置 token bucket；配置 Redis 共享运行态后可在多副本间共享限速状态
 - **429 自适应回填调节**: 遭遇 `429` 时会清空该账号 bucket 并下调回填速率，成功后再逐步恢复
 - **智能重试**: 单凭据最多重试 3 次，单请求最多重试 9 次
 - **凭据回写**: 多凭据格式下自动回写刷新后的 Token
@@ -201,10 +201,11 @@ GitHub Actions 镜像构建：
 | `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
 | `stateBackend` | string | `file` | 状态存储后端：`file` 或 `postgres` |
 | `statePostgresUrl` | string | - | PostgreSQL 连接串；当 `stateBackend=postgres` 时必填 |
-| `stateRedisUrl` | string | - | Redis 连接串；配置后余额缓存等短生命周期状态优先使用 Redis |
+| `stateRedisUrl` | string | - | Redis 连接串；配置后余额缓存、共享调度热态和运行时协调状态优先使用 Redis |
 | `instanceId` | string | 自动推导 | 当前运行实例标识；未配置时使用 `HOSTNAME:port:pid` 推导 |
 | `stateRedisHeartbeatIntervalSecs` | number | `10` | Redis 运行时协调心跳间隔（秒） |
 | `stateRedisLeaderLeaseTtlSecs` | number | `30` | Redis leader 租约 TTL（秒），必须大于心跳间隔 |
+| `stateHotPathSyncMinIntervalMs` | number | `25` | 数据面热路径检查共享状态修订号的最小间隔（毫秒，`0` 表示每次请求都检查） |
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
 | `defaultMaxConcurrency` | number | - | 全局默认单账号并发上限；仅在凭据未单独配置 `maxConcurrency` 时生效，留空或 <= 0 表示不限制 |
 | `queueMaxSize` | number | `0` | 等待队列最大长度；`0` 表示禁用等待队列 |
@@ -243,6 +244,7 @@ GitHub Actions 镜像构建：
    "instanceId": "kiro-rs-a",
    "stateRedisHeartbeatIntervalSecs": 10,
    "stateRedisLeaderLeaseTtlSecs": 30,
+   "stateHotPathSyncMinIntervalMs": 25,
    "loadBalancingMode": "balanced",
    "defaultMaxConcurrency": 3,
    "queueMaxSize": 16,
@@ -267,8 +269,9 @@ GitHub Actions 镜像构建：
 当同时配置 `stateRedisUrl` 时，以下短生命周期状态会优先写入 Redis：
 
 - 余额缓存
+- 共享调度热态（全局并发租约、429 冷却、token bucket、`rate_limit_hit_streak`）
 - 运行实例心跳
-- Leader 租约（仅用于运行时协调基础能力，当前尚不改变调度选择逻辑）
+- Leader 租约（用于运行时协调和 Admin 写 leader 路由）
 
 启动行为如下：
 
@@ -276,8 +279,10 @@ GitHub Actions 镜像构建：
 - 如果 PostgreSQL 中还没有调度配置，会用当前 `config.json` 初始化
 - 如果 PostgreSQL 中还没有凭据，会用本地 `credentials.json` 做一次种子导入
 - 如果配置了 Redis，Admin API 启动时会优先从 Redis 读取余额缓存
+- 如果配置了 Redis，请求热路径会基于 Redis 共享调度运行态做选号和租约保留，多副本下单账号并发上限、429 冷却和 token bucket 会按全局语义生效
+- 启用 Redis 共享运行态只改变调度热态的承载位置，不改变 `priority` / `balanced` / 等待队列 / 429 冷却 / fallback 等原有业务分支语义
 - 如果配置了 Redis，启动时会先完成一次实例注册和 Leader 租约续约；失败会直接终止启动，避免多实例状态不一致
-- 如果配置了 Redis，Admin API 的写操作只允许由当前 leader 实例执行；命中 follower 会返回 `409` 或 `503`
+- 如果配置了 Redis，Admin API 的写操作会优先路由到当前 leader；命中 follower 时会自动转发到 leader，只有当前无 leader 或无法解析 leader 地址时才会返回 `409` 或 `503`
 
 示例：
 
@@ -292,6 +297,43 @@ GitHub Actions 镜像构建：
    "stateRedisLeaderLeaseTtlSecs": 30
 }
 ```
+
+### external -> file 回滚导出
+
+当线上已经使用 `stateBackend=postgres` 承接写流量时，如需切回 file backend，不建议只手工改配置。可以直接使用内置导出命令生成一套可回滚文件：
+
+```bash
+kiro-rs \
+  --config config.json \
+  --credentials credentials.json \
+  export-file-state \
+  --output-dir ./rollback-export
+```
+
+如目标目录中已有导出文件，可追加 `--overwrite`。
+
+导出目录默认会包含：
+
+- `credentials.json`
+- `dispatch-config.json`
+- `config.rollback.json`
+- `kiro_stats.json`
+- `kiro_balance_cache.json`
+- `rollback-manifest.json`
+
+其中 `config.rollback.json` 已自动切回 `stateBackend=file`，并清空 `statePostgresUrl` / `stateRedisUrl`。推荐按 manifest 中的命令启动回滚实例，例如：
+
+```bash
+kiro-rs \
+  --config ./rollback-export/config.rollback.json \
+  --credentials ./rollback-export/credentials.json
+```
+
+说明：
+
+- 凭据、调度配置、统计缓存、余额缓存会被导出
+- dispatch lease、429 冷却窗口、共享 token bucket 等瞬时运行态不会导出，它们属于热态而非 file backend 持久状态
+- 如源配置启用了 Redis，但导出时 Redis 不可达，余额缓存会自动回退到主状态后端视图；这不会影响凭据和调度配置导出，但可能导致导出的 `kiro_balance_cache.json` 不是最新值
 
 ### credentials.json
 
