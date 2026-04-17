@@ -8,20 +8,20 @@ use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::token;
 use anyhow::Error;
 use axum::{
-    Json as JsonExtractor,
     body::Body,
     extract::State,
-    http::{HeaderMap, StatusCode, header},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
+    Json as JsonExtractor,
 };
 use bytes::Bytes;
-use futures::{Stream, StreamExt, stream};
+use futures::{stream, Stream, StreamExt};
 use serde_json::json;
 use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
-use super::converter::{ConversionError, convert_request_with_probe};
+use super::converter::{convert_request_with_probe, ConversionError};
 use super::middleware::AppState;
 use super::probe::parse_upstream_probe;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
@@ -123,6 +123,24 @@ pub async fn get_models() -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
 
     let models = vec![
+        Model {
+            id: "claude-opus-4-7".to_string(),
+            object: "model".to_string(),
+            created: 1793404800, // Jul 31, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.7".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128000,
+        },
+        Model {
+            id: "claude-opus-4-7-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1793404800, // Jul 31, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.7 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128000,
+        },
         Model {
             id: "claude-opus-4-6".to_string(),
             object: "model".to_string(),
@@ -321,6 +339,9 @@ pub async fn post_messages(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
+    // 检查是否启用了thinking
+    let thinking_enabled = request_thinking_enabled(&payload);
+
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -328,13 +349,6 @@ pub async fn post_messages(
         payload.messages,
         payload.tools,
     ) as i32;
-
-    // 检查是否启用了thinking
-    let thinking_enabled = payload
-        .thinking
-        .as_ref()
-        .map(|t| t.is_enabled())
-        .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
 
@@ -698,7 +712,7 @@ async fn handle_non_stream_request(
 
 /// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
 ///
-/// - Opus 4.6：覆写为 adaptive 类型
+/// - Opus 4.7：覆写为 adaptive 类型，并默认显示 summarized thinking
 /// - 其他模型：覆写为 enabled 类型
 /// - budget_tokens 固定为 20000
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
@@ -707,10 +721,9 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         return;
     }
 
-    let is_opus_4_6 = model_lower.contains("opus")
-        && (model_lower.contains("4-6") || model_lower.contains("4.6"));
+    let is_opus_4_7 = is_opus_4_7_model(&payload.model);
 
-    let thinking_type = if is_opus_4_6 { "adaptive" } else { "enabled" };
+    let thinking_type = if is_opus_4_7 { "adaptive" } else { "enabled" };
 
     tracing::info!(
         model = %payload.model,
@@ -720,14 +733,43 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
 
     payload.thinking = Some(Thinking {
         thinking_type: thinking_type.to_string(),
+        display: if is_opus_4_7 {
+            Some("summarized".to_string())
+        } else {
+            None
+        },
         budget_tokens: 20000,
     });
 
-    if is_opus_4_6 {
+    if is_opus_4_7 {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
         });
     }
+}
+
+fn is_opus_4_7_model(model: &str) -> bool {
+    let model_lower = model.to_lowercase();
+    model_lower.contains("opus") && (model_lower.contains("4-7") || model_lower.contains("4.7"))
+}
+
+fn system_contains_thinking_tags(system: Option<&Vec<super::types::SystemMessage>>) -> bool {
+    system.is_some_and(|messages| {
+        messages.iter().any(|message| {
+            message.text.contains("<thinking_mode>")
+                || message.text.contains("<max_thinking_length>")
+                || message.text.contains("<thinking_effort>")
+        })
+    })
+}
+
+fn request_thinking_enabled(payload: &MessagesRequest) -> bool {
+    payload
+        .thinking
+        .as_ref()
+        .map(|t| t.is_enabled())
+        .unwrap_or(false)
+        || system_contains_thinking_tags(payload.system.as_ref())
 }
 
 /// POST /v1/messages/count_tokens
@@ -857,6 +899,9 @@ pub async fn post_messages_cc(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
+    // 检查是否启用了thinking
+    let thinking_enabled = request_thinking_enabled(&payload);
+
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -864,13 +909,6 @@ pub async fn post_messages_cc(
         payload.messages,
         payload.tools,
     ) as i32;
-
-    // 检查是否启用了thinking
-    let thinking_enabled = payload
-        .thinking
-        .as_ref()
-        .map(|t| t.is_enabled())
-        .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
 
@@ -1038,4 +1076,76 @@ fn create_buffered_sse_stream(
         },
     )
     .flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_opus_4_7_model, override_thinking_from_model_name, request_thinking_enabled};
+    use crate::anthropic::types::{Message, MessagesRequest, Thinking};
+
+    fn base_request(model: &str) -> MessagesRequest {
+        MessagesRequest {
+            model: model.to_string(),
+            max_tokens: 1024,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String("hi".to_string()),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn test_is_opus_4_7_model_accepts_direct_and_bedrock_ids() {
+        assert!(is_opus_4_7_model("claude-opus-4-7"));
+        assert!(is_opus_4_7_model("us.anthropic.claude-opus-4-7-v1"));
+        assert!(!is_opus_4_7_model("claude-opus-4-6"));
+    }
+
+    #[test]
+    fn test_override_thinking_from_model_name_uses_adaptive_for_opus_4_7() {
+        let mut payload = base_request("claude-opus-4-7-thinking");
+
+        override_thinking_from_model_name(&mut payload);
+
+        let thinking = payload.thinking.expect("thinking should be set");
+        assert_eq!(thinking.thinking_type, "adaptive");
+        assert_eq!(thinking.display.as_deref(), Some("summarized"));
+        assert_eq!(
+            payload
+                .output_config
+                .as_ref()
+                .map(|config| config.effort.as_str()),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn test_request_thinking_enabled_detects_injected_system_tags() {
+        let mut payload = base_request("claude-opus-4-7");
+        payload.system = Some(vec![crate::anthropic::types::SystemMessage {
+            text: "<thinking_mode>adaptive</thinking_mode><thinking_effort>high</thinking_effort>"
+                .to_string(),
+        }]);
+
+        assert!(request_thinking_enabled(&payload));
+    }
+
+    #[test]
+    fn test_request_thinking_enabled_respects_explicit_thinking_field() {
+        let mut payload = base_request("claude-sonnet-4-6");
+        payload.thinking = Some(Thinking {
+            thinking_type: "enabled".to_string(),
+            display: None,
+            budget_tokens: 12000,
+        });
+
+        assert!(request_thinking_enabled(&payload));
+    }
 }

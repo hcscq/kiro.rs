@@ -109,6 +109,7 @@ const CURRENT_TOOL_RESULT_FALLBACK_TEXT: &str = "Please continue based on the to
 /// - sonnet 4.6/4-6 → claude-sonnet-4.6
 /// - 其他 sonnet → claude-sonnet-4.5
 /// - opus 4.5/4-5 → claude-opus-4.5
+/// - opus 4.7/4-7 → claude-opus-4.7
 /// - 其他 opus → claude-opus-4.6
 /// - 所有 haiku → claude-haiku-4.5
 pub fn map_model(model: &str) -> Option<String> {
@@ -123,6 +124,8 @@ pub fn map_model(model: &str) -> Option<String> {
     } else if model_lower.contains("opus") {
         if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-opus-4.5".to_string())
+        } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
+            Some("claude-opus-4.7".to_string())
         } else {
             Some("claude-opus-4.6".to_string())
         }
@@ -136,10 +139,17 @@ pub fn map_model(model: &str) -> Option<String> {
 /// 根据模型名称返回对应的上下文窗口大小
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
-/// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
+/// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文，
+/// 当前真实 Opus 4.7 也沿用同级别窗口。
 pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
-        Some(mapped) if mapped == "claude-sonnet-4.6" || mapped == "claude-opus-4.6" => 1_000_000,
+        Some(mapped)
+            if mapped == "claude-sonnet-4.6"
+                || mapped == "claude-opus-4.6"
+                || mapped == "claude-opus-4.7" =>
+        {
+            1_000_000
+        }
         _ => 200_000,
     }
 }
@@ -1193,34 +1203,26 @@ mod tests {
 
     #[test]
     fn test_map_model_sonnet() {
-        assert!(
-            map_model("claude-sonnet-4-20250514")
-                .unwrap()
-                .contains("sonnet")
-        );
-        assert!(
-            map_model("claude-3-5-sonnet-20241022")
-                .unwrap()
-                .contains("sonnet")
-        );
+        assert!(map_model("claude-sonnet-4-20250514")
+            .unwrap()
+            .contains("sonnet"));
+        assert!(map_model("claude-3-5-sonnet-20241022")
+            .unwrap()
+            .contains("sonnet"));
     }
 
     #[test]
     fn test_map_model_opus() {
-        assert!(
-            map_model("claude-opus-4-20250514")
-                .unwrap()
-                .contains("opus")
-        );
+        assert!(map_model("claude-opus-4-20250514")
+            .unwrap()
+            .contains("opus"));
     }
 
     #[test]
     fn test_map_model_haiku() {
-        assert!(
-            map_model("claude-haiku-4-20250514")
-                .unwrap()
-                .contains("haiku")
-        );
+        assert!(map_model("claude-haiku-4-20250514")
+            .unwrap()
+            .contains("haiku"));
     }
 
     #[test]
@@ -1247,6 +1249,21 @@ mod tests {
         // thinking 后缀不应影响 opus 4.6 模型映射
         let result = map_model("claude-opus-4-6-thinking");
         assert_eq!(result, Some("claude-opus-4.6".to_string()));
+    }
+
+    #[test]
+    fn test_map_model_thinking_suffix_opus_4_7_uses_real_4_7_profile() {
+        let result = map_model("claude-opus-4-7-thinking");
+        assert_eq!(result, Some("claude-opus-4.7".to_string()));
+    }
+
+    #[test]
+    fn test_get_context_window_size_opus_4_7_is_1m() {
+        assert_eq!(get_context_window_size("claude-opus-4-7"), 1_000_000);
+        assert_eq!(
+            get_context_window_size("claude-opus-4.7-thinking"),
+            1_000_000
+        );
     }
 
     #[test]
@@ -1840,10 +1857,9 @@ mod tests {
 
         // 测试孤立的 tool_use（有 tool_use 但没有对应的 tool_result）
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
-        assistant_msg = assistant_msg.with_tool_uses(vec![
-            ToolUseEntry::new("tool-orphan", "read")
-                .with_input(serde_json::json!({"path": "/test.txt"})),
-        ]);
+        assistant_msg =
+            assistant_msg.with_tool_uses(vec![ToolUseEntry::new("tool-orphan", "read")
+                .with_input(serde_json::json!({"path": "/test.txt"}))]);
 
         let history = vec![
             Message::User(HistoryUserMessage::new(
@@ -1872,10 +1888,8 @@ mod tests {
 
         // 测试正常配对的情况
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
-        assistant_msg = assistant_msg.with_tool_uses(vec![
-            ToolUseEntry::new("tool-1", "read")
-                .with_input(serde_json::json!({"path": "/test.txt"})),
-        ]);
+        assistant_msg = assistant_msg.with_tool_uses(vec![ToolUseEntry::new("tool-1", "read")
+            .with_input(serde_json::json!({"path": "/test.txt"}))]);
 
         let history = vec![
             Message::User(HistoryUserMessage::new(
@@ -1937,10 +1951,8 @@ mod tests {
         // 测试历史中已配对的 tool_use 不应该被报告为孤立
         // 场景：多轮对话中，之前的 tool_use 已经在历史中有对应的 tool_result
         let mut assistant_msg1 = AssistantMessage::new("I'll read the file.");
-        assistant_msg1 = assistant_msg1.with_tool_uses(vec![
-            ToolUseEntry::new("tool-1", "read")
-                .with_input(serde_json::json!({"path": "/test.txt"})),
-        ]);
+        assistant_msg1 = assistant_msg1.with_tool_uses(vec![ToolUseEntry::new("tool-1", "read")
+            .with_input(serde_json::json!({"path": "/test.txt"}))]);
 
         // 构建历史中的 user 消息，包含 tool_result
         let mut user_msg_with_result = UserMessage::new("", "claude-sonnet-4.5");
@@ -1983,10 +1995,8 @@ mod tests {
 
         // 测试重复的 tool_result（历史中已配对，当前消息又发送了相同的 tool_result）
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
-        assistant_msg = assistant_msg.with_tool_uses(vec![
-            ToolUseEntry::new("tool-1", "read")
-                .with_input(serde_json::json!({"path": "/test.txt"})),
-        ]);
+        assistant_msg = assistant_msg.with_tool_uses(vec![ToolUseEntry::new("tool-1", "read")
+            .with_input(serde_json::json!({"path": "/test.txt"}))]);
 
         // 历史中已有 tool_result
         let mut user_msg_with_result = UserMessage::new("", "claude-sonnet-4.5");
@@ -2129,7 +2139,7 @@ mod tests {
         // 测试移除所有 tool_use 后，tool_uses 变为 None
         let mut assistant_msg = AssistantMessage::new("I'll use a tool.");
         assistant_msg = assistant_msg.with_tool_uses(vec![
-            ToolUseEntry::new("tool-1", "read").with_input(serde_json::json!({})),
+            ToolUseEntry::new("tool-1", "read").with_input(serde_json::json!({}))
         ]);
 
         let mut history = vec![
@@ -2701,12 +2711,11 @@ mod tests {
             Message::User(user) => {
                 assert_eq!(user.user_input_message.content, "");
                 assert_eq!(user.user_input_message.images.len(), 10);
-                assert!(
-                    user.user_input_message
-                        .user_input_message_context
-                        .tool_results
-                        .is_empty()
-                );
+                assert!(user
+                    .user_input_message
+                    .user_input_message_context
+                    .tool_results
+                    .is_empty());
             }
             other => panic!(
                 "history[0] should be synthetic image chunk user, got {:?}",
@@ -3038,12 +3047,11 @@ mod tests {
             Message::User(user) => {
                 assert_eq!(user.user_input_message.content, "");
                 assert_eq!(user.user_input_message.images.len(), 10);
-                assert!(
-                    user.user_input_message
-                        .user_input_message_context
-                        .tool_results
-                        .is_empty()
-                );
+                assert!(user
+                    .user_input_message
+                    .user_input_message_context
+                    .tool_results
+                    .is_empty());
             }
             other => panic!(
                 "history[4] should be synthetic image chunk user, got {:?}",

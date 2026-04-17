@@ -68,6 +68,8 @@ const MAX_BUDGET_TOKENS: i32 = 24576;
 pub struct Thinking {
     #[serde(rename = "type")]
     pub thinking_type: String,
+    #[serde(default)]
+    pub display: Option<String>,
     #[serde(
         default = "default_budget_tokens",
         deserialize_with = "deserialize_budget_tokens"
