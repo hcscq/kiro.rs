@@ -8,16 +8,16 @@ use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tokio::sync::{oneshot, Mutex as TokioMutex, Notify};
+use tokio::sync::{Mutex as TokioMutex, Notify, oneshot};
 
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
-use crate::http_client::{build_client, ProxyConfig};
+use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
@@ -26,10 +26,9 @@ use crate::kiro::model::token_refresh::{
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
 use crate::state::{
-    current_epoch_ms, DispatchLeaseReservationStatus, DispatchRuntimeBucketPolicy,
-    DispatchRuntimeCredential, DispatchRuntimeSnapshot, PersistedDispatchConfig,
-    RuntimeCoordinationStatus, StateChangeKind, StateChangeRevisions, StateStore,
-    StatsEntryRecord, StatsMergeRecord,
+    DispatchLeaseReservationStatus, DispatchRuntimeBucketPolicy, DispatchRuntimeCredential,
+    DispatchRuntimeSnapshot, PersistedDispatchConfig, RuntimeCoordinationStatus, StateChangeKind,
+    StateChangeRevisions, StateStore, StatsEntryRecord, StatsMergeRecord, current_epoch_ms,
 };
 
 /// 检查 Token 是否在指定时间内过期
@@ -453,7 +452,7 @@ struct CredentialEntry {
     last_used_at: Option<String>,
     /// 当前运行中的请求数
     active_requests: usize,
-    /// 429 限流冷却到期时间
+    /// 限流或临时避让冷却到期时间
     rate_limit_cooldown_until: Option<Instant>,
     /// 本地 token bucket 与自适应退避状态
     rate_limit_bucket: Option<AdaptiveTokenBucket>,
@@ -951,6 +950,13 @@ enum ReservationFailure {
     AllTemporarilyUnavailable { next_ready_at: Option<Instant> },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelRequirement {
+    Any,
+    PaidOpus,
+    RealOpus47,
+}
+
 struct WaitQueueGuard {
     waiting_requests: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -1108,14 +1114,33 @@ impl MultiTokenManager {
         self.waiting_requests.load(Ordering::SeqCst)
     }
 
-    fn model_requires_paid_tier(model: Option<&str>) -> bool {
-        model
-            .map(|name| name.to_ascii_lowercase().contains("opus"))
-            .unwrap_or(false)
+    fn model_requirement(model: Option<&str>) -> ModelRequirement {
+        let Some(model) = model.map(|name| name.to_ascii_lowercase()) else {
+            return ModelRequirement::Any;
+        };
+
+        if model.contains("claude-opus-4.7") || model.contains("claude-opus-4-7") {
+            ModelRequirement::RealOpus47
+        } else if model.contains("opus") {
+            ModelRequirement::PaidOpus
+        } else {
+            ModelRequirement::Any
+        }
     }
 
-    fn is_model_supported(credentials: &KiroCredentials, requires_paid_tier: bool) -> bool {
-        !requires_paid_tier || credentials.supports_opus()
+    fn is_model_supported(credentials: &KiroCredentials, requirement: ModelRequirement) -> bool {
+        match requirement {
+            ModelRequirement::Any => true,
+            ModelRequirement::PaidOpus => credentials.supports_opus(),
+            ModelRequirement::RealOpus47 => credentials.supports_real_opus_4_7(),
+        }
+    }
+
+    fn model_preference_rank(credentials: &KiroCredentials, requirement: ModelRequirement) -> u8 {
+        match requirement {
+            ModelRequirement::RealOpus47 => credentials.opus_4_7_preference_rank(),
+            ModelRequirement::Any | ModelRequirement::PaidOpus => 0,
+        }
     }
 
     fn has_capacity(
@@ -1209,13 +1234,13 @@ impl MultiTokenManager {
 
     fn next_ready_at(
         entries: &mut [CredentialEntry],
-        requires_paid_tier: bool,
+        model_requirement: ModelRequirement,
         now: Instant,
     ) -> Option<Instant> {
         entries
             .iter_mut()
             .filter(|entry| {
-                !entry.disabled && Self::is_model_supported(&entry.credentials, requires_paid_tier)
+                !entry.disabled && Self::is_model_supported(&entry.credentials, model_requirement)
             })
             .filter_map(|entry| Self::combined_ready_at(entry, now))
             .min()
@@ -1485,10 +1510,11 @@ impl MultiTokenManager {
                             .find(|entry| entry.id == *id)
                             .and_then(|entry| dispatch.shared_bucket_policy_for(&entry.credentials))
                     };
-                    if let Err(err) =
-                        self.state_store
-                            .reset_dispatch_runtime(*id, bucket_policy, current_epoch_ms())
-                    {
+                    if let Err(err) = self.state_store.reset_dispatch_runtime(
+                        *id,
+                        bucket_policy,
+                        current_epoch_ms(),
+                    ) {
                         tracing::warn!("重置共享调度运行态失败（credentialId={}）: {}", id, err);
                     }
                 }
@@ -1513,7 +1539,7 @@ impl MultiTokenManager {
         let mode = dispatch.mode;
         let mut entries = self.entries.lock();
         let now = Instant::now();
-        let requires_paid_tier = Self::model_requires_paid_tier(model);
+        let model_requirement = Self::model_requirement(model);
 
         if entries.is_empty() {
             return Err(ReservationFailure::NoCredentials);
@@ -1525,8 +1551,8 @@ impl MultiTokenManager {
         let mut has_enabled = false;
         let mut has_supported = false;
         let mut selected_index: Option<usize> = None;
-        let mut priority_key: Option<(u32, usize, u8, u64)> = None;
-        let mut balanced_key: Option<(usize, u64, u32, u64)> = None;
+        let mut priority_key: Option<(u8, u32, usize, u8, u64)> = None;
+        let mut balanced_key: Option<(u8, usize, u64, u32, u64)> = None;
         let mut next_ready_at: Option<Instant> = None;
 
         for (index, entry) in entries.iter_mut().enumerate() {
@@ -1537,7 +1563,7 @@ impl MultiTokenManager {
             }
             has_enabled = true;
 
-            if !Self::is_model_supported(&entry.credentials, requires_paid_tier) {
+            if !Self::is_model_supported(&entry.credentials, model_requirement) {
                 continue;
             }
             has_supported = true;
@@ -1557,6 +1583,7 @@ impl MultiTokenManager {
 
             if is_balanced {
                 let candidate_key = (
+                    Self::model_preference_rank(&entry.credentials, model_requirement),
                     entry.active_requests,
                     entry.success_count,
                     entry.credentials.priority,
@@ -1574,6 +1601,7 @@ impl MultiTokenManager {
             }
 
             let candidate_key = (
+                Self::model_preference_rank(&entry.credentials, model_requirement),
                 entry.credentials.priority,
                 entry.active_requests,
                 u8::from(entry.id != current_id_value),
@@ -1612,7 +1640,7 @@ impl MultiTokenManager {
                 .map_or(true, |bucket| bucket.consume(now))
         };
         if !token_consumed {
-            let next_ready_at = Self::next_ready_at(&mut entries, requires_paid_tier, now);
+            let next_ready_at = Self::next_ready_at(&mut entries, model_requirement, now);
             return Err(ReservationFailure::AllTemporarilyUnavailable { next_ready_at });
         }
         let entry = &mut entries[entry_index];
@@ -1673,7 +1701,7 @@ impl MultiTokenManager {
         model: Option<&str>,
     ) -> Result<(u64, KiroCredentials, CallLease), ReservationFailure> {
         let dispatch = self.dispatch_config();
-        let requires_paid_tier = Self::model_requires_paid_tier(model);
+        let model_requirement = Self::model_requirement(model);
         let mode = dispatch.mode.clone();
         let is_balanced = mode == "balanced";
         let retry_budget = self.total_count().max(1).saturating_mul(2);
@@ -1686,7 +1714,9 @@ impl MultiTokenManager {
                 .load_shared_dispatch_runtime_snapshots(&dispatch, now_epoch_ms)
                 .map_err(|err| {
                     tracing::warn!("读取共享调度热态失败: {}", err);
-                    ReservationFailure::AllTemporarilyUnavailable { next_ready_at: None }
+                    ReservationFailure::AllTemporarilyUnavailable {
+                        next_ready_at: None,
+                    }
                 })?;
 
             let selection = {
@@ -1702,8 +1732,8 @@ impl MultiTokenManager {
                 let mut selected_credentials: Option<KiroCredentials> = None;
                 let mut selected_max_concurrency: Option<usize> = None;
                 let mut selected_bucket_policy: Option<DispatchRuntimeBucketPolicy> = None;
-                let mut priority_key: Option<(u32, usize, u8, u64)> = None;
-                let mut balanced_key: Option<(usize, u64, u32, u64)> = None;
+                let mut priority_key: Option<(u8, u32, usize, u8, u64)> = None;
+                let mut balanced_key: Option<(u8, usize, u64, u32, u64)> = None;
                 let mut next_ready_at: Option<Instant> = fallback_next_ready_at;
 
                 for entry in entries.iter() {
@@ -1712,7 +1742,7 @@ impl MultiTokenManager {
                     }
                     has_enabled = true;
 
-                    if !Self::is_model_supported(&entry.credentials, requires_paid_tier) {
+                    if !Self::is_model_supported(&entry.credentials, model_requirement) {
                         continue;
                     }
                     has_supported = true;
@@ -1743,6 +1773,7 @@ impl MultiTokenManager {
 
                     if is_balanced {
                         let candidate_key = (
+                            Self::model_preference_rank(&entry.credentials, model_requirement),
                             runtime.active_requests,
                             entry.success_count,
                             entry.credentials.priority,
@@ -1756,9 +1787,8 @@ impl MultiTokenManager {
                             balanced_key = Some(candidate_key);
                             selected_id = Some(entry.id);
                             selected_credentials = Some(entry.credentials.clone());
-                            selected_max_concurrency = entry
-                                .credentials
-                                .effective_max_concurrency_with_default(
+                            selected_max_concurrency =
+                                entry.credentials.effective_max_concurrency_with_default(
                                     dispatch.default_max_concurrency,
                                 );
                             selected_bucket_policy =
@@ -1768,6 +1798,7 @@ impl MultiTokenManager {
                     }
 
                     let candidate_key = (
+                        Self::model_preference_rank(&entry.credentials, model_requirement),
                         entry.credentials.priority,
                         runtime.active_requests,
                         u8::from(entry.id != current_id_value),
@@ -1781,9 +1812,10 @@ impl MultiTokenManager {
                         priority_key = Some(candidate_key);
                         selected_id = Some(entry.id);
                         selected_credentials = Some(entry.credentials.clone());
-                        selected_max_concurrency = entry
-                            .credentials
-                            .effective_max_concurrency_with_default(dispatch.default_max_concurrency);
+                        selected_max_concurrency =
+                            entry.credentials.effective_max_concurrency_with_default(
+                                dispatch.default_max_concurrency,
+                            );
                         selected_bucket_policy =
                             dispatch.shared_bucket_policy_for(&entry.credentials);
                     }
@@ -1807,11 +1839,15 @@ impl MultiTokenManager {
                 }
             };
 
-            let (selected_id, selected_credentials, selected_max_concurrency, selected_bucket_policy) =
-                match selection {
-                    Ok(selection) => selection,
-                    Err(err) => return Err(err),
-                };
+            let (
+                selected_id,
+                selected_credentials,
+                selected_max_concurrency,
+                selected_bucket_policy,
+            ) = match selection {
+                Ok(selection) => selection,
+                Err(err) => return Err(err),
+            };
 
             let shared_lease_id = uuid::Uuid::new_v4().to_string();
             let reservation = self
@@ -1826,11 +1862,15 @@ impl MultiTokenManager {
                 )
                 .map_err(|err| {
                     tracing::warn!("申请共享调度占位失败: {}", err);
-                    ReservationFailure::AllTemporarilyUnavailable { next_ready_at: None }
+                    ReservationFailure::AllTemporarilyUnavailable {
+                        next_ready_at: None,
+                    }
                 })?;
 
             let Some(reservation) = reservation else {
-                return Err(ReservationFailure::AllTemporarilyUnavailable { next_ready_at: None });
+                return Err(ReservationFailure::AllTemporarilyUnavailable {
+                    next_ready_at: None,
+                });
             };
 
             if reservation.status == DispatchLeaseReservationStatus::Reserved {
@@ -2778,6 +2818,102 @@ impl MultiTokenManager {
         result
     }
 
+    /// 当上游明确返回真实 Opus 4.7 `INVALID_MODEL_ID` 时，
+    /// 将当前凭据视为“不支持该模型”，临时避让并切换到下一张更合适的卡。
+    pub fn defer_model_unsupported_credential(&self, id: u64, cooldown: StdDuration) -> bool {
+        let now = Instant::now();
+        let deferred_until = now + cooldown;
+        let requirement = ModelRequirement::RealOpus47;
+        let result = {
+            let mut entries = self.entries.lock();
+            let mut current_id = self.current_id.lock();
+
+            let entry = match entries.iter_mut().find(|e| e.id == id) {
+                Some(e) => e,
+                None => {
+                    return entries.iter().any(|e| {
+                        !e.disabled
+                            && e.id != id
+                            && Self::is_model_supported(&e.credentials, requirement)
+                    });
+                }
+            };
+
+            if entry.disabled {
+                return entries.iter().any(|e| {
+                    !e.disabled
+                        && e.id != id
+                        && Self::is_model_supported(&e.credentials, requirement)
+                });
+            }
+
+            entry.rate_limit_cooldown_until = Some(
+                entry
+                    .rate_limit_cooldown_until
+                    .map(|until| until.max(deferred_until))
+                    .unwrap_or(deferred_until),
+            );
+            entry.last_used_at = Some(Utc::now().to_rfc3339());
+
+            if *current_id == id {
+                if let Some(next) = entries
+                    .iter()
+                    .filter(|e| {
+                        !e.disabled
+                            && e.id != id
+                            && Self::is_model_supported(&e.credentials, requirement)
+                    })
+                    .min_by_key(|e| {
+                        (
+                            Self::model_preference_rank(&e.credentials, requirement),
+                            e.credentials.priority,
+                            e.id,
+                        )
+                    })
+                {
+                    *current_id = next.id;
+                    tracing::info!(
+                        "凭据 #{} 不支持真实 claude-opus-4.7，已临时冷却 {}ms 并切换到凭据 #{}",
+                        id,
+                        cooldown.as_millis(),
+                        next.id
+                    );
+                } else {
+                    tracing::warn!(
+                        "凭据 #{} 不支持真实 claude-opus-4.7，已临时冷却 {}ms，当前无其他可切换凭据",
+                        id,
+                        cooldown.as_millis()
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    "凭据 #{} 不支持真实 claude-opus-4.7，已临时冷却 {}ms",
+                    id,
+                    cooldown.as_millis()
+                );
+            }
+
+            entries.iter().any(|e| {
+                !e.disabled && e.id != id && Self::is_model_supported(&e.credentials, requirement)
+            })
+        };
+        if self.shared_dispatch_runtime_enabled() {
+            let cooldown_ms = cooldown.as_millis().min(u128::from(u64::MAX)) as u64;
+            if let Err(err) =
+                self.state_store
+                    .defer_dispatch_credential(id, cooldown_ms, current_epoch_ms())
+            {
+                tracing::warn!(
+                    "更新共享调度模型不支持冷却失败（credentialId={}）: {}",
+                    id,
+                    err
+                );
+            }
+        }
+        self.save_stats_debounced();
+        result
+    }
+
     /// 报告指定凭据 API 调用失败
     ///
     /// 增加失败计数，达到阈值时禁用凭据并切换到优先级最高的可用凭据
@@ -3123,7 +3259,8 @@ impl MultiTokenManager {
                         disabled: e.disabled,
                         failure_count: e.failure_count,
                         auth_method: e.credentials.auth_method.as_deref().map(|m| {
-                            if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam") {
+                            if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam")
+                            {
                                 "idc".to_string()
                             } else {
                                 m.to_string()
@@ -3140,7 +3277,9 @@ impl MultiTokenManager {
                         active_requests,
                         max_concurrency: e
                             .credentials
-                            .effective_max_concurrency_with_default(dispatch.default_max_concurrency)
+                            .effective_max_concurrency_with_default(
+                                dispatch.default_max_concurrency,
+                            )
                             .and_then(|limit| u32::try_from(limit).ok()),
                         has_proxy: e.credentials.proxy_url.is_some(),
                         proxy_url: e.credentials.proxy_url.clone(),
@@ -3164,7 +3303,11 @@ impl MultiTokenManager {
                         rate_limit_bucket_capacity: shared_runtime
                             .as_ref()
                             .and_then(|runtime| runtime.bucket_capacity)
-                            .or_else(|| e.rate_limit_bucket.as_ref().map(|bucket| bucket.policy.capacity)),
+                            .or_else(|| {
+                                e.rate_limit_bucket
+                                    .as_ref()
+                                    .map(|bucket| bucket.policy.capacity)
+                            }),
                         rate_limit_bucket_capacity_override: e
                             .credentials
                             .rate_limit_bucket_capacity_override(),
@@ -3438,11 +3581,28 @@ impl MultiTokenManager {
             .ok_or_else(|| anyhow::anyhow!("缺少 refreshToken"))?;
         let new_refresh_token_hash = sha256_hex(new_refresh_token);
 
-        // 3. 尝试刷新 Token 验证凭据有效性
+        // 3. 先做一次本地去重，避免重复凭据还去触发上游刷新校验
+        let duplicate_exists = self
+            .persisted_credentials_snapshot()
+            .iter()
+            .any(|credential| {
+                credential
+                    .refresh_token
+                    .as_deref()
+                    .map(sha256_hex)
+                    .as_deref()
+                    == Some(new_refresh_token_hash.as_str())
+            });
+        if duplicate_exists {
+            anyhow::bail!("凭据已存在（refreshToken 重复）");
+        }
+
+        // 4. 尝试刷新 Token 验证凭据有效性
         let effective_proxy = new_cred.effective_proxy(self.proxy.as_ref());
         let mut validated_cred =
             refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?;
 
+        // 5. 写入前重新检查一次，避免并发添加时插入重复凭据
         let _state_write_guard = self.state_write_lock.lock();
         let mut persisted = self.persisted_credentials_snapshot();
         let duplicate_exists = persisted.iter().any(|credential| {
@@ -4143,6 +4303,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ctx.id, 2);
+    }
+
+    #[tokio::test]
+    async fn test_priority_mode_skips_power_tier_for_real_opus_4_7() {
+        let config = Config::default();
+        let mut power = available_credential(0);
+        power.subscription_title = Some("KIRO POWER".to_string());
+        let mut pro_plus = available_credential(9);
+        pro_plus.subscription_title = Some("KIRO PRO+".to_string());
+
+        let manager =
+            MultiTokenManager::new(config, vec![power, pro_plus], None, None, false).unwrap();
+
+        let ctx = manager
+            .acquire_context(Some("claude-opus-4.7"))
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 2);
+    }
+
+    #[tokio::test]
+    async fn test_real_opus_4_7_returns_no_model_support_when_only_power_available() {
+        let config = Config::default();
+        let mut power = available_credential(0);
+        power.subscription_title = Some("KIRO POWER".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![power], None, None, false).unwrap();
+
+        let err = manager
+            .acquire_context(Some("claude-opus-4.7"))
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            err.to_string().contains("当前没有可用凭据支持该模型"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
@@ -4858,8 +5055,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_multi_token_manager_acquire_context_balanced_retries_until_bad_credential_disabled(
-    ) {
+    async fn test_multi_token_manager_acquire_context_balanced_retries_until_bad_credential_disabled()
+     {
         let mut config = Config::default();
         config.load_balancing_mode = "balanced".to_string();
 

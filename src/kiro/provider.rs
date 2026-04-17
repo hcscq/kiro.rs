@@ -6,7 +6,7 @@
 
 use bytes::Bytes;
 use futures::stream::BoxStream;
-use futures::{stream, StreamExt};
+use futures::{StreamExt, stream};
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use uuid::Uuid;
 
-use crate::http_client::{build_client, ProxyConfig};
+use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::{CallLease, MultiTokenManager, RuntimeRefreshLeaderRequiredError};
@@ -26,6 +26,7 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
+const REAL_OPUS_4_7_UNSUPPORTED_COOLDOWN: Duration = Duration::from_secs(30);
 const SLOW_UPSTREAM_HEADERS_MS: u128 = 3_000;
 const SLOW_FIRST_CHUNK_MS: u128 = 3_000;
 const SLOW_HEADERS_TO_FIRST_CHUNK_MS: u128 = 1_000;
@@ -627,8 +628,8 @@ impl KiroProvider {
     ///
     /// 重试策略：
     /// - 每个凭据最多重试 MAX_RETRIES_PER_CREDENTIAL 次
-    /// - 总重试次数 = min(凭据数量 × 每凭据重试次数, MAX_TOTAL_RETRIES)
-    /// - 硬上限 9 次，避免无限重试
+    /// - 默认总重试次数 = min(凭据数量 × 每凭据重试次数, MAX_TOTAL_RETRIES)
+    /// - 真实 Opus 4.7 允许把所有凭据至少探测一遍，避免被前几张不支持的账号截断
     async fn call_api_with_retry(
         &self,
         request_body: &str,
@@ -636,7 +637,6 @@ impl KiroProvider {
         options: RequestOptions,
     ) -> anyhow::Result<ManagedResponse> {
         let total_credentials = self.token_manager.total_count();
-        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
@@ -648,6 +648,12 @@ impl KiroProvider {
 
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
+        let retry_cap = if Self::is_real_opus_4_7_model(model.as_deref()) {
+            MAX_TOTAL_RETRIES.max(total_credentials)
+        } else {
+            MAX_TOTAL_RETRIES
+        };
+        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(retry_cap);
 
         for attempt in 0..max_retries {
             let attempt_started_at = Instant::now();
@@ -845,8 +851,39 @@ impl KiroProvider {
                 continue;
             }
 
-            // 400 Bad Request - 请求问题，重试/切换凭据无意义
+            // 真实 Opus 4.7 的 INVALID_MODEL_ID 说明“当前凭据不支持该模型”，应切卡继续尝试。
             if status.as_u16() == 400 {
+                if Self::should_failover_real_opus_4_7(model.as_deref(), &body) {
+                    tracing::warn!(
+                        "API 请求失败（真实 Opus 4.7 当前凭据不支持，尝试 {}/{}）: {} {}",
+                        attempt + 1,
+                        max_retries,
+                        status,
+                        body
+                    );
+
+                    let has_available = self.token_manager.defer_model_unsupported_credential(
+                        ctx_id,
+                        REAL_OPUS_4_7_UNSUPPORTED_COOLDOWN,
+                    );
+                    if !has_available {
+                        anyhow::bail!(
+                            "{} API 请求失败（当前没有凭据支持真实 claude-opus-4.7）: {} {}",
+                            api_type,
+                            status,
+                            body
+                        );
+                    }
+
+                    last_error = Some(anyhow::anyhow!(
+                        "{} API 请求失败: {} {}",
+                        api_type,
+                        status,
+                        body
+                    ));
+                    continue;
+                }
+
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
@@ -1024,6 +1061,36 @@ impl KiroProvider {
         Duration::from_millis(backoff.saturating_add(jitter))
     }
 
+    fn is_real_opus_4_7_model(model: Option<&str>) -> bool {
+        model.is_some_and(|model| {
+            let lower = model.to_ascii_lowercase();
+            lower.contains("claude-opus-4.7") || lower.contains("claude-opus-4-7")
+        })
+    }
+
+    fn is_invalid_model_id(body: &str) -> bool {
+        if body.contains("INVALID_MODEL_ID") {
+            return true;
+        }
+
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+            return false;
+        };
+
+        value
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| v == "INVALID_MODEL_ID")
+            || value
+                .pointer("/error/reason")
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| v == "INVALID_MODEL_ID")
+    }
+
+    fn should_failover_real_opus_4_7(model: Option<&str>, body: &str) -> bool {
+        Self::is_real_opus_4_7_model(model) && Self::is_invalid_model_id(body)
+    }
+
     fn is_monthly_request_limit(body: &str) -> bool {
         if body.contains("MONTHLY_REQUEST_COUNT") {
             return true;
@@ -1082,6 +1149,29 @@ mod tests {
     fn test_is_monthly_request_limit_false() {
         let body = r#"{"message":"nope","reason":"DAILY_REQUEST_COUNT"}"#;
         assert!(!KiroProvider::is_monthly_request_limit(body));
+    }
+
+    #[test]
+    fn test_is_invalid_model_id_detects_reason() {
+        let body = r#"{"message":"Invalid model. Please select a different model to continue.","reason":"INVALID_MODEL_ID"}"#;
+        assert!(KiroProvider::is_invalid_model_id(body));
+    }
+
+    #[test]
+    fn test_should_failover_real_opus_4_7_detects_current_model() {
+        let body = r#"{"message":"Invalid model. Please select a different model to continue.","reason":"INVALID_MODEL_ID"}"#;
+        assert!(KiroProvider::should_failover_real_opus_4_7(
+            Some("claude-opus-4.7"),
+            body
+        ));
+        assert!(KiroProvider::should_failover_real_opus_4_7(
+            Some("claude-opus-4-7"),
+            body
+        ));
+        assert!(!KiroProvider::should_failover_real_opus_4_7(
+            Some("claude-opus-4.6"),
+            body
+        ));
     }
 
     #[test]

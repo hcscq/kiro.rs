@@ -258,6 +258,12 @@ impl KiroCredentials {
         }
     }
 
+    fn subscription_title_upper(&self) -> Option<String> {
+        self.subscription_title
+            .as_ref()
+            .map(|title| title.to_ascii_uppercase())
+    }
+
     /// 获取有效的并发上限
     ///
     /// 返回 `None` 表示不限制并发。
@@ -294,14 +300,32 @@ impl KiroCredentials {
     ///
     /// Free 账号不支持 Opus 模型，需要 PRO 或更高等级订阅
     pub fn supports_opus(&self) -> bool {
-        match &self.subscription_title {
-            Some(title) => {
-                let title_upper = title.to_uppercase();
-                // 如果包含 FREE，则不支持 Opus
-                !title_upper.contains("FREE")
-            }
+        self.subscription_title_upper()
+            .map(|title| !title.contains("FREE"))
             // 如果还没有获取订阅信息，暂时允许（首次使用时会获取）
-            None => true,
+            .unwrap_or(true)
+    }
+
+    /// 检查凭据是否适合作为真实 Opus 4.7 的候选账号
+    ///
+    /// 已确认 `KIRO POWER` 会被上游拒绝 `claude-opus-4.7`，因此这里直接排除。
+    /// 其余非 FREE 档位保留为候选，未知档位也先允许，交由运行时兜底探测。
+    pub fn supports_real_opus_4_7(&self) -> bool {
+        self.subscription_title_upper()
+            .map(|title| !title.contains("FREE") && !title.contains("POWER"))
+            .unwrap_or(true)
+    }
+
+    /// 返回真实 Opus 4.7 的调度偏好，数值越小越优先。
+    pub fn opus_4_7_preference_rank(&self) -> u8 {
+        match self.subscription_title_upper() {
+            Some(title)
+                if title.contains("MAX") || title.contains("ULTRA") || title.contains("PRO+") =>
+            {
+                0
+            }
+            Some(title) if title.contains("FREE") || title.contains("POWER") => 2,
+            Some(_) | None => 1,
         }
     }
 }
@@ -929,5 +953,27 @@ mod tests {
         let creds = KiroCredentials::default();
         let result = creds.effective_proxy(None);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_supports_real_opus_4_7_rejects_power_tier() {
+        let creds = KiroCredentials {
+            subscription_title: Some("KIRO POWER".to_string()),
+            ..Default::default()
+        };
+
+        assert!(!creds.supports_real_opus_4_7());
+        assert_eq!(creds.opus_4_7_preference_rank(), 2);
+    }
+
+    #[test]
+    fn test_supports_real_opus_4_7_prefers_pro_plus_tier() {
+        let creds = KiroCredentials {
+            subscription_title: Some("KIRO PRO+".to_string()),
+            ..Default::default()
+        };
+
+        assert!(creds.supports_real_opus_4_7());
+        assert_eq!(creds.opus_4_7_preference_rank(), 0);
     }
 }
