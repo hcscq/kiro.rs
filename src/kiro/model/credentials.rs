@@ -308,11 +308,11 @@ impl KiroCredentials {
 
     /// 检查凭据是否适合作为真实 Opus 4.7 的候选账号
     ///
-    /// 已确认 `KIRO POWER` 会被上游拒绝 `claude-opus-4.7`，因此这里直接排除。
-    /// 其余非 FREE 档位保留为候选，未知档位也先允许，交由运行时兜底探测。
+    /// 在上游正式全量开放前，所有非 FREE 档位都保留为候选，
+    /// 交由运行时根据 `INVALID_MODEL_ID` 动态探测。
     pub fn supports_real_opus_4_7(&self) -> bool {
         self.subscription_title_upper()
-            .map(|title| !title.contains("FREE") && !title.contains("POWER"))
+            .map(|title| !title.contains("FREE"))
             .unwrap_or(true)
     }
 
@@ -324,7 +324,7 @@ impl KiroCredentials {
             {
                 0
             }
-            Some(title) if title.contains("FREE") || title.contains("POWER") => 2,
+            Some(title) if title.contains("FREE") => 2,
             Some(_) | None => 1,
         }
     }
@@ -956,14 +956,14 @@ mod tests {
     }
 
     #[test]
-    fn test_supports_real_opus_4_7_rejects_power_tier() {
+    fn test_supports_real_opus_4_7_allows_power_tier_as_candidate() {
         let creds = KiroCredentials {
             subscription_title: Some("KIRO POWER".to_string()),
             ..Default::default()
         };
 
-        assert!(!creds.supports_real_opus_4_7());
-        assert_eq!(creds.opus_4_7_preference_rank(), 2);
+        assert!(creds.supports_real_opus_4_7());
+        assert_eq!(creds.opus_4_7_preference_rank(), 1);
     }
 
     #[test]
@@ -975,5 +975,16 @@ mod tests {
 
         assert!(creds.supports_real_opus_4_7());
         assert_eq!(creds.opus_4_7_preference_rank(), 0);
+    }
+
+    #[test]
+    fn test_supports_real_opus_4_7_still_rejects_free_tier() {
+        let creds = KiroCredentials {
+            subscription_title: Some("KIRO FREE".to_string()),
+            ..Default::default()
+        };
+
+        assert!(!creds.supports_real_opus_4_7());
+        assert_eq!(creds.opus_4_7_preference_rank(), 2);
     }
 }

@@ -868,7 +868,7 @@ impl KiroProvider {
                     );
                     if !has_available {
                         anyhow::bail!(
-                            "{} API 请求失败（当前没有凭据支持真实 claude-opus-4.7）: {} {}",
+                            "{} API 请求失败（所有候选凭据当前均被上游拒绝真实 claude-opus-4.7，模型可能尚未正式开放）: {} {}",
                             api_type,
                             status,
                             body

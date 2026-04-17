@@ -4306,7 +4306,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_priority_mode_skips_power_tier_for_real_opus_4_7() {
+    async fn test_priority_mode_deprioritizes_power_tier_for_real_opus_4_7() {
         let config = Config::default();
         let mut power = available_credential(0);
         power.subscription_title = Some("KIRO POWER".to_string());
@@ -4324,22 +4324,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_real_opus_4_7_returns_no_model_support_when_only_power_available() {
+    async fn test_real_opus_4_7_allows_power_when_only_power_available() {
         let config = Config::default();
         let mut power = available_credential(0);
         power.subscription_title = Some("KIRO POWER".to_string());
 
         let manager = MultiTokenManager::new(config, vec![power], None, None, false).unwrap();
 
-        let err = manager
+        let ctx = manager
             .acquire_context(Some("claude-opus-4.7"))
             .await
-            .err()
             .unwrap();
-        assert!(
-            err.to_string().contains("当前没有可用凭据支持该模型"),
-            "unexpected error: {err}"
-        );
+        assert_eq!(ctx.id, 1);
     }
 
     #[tokio::test]
