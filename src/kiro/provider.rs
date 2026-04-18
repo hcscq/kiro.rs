@@ -27,7 +27,6 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
-const MODEL_UNSUPPORTED_COOLDOWN: Duration = Duration::from_secs(30);
 const SLOW_UPSTREAM_HEADERS_MS: u128 = 3_000;
 const SLOW_FIRST_CHUNK_MS: u128 = 3_000;
 const SLOW_HEADERS_TO_FIRST_CHUNK_MS: u128 = 1_000;
@@ -913,7 +912,8 @@ impl KiroProvider {
                 continue;
             }
 
-            // INVALID_MODEL_ID 说明“当前凭据不支持该模型”或“该模型尚未对该账号开放”，应切卡继续尝试。
+            // INVALID_MODEL_ID 说明“当前凭据不支持该模型”或“该模型尚未对该账号开放”，
+            // 记录模型族运行时限制后应切卡继续尝试，但不要对整个账号施加全局冷却。
             if status.as_u16() == 400 {
                 if Self::should_failover_model_unsupported(model.as_deref(), &body) {
                     tracing::warn!(
@@ -933,7 +933,6 @@ impl KiroProvider {
                     let has_available = self.token_manager.defer_model_unsupported_credential(
                         ctx_id,
                         model.as_deref().unwrap_or("unknown"),
-                        MODEL_UNSUPPORTED_COOLDOWN,
                     );
                     if !has_available {
                         anyhow::bail!(

@@ -3000,15 +3000,8 @@ impl MultiTokenManager {
     }
 
     /// 当上游明确返回 `INVALID_MODEL_ID` 时，
-    /// 将当前凭据视为“不支持该模型”，临时避让并记录一段时间的运行时限制。
-    pub fn defer_model_unsupported_credential(
-        &self,
-        id: u64,
-        model: &str,
-        cooldown: StdDuration,
-    ) -> bool {
-        let now = Instant::now();
-        let deferred_until = now + cooldown;
+    /// 将当前凭据视为“不支持该模型”，仅记录模型族运行时限制，不对账号施加全局冷却。
+    pub fn defer_model_unsupported_credential(&self, id: u64, model: &str) -> bool {
         let restriction_expires_at = Utc::now() + Duration::minutes(30);
         let dispatch = self.dispatch_config();
         let requirement = Self::model_requirement(Some(model));
@@ -3049,12 +3042,6 @@ impl MultiTokenManager {
                 });
             }
 
-            entry.rate_limit_cooldown_until = Some(
-                entry
-                    .rate_limit_cooldown_until
-                    .map(|until| until.max(deferred_until))
-                    .unwrap_or(deferred_until),
-            );
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             let restriction_changed = entry
                 .credentials
@@ -3094,27 +3081,20 @@ impl MultiTokenManager {
                 {
                     *current_id = next.id;
                     tracing::info!(
-                        "凭据 #{} 不支持模型 {}，已临时冷却 {}ms 并切换到凭据 #{}",
+                        "凭据 #{} 不支持模型 {}，已记录运行时限制并切换到凭据 #{}",
                         id,
                         model_label,
-                        cooldown.as_millis(),
                         next.id
                     );
                 } else {
                     tracing::warn!(
-                        "凭据 #{} 不支持模型 {}，已临时冷却 {}ms，当前无其他可切换凭据",
+                        "凭据 #{} 不支持模型 {}，已记录运行时限制，当前无其他可切换凭据",
                         id,
-                        model_label,
-                        cooldown.as_millis()
+                        model_label
                     );
                 }
             } else {
-                tracing::warn!(
-                    "凭据 #{} 不支持模型 {}，已临时冷却 {}ms",
-                    id,
-                    model_label,
-                    cooldown.as_millis()
-                );
+                tracing::warn!("凭据 #{} 不支持模型 {}，已记录运行时限制", id, model_label);
             }
 
             entries.iter().any(|e| {
@@ -3123,19 +3103,6 @@ impl MultiTokenManager {
                     && Self::is_model_supported(&dispatch, &e.credentials, Some(model), requirement)
             })
         };
-        if self.shared_dispatch_runtime_enabled() {
-            let cooldown_ms = cooldown.as_millis().min(u128::from(u64::MAX)) as u64;
-            if let Err(err) =
-                self.state_store
-                    .defer_dispatch_credential(id, cooldown_ms, current_epoch_ms())
-            {
-                tracing::warn!(
-                    "更新共享调度模型不支持冷却失败（credentialId={}）: {}",
-                    id,
-                    err
-                );
-            }
-        }
         self.save_stats_debounced();
         result
     }
@@ -4539,12 +4506,15 @@ mod tests {
         let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
         assert!(manager.supports_model("claude-opus-4-6"));
 
-        assert!(!manager.defer_model_unsupported_credential(
-            1,
-            "claude-opus-4.6",
-            StdDuration::from_secs(30)
-        ));
+        assert!(!manager.defer_model_unsupported_credential(1, "claude-opus-4.6"));
         assert!(!manager.supports_model("claude-opus-4-6"));
+
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert_eq!(
+            entry.cooldown_remaining_ms, None,
+            "模型不支持不应再给账号施加全局冷却"
+        );
 
         manager
             .set_credential_model_policy(1, None, None, None, true)
@@ -4732,6 +4702,40 @@ mod tests {
             .acquire_context(Some("claude-opus-4.7"))
             .await
             .unwrap();
+        assert_eq!(ctx.id, 1);
+    }
+
+    #[tokio::test]
+    async fn test_model_unsupported_restriction_does_not_cool_down_account_for_other_models() {
+        let config = Config::default();
+        let mut cred = available_credential(0);
+        cred.subscription_title = Some("KIRO PRO+".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        assert!(!manager.defer_model_unsupported_credential(1, "claude-opus-4.7"));
+        assert!(
+            !manager.supports_model("claude-opus-4-7"),
+            "被上游拒绝的模型族应被运行时屏蔽"
+        );
+        assert!(
+            manager.supports_model("claude-opus-4-6"),
+            "同一账号仍应可继续承载其他合法模型"
+        );
+
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert_eq!(
+            entry.cooldown_remaining_ms, None,
+            "模型不支持限制不应把账号打进冷却"
+        );
+        assert_eq!(entry.runtime_model_restrictions.len(), 1);
+        assert_eq!(entry.runtime_model_restrictions[0].model, "claude-opus-4.7");
+
+        let ctx = manager
+            .acquire_context(Some("claude-opus-4.6"))
+            .await
+            .expect("其他合法模型不应被前一个 INVALID_MODEL_ID 拖住");
         assert_eq!(ctx.id, 1);
     }
 
