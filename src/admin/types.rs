@@ -1,7 +1,15 @@
 //! Admin API 类型定义
 
 use crate::model::config::RequestWeightingConfig;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+fn deserialize_optional_nullable<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
 
 // ============ 凭据状态 ============
 
@@ -129,9 +137,11 @@ pub struct SetMaxConcurrencyRequest {
 pub struct SetCredentialRateLimitConfigRequest {
     /// 凭据级 bucket 容量覆盖
     /// 字段缺失表示不修改；null 表示跟随全局；0 表示仅对该账号禁用 bucket
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
     pub rate_limit_bucket_capacity: Option<Option<f64>>,
     /// 凭据级回填速率覆盖（token/s）
     /// 字段缺失表示不修改；null 表示跟随全局；0 表示仅对该账号禁用 bucket
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
     pub rate_limit_refill_per_second: Option<Option<f64>>,
 }
 
@@ -350,5 +360,37 @@ impl AdminErrorResponse {
 
     pub fn internal_error(message: impl Into<String>) -> Self {
         Self::new("internal_error", message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SetCredentialRateLimitConfigRequest;
+
+    #[test]
+    fn set_credential_rate_limit_config_request_distinguishes_missing_null_and_values() {
+        let missing: SetCredentialRateLimitConfigRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!(missing.rate_limit_bucket_capacity, None);
+        assert_eq!(missing.rate_limit_refill_per_second, None);
+
+        let nulls: SetCredentialRateLimitConfigRequest = serde_json::from_str(
+            r#"{
+                "rateLimitBucketCapacity": null,
+                "rateLimitRefillPerSecond": null
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(nulls.rate_limit_bucket_capacity, Some(None));
+        assert_eq!(nulls.rate_limit_refill_per_second, Some(None));
+
+        let values: SetCredentialRateLimitConfigRequest = serde_json::from_str(
+            r#"{
+                "rateLimitBucketCapacity": 0,
+                "rateLimitRefillPerSecond": 1.5
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(values.rate_limit_bucket_capacity, Some(Some(0.0)));
+        assert_eq!(values.rate_limit_refill_per_second, Some(Some(1.5)));
     }
 }
