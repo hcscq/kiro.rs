@@ -31,6 +31,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [rateLimitBucketCapacity, setRateLimitBucketCapacity] = useState('')
   const [rateLimitRefillPerSecond, setRateLimitRefillPerSecond] = useState('')
   const [machineId, setMachineId] = useState('')
+  const [accountType, setAccountType] = useState('')
+  const [allowedModels, setAllowedModels] = useState('')
+  const [blockedModels, setBlockedModels] = useState('')
   const [proxyUrl, setProxyUrl] = useState('')
   const [proxyUsername, setProxyUsername] = useState('')
   const [proxyPassword, setProxyPassword] = useState('')
@@ -49,10 +52,19 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setRateLimitBucketCapacity('')
     setRateLimitRefillPerSecond('')
     setMachineId('')
+    setAccountType('')
+    setAllowedModels('')
+    setBlockedModels('')
     setProxyUrl('')
     setProxyUsername('')
     setProxyPassword('')
   }
+
+  const parseModelList = (value: string) =>
+    value
+      .split(/[,\n]/)
+      .map((item) => item.trim())
+      .filter(Boolean)
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
@@ -86,6 +98,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     const parsedRateLimitRefillPerSecond = rateLimitRefillPerSecond.trim()
       ? Number.parseFloat(rateLimitRefillPerSecond)
       : undefined
+    const parsedAllowedModels = parseModelList(allowedModels)
+    const parsedBlockedModels = parseModelList(blockedModels)
     if (
       parsedRateLimitBucketCapacity !== undefined &&
       (!Number.isFinite(parsedRateLimitBucketCapacity) || parsedRateLimitBucketCapacity < 0)
@@ -114,6 +128,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         rateLimitBucketCapacity: parsedRateLimitBucketCapacity,
         rateLimitRefillPerSecond: parsedRateLimitRefillPerSecond,
         machineId: machineId.trim() || undefined,
+        accountType: accountType.trim() || undefined,
+        allowedModels: parsedAllowedModels.length ? parsedAllowedModels : undefined,
+        blockedModels: parsedBlockedModels.length ? parsedBlockedModels : undefined,
         proxyUrl: proxyUrl.trim() || undefined,
         proxyUsername: proxyUsername.trim() || undefined,
         proxyPassword: proxyPassword.trim() || undefined,
@@ -311,6 +328,58 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               />
               <p className="text-xs text-muted-foreground">
                 可选，64 位十六进制字符串，留空使用配置中字段, 否则由刷新Token自动派生
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <label htmlFor="accountType" className="text-sm font-medium">
+                账号类型
+              </label>
+              <Input
+                id="accountType"
+                placeholder="例如 pro-plus / power / reseller-a"
+                value={accountType}
+                onChange={(e) => setAccountType(e.target.value)}
+                disabled={isPending}
+              />
+              <p className="text-xs text-muted-foreground">
+                可选。会命中全局账号类型模型策略，再叠加此账号自己的允许/拒绝列表
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <label htmlFor="allowedModels" className="text-sm font-medium">
+                账号级额外允许模型
+              </label>
+              <textarea
+                id="allowedModels"
+                rows={3}
+                value={allowedModels}
+                onChange={(e) => setAllowedModels(e.target.value)}
+                disabled={isPending}
+                placeholder="每行一个或逗号分隔，例如 claude-opus-4-6"
+                className="flex min-h-[72px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+              />
+              <p className="text-xs text-muted-foreground">
+                如果账号类型已有允许列表，这里会追加额外允许项
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <label htmlFor="blockedModels" className="text-sm font-medium">
+                账号级额外禁用模型
+              </label>
+              <textarea
+                id="blockedModels"
+                rows={3}
+                value={blockedModels}
+                onChange={(e) => setBlockedModels(e.target.value)}
+                disabled={isPending}
+                placeholder="每行一个或逗号分隔，例如 claude-opus-4-7"
+                className="flex min-h-[72px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+              />
+              <p className="text-xs text-muted-foreground">
+                显式禁用优先级最高，可用于覆盖账号类型默认策略
               </p>
             </div>
 

@@ -13,7 +13,9 @@ use crate::state::{CachedBalanceRecord, RuntimeCoordinationStatus, StateChangeKi
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
+    CredentialsStatusResponse, LoadBalancingModeResponse, ModelCapabilitiesConfigResponse,
+    SetCredentialModelPolicyRequest, SetLoadBalancingModeRequest,
+    SetModelCapabilitiesConfigRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -83,6 +85,10 @@ impl AdminService {
                 refresh_token_hash: entry.refresh_token_hash,
                 email: entry.email,
                 subscription_title: entry.subscription_title,
+                account_type: entry.account_type,
+                allowed_models: entry.allowed_models,
+                blocked_models: entry.blocked_models,
+                runtime_model_restrictions: entry.runtime_model_restrictions,
                 imported_at: entry.imported_at,
                 success_count: entry.success_count,
                 last_used_at: entry.last_used_at.clone(),
@@ -168,6 +174,24 @@ impl AdminService {
 
         self.token_manager
             .set_rate_limit_config(id, rate_limit_bucket_capacity, rate_limit_refill_per_second)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    pub fn set_model_policy(
+        &self,
+        id: u64,
+        req: SetCredentialModelPolicyRequest,
+    ) -> Result<(), AdminServiceError> {
+        self.ensure_runtime_write_leader()?;
+
+        self.token_manager
+            .set_credential_model_policy(
+                id,
+                req.account_type,
+                req.allowed_models,
+                req.blocked_models,
+                req.clear_runtime_model_restrictions,
+            )
             .map_err(|e| self.classify_error(e, id))
     }
 
@@ -273,6 +297,10 @@ impl AdminService {
             machine_id: req.machine_id,
             email: req.email,
             subscription_title: None, // 将在首次获取使用额度时自动更新
+            account_type: req.account_type,
+            allowed_models: req.allowed_models.unwrap_or_default(),
+            blocked_models: req.blocked_models.unwrap_or_default(),
+            runtime_model_restrictions: Vec::new(),
             imported_at: None,
             proxy_url: req.proxy_url,
             proxy_username: req.proxy_username,
@@ -339,6 +367,15 @@ impl AdminService {
         })
     }
 
+    pub fn get_model_capabilities_config(
+        &self,
+    ) -> Result<ModelCapabilitiesConfigResponse, AdminServiceError> {
+        self.sync_runtime_state_for_read()?;
+        Ok(ModelCapabilitiesConfigResponse {
+            account_type_policies: self.token_manager.account_type_policies_snapshot(),
+        })
+    }
+
     /// 设置负载均衡模式
     pub fn set_load_balancing_mode(
         &self,
@@ -385,6 +422,23 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
         self.get_load_balancing_mode()
+    }
+
+    pub fn set_model_capabilities_config(
+        &self,
+        req: SetModelCapabilitiesConfigRequest,
+    ) -> Result<ModelCapabilitiesConfigResponse, AdminServiceError> {
+        self.ensure_runtime_write_leader()?;
+
+        let Some(account_type_policies) = req.account_type_policies else {
+            return self.get_model_capabilities_config();
+        };
+
+        self.token_manager
+            .set_account_type_policies(account_type_policies)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        self.get_model_capabilities_config()
     }
 
     /// 强制刷新指定凭据的 Token

@@ -314,7 +314,7 @@ fn is_retryable_admin_write_route(method: &Method, path: &str) -> bool {
         .trim_end_matches('/');
 
     match *method {
-        Method::PUT => path == "/config/load-balancing",
+        Method::PUT => path == "/config/load-balancing" || path == "/config/model-capabilities",
         Method::POST => retryable_credential_admin_action(path),
         _ => false,
     }
@@ -331,7 +331,7 @@ fn retryable_credential_admin_action(path: &str) -> bool {
 
     matches!(
         segments[2],
-        "disabled" | "priority" | "max-concurrency" | "rate-limit-config"
+        "disabled" | "priority" | "max-concurrency" | "rate-limit-config" | "model-policy"
     )
 }
 
@@ -344,6 +344,10 @@ mod tests {
         assert!(is_retryable_admin_write_route(
             &Method::PUT,
             "/api/admin/config/load-balancing",
+        ));
+        assert!(is_retryable_admin_write_route(
+            &Method::PUT,
+            "/api/admin/config/model-capabilities",
         ));
         assert!(is_retryable_admin_write_route(
             &Method::POST,
@@ -360,6 +364,10 @@ mod tests {
         assert!(is_retryable_admin_write_route(
             &Method::POST,
             "/api/admin/credentials/12/rate-limit-config",
+        ));
+        assert!(is_retryable_admin_write_route(
+            &Method::POST,
+            "/api/admin/credentials/12/model-policy",
         ));
 
         assert!(!is_retryable_admin_write_route(

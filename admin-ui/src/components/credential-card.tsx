@@ -18,6 +18,7 @@ import {
 import type { CredentialStatusItem, BalanceResponse } from '@/types/api'
 import {
   useSetDisabled,
+  useSetCredentialModelPolicy,
   useSetCredentialRateLimitConfig,
   useSetMaxConcurrency,
   useSetPriority,
@@ -51,6 +52,21 @@ function formatLastUsed(lastUsedAt: string | null): string {
   return `${days} 天前`
 }
 
+function parseModelList(value: string): string[] {
+  return value
+    .split(/[,\n]/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+}
+
+function formatRestrictionExpiresAt(expiresAt: string): string {
+  const date = new Date(expiresAt)
+  if (Number.isNaN(date.getTime())) {
+    return expiresAt
+  }
+  return date.toLocaleString('zh-CN', { hour12: false })
+}
+
 export function CredentialCard({
   credential,
   onViewBalance,
@@ -78,9 +94,19 @@ export function CredentialCard({
       ? String(credential.rateLimitRefillPerSecondOverride)
       : ''
   )
+  const [showModelPolicyDialog, setShowModelPolicyDialog] = useState(false)
+  const [accountTypeValue, setAccountTypeValue] = useState(credential.accountType ?? '')
+  const [allowedModelsValue, setAllowedModelsValue] = useState(
+    credential.allowedModels?.join('\n') ?? ''
+  )
+  const [blockedModelsValue, setBlockedModelsValue] = useState(
+    credential.blockedModels?.join('\n') ?? ''
+  )
+  const [clearRuntimeModelRestrictions, setClearRuntimeModelRestrictions] = useState(false)
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
 
   const setDisabled = useSetDisabled()
+  const setModelPolicy = useSetCredentialModelPolicy()
   const setMaxConcurrency = useSetMaxConcurrency()
   const setRateLimitConfig = useSetCredentialRateLimitConfig()
   const setPriority = useSetPriority()
@@ -228,6 +254,40 @@ export function CredentialCard({
         toast.error('删除失败: ' + (err as Error).message)
       },
     })
+  }
+
+  const openModelPolicyDialog = () => {
+    setAccountTypeValue(credential.accountType ?? '')
+    setAllowedModelsValue(credential.allowedModels?.join('\n') ?? '')
+    setBlockedModelsValue(credential.blockedModels?.join('\n') ?? '')
+    setClearRuntimeModelRestrictions(false)
+    setShowModelPolicyDialog(true)
+  }
+
+  const handleModelPolicySave = () => {
+    const parsedAllowedModels = parseModelList(allowedModelsValue)
+    const parsedBlockedModels = parseModelList(blockedModelsValue)
+
+    setModelPolicy.mutate(
+      {
+        id: credential.id,
+        payload: {
+          accountType: accountTypeValue.trim() ? accountTypeValue.trim() : null,
+          allowedModels: parsedAllowedModels.length ? parsedAllowedModels : null,
+          blockedModels: parsedBlockedModels.length ? parsedBlockedModels : null,
+          clearRuntimeModelRestrictions,
+        },
+      },
+      {
+        onSuccess: (res) => {
+          toast.success(res.message)
+          setShowModelPolicyDialog(false)
+        },
+        onError: (err) => {
+          toast.error('操作失败: ' + (err as Error).message)
+        },
+      }
+    )
   }
 
   return (
@@ -510,6 +570,28 @@ export function CredentialCard({
               <span className="font-medium">{formatLastUsed(credential.lastUsedAt)}</span>
             </div>
             <div className="col-span-2">
+              <span className="text-muted-foreground">账号类型：</span>
+              <span className="font-medium ml-1">{credential.accountType || '未设置'}</span>
+            </div>
+            <div className="col-span-2">
+              <span className="text-muted-foreground">模型策略：</span>
+              <span className="font-medium ml-1">
+                允许 {credential.allowedModels?.length ?? 0} 项 / 禁用 {credential.blockedModels?.length ?? 0} 项
+              </span>
+            </div>
+            {(credential.runtimeModelRestrictions?.length ?? 0) > 0 && (
+              <div className="col-span-2 space-y-2">
+                <span className="text-muted-foreground">运行时临时限制：</span>
+                <div className="flex flex-wrap gap-2">
+                  {credential.runtimeModelRestrictions?.map((restriction) => (
+                    <Badge key={`${restriction.model}-${restriction.expiresAt}`} variant="outline">
+                      {restriction.model} 至 {formatRestrictionExpiresAt(restriction.expiresAt)}
+                    </Badge>
+                  ))}
+                </div>
+              </div>
+            )}
+            <div className="col-span-2">
               <span className="text-muted-foreground">剩余用量：</span>
               {loadingBalance ? (
                 <span className="text-sm ml-1">
@@ -606,6 +688,14 @@ export function CredentialCard({
             </Button>
             <Button
               size="sm"
+              variant="outline"
+              onClick={openModelPolicyDialog}
+              disabled={setModelPolicy.isPending}
+            >
+              模型策略
+            </Button>
+            <Button
+              size="sm"
               variant="destructive"
               onClick={() => setShowDeleteDialog(true)}
               disabled={!credential.disabled}
@@ -617,6 +707,83 @@ export function CredentialCard({
           </div>
         </CardContent>
       </Card>
+
+      <Dialog open={showModelPolicyDialog} onOpenChange={setShowModelPolicyDialog}>
+        <DialogContent className="sm:max-w-xl">
+          <DialogHeader>
+            <DialogTitle>编辑模型策略</DialogTitle>
+            <DialogDescription>
+              账号类型策略先命中，再叠加此账号自己的允许/禁用列表。运行时临时限制可在这里一并清空。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <label htmlFor={`account-type-${credential.id}`} className="text-sm font-medium">
+                账号类型
+              </label>
+              <Input
+                id={`account-type-${credential.id}`}
+                value={accountTypeValue}
+                onChange={(e) => setAccountTypeValue(e.target.value)}
+                placeholder="例如 pro-plus / power / reseller-a"
+              />
+            </div>
+
+            <div className="space-y-2">
+              <label htmlFor={`allowed-models-${credential.id}`} className="text-sm font-medium">
+                账号级额外允许模型
+              </label>
+              <textarea
+                id={`allowed-models-${credential.id}`}
+                rows={4}
+                value={allowedModelsValue}
+                onChange={(e) => setAllowedModelsValue(e.target.value)}
+                placeholder="每行一个或逗号分隔，例如 claude-opus-4-6"
+                className="flex min-h-[96px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+              />
+            </div>
+
+            <div className="space-y-2">
+              <label htmlFor={`blocked-models-${credential.id}`} className="text-sm font-medium">
+                账号级额外禁用模型
+              </label>
+              <textarea
+                id={`blocked-models-${credential.id}`}
+                rows={4}
+                value={blockedModelsValue}
+                onChange={(e) => setBlockedModelsValue(e.target.value)}
+                placeholder="每行一个或逗号分隔，例如 claude-opus-4-7"
+                className="flex min-h-[96px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+              />
+            </div>
+
+            <div className="flex items-center gap-2 rounded-lg border border-dashed p-3">
+              <Checkbox
+                checked={clearRuntimeModelRestrictions}
+                onCheckedChange={(checked) => setClearRuntimeModelRestrictions(Boolean(checked))}
+              />
+              <div className="space-y-1">
+                <div className="text-sm font-medium">保存时清空运行时临时限制</div>
+                <p className="text-xs text-muted-foreground">
+                  当前 {credential.runtimeModelRestrictions?.length ?? 0} 条。适合上游刚开权限后手动重试。
+                </p>
+              </div>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setShowModelPolicyDialog(false)}
+              disabled={setModelPolicy.isPending}
+            >
+              取消
+            </Button>
+            <Button onClick={handleModelPolicySave} disabled={setModelPolicy.isPending}>
+              保存
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* 删除确认对话框 */}
       <Dialog open={showDeleteDialog} onOpenChange={setShowDeleteDialog}>

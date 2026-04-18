@@ -7,10 +7,13 @@ import type {
   SetDisabledRequest,
   SetPriorityRequest,
   SetCredentialRateLimitConfigRequest,
+  SetCredentialModelPolicyRequest,
   AddCredentialRequest,
   AddCredentialResponse,
   LoadBalancingConfigResponse,
+  ModelCapabilitiesConfigResponse,
   UpdateLoadBalancingConfigRequest,
+  UpdateModelCapabilitiesConfigRequest,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -84,6 +87,18 @@ export async function setCredentialRateLimitConfig(
   return data
 }
 
+// 设置凭据级模型策略
+export async function setCredentialModelPolicy(
+  id: number,
+  payload: SetCredentialModelPolicyRequest
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/${id}/model-policy`,
+    payload
+  )
+  return data
+}
+
 // 重置失败计数
 export async function resetCredentialFailure(
   id: number
@@ -131,5 +146,20 @@ export async function setLoadBalancingMode(
   payload: UpdateLoadBalancingConfigRequest
 ): Promise<LoadBalancingConfigResponse> {
   const { data } = await api.put<LoadBalancingConfigResponse>('/config/load-balancing', payload)
+  return data
+}
+
+export async function getModelCapabilitiesConfig(): Promise<ModelCapabilitiesConfigResponse> {
+  const { data } = await api.get<ModelCapabilitiesConfigResponse>('/config/model-capabilities')
+  return data
+}
+
+export async function setModelCapabilitiesConfig(
+  payload: UpdateModelCapabilitiesConfigRequest
+): Promise<ModelCapabilitiesConfigResponse> {
+  const { data } = await api.put<ModelCapabilitiesConfigResponse>(
+    '/config/model-capabilities',
+    payload
+  )
   return data
 }

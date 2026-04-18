@@ -1,7 +1,10 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use super::model_policy::{ModelSupportPolicy, normalize_account_type_policies};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -305,6 +308,10 @@ pub struct Config {
     #[serde(default)]
     pub request_weighting: RequestWeightingConfig,
 
+    /// 账号类型默认模型策略
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub account_type_policies: BTreeMap<String, ModelSupportPolicy>,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -479,6 +486,7 @@ impl Default for Config {
                 default_rate_limit_refill_recovery_step_per_success(),
             rate_limit_refill_backoff_factor: default_rate_limit_refill_backoff_factor(),
             request_weighting: RequestWeightingConfig::default(),
+            account_type_policies: BTreeMap::new(),
             config_path: None,
         }
     }
@@ -516,6 +524,7 @@ impl Config {
         let content = fs::read_to_string(path)?;
         let mut config: Config = serde_json::from_str(&content)?;
         config.config_path = Some(path.to_path_buf());
+        config.normalize();
         config.validate()?;
         Ok(config)
     }
@@ -549,6 +558,10 @@ impl Config {
         self.request_weighting.validate()?;
 
         Ok(())
+    }
+
+    fn normalize(&mut self) {
+        normalize_account_type_policies(&mut self.account_type_policies);
     }
 
     pub fn resolved_instance_id(&self) -> String {

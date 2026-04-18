@@ -924,6 +924,7 @@ mod tests {
                 tools_bonus: 1.0,
                 ..RequestWeightingConfig::default()
             },
+            account_type_policies: std::collections::BTreeMap::new(),
         };
 
         let rollback = build_file_rollback_config(&config, &dispatch);

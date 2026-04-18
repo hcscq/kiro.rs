@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -15,6 +15,7 @@ use tokio::runtime::RuntimeFlavor;
 use crate::admin::types::BalanceResponse;
 use crate::kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use crate::model::config::{Config, RequestWeightingConfig, StateBackendKind};
+use crate::model::model_policy::{ModelSupportPolicy, normalize_account_type_policies};
 
 const STATS_FILE_NAME: &str = "kiro_stats.json";
 const BALANCE_CACHE_FILE_NAME: &str = "kiro_balance_cache.json";
@@ -729,6 +730,8 @@ pub struct PersistedDispatchConfig {
     pub rate_limit_refill_backoff_factor: f64,
     #[serde(default)]
     pub request_weighting: RequestWeightingConfig,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub account_type_policies: BTreeMap<String, ModelSupportPolicy>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -747,6 +750,8 @@ pub struct StateChangeRevisions {
 
 impl PersistedDispatchConfig {
     pub fn from_config(config: &Config) -> Self {
+        let mut account_type_policies = config.account_type_policies.clone();
+        normalize_account_type_policies(&mut account_type_policies);
         Self {
             mode: config.load_balancing_mode.clone(),
             queue_max_size: config.queue_max_size,
@@ -760,6 +765,7 @@ impl PersistedDispatchConfig {
                 .rate_limit_refill_recovery_step_per_success,
             rate_limit_refill_backoff_factor: config.rate_limit_refill_backoff_factor,
             request_weighting: config.request_weighting.clone(),
+            account_type_policies,
         }
     }
 
@@ -776,6 +782,7 @@ impl PersistedDispatchConfig {
             self.rate_limit_refill_recovery_step_per_success;
         config.rate_limit_refill_backoff_factor = self.rate_limit_refill_backoff_factor;
         config.request_weighting = self.request_weighting.clone();
+        config.account_type_policies = self.account_type_policies.clone();
     }
 }
 
@@ -2678,6 +2685,7 @@ mod tests {
                 tools_bonus: 1.0,
                 ..RequestWeightingConfig::default()
             },
+            account_type_policies: BTreeMap::new(),
         };
 
         store.persist_dispatch_config(&dispatch).unwrap();

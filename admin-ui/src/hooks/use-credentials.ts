@@ -4,6 +4,7 @@ import {
   setCredentialDisabled,
   setCredentialMaxConcurrency,
   setCredentialRateLimitConfig,
+  setCredentialModelPolicy,
   setCredentialPriority,
   resetCredentialFailure,
   forceRefreshToken,
@@ -12,8 +13,15 @@ import {
   deleteCredential,
   getLoadBalancingMode,
   setLoadBalancingMode,
+  getModelCapabilitiesConfig,
+  setModelCapabilitiesConfig,
 } from '@/api/credentials'
-import type { AddCredentialRequest, UpdateLoadBalancingConfigRequest } from '@/types/api'
+import type {
+  AddCredentialRequest,
+  SetCredentialModelPolicyRequest,
+  UpdateLoadBalancingConfigRequest,
+  UpdateModelCapabilitiesConfigRequest,
+} from '@/types/api'
 
 // 查询凭据列表
 export function useCredentials() {
@@ -93,6 +101,19 @@ export function useSetCredentialRateLimitConfig() {
   })
 }
 
+// 设置凭据级模型策略
+export function useSetCredentialModelPolicy() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, payload }: { id: number; payload: SetCredentialModelPolicyRequest }) =>
+      setCredentialModelPolicy(id, payload),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      queryClient.invalidateQueries({ queryKey: ['modelCapabilities'] })
+    },
+  })
+}
+
 // 重置失败计数
 export function useResetFailure() {
   const queryClient = useQueryClient()
@@ -152,6 +173,25 @@ export function useSetLoadBalancingMode() {
     mutationFn: (payload: UpdateLoadBalancingConfigRequest) => setLoadBalancingMode(payload),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
+    },
+  })
+}
+
+export function useModelCapabilitiesConfig() {
+  return useQuery({
+    queryKey: ['modelCapabilities'],
+    queryFn: getModelCapabilitiesConfig,
+  })
+}
+
+export function useSetModelCapabilitiesConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (payload: UpdateModelCapabilitiesConfigRequest) =>
+      setModelCapabilitiesConfig(payload),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['modelCapabilities'] })
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
   })
 }

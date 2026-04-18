@@ -45,102 +45,8 @@ fn request_id_from_headers(headers: &HeaderMap) -> String {
         .unwrap_or_else(|| format!("kirors-{}", Uuid::new_v4().simple()))
 }
 
-/// 将 KiroProvider 错误映射为 HTTP 响应
-fn map_provider_error(err: Error) -> Response {
-    let err_str = err.to_string();
-    let err_summary = summarize_text_for_log(&err_str, 240);
-
-    if err
-        .downcast_ref::<RuntimeRefreshLeaderRequiredError>()
-        .is_some()
-    {
-        tracing::warn!(error = %err_summary, "共享凭据刷新需由 leader 处理，当前请求快速失败");
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse::new(
-                "service_unavailable",
-                "Shared credential refresh must be handled by the runtime leader. Retry later or route this request to the leader.",
-            )),
-        )
-            .into_response();
-    }
-
-    // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
-    if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
-        tracing::warn!(error = %err_summary, "上游拒绝请求：上下文窗口已满（不应重试）");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Context window is full. Reduce conversation history, system prompt, or tools.",
-            )),
-        )
-            .into_response();
-    }
-
-    // 单次输入太长（请求体本身超出上游限制）
-    if err_str.contains("Input is too long") {
-        tracing::warn!(error = %err_summary, "上游拒绝请求：输入过长（不应重试）");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Input is too long. Reduce the size of your messages.",
-            )),
-        )
-            .into_response();
-    }
-    if err_str.contains("等待队列已满") {
-        tracing::warn!(error = %err_summary, "本地等待队列已满");
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(ErrorResponse::new(
-                "rate_limit_error",
-                "Request queue is full. Retry later or raise queueMaxSize.",
-            )),
-        )
-            .into_response();
-    }
-    if err_str.contains("等待可用凭据超时") {
-        tracing::warn!(error = %err_summary, "请求等待可用凭据超时");
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse::new(
-                "service_unavailable",
-                "Timed out waiting for a dispatchable account. Accounts may be at maxConcurrency, cooling down after 429s, or waiting for local token-bucket refill. Retry later or tune queueMaxWaitMs/maxConcurrency/token-bucket settings.",
-            )),
-        )
-            .into_response();
-    }
-    if err_str.contains("并发上限") {
-        tracing::warn!(error = %err_summary, "所有可用凭据暂时不可用");
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse::new(
-                "service_unavailable",
-                "All available accounts are saturated, cooling down, or throttled by the local token bucket. Retry later or tune maxConcurrency/token-bucket settings.",
-            )),
-        )
-            .into_response();
-    }
-    tracing::error!(error = %err_summary, "Kiro API 调用失败");
-    (
-        StatusCode::BAD_GATEWAY,
-        Json(ErrorResponse::new(
-            "api_error",
-            "上游 API 调用失败，请稍后重试。",
-        )),
-    )
-        .into_response()
-}
-
-/// GET /v1/models
-///
-/// 返回可用的模型列表
-pub async fn get_models() -> impl IntoResponse {
-    tracing::info!("Received GET /v1/models request");
-
-    let models = vec![
+fn built_in_models() -> Vec<Model> {
+    vec![
         Model {
             id: "claude-opus-4-7".to_string(),
             object: "model".to_string(),
@@ -249,7 +155,108 @@ pub async fn get_models() -> impl IntoResponse {
             model_type: "chat".to_string(),
             max_tokens: 64000,
         },
-    ];
+    ]
+}
+
+/// 将 KiroProvider 错误映射为 HTTP 响应
+fn map_provider_error(err: Error) -> Response {
+    let err_str = err.to_string();
+    let err_summary = summarize_text_for_log(&err_str, 240);
+
+    if err
+        .downcast_ref::<RuntimeRefreshLeaderRequiredError>()
+        .is_some()
+    {
+        tracing::warn!(error = %err_summary, "共享凭据刷新需由 leader 处理，当前请求快速失败");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse::new(
+                "service_unavailable",
+                "Shared credential refresh must be handled by the runtime leader. Retry later or route this request to the leader.",
+            )),
+        )
+            .into_response();
+    }
+
+    // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
+    if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
+        tracing::warn!(error = %err_summary, "上游拒绝请求：上下文窗口已满（不应重试）");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                "Context window is full. Reduce conversation history, system prompt, or tools.",
+            )),
+        )
+            .into_response();
+    }
+
+    // 单次输入太长（请求体本身超出上游限制）
+    if err_str.contains("Input is too long") {
+        tracing::warn!(error = %err_summary, "上游拒绝请求：输入过长（不应重试）");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                "Input is too long. Reduce the size of your messages.",
+            )),
+        )
+            .into_response();
+    }
+    if err_str.contains("等待队列已满") {
+        tracing::warn!(error = %err_summary, "本地等待队列已满");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorResponse::new(
+                "rate_limit_error",
+                "Request queue is full. Retry later or raise queueMaxSize.",
+            )),
+        )
+            .into_response();
+    }
+    if err_str.contains("等待可用凭据超时") {
+        tracing::warn!(error = %err_summary, "请求等待可用凭据超时");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse::new(
+                "service_unavailable",
+                "Timed out waiting for a dispatchable account. Accounts may be at maxConcurrency, cooling down after 429s, or waiting for local token-bucket refill. Retry later or tune queueMaxWaitMs/maxConcurrency/token-bucket settings.",
+            )),
+        )
+            .into_response();
+    }
+    if err_str.contains("并发上限") {
+        tracing::warn!(error = %err_summary, "所有可用凭据暂时不可用");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse::new(
+                "service_unavailable",
+                "All available accounts are saturated, cooling down, or throttled by the local token bucket. Retry later or tune maxConcurrency/token-bucket settings.",
+            )),
+        )
+            .into_response();
+    }
+    tracing::error!(error = %err_summary, "Kiro API 调用失败");
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(ErrorResponse::new(
+            "api_error",
+            "上游 API 调用失败，请稍后重试。",
+        )),
+    )
+        .into_response()
+}
+
+/// GET /v1/models
+///
+/// 返回可用的模型列表
+pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
+    tracing::info!("Received GET /v1/models request");
+
+    let mut models = built_in_models();
+    if let Some(provider) = &state.kiro_provider {
+        models.retain(|model| provider.supports_model(&model.id));
+    }
 
     Json(ModelsResponse {
         object: "list".to_string(),

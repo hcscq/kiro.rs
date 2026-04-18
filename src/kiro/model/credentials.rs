@@ -3,12 +3,17 @@
 //! 支持从 Kiro IDE 的凭证文件加载，使用 Social 认证方式
 //! 支持单凭据和多凭据配置格式
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
 use crate::http_client::ProxyConfig;
 use crate::model::config::Config;
+use crate::model::model_policy::{
+    ModelSupportPolicy, RuntimeModelRestriction, normalize_account_type, normalize_model_entries,
+    normalize_model_selector,
+};
 
 /// Kiro OAuth 凭证
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -92,6 +97,23 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub subscription_title: Option<String>,
+
+    /// 账号类型（用于命中全局账号类型策略）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub account_type: Option<String>,
+
+    /// 账号级额外允许的模型列表
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_models: Vec<String>,
+
+    /// 账号级额外禁用的模型列表
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_models: Vec<String>,
+
+    /// 运行时探测到的临时模型限制
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_model_restrictions: Vec<RuntimeModelRestriction>,
 
     /// 导入时间（RFC3339 格式）
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -182,6 +204,7 @@ impl CredentialsConfig {
         match self {
             CredentialsConfig::Single(mut cred) => {
                 cred.canonicalize_auth_method();
+                cred.normalize_model_capabilities();
                 vec![cred]
             }
             CredentialsConfig::Multiple(mut creds) => {
@@ -189,6 +212,7 @@ impl CredentialsConfig {
                 creds.sort_by_key(|c| c.priority);
                 for cred in &mut creds {
                     cred.canonicalize_auth_method();
+                    cred.normalize_model_capabilities();
                 }
                 creds
             }
@@ -256,6 +280,22 @@ impl KiroCredentials {
         if canonical != auth_method {
             self.auth_method = Some(canonical.to_string());
         }
+    }
+
+    pub fn normalize_model_capabilities(&mut self) {
+        self.account_type = self
+            .account_type
+            .as_deref()
+            .and_then(normalize_account_type);
+        self.allowed_models = normalize_model_entries(&self.allowed_models);
+        self.blocked_models = normalize_model_entries(&self.blocked_models);
+        self.runtime_model_restrictions.retain_mut(|restriction| {
+            restriction.normalize() && restriction.is_active_at(Utc::now())
+        });
+        self.runtime_model_restrictions
+            .sort_by(|left, right| left.model.cmp(&right.model));
+        self.runtime_model_restrictions
+            .dedup_by(|left, right| left.model == right.model);
     }
 
     fn subscription_title_upper(&self) -> Option<String> {
@@ -328,6 +368,121 @@ impl KiroCredentials {
             Some(_) | None => 1,
         }
     }
+
+    pub fn account_type_policy<'a>(
+        &'a self,
+        policies: &'a std::collections::BTreeMap<String, ModelSupportPolicy>,
+    ) -> Option<&'a ModelSupportPolicy> {
+        self.account_type
+            .as_ref()
+            .and_then(|account_type| policies.get(account_type))
+    }
+
+    pub fn policy_allows_model(
+        &self,
+        account_type_policy: Option<&ModelSupportPolicy>,
+        model: &str,
+    ) -> bool {
+        let Some(selector) = normalize_model_selector(model) else {
+            return true;
+        };
+
+        if self
+            .runtime_model_restrictions
+            .iter()
+            .filter(|restriction| restriction.is_active_at(Utc::now()))
+            .any(|restriction| {
+                normalize_model_selector(&restriction.model).is_some_and(|entry| {
+                    entry.family == selector.family || entry.exact == selector.exact
+                })
+            })
+        {
+            return false;
+        }
+
+        if account_type_policy.is_some_and(|policy| policy.matches_blocked(&selector)) {
+            return false;
+        }
+        if self
+            .blocked_models
+            .iter()
+            .any(|entry| crate::model::model_policy::matches_model_entry(entry, &selector))
+        {
+            return false;
+        }
+
+        let has_any_allowlist = account_type_policy
+            .is_some_and(|policy| !policy.allowed_models.is_empty())
+            || !self.allowed_models.is_empty();
+        if !has_any_allowlist {
+            return true;
+        }
+
+        account_type_policy.is_some_and(|policy| policy.matches_allowed(&selector))
+            || self
+                .allowed_models
+                .iter()
+                .any(|entry| crate::model::model_policy::matches_model_entry(entry, &selector))
+    }
+
+    pub fn upsert_runtime_model_restriction(
+        &mut self,
+        model: &str,
+        expires_at: DateTime<Utc>,
+    ) -> bool {
+        let Some(selector) = normalize_model_selector(model) else {
+            return false;
+        };
+        let family = selector.family;
+        let expires_at_rfc3339 = expires_at.to_rfc3339();
+
+        let mut changed = false;
+        let mut found = false;
+        self.runtime_model_restrictions.retain_mut(|restriction| {
+            let keep = restriction.normalize() && restriction.is_active_at(Utc::now());
+            if !keep {
+                changed = true;
+            }
+            keep
+        });
+
+        for restriction in &mut self.runtime_model_restrictions {
+            if restriction.model == family {
+                found = true;
+                if restriction.expires_at != expires_at_rfc3339 {
+                    restriction.expires_at = expires_at_rfc3339.clone();
+                    changed = true;
+                }
+            }
+        }
+
+        if !found {
+            self.runtime_model_restrictions
+                .push(RuntimeModelRestriction::new(family, expires_at));
+            changed = true;
+        }
+
+        self.runtime_model_restrictions
+            .sort_by(|left, right| left.model.cmp(&right.model));
+        changed
+    }
+
+    pub fn clear_runtime_model_restrictions(&mut self) -> bool {
+        if self.runtime_model_restrictions.is_empty() {
+            return false;
+        }
+        self.runtime_model_restrictions.clear();
+        true
+    }
+
+    pub fn active_runtime_model_restrictions(&self) -> Vec<RuntimeModelRestriction> {
+        let now = Utc::now();
+        self.runtime_model_restrictions
+            .iter()
+            .filter(|restriction| restriction.is_active_at(now))
+            .cloned()
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -396,6 +551,10 @@ mod tests {
             machine_id: None,
             email: None,
             subscription_title: None,
+            account_type: None,
+            allowed_models: vec![],
+            blocked_models: vec![],
+            runtime_model_restrictions: vec![],
             imported_at: None,
             proxy_url: None,
             proxy_username: None,
@@ -534,6 +693,10 @@ mod tests {
             machine_id: None,
             email: None,
             subscription_title: None,
+            account_type: None,
+            allowed_models: vec![],
+            blocked_models: vec![],
+            runtime_model_restrictions: vec![],
             imported_at: None,
             proxy_url: None,
             proxy_username: None,
@@ -568,6 +731,10 @@ mod tests {
             machine_id: None,
             email: None,
             subscription_title: None,
+            account_type: None,
+            allowed_models: vec![],
+            blocked_models: vec![],
+            runtime_model_restrictions: vec![],
             imported_at: None,
             proxy_url: None,
             proxy_username: None,
@@ -684,6 +851,10 @@ mod tests {
             machine_id: Some("c".repeat(64)),
             email: None,
             subscription_title: None,
+            account_type: None,
+            allowed_models: vec![],
+            blocked_models: vec![],
+            runtime_model_restrictions: vec![],
             imported_at: Some("2025-01-01T00:00:00Z".to_string()),
             proxy_url: None,
             proxy_username: None,

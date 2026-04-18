@@ -19,6 +19,10 @@ export interface CredentialStatusItem {
   hasProfileArn: boolean
   email?: string
   subscriptionTitle?: string | null
+  accountType?: string | null
+  allowedModels?: string[]
+  blockedModels?: string[]
+  runtimeModelRestrictions?: RuntimeModelRestriction[]
   importedAt?: string | null
   refreshTokenHash?: string
   successCount: number
@@ -79,6 +83,23 @@ export interface SetCredentialRateLimitConfigRequest {
   rateLimitRefillPerSecond?: number | null
 }
 
+export interface RuntimeModelRestriction {
+  model: string
+  expiresAt: string
+}
+
+export interface ModelSupportPolicy {
+  allowedModels: string[]
+  blockedModels: string[]
+}
+
+export interface SetCredentialModelPolicyRequest {
+  accountType?: string | null
+  allowedModels?: string[] | null
+  blockedModels?: string[] | null
+  clearRuntimeModelRestrictions?: boolean
+}
+
 // 添加凭据请求
 export interface AddCredentialRequest {
   refreshToken: string
@@ -94,6 +115,9 @@ export interface AddCredentialRequest {
   apiRegion?: string
   machineId?: string
   email?: string
+  accountType?: string
+  allowedModels?: string[]
+  blockedModels?: string[]
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string
@@ -150,4 +174,12 @@ export interface UpdateLoadBalancingConfigRequest {
   rateLimitRefillRecoveryStepPerSuccess?: number
   rateLimitRefillBackoffFactor?: number
   requestWeighting?: RequestWeightingConfig
+}
+
+export interface ModelCapabilitiesConfigResponse {
+  accountTypePolicies: Record<string, ModelSupportPolicy>
+}
+
+export interface UpdateModelCapabilitiesConfigRequest {
+  accountTypePolicies?: Record<string, ModelSupportPolicy>
 }

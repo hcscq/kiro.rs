@@ -9,8 +9,9 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetCredentialRateLimitConfigRequest, SetDisabledRequest,
-        SetLoadBalancingModeRequest, SetMaxConcurrencyRequest, SetPriorityRequest, SuccessResponse,
+        AddCredentialRequest, SetCredentialModelPolicyRequest, SetCredentialRateLimitConfigRequest,
+        SetDisabledRequest, SetLoadBalancingModeRequest, SetMaxConcurrencyRequest,
+        SetModelCapabilitiesConfigRequest, SetPriorityRequest, SuccessResponse,
     },
 };
 
@@ -102,6 +103,19 @@ pub async fn set_credential_rate_limit_config(
     }
 }
 
+/// POST /api/admin/credentials/:id/model-policy
+/// 设置凭据级模型策略
+pub async fn set_credential_model_policy(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetCredentialModelPolicyRequest>,
+) -> impl IntoResponse {
+    match state.service.set_model_policy(id, payload) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 模型策略已更新", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// POST /api/admin/credentials/:id/reset
 /// 重置失败计数并重新启用
 pub async fn reset_failure_count(
@@ -179,6 +193,15 @@ pub async fn get_load_balancing_mode(State(state): State<AdminState>) -> impl In
     }
 }
 
+/// GET /api/admin/config/model-capabilities
+/// 获取账号类型模型策略配置
+pub async fn get_model_capabilities_config(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.get_model_capabilities_config() {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// PUT /api/admin/config/load-balancing
 /// 设置负载均衡与等待队列配置
 pub async fn set_load_balancing_mode(
@@ -186,6 +209,18 @@ pub async fn set_load_balancing_mode(
     Json(payload): Json<SetLoadBalancingModeRequest>,
 ) -> impl IntoResponse {
     match state.service.set_load_balancing_mode(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// PUT /api/admin/config/model-capabilities
+/// 设置账号类型模型策略配置
+pub async fn set_model_capabilities_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetModelCapabilitiesConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_model_capabilities_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

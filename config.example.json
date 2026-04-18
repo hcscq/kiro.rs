@@ -36,5 +36,21 @@
     "thinkingBonus": 0.35,
     "heavyThinkingBudgetThreshold": 24000,
     "heavyThinkingBudgetBonus": 0.35
+  },
+  "accountTypePolicies": {
+    "power": {
+      "allowedModels": [
+        "claude-opus-4.6",
+        "claude-sonnet-4.6"
+      ],
+      "blockedModels": [
+        "claude-opus-4.7"
+      ]
+    },
+    "pro-plus": {
+      "allowedModels": [
+        "claude-opus-4.7"
+      ]
+    }
   }
 }

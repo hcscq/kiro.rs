@@ -10,7 +10,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as TokioMutex, Notify, oneshot};
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,6 +26,9 @@ use crate::kiro::model::token_refresh::{
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::{Config, RequestWeightingConfig};
+use crate::model::model_policy::{
+    ModelSupportPolicy, normalize_account_type_policies, normalize_model_selector,
+};
 use crate::state::{
     DispatchLeaseReservationStatus, DispatchRuntimeBucketPolicy, DispatchRuntimeCredential,
     DispatchRuntimeSnapshot, PersistedDispatchConfig, RuntimeCoordinationStatus, StateChangeKind,
@@ -635,6 +638,18 @@ pub struct CredentialEntrySnapshot {
     /// 订阅等级（KIRO PRO+ / KIRO FREE 等）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subscription_title: Option<String>,
+    /// 账号类型
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_type: Option<String>,
+    /// 账号级额外允许模型
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub allowed_models: Vec<String>,
+    /// 账号级额外禁用模型
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub blocked_models: Vec<String>,
+    /// 运行时探测到的临时模型限制
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub runtime_model_restrictions: Vec<crate::model::model_policy::RuntimeModelRestriction>,
     /// 导入时间（RFC3339 格式）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub imported_at: Option<String>,
@@ -736,6 +751,7 @@ struct DispatchConfig {
     rate_limit_refill_recovery_step_per_success: f64,
     rate_limit_refill_backoff_factor: f64,
     request_weighting: RequestWeightingConfig,
+    account_type_policies: BTreeMap<String, ModelSupportPolicy>,
 }
 
 impl DispatchConfig {
@@ -754,6 +770,8 @@ impl DispatchConfig {
                 0.5
             }
         };
+        let mut account_type_policies = config.account_type_policies.clone();
+        normalize_account_type_policies(&mut account_type_policies);
 
         Self {
             mode: config.load_balancing_mode.clone(),
@@ -781,6 +799,7 @@ impl DispatchConfig {
                 config.rate_limit_refill_backoff_factor,
             ),
             request_weighting: config.request_weighting.clone(),
+            account_type_policies,
         }
     }
 
@@ -790,6 +809,13 @@ impl DispatchConfig {
 
     fn queue_wait_duration(&self) -> StdDuration {
         StdDuration::from_millis(self.queue_max_wait_ms)
+    }
+
+    fn account_type_policy_for<'a>(
+        &'a self,
+        credentials: &'a KiroCredentials,
+    ) -> Option<&'a ModelSupportPolicy> {
+        credentials.account_type_policy(&self.account_type_policies)
     }
 
     fn bucket_policy_for(&self, credentials: &KiroCredentials) -> Option<TokenBucketPolicy> {
@@ -1027,6 +1053,7 @@ impl MultiTokenManager {
             .into_iter()
             .map(|mut cred| {
                 cred.canonicalize_auth_method();
+                cred.normalize_model_capabilities();
                 let id = cred.id.unwrap_or_else(|| {
                     let id = next_id;
                     next_id += 1;
@@ -1186,7 +1213,26 @@ impl MultiTokenManager {
         }
     }
 
-    fn is_model_supported(credentials: &KiroCredentials, requirement: ModelRequirement) -> bool {
+    fn policy_allows_model(
+        dispatch: &DispatchConfig,
+        credentials: &KiroCredentials,
+        model: Option<&str>,
+    ) -> bool {
+        let Some(model) = model else {
+            return true;
+        };
+        credentials.policy_allows_model(dispatch.account_type_policy_for(credentials), model)
+    }
+
+    fn is_model_supported(
+        dispatch: &DispatchConfig,
+        credentials: &KiroCredentials,
+        model: Option<&str>,
+        requirement: ModelRequirement,
+    ) -> bool {
+        if !Self::policy_allows_model(dispatch, credentials, model) {
+            return false;
+        }
         match requirement {
             ModelRequirement::Any => true,
             ModelRequirement::PaidOpus => credentials.supports_opus(),
@@ -1303,7 +1349,9 @@ impl MultiTokenManager {
     }
 
     fn next_ready_at_for(
+        dispatch: &DispatchConfig,
         entries: &mut [CredentialEntry],
+        model: Option<&str>,
         model_requirement: ModelRequirement,
         now: Instant,
         request_weight: f64,
@@ -1311,7 +1359,13 @@ impl MultiTokenManager {
         entries
             .iter_mut()
             .filter(|entry| {
-                !entry.disabled && Self::is_model_supported(&entry.credentials, model_requirement)
+                !entry.disabled
+                    && Self::is_model_supported(
+                        dispatch,
+                        &entry.credentials,
+                        model,
+                        model_requirement,
+                    )
             })
             .filter_map(|entry| Self::combined_ready_at_for(entry, now, request_weight))
             .min()
@@ -1610,7 +1664,7 @@ impl MultiTokenManager {
         request_weight: f64,
     ) -> Result<(u64, KiroCredentials, CallLease), ReservationFailure> {
         let dispatch = self.dispatch_config();
-        let mode = dispatch.mode;
+        let mode = dispatch.mode.clone();
         let mut entries = self.entries.lock();
         let now = Instant::now();
         let model_requirement = Self::model_requirement(model);
@@ -1637,7 +1691,7 @@ impl MultiTokenManager {
             }
             has_enabled = true;
 
-            if !Self::is_model_supported(&entry.credentials, model_requirement) {
+            if !Self::is_model_supported(&dispatch, &entry.credentials, model, model_requirement) {
                 continue;
             }
             has_supported = true;
@@ -1714,8 +1768,14 @@ impl MultiTokenManager {
                 .map_or(true, |bucket| bucket.consume(now, request_weight))
         };
         if !token_consumed {
-            let next_ready_at =
-                Self::next_ready_at_for(&mut entries, model_requirement, now, request_weight);
+            let next_ready_at = Self::next_ready_at_for(
+                &dispatch,
+                &mut entries,
+                model,
+                model_requirement,
+                now,
+                request_weight,
+            );
             return Err(ReservationFailure::AllTemporarilyUnavailable { next_ready_at });
         }
         let entry = &mut entries[entry_index];
@@ -1834,7 +1894,12 @@ impl MultiTokenManager {
                     }
                     has_enabled = true;
 
-                    if !Self::is_model_supported(&entry.credentials, model_requirement) {
+                    if !Self::is_model_supported(
+                        &dispatch,
+                        &entry.credentials,
+                        model,
+                        model_requirement,
+                    ) {
                         continue;
                     }
                     has_supported = true;
@@ -2295,6 +2360,7 @@ impl MultiTokenManager {
             .map(|entry| {
                 let mut credential = entry.credentials.clone();
                 credential.canonicalize_auth_method();
+                credential.normalize_model_capabilities();
                 credential.disabled = entry.disabled;
                 credential
             })
@@ -2308,6 +2374,7 @@ impl MultiTokenManager {
         let mut normalized = credentials.to_vec();
         for credential in &mut normalized {
             credential.canonicalize_auth_method();
+            credential.normalize_model_capabilities();
         }
 
         let persisted = self
@@ -2525,6 +2592,7 @@ impl MultiTokenManager {
 
         for mut credential in persisted.credentials {
             credential.canonicalize_auth_method();
+            credential.normalize_model_capabilities();
             let Some(id) = credential.id else {
                 tracing::warn!("外部状态中的凭据缺少 ID，已跳过热重载");
                 continue;
@@ -2931,13 +2999,24 @@ impl MultiTokenManager {
         result
     }
 
-    /// 当上游明确返回真实 Opus 4.7 `INVALID_MODEL_ID` 时，
-    /// 将当前凭据视为“不支持该模型”，临时避让并切换到下一张更合适的卡。
-    pub fn defer_model_unsupported_credential(&self, id: u64, cooldown: StdDuration) -> bool {
+    /// 当上游明确返回 `INVALID_MODEL_ID` 时，
+    /// 将当前凭据视为“不支持该模型”，临时避让并记录一段时间的运行时限制。
+    pub fn defer_model_unsupported_credential(
+        &self,
+        id: u64,
+        model: &str,
+        cooldown: StdDuration,
+    ) -> bool {
         let now = Instant::now();
         let deferred_until = now + cooldown;
-        let requirement = ModelRequirement::RealOpus47;
+        let restriction_expires_at = Utc::now() + Duration::minutes(30);
+        let dispatch = self.dispatch_config();
+        let requirement = Self::model_requirement(Some(model));
+        let model_label = normalize_model_selector(model)
+            .map(|selector| selector.family)
+            .unwrap_or_else(|| model.to_ascii_lowercase());
         let result = {
+            let _state_write_guard = self.state_write_lock.lock();
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
 
@@ -2947,7 +3026,12 @@ impl MultiTokenManager {
                     return entries.iter().any(|e| {
                         !e.disabled
                             && e.id != id
-                            && Self::is_model_supported(&e.credentials, requirement)
+                            && Self::is_model_supported(
+                                &dispatch,
+                                &e.credentials,
+                                Some(model),
+                                requirement,
+                            )
                     });
                 }
             };
@@ -2956,7 +3040,12 @@ impl MultiTokenManager {
                 return entries.iter().any(|e| {
                     !e.disabled
                         && e.id != id
-                        && Self::is_model_supported(&e.credentials, requirement)
+                        && Self::is_model_supported(
+                            &dispatch,
+                            &e.credentials,
+                            Some(model),
+                            requirement,
+                        )
                 });
             }
 
@@ -2967,6 +3056,20 @@ impl MultiTokenManager {
                     .unwrap_or(deferred_until),
             );
             entry.last_used_at = Some(Utc::now().to_rfc3339());
+            let restriction_changed = entry
+                .credentials
+                .upsert_runtime_model_restriction(model, restriction_expires_at);
+            if restriction_changed {
+                let credentials = Self::persisted_credentials_from_entries(&entries);
+                if let Err(err) = self.persist_credentials_snapshot(&credentials) {
+                    tracing::warn!(
+                        "持久化模型运行时限制失败（credentialId={}, model={}）: {}",
+                        id,
+                        model_label,
+                        err
+                    );
+                }
+            }
 
             if *current_id == id {
                 if let Some(next) = entries
@@ -2974,7 +3077,12 @@ impl MultiTokenManager {
                     .filter(|e| {
                         !e.disabled
                             && e.id != id
-                            && Self::is_model_supported(&e.credentials, requirement)
+                            && Self::is_model_supported(
+                                &dispatch,
+                                &e.credentials,
+                                Some(model),
+                                requirement,
+                            )
                     })
                     .min_by_key(|e| {
                         (
@@ -2986,28 +3094,33 @@ impl MultiTokenManager {
                 {
                     *current_id = next.id;
                     tracing::info!(
-                        "凭据 #{} 不支持真实 claude-opus-4.7，已临时冷却 {}ms 并切换到凭据 #{}",
+                        "凭据 #{} 不支持模型 {}，已临时冷却 {}ms 并切换到凭据 #{}",
                         id,
+                        model_label,
                         cooldown.as_millis(),
                         next.id
                     );
                 } else {
                     tracing::warn!(
-                        "凭据 #{} 不支持真实 claude-opus-4.7，已临时冷却 {}ms，当前无其他可切换凭据",
+                        "凭据 #{} 不支持模型 {}，已临时冷却 {}ms，当前无其他可切换凭据",
                         id,
+                        model_label,
                         cooldown.as_millis()
                     );
                 }
             } else {
                 tracing::warn!(
-                    "凭据 #{} 不支持真实 claude-opus-4.7，已临时冷却 {}ms",
+                    "凭据 #{} 不支持模型 {}，已临时冷却 {}ms",
                     id,
+                    model_label,
                     cooldown.as_millis()
                 );
             }
 
             entries.iter().any(|e| {
-                !e.disabled && e.id != id && Self::is_model_supported(&e.credentials, requirement)
+                !e.disabled
+                    && e.id != id
+                    && Self::is_model_supported(&dispatch, &e.credentials, Some(model), requirement)
             })
         };
         if self.shared_dispatch_runtime_enabled() {
@@ -3384,6 +3497,12 @@ impl MultiTokenManager {
                         refresh_token_hash: e.credentials.refresh_token.as_deref().map(sha256_hex),
                         email: e.credentials.email.clone(),
                         subscription_title: e.credentials.subscription_title.clone(),
+                        account_type: e.credentials.account_type.clone(),
+                        allowed_models: e.credentials.allowed_models.clone(),
+                        blocked_models: e.credentials.blocked_models.clone(),
+                        runtime_model_restrictions: e
+                            .credentials
+                            .active_runtime_model_restrictions(),
                         imported_at: e.credentials.imported_at.clone(),
                         success_count: e.success_count,
                         last_used_at: e.last_used_at.clone(),
@@ -3594,6 +3713,54 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 设置凭据级模型策略（Admin API）
+    pub fn set_credential_model_policy(
+        &self,
+        id: u64,
+        account_type: Option<Option<String>>,
+        allowed_models: Option<Option<Vec<String>>>,
+        blocked_models: Option<Option<Vec<String>>>,
+        clear_runtime_model_restrictions: bool,
+    ) -> anyhow::Result<()> {
+        let _state_write_guard = self.state_write_lock.lock();
+        let mut persisted = self.persisted_credentials_snapshot();
+        let credential = Self::persisted_credential_mut(&mut persisted, id)?;
+
+        if let Some(account_type) = account_type {
+            credential.account_type = account_type
+                .as_deref()
+                .and_then(crate::model::model_policy::normalize_account_type);
+        }
+        if let Some(allowed_models) = allowed_models {
+            credential.allowed_models = allowed_models
+                .map(|models| crate::model::model_policy::normalize_model_entries(&models))
+                .unwrap_or_default();
+        }
+        if let Some(blocked_models) = blocked_models {
+            credential.blocked_models = blocked_models
+                .map(|models| crate::model::model_policy::normalize_model_entries(&models))
+                .unwrap_or_default();
+        }
+        if clear_runtime_model_restrictions {
+            credential.clear_runtime_model_restrictions();
+        }
+        credential.normalize_model_capabilities();
+        let updated_credential = credential.clone();
+        self.persist_credentials_snapshot(&persisted)?;
+
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials = updated_credential;
+        }
+
+        self.availability_notify.notify_waiters();
+        Ok(())
+    }
+
     /// 重置凭据失败计数并重新启用（Admin API）
     pub fn reset_and_enable(&self, id: u64) -> anyhow::Result<()> {
         let dispatch = self.dispatch_config();
@@ -3753,6 +3920,10 @@ impl MultiTokenManager {
         validated_cred.api_region = new_cred.api_region;
         validated_cred.machine_id = new_cred.machine_id;
         validated_cred.email = new_cred.email;
+        validated_cred.account_type = new_cred.account_type;
+        validated_cred.allowed_models = new_cred.allowed_models;
+        validated_cred.blocked_models = new_cred.blocked_models;
+        validated_cred.runtime_model_restrictions = new_cred.runtime_model_restrictions;
         validated_cred.imported_at = new_cred
             .imported_at
             .or_else(|| Some(Utc::now().to_rfc3339()));
@@ -3763,6 +3934,7 @@ impl MultiTokenManager {
         validated_cred.proxy_username = new_cred.proxy_username;
         validated_cred.proxy_password = new_cred.proxy_password;
         validated_cred.disabled = false;
+        validated_cred.normalize_model_capabilities();
 
         persisted.push(validated_cred.clone());
         self.persist_credentials_snapshot(&persisted)?;
@@ -3949,6 +4121,20 @@ impl MultiTokenManager {
         }
     }
 
+    pub fn account_type_policies_snapshot(&self) -> BTreeMap<String, ModelSupportPolicy> {
+        self.dispatch_config().account_type_policies
+    }
+
+    pub fn supports_model(&self, model: &str) -> bool {
+        let dispatch = self.dispatch_config();
+        let requirement = Self::model_requirement(Some(model));
+        let entries = self.entries.lock();
+        entries.iter().any(|entry| {
+            !entry.disabled
+                && Self::is_model_supported(&dispatch, &entry.credentials, Some(model), requirement)
+        })
+    }
+
     pub fn request_weighting_config_snapshot(&self) -> RequestWeightingConfig {
         self.dispatch_config().request_weighting
     }
@@ -3973,6 +4159,7 @@ impl MultiTokenManager {
                     .rate_limit_refill_recovery_step_per_success,
                 rate_limit_refill_backoff_factor: dispatch.rate_limit_refill_backoff_factor,
                 request_weighting: dispatch.request_weighting.clone(),
+                account_type_policies: dispatch.account_type_policies.clone(),
             })?;
         self.try_bump_state_change_revision(StateChangeKind::DispatchConfig);
         Ok(())
@@ -3993,6 +4180,31 @@ impl MultiTokenManager {
             None,
             None,
         )
+    }
+
+    pub fn set_account_type_policies(
+        &self,
+        mut account_type_policies: BTreeMap<String, ModelSupportPolicy>,
+    ) -> anyhow::Result<()> {
+        crate::model::model_policy::normalize_account_type_policies(&mut account_type_policies);
+        let previous = self.dispatch_config();
+        let mut next = previous.clone();
+        next.account_type_policies = account_type_policies;
+
+        if previous == next {
+            return Ok(());
+        }
+
+        let _state_write_guard = self.state_write_lock.lock();
+        *self.dispatch_config.lock() = next.clone();
+
+        if let Err(err) = self.persist_dispatch_config(&next) {
+            *self.dispatch_config.lock() = previous;
+            return Err(err);
+        }
+
+        self.availability_notify.notify_waiters();
+        Ok(())
     }
 
     /// 设置调度配置（Admin API）
@@ -4280,6 +4492,64 @@ mod tests {
             "错误消息应包含 '重复的凭据 ID'，实际: {}",
             err_msg
         );
+    }
+
+    #[tokio::test]
+    async fn test_account_type_policy_with_credential_blocklist_skips_higher_priority_card() {
+        let mut config = Config::default();
+        config.account_type_policies.insert(
+            "power".to_string(),
+            ModelSupportPolicy {
+                allowed_models: vec!["claude-opus-4.6".to_string()],
+                blocked_models: vec![],
+            },
+        );
+
+        let mut blocked = available_credential(0);
+        blocked.account_type = Some("power".to_string());
+        blocked.blocked_models = vec!["claude-opus-4.6".to_string()];
+
+        let mut allowed = available_credential(1);
+        allowed.account_type = Some("power".to_string());
+
+        let manager =
+            MultiTokenManager::new(config, vec![blocked, allowed], None, None, false).unwrap();
+
+        let ctx = manager
+            .acquire_context(Some("claude-opus-4.6"))
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 2);
+    }
+
+    #[test]
+    fn test_runtime_model_restriction_hides_model_until_cache_cleared() {
+        let mut config = Config::default();
+        config.account_type_policies.insert(
+            "power".to_string(),
+            ModelSupportPolicy {
+                allowed_models: vec!["claude-opus-4.6".to_string()],
+                blocked_models: vec![],
+            },
+        );
+
+        let mut cred = available_credential(0);
+        cred.account_type = Some("power".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+        assert!(manager.supports_model("claude-opus-4-6"));
+
+        assert!(!manager.defer_model_unsupported_credential(
+            1,
+            "claude-opus-4.6",
+            StdDuration::from_secs(30)
+        ));
+        assert!(!manager.supports_model("claude-opus-4-6"));
+
+        manager
+            .set_credential_model_policy(1, None, None, None, true)
+            .unwrap();
+        assert!(manager.supports_model("claude-opus-4-6"));
     }
 
     #[test]
@@ -5032,6 +5302,7 @@ mod tests {
                 tools_bonus: 1.0,
                 ..RequestWeightingConfig::default()
             },
+            account_type_policies: BTreeMap::new(),
         };
 
         assert!(manager.apply_dispatch_config_from_state(&persisted));

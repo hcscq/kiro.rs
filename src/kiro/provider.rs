@@ -27,7 +27,7 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
-const REAL_OPUS_4_7_UNSUPPORTED_COOLDOWN: Duration = Duration::from_secs(30);
+const MODEL_UNSUPPORTED_COOLDOWN: Duration = Duration::from_secs(30);
 const SLOW_UPSTREAM_HEADERS_MS: u128 = 3_000;
 const SLOW_FIRST_CHUNK_MS: u128 = 3_000;
 const SLOW_HEADERS_TO_FIRST_CHUNK_MS: u128 = 1_000;
@@ -320,6 +320,10 @@ impl KiroProvider {
 
     pub fn request_weighting_config(&self) -> RequestWeightingConfig {
         self.token_manager.request_weighting_config_snapshot()
+    }
+
+    pub fn supports_model(&self, model: &str) -> bool {
+        self.token_manager.supports_model(model)
     }
 
     pub fn leader_message_forward_target(&self) -> anyhow::Result<Option<String>> {
@@ -909,9 +913,9 @@ impl KiroProvider {
                 continue;
             }
 
-            // 真实 Opus 4.7 的 INVALID_MODEL_ID 说明“当前凭据不支持该模型”，应切卡继续尝试。
+            // INVALID_MODEL_ID 说明“当前凭据不支持该模型”或“该模型尚未对该账号开放”，应切卡继续尝试。
             if status.as_u16() == 400 {
-                if Self::should_failover_real_opus_4_7(model.as_deref(), &body) {
+                if Self::should_failover_model_unsupported(model.as_deref(), &body) {
                     tracing::warn!(
                         request_id = %request_id,
                         api_type,
@@ -923,17 +927,19 @@ impl KiroProvider {
                         stream = is_stream,
                         status_code = status.as_u16(),
                         error_summary = %error_summary,
-                        "API 请求失败（真实 Opus 4.7 当前凭据不支持）"
+                        "API 请求失败（当前凭据不支持该模型）"
                     );
 
                     let has_available = self.token_manager.defer_model_unsupported_credential(
                         ctx_id,
-                        REAL_OPUS_4_7_UNSUPPORTED_COOLDOWN,
+                        model.as_deref().unwrap_or("unknown"),
+                        MODEL_UNSUPPORTED_COOLDOWN,
                     );
                     if !has_available {
                         anyhow::bail!(
-                            "{} API 请求失败（所有候选凭据当前均被上游拒绝真实 claude-opus-4.7，模型可能尚未正式开放）: {}",
+                            "{} API 请求失败（所有候选凭据当前均被上游拒绝模型 {}）: {}",
                             api_type,
+                            model.as_deref().unwrap_or("unknown"),
                             error_summary
                         );
                     }
@@ -1168,8 +1174,8 @@ impl KiroProvider {
                 .is_some_and(|v| v == "INVALID_MODEL_ID")
     }
 
-    fn should_failover_real_opus_4_7(model: Option<&str>, body: &str) -> bool {
-        Self::is_real_opus_4_7_model(model) && Self::is_invalid_model_id(body)
+    fn should_failover_model_unsupported(model: Option<&str>, body: &str) -> bool {
+        model.is_some() && Self::is_invalid_model_id(body)
     }
 
     fn is_monthly_request_limit(body: &str) -> bool {
@@ -1239,20 +1245,21 @@ mod tests {
     }
 
     #[test]
-    fn test_should_failover_real_opus_4_7_detects_current_model() {
+    fn test_should_failover_model_unsupported_detects_invalid_model_body() {
         let body = r#"{"message":"Invalid model. Please select a different model to continue.","reason":"INVALID_MODEL_ID"}"#;
-        assert!(KiroProvider::should_failover_real_opus_4_7(
+        assert!(KiroProvider::should_failover_model_unsupported(
             Some("claude-opus-4.7"),
             body
         ));
-        assert!(KiroProvider::should_failover_real_opus_4_7(
+        assert!(KiroProvider::should_failover_model_unsupported(
             Some("claude-opus-4-7"),
             body
         ));
-        assert!(!KiroProvider::should_failover_real_opus_4_7(
+        assert!(KiroProvider::should_failover_model_unsupported(
             Some("claude-opus-4.6"),
             body
         ));
+        assert!(!KiroProvider::should_failover_model_unsupported(None, body));
     }
 
     #[test]

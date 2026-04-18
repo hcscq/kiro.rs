@@ -1,6 +1,9 @@
 //! Admin API 类型定义
 
+use std::collections::BTreeMap;
+
 use crate::model::config::RequestWeightingConfig;
+use crate::model::model_policy::{ModelSupportPolicy, RuntimeModelRestriction};
 use serde::{Deserialize, Deserializer, Serialize};
 
 fn deserialize_optional_nullable<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
@@ -56,6 +59,18 @@ pub struct CredentialStatusItem {
     /// 订阅等级（KIRO PRO+ / KIRO FREE 等）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subscription_title: Option<String>,
+    /// 账号类型
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_type: Option<String>,
+    /// 账号级额外允许模型
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub allowed_models: Vec<String>,
+    /// 账号级额外禁用模型
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub blocked_models: Vec<String>,
+    /// 运行时探测到的临时模型限制
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub runtime_model_restrictions: Vec<RuntimeModelRestriction>,
     /// 导入时间（RFC3339 格式）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub imported_at: Option<String>,
@@ -145,6 +160,24 @@ pub struct SetCredentialRateLimitConfigRequest {
     pub rate_limit_refill_per_second: Option<Option<f64>>,
 }
 
+/// 修改凭据模型策略请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCredentialModelPolicyRequest {
+    /// 字段缺失表示不修改；null 表示清空账号类型
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub account_type: Option<Option<String>>,
+    /// 字段缺失表示不修改；null 表示清空允许列表
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub allowed_models: Option<Option<Vec<String>>>,
+    /// 字段缺失表示不修改；null 表示清空拒绝列表
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub blocked_models: Option<Option<Vec<String>>>,
+    /// 是否清空运行时探测到的临时限制
+    #[serde(default)]
+    pub clear_runtime_model_restrictions: bool,
+}
+
 /// 添加凭据请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -191,6 +224,15 @@ pub struct AddCredentialRequest {
 
     /// 用户邮箱（可选，用于前端显示）
     pub email: Option<String>,
+
+    /// 账号类型（可选）
+    pub account_type: Option<String>,
+
+    /// 账号级额外允许模型
+    pub allowed_models: Option<Vec<String>>,
+
+    /// 账号级额外禁用模型
+    pub blocked_models: Option<Vec<String>>,
 
     /// 凭据级代理 URL（可选，特殊值 "direct" 表示不使用代理）
     pub proxy_url: Option<String>,
@@ -299,6 +341,18 @@ pub struct SetLoadBalancingModeRequest {
     pub rate_limit_refill_backoff_factor: Option<f64>,
     /// 轻/重请求的本地令牌消耗权重规则
     pub request_weighting: Option<RequestWeightingConfig>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCapabilitiesConfigResponse {
+    pub account_type_policies: BTreeMap<String, ModelSupportPolicy>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetModelCapabilitiesConfigRequest {
+    pub account_type_policies: Option<BTreeMap<String, ModelSupportPolicy>>,
 }
 
 // ============ 通用响应 ============

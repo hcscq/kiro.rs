@@ -534,7 +534,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 | 端点 | 方法 | 描述 |
 |------|------|------|
-| `/v1/models` | GET | 获取可用模型列表 |
+| `/v1/models` | GET | 获取当前启用账号并集下可用的模型列表 |
 | `/v1/messages` | POST | 创建消息（对话） |
 | `/v1/messages/count_tokens` | POST | 估算 Token 数量 |
 
@@ -600,6 +600,13 @@ RUST_LOG=debug ./target/release/kiro-rs
 | `*opus*`（其他） | `claude-opus-4.6` |
 | `*haiku*` | `claude-haiku-4.5` |
 
+### 账号模型能力策略
+
+- 支持给单个账号配置 `accountType`、`allowedModels`、`blockedModels`
+- 支持通过全局 `accountTypePolicies` 为同类型账号统一设置默认模型能力
+- 最终生效顺序：账号类型策略 + 账号级允许/禁用 + 运行时探测到的临时限制
+- `/v1/models` 会按当前启用账号的能力并集动态过滤，不再固定返回全量静态列表
+
 ## Admin（可选）
 
 当 `config.json` 配置了非空 `adminApiKey` 时，会启用：
@@ -612,9 +619,12 @@ RUST_LOG=debug ./target/release/kiro-rs
   - `POST /api/admin/credentials/:id/priority` - 设置凭据优先级
   - `POST /api/admin/credentials/:id/max-concurrency` - 设置凭据并发上限
   - `POST /api/admin/credentials/:id/reset` - 重置失败计数
+  - `POST /api/admin/credentials/:id/model-policy` - 设置凭据级模型策略
   - `GET /api/admin/credentials/:id/balance` - 获取凭据余额
   - `GET /api/admin/config/load-balancing` - 获取当前负载均衡、默认并发和限流配置
   - `PUT /api/admin/config/load-balancing` - 更新负载均衡、默认并发和限流配置
+  - `GET /api/admin/config/model-capabilities` - 获取账号类型模型策略
+  - `PUT /api/admin/config/model-capabilities` - 更新账号类型模型策略
 
 - **Admin UI**
   - `GET /admin` - 访问管理页面（需要在编译前构建 `admin-ui/dist`）

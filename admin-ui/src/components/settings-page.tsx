@@ -5,10 +5,15 @@ import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
 import { toast } from 'sonner'
-import { useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
+import {
+  useLoadBalancingMode,
+  useModelCapabilitiesConfig,
+  useSetLoadBalancingMode,
+  useSetModelCapabilitiesConfig,
+} from '@/hooks/use-credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import { Save, AlertCircle } from 'lucide-react'
-import type { RequestWeightingConfig } from '@/types/api'
+import type { ModelSupportPolicy, RequestWeightingConfig } from '@/types/api'
 
 type RequestWeightingNumericField = Exclude<keyof RequestWeightingConfig, 'enabled'>
 
@@ -178,6 +183,9 @@ function createRequestWeightingInputs(config: RequestWeightingConfig): RequestWe
 export function SettingsPage() {
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
+  const { data: modelCapabilitiesData, isLoading: isLoadingCapabilities } = useModelCapabilitiesConfig()
+  const { mutate: setModelCapabilitiesConfig, isPending: isSettingCapabilities } =
+    useSetModelCapabilitiesConfig()
 
   const [queueMaxSizeInput, setQueueMaxSizeInput] = useState('0')
   const [queueMaxWaitMsInput, setQueueMaxWaitMsInput] = useState('0')
@@ -192,6 +200,7 @@ export function SettingsPage() {
   const [requestWeightingInputs, setRequestWeightingInputs] = useState<RequestWeightingInputState>(
     () => createRequestWeightingInputs(DEFAULT_REQUEST_WEIGHTING)
   )
+  const [modelCapabilitiesJson, setModelCapabilitiesJson] = useState('{\n  \n}')
 
   useEffect(() => {
     if (!loadBalancingData) {
@@ -210,6 +219,15 @@ export function SettingsPage() {
     setRequestWeightingEnabled(requestWeighting.enabled)
     setRequestWeightingInputs(createRequestWeightingInputs(requestWeighting))
   }, [loadBalancingData])
+
+  useEffect(() => {
+    if (!modelCapabilitiesData) {
+      return
+    }
+    setModelCapabilitiesJson(
+      JSON.stringify(modelCapabilitiesData.accountTypePolicies ?? {}, null, 2)
+    )
+  }, [modelCapabilitiesData])
 
   const handleRequestWeightingInputChange = (
     key: RequestWeightingNumericField,
@@ -338,6 +356,35 @@ export function SettingsPage() {
         onError: (error) => {
           toast.error(`保存失败: ${extractErrorMessage(error)}`)
         }
+      }
+    )
+  }
+
+  const handleSaveModelCapabilities = () => {
+    let parsed: Record<string, ModelSupportPolicy>
+    try {
+      const raw = modelCapabilitiesJson.trim() || '{}'
+      const value = JSON.parse(raw)
+      if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+        toast.error('账号类型策略必须是一个 JSON 对象')
+        return
+      }
+      parsed = value as Record<string, ModelSupportPolicy>
+    } catch (error) {
+      toast.error(`账号类型策略 JSON 解析失败: ${extractErrorMessage(error)}`)
+      return
+    }
+
+    setModelCapabilitiesConfig(
+      { accountTypePolicies: parsed },
+      {
+        onSuccess: (response) => {
+          setModelCapabilitiesJson(JSON.stringify(response.accountTypePolicies ?? {}, null, 2))
+          toast.success('账号类型模型策略已更新')
+        },
+        onError: (error) => {
+          toast.error(`保存失败: ${extractErrorMessage(error)}`)
+        },
       }
     )
   }
@@ -606,6 +653,45 @@ export function SettingsPage() {
             保存所有配置
           </Button>
         </div>
+      </Card>
+
+      <Card className="border-muted shadow-sm">
+        <CardHeader>
+          <CardTitle>账号类型模型策略</CardTitle>
+          <CardDescription>
+            用 JSON 维护“账号类型 → 默认允许/禁用模型”映射。账号级策略会在这里的基础上继续叠加。
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="rounded-lg bg-muted/30 p-4">
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <div className="text-sm font-medium">`accountTypePolicies` JSON</div>
+              {isLoadingCapabilities && (
+                <Badge variant="outline">加载中</Badge>
+              )}
+            </div>
+            <textarea
+              rows={14}
+              value={modelCapabilitiesJson}
+              onChange={(e) => setModelCapabilitiesJson(e.target.value)}
+              spellCheck={false}
+              className="flex min-h-[280px] w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+              placeholder={`{\n  "power": {\n    "allowedModels": ["claude-opus-4.6"],\n    "blockedModels": ["claude-opus-4.7"]\n  }\n}`}
+            />
+            <p className="mt-2 text-xs text-muted-foreground">
+              键是账号类型名，值支持 `allowedModels` 和 `blockedModels`。允许列表为空表示不限制，拒绝列表始终优先。
+            </p>
+          </div>
+          <div className="flex items-center justify-between gap-4">
+            <p className="text-sm text-muted-foreground">
+              建议把稳定的账号池差异放在这里，把单个例外账号留到凭据卡片里单独覆盖。
+            </p>
+            <Button onClick={handleSaveModelCapabilities} disabled={isSettingCapabilities}>
+              <Save className="h-4 w-4 mr-2" />
+              保存账号类型策略
+            </Button>
+          </div>
+        </CardContent>
       </Card>
     </div>
   )
