@@ -1,4 +1,4 @@
-import { useId, useMemo, useState } from 'react'
+import { useEffect, useId, useMemo, useState } from 'react'
 import { Plus, Search, X } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -52,6 +52,9 @@ interface AccountTypeInputProps {
   id?: string
 }
 
+const nativeSelectClassName =
+  'flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50'
+
 export function AccountTypeInput({
   label,
   value,
@@ -64,28 +67,108 @@ export function AccountTypeInput({
 }: AccountTypeInputProps) {
   const fallbackId = useId()
   const inputId = id ?? fallbackId
-  const datalistId = `${inputId}-suggestions`
+  const [useCustomValue, setUseCustomValue] = useState(false)
+
+  const normalizedSuggestions = useMemo(() => {
+    return Array.from(
+      new Set(
+        suggestions
+          .map((suggestion) => suggestion.trim())
+          .filter(Boolean)
+      )
+    ).sort((left, right) => left.localeCompare(right, 'zh-CN'))
+  }, [suggestions])
+
+  const trimmedValue = value.trim()
+  const matchesSuggestion = trimmedValue !== '' && normalizedSuggestions.includes(trimmedValue)
+  const canSelectSuggestion = normalizedSuggestions.length > 0
+
+  useEffect(() => {
+    if (!canSelectSuggestion) {
+      setUseCustomValue(true)
+      return
+    }
+
+    if (!trimmedValue) {
+      setUseCustomValue(false)
+      return
+    }
+
+    setUseCustomValue(!matchesSuggestion)
+  }, [canSelectSuggestion, matchesSuggestion, trimmedValue])
 
   return (
     <div className="space-y-2">
-      <label htmlFor={inputId} className="text-sm font-medium">
-        {label}
-      </label>
-      <Input
-        id={inputId}
-        list={suggestions.length > 0 ? datalistId : undefined}
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-        placeholder={placeholder}
-        disabled={disabled}
-      />
-      {suggestions.length > 0 && (
-        <datalist id={datalistId}>
-          {suggestions.map((suggestion) => (
-            <option key={suggestion} value={suggestion} />
-          ))}
-        </datalist>
-      )}
+      <div className="flex items-center justify-between gap-2">
+        <label htmlFor={inputId} className="text-sm font-medium">
+          {label}
+        </label>
+        {canSelectSuggestion && <Badge variant="outline">{normalizedSuggestions.length} 个候选</Badge>}
+      </div>
+
+      <div className="space-y-3 rounded-lg border border-input bg-background p-3">
+        {canSelectSuggestion && (
+          <div className="flex flex-wrap gap-2">
+            <Button
+              type="button"
+              size="sm"
+              variant={useCustomValue ? 'outline' : 'secondary'}
+              onClick={() => setUseCustomValue(false)}
+              disabled={disabled}
+            >
+              选择已有
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant={useCustomValue ? 'secondary' : 'outline'}
+              onClick={() => setUseCustomValue(true)}
+              disabled={disabled}
+            >
+              自定义类型
+            </Button>
+          </div>
+        )}
+
+        {!useCustomValue && canSelectSuggestion ? (
+          <select
+            id={inputId}
+            value={matchesSuggestion ? trimmedValue : ''}
+            onChange={(event) => onChange(event.target.value)}
+            disabled={disabled}
+            className={nativeSelectClassName}
+          >
+            <option value="">未设置</option>
+            {normalizedSuggestions.map((suggestion) => (
+              <option key={suggestion} value={suggestion}>
+                {suggestion}
+              </option>
+            ))}
+          </select>
+        ) : (
+          <div className="space-y-2">
+            <Input
+              id={inputId}
+              value={value}
+              onChange={(event) => onChange(event.target.value)}
+              placeholder={placeholder ?? '输入新的账号类型'}
+              disabled={disabled}
+            />
+            {matchesSuggestion && (
+              <p className="text-xs text-muted-foreground">
+                当前输入已命中已有账号类型，切回“选择已有”即可直接复用。
+              </p>
+            )}
+          </div>
+        )}
+
+        {!useCustomValue && !matchesSuggestion && trimmedValue && (
+          <p className="text-xs text-muted-foreground">
+            当前值是未收录类型，切换到“自定义类型”后可继续编辑。
+          </p>
+        )}
+      </div>
+
       {description && <p className="text-xs text-muted-foreground">{description}</p>}
     </div>
   )

@@ -1,5 +1,5 @@
 import { ReactNode, useState } from 'react'
-import { Server, Moon, Sun, LogOut, RefreshCw, LayoutDashboard, Settings } from 'lucide-react'
+import { Server, Moon, Sun, LogOut, RefreshCw, LayoutDashboard, Settings, Shield } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 import { toast } from 'sonner'
@@ -7,10 +7,12 @@ import { useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-crede
 import { extractErrorMessage } from '@/lib/utils'
 import { useQueryClient } from '@tanstack/react-query'
 
+type MainLayoutTab = 'dashboard' | 'model-policies' | 'settings'
+
 interface MainLayoutProps {
   children: ReactNode
-  activeTab: string
-  onTabChange: (tab: string) => void
+  activeTab: MainLayoutTab
+  onTabChange: (tab: MainLayoutTab) => void
   onLogout: () => void
 }
 
@@ -52,6 +54,13 @@ export function MainLayout({ children, activeTab, onTabChange, onLogout }: MainL
     })
   }
 
+  const activeTabLabel =
+    activeTab === 'dashboard'
+      ? 'Kiro / 凭据管理'
+      : activeTab === 'model-policies'
+        ? 'Kiro / 模型策略'
+        : 'Kiro / 调度设置'
+
   return (
     <div className="flex h-screen w-full overflow-hidden bg-background">
       {/* Sidebar */}
@@ -69,6 +78,14 @@ export function MainLayout({ children, activeTab, onTabChange, onLogout }: MainL
           >
             <LayoutDashboard className="h-4 w-4 mr-3" />
             凭据管理
+          </Button>
+          <Button
+            variant={activeTab === 'model-policies' ? 'secondary' : 'ghost'}
+            className={cn('justify-start font-medium', activeTab === 'model-policies' && 'bg-secondary')}
+            onClick={() => onTabChange('model-policies')}
+          >
+            <Shield className="h-4 w-4 mr-3" />
+            模型策略
           </Button>
           <Button 
             variant={activeTab === 'settings' ? 'secondary' : 'ghost'} 
@@ -92,7 +109,7 @@ export function MainLayout({ children, activeTab, onTabChange, onLogout }: MainL
             </div>
             
             <div className="font-semibold text-sm text-muted-foreground hidden md:block">
-              {activeTab === 'dashboard' ? 'Kiro / 凭据管理' : 'Kiro / 调度设置'}
+              {activeTabLabel}
             </div>
 
             <div className="flex items-center gap-2">
@@ -119,11 +136,11 @@ export function MainLayout({ children, activeTab, onTabChange, onLogout }: MainL
         </header>
 
         <div className="border-b bg-background px-4 py-2 md:hidden">
-          <div className="flex gap-2">
+          <div className="grid grid-cols-3 gap-2">
             <Button
               variant={activeTab === 'dashboard' ? 'secondary' : 'ghost'}
               className={cn(
-                'flex-1 justify-center',
+                'justify-center',
                 activeTab === 'dashboard' && 'bg-secondary'
               )}
               onClick={() => onTabChange('dashboard')}
@@ -132,9 +149,20 @@ export function MainLayout({ children, activeTab, onTabChange, onLogout }: MainL
               凭据管理
             </Button>
             <Button
+              variant={activeTab === 'model-policies' ? 'secondary' : 'ghost'}
+              className={cn(
+                'justify-center',
+                activeTab === 'model-policies' && 'bg-secondary'
+              )}
+              onClick={() => onTabChange('model-policies')}
+            >
+              <Shield className="h-4 w-4 mr-2" />
+              模型策略
+            </Button>
+            <Button
               variant={activeTab === 'settings' ? 'secondary' : 'ghost'}
               className={cn(
-                'flex-1 justify-center',
+                'justify-center',
                 activeTab === 'settings' && 'bg-secondary'
               )}
               onClick={() => onTabChange('settings')}

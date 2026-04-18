@@ -2,14 +2,17 @@ import { useState, useEffect } from 'react'
 import { storage } from '@/lib/storage'
 import { LoginPage } from '@/components/login-page'
 import { Dashboard } from '@/components/dashboard'
+import { ModelPoliciesPage } from '@/components/model-policies-page'
 import { SettingsPage } from '@/components/settings-page'
 import { MainLayout } from '@/components/layout/main-layout'
 import { Toaster } from '@/components/ui/sonner'
 import { useQueryClient } from '@tanstack/react-query'
 
+type AppTab = 'dashboard' | 'model-policies' | 'settings'
+
 function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(false)
-  const [activeTab, setActiveTab] = useState('dashboard')
+  const [activeTab, setActiveTab] = useState<AppTab>('dashboard')
   const queryClient = useQueryClient()
 
   useEffect(() => {
@@ -39,7 +42,13 @@ function App() {
           onTabChange={setActiveTab} 
           onLogout={handleLogout}
         >
-          {activeTab === 'dashboard' ? <Dashboard /> : <SettingsPage />}
+          {activeTab === 'dashboard' ? (
+            <Dashboard />
+          ) : activeTab === 'model-policies' ? (
+            <ModelPoliciesPage />
+          ) : (
+            <SettingsPage />
+          )}
         </MainLayout>
       ) : (
         <LoginPage onLogin={handleLogin} />
