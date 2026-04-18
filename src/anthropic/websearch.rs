@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
+use crate::common::logging::summarize_text_for_log;
+
 use super::stream::SseEvent;
 use super::types::{ErrorResponse, MessagesRequest, Tool};
 
@@ -697,12 +699,22 @@ async fn call_mcp_api(
 ) -> anyhow::Result<McpResponse> {
     let request_body = serde_json::to_string(request)?;
 
-    tracing::debug!("MCP request: {}", request_body);
+    tracing::debug!(
+        request_id = %request.id,
+        method = %request.method,
+        request_body_len = request_body.len(),
+        "MCP request prepared"
+    );
 
     let response = provider.call_mcp(&request_body).await?;
 
     let body = response.text().await?;
-    tracing::debug!("MCP response: {}", body);
+    tracing::debug!(
+        request_id = %request.id,
+        response_body_len = body.len(),
+        response_summary = %summarize_text_for_log(&body, 200),
+        "MCP response body received"
+    );
 
     let mcp_response: McpResponse = serde_json::from_str(&body)?;
 
@@ -769,6 +781,35 @@ mod tests {
                 description: String::new(),
                 input_schema: Default::default(),
                 max_uses: None,
+            }]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        assert!(has_web_search_tool(&req));
+    }
+
+    #[test]
+    fn test_has_web_search_tool_by_name_only() {
+        use crate::anthropic::types::{Message, Tool};
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!("test"),
+            }],
+            stream: true,
+            system: None,
+            tools: Some(vec![Tool {
+                tool_type: None,
+                name: "web_search".to_string(),
+                description: String::new(),
+                input_schema: Default::default(),
+                max_uses: Some(8),
             }]),
             tool_choice: None,
             thinking: None,
@@ -1020,6 +1061,25 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_search_results_returns_none_for_is_error() {
+        let response = McpResponse {
+            error: None,
+            id: "test_id".to_string(),
+            jsonrpc: "2.0".to_string(),
+            result: Some(McpResult {
+                content: vec![McpContent {
+                    content_type: "text".to_string(),
+                    text: r#"{"results":[{"title":"Ignored","url":"https://example.com"}]}"#
+                        .to_string(),
+                }],
+                is_error: true,
+            }),
+        };
+
+        assert!(parse_search_results(&response).is_none());
+    }
+
+    #[test]
     fn test_generate_search_summary() {
         let results = WebSearchResults {
             results: vec![WebSearchResult {
@@ -1053,6 +1113,82 @@ mod tests {
 
         assert!(summary.contains("web_search tool is currently unavailable"));
         assert!(summary.contains("network error"));
+    }
+
+    #[test]
+    fn test_generate_websearch_events_stream_shape() {
+        let results = WebSearchResults {
+            results: vec![WebSearchResult {
+                title: "Rust 2026".to_string(),
+                url: "https://example.com/rust".to_string(),
+                snippet: Some("Rust release notes summary".to_string()),
+                published_date: Some(1_767_225_600_000),
+                id: None,
+                domain: None,
+                max_verbatim_word_limit: None,
+                public_domain: None,
+            }],
+            total_results: Some(1),
+            query: Some("rust".to_string()),
+            error: None,
+        };
+
+        let events = generate_websearch_events(
+            "claude-sonnet-4",
+            "rust latest release",
+            "srvtoolu_test",
+            &WebSearchOutcome::Results(results),
+            321,
+        );
+
+        assert_eq!(events.first().unwrap().event, "message_start");
+        assert_eq!(events.last().unwrap().event, "message_stop");
+
+        let tool_use_start = events
+            .iter()
+            .find(|event| {
+                event.event == "content_block_start"
+                    && event.data["index"] == 1
+                    && event.data["content_block"]["type"] == "server_tool_use"
+            })
+            .expect("server_tool_use block should exist");
+        assert_eq!(tool_use_start.data["content_block"]["name"], "web_search");
+        assert_eq!(
+            tool_use_start.data["content_block"]["input"]["query"],
+            "rust latest release"
+        );
+
+        let tool_result_start = events
+            .iter()
+            .find(|event| {
+                event.event == "content_block_start"
+                    && event.data["index"] == 2
+                    && event.data["content_block"]["type"] == "web_search_tool_result"
+            })
+            .expect("web_search_tool_result block should exist");
+        assert_eq!(
+            tool_result_start.data["content_block"]["content"][0]["title"],
+            "Rust 2026"
+        );
+        assert_eq!(
+            tool_result_start.data["content_block"]["content"][0]["page_age"],
+            "January 1, 2026"
+        );
+
+        let message_delta = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta should exist");
+        assert_eq!(message_delta.data["delta"]["stop_reason"], "end_turn");
+        assert_eq!(
+            message_delta.data["usage"]["server_tool_use"]["web_search_requests"],
+            1
+        );
+        assert!(
+            message_delta.data["usage"]["output_tokens"]
+                .as_i64()
+                .is_some_and(|tokens| tokens > 0)
+        );
     }
 
     #[test]
@@ -1097,5 +1233,25 @@ mod tests {
         assert_eq!(content[1]["input"]["query"], "test");
         assert_eq!(content[2]["type"], "web_search_tool_result");
         assert_eq!(content[2]["content"][0]["title"], "Test Result");
+    }
+
+    #[test]
+    fn test_create_websearch_json_response_unavailable_has_empty_result_block() {
+        let response = create_websearch_json_response(
+            "claude-sonnet-4",
+            "test",
+            "srvtoolu_test",
+            &WebSearchOutcome::Unavailable("network error".to_string()),
+            12,
+        );
+
+        let content = response["content"].as_array().expect("content array");
+        assert_eq!(content[2]["type"], "web_search_tool_result");
+        assert_eq!(content[2]["content"], serde_json::json!([]));
+        assert!(
+            content[3]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("network error"))
+        );
     }
 }

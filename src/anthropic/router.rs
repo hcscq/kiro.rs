@@ -11,7 +11,7 @@ use crate::kiro::provider::KiroProvider;
 
 use super::{
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
-    middleware::{AppState, auth_middleware, cors_layer},
+    middleware::{AppState, auth_middleware, cors_layer, message_routing_middleware},
 };
 
 /// 请求体最大大小限制 (50MB)
@@ -50,6 +50,10 @@ pub fn create_router_with_provider(
         .route("/messages/count_tokens", post(count_tokens))
         .layer(middleware::from_fn_with_state(
             state.clone(),
+            message_routing_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
             auth_middleware,
         ));
 
@@ -58,6 +62,10 @@ pub fn create_router_with_provider(
     let cc_v1_routes = Router::new()
         .route("/messages", post(post_messages_cc))
         .route("/messages/count_tokens", post(count_tokens))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            message_routing_middleware,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,

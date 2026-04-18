@@ -14,13 +14,13 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
 };
 
 use anyhow::Context;
-use axum::{http::StatusCode, routing::get, Json, Router};
+use axum::{Json, Router, http::StatusCode, routing::get};
 use chrono::Utc;
 use clap::Parser;
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
@@ -38,7 +38,7 @@ use state::{
 use tokio::{
     sync::watch,
     task::JoinHandle,
-    time::{sleep, Duration},
+    time::{Duration, sleep},
 };
 
 const READINESS_DRAIN_FILE: &str = "/tmp/kiro-rs-drain";
@@ -661,9 +661,19 @@ async fn main() {
         });
     }
 
-    // 获取第一个凭据用于日志显示
-    let first_credentials = credentials_list.first().cloned().unwrap_or_default();
-    tracing::debug!("主凭证: {:?}", first_credentials);
+    if let Some(first_credentials) = credentials_list.first() {
+        tracing::debug!(
+            credential_id = first_credentials.id.unwrap_or_default(),
+            auth_method = first_credentials
+                .auth_method
+                .as_deref()
+                .unwrap_or("unknown"),
+            has_access_token = first_credentials.access_token.is_some(),
+            has_refresh_token = first_credentials.refresh_token.is_some(),
+            has_profile_arn = first_credentials.profile_arn.is_some(),
+            "主凭证摘要"
+        );
+    }
 
     // 获取 API Key
     let api_key = config.api_key.clone().unwrap_or_else(|| {

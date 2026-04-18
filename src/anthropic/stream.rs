@@ -1972,9 +1972,7 @@ mod tests {
             "should emit text_delta with a single space for semantic empty completion"
         );
         assert!(
-            all_events
-                .iter()
-                .any(|e| e.event == "message_stop"),
+            all_events.iter().any(|e| e.event == "message_stop"),
             "should end with message_stop"
         );
     }

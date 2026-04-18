@@ -1,9 +1,8 @@
 //! Admin API 路由配置
 
 use axum::{
-    middleware,
+    Router, middleware,
     routing::{delete, get, post},
-    Router,
 };
 
 use super::{
@@ -13,7 +12,7 @@ use super::{
         set_credential_disabled, set_credential_max_concurrency, set_credential_priority,
         set_credential_rate_limit_config, set_load_balancing_mode,
     },
-    middleware::{admin_auth_middleware, admin_write_routing_middleware, AdminState},
+    middleware::{AdminState, admin_auth_middleware, admin_write_routing_middleware},
 };
 
 /// 创建 Admin API 路由

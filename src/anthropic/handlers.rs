@@ -2,26 +2,28 @@
 
 use std::convert::Infallible;
 
+use crate::common::logging::summarize_text_for_log;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
+use crate::kiro::token_manager::RuntimeRefreshLeaderRequiredError;
 use crate::token;
 use anyhow::Error;
 use axum::{
+    Json as JsonExtractor,
     body::Body,
     extract::State,
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json, Response},
-    Json as JsonExtractor,
 };
 use bytes::Bytes;
-use futures::{stream, Stream, StreamExt};
+use futures::{Stream, StreamExt, stream};
 use serde_json::json;
 use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
-use super::converter::{convert_request_with_probe, ConversionError};
+use super::converter::{ConversionError, convert_request_with_probe};
 use super::middleware::AppState;
 use super::probe::parse_upstream_probe;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
@@ -46,10 +48,26 @@ fn request_id_from_headers(headers: &HeaderMap) -> String {
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
     let err_str = err.to_string();
+    let err_summary = summarize_text_for_log(&err_str, 240);
+
+    if err
+        .downcast_ref::<RuntimeRefreshLeaderRequiredError>()
+        .is_some()
+    {
+        tracing::warn!(error = %err_summary, "共享凭据刷新需由 leader 处理，当前请求快速失败");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse::new(
+                "service_unavailable",
+                "Shared credential refresh must be handled by the runtime leader. Retry later or route this request to the leader.",
+            )),
+        )
+            .into_response();
+    }
 
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
     if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
-        tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满（不应重试）");
+        tracing::warn!(error = %err_summary, "上游拒绝请求：上下文窗口已满（不应重试）");
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new(
@@ -62,7 +80,7 @@ fn map_provider_error(err: Error) -> Response {
 
     // 单次输入太长（请求体本身超出上游限制）
     if err_str.contains("Input is too long") {
-        tracing::warn!(error = %err, "上游拒绝请求：输入过长（不应重试）");
+        tracing::warn!(error = %err_summary, "上游拒绝请求：输入过长（不应重试）");
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new(
@@ -73,7 +91,7 @@ fn map_provider_error(err: Error) -> Response {
             .into_response();
     }
     if err_str.contains("等待队列已满") {
-        tracing::warn!(error = %err, "本地等待队列已满");
+        tracing::warn!(error = %err_summary, "本地等待队列已满");
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(ErrorResponse::new(
@@ -84,7 +102,7 @@ fn map_provider_error(err: Error) -> Response {
             .into_response();
     }
     if err_str.contains("等待可用凭据超时") {
-        tracing::warn!(error = %err, "请求等待可用凭据超时");
+        tracing::warn!(error = %err_summary, "请求等待可用凭据超时");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse::new(
@@ -95,7 +113,7 @@ fn map_provider_error(err: Error) -> Response {
             .into_response();
     }
     if err_str.contains("并发上限") {
-        tracing::warn!(error = %err, "所有可用凭据暂时不可用");
+        tracing::warn!(error = %err_summary, "所有可用凭据暂时不可用");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse::new(
@@ -105,12 +123,12 @@ fn map_provider_error(err: Error) -> Response {
         )
             .into_response();
     }
-    tracing::error!("Kiro API 调用失败: {}", err);
+    tracing::error!(error = %err_summary, "Kiro API 调用失败");
     (
         StatusCode::BAD_GATEWAY,
         Json(ErrorResponse::new(
             "api_error",
-            format!("上游 API 调用失败: {}", err),
+            "上游 API 调用失败，请稍后重试。",
         )),
     )
         .into_response()
@@ -337,7 +355,11 @@ pub async fn post_messages(
         }
     };
 
-    tracing::debug!("Kiro request body: {}", request_body);
+    tracing::debug!(
+        request_id = %request_id,
+        request_body_len = request_body.len(),
+        "Kiro request body prepared"
+    );
 
     // 检查是否启用了thinking
     let thinking_enabled = request_thinking_enabled(&payload);
@@ -908,7 +930,11 @@ pub async fn post_messages_cc(
         }
     };
 
-    tracing::debug!("Kiro request body: {}", request_body);
+    tracing::debug!(
+        request_id = %request_id,
+        request_body_len = request_body.len(),
+        "Kiro request body prepared"
+    );
 
     // 检查是否启用了thinking
     let thinking_enabled = request_thinking_enabled(&payload);
@@ -1102,8 +1128,13 @@ fn create_buffered_sse_stream(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_opus_4_7_model, override_thinking_from_model_name, request_thinking_enabled};
+    use super::{
+        is_opus_4_7_model, map_provider_error, override_thinking_from_model_name,
+        request_thinking_enabled,
+    };
     use crate::anthropic::types::{Message, MessagesRequest, Thinking};
+    use crate::kiro::token_manager::RuntimeRefreshLeaderRequiredError;
+    use axum::{body::to_bytes, http::StatusCode};
 
     fn base_request(model: &str) -> MessagesRequest {
         MessagesRequest {
@@ -1169,5 +1200,40 @@ mod tests {
         });
 
         assert!(request_thinking_enabled(&payload));
+    }
+
+    #[tokio::test]
+    async fn test_map_provider_error_hides_verbose_upstream_details_from_client() {
+        let noisy_error = anyhow::anyhow!(
+            "流式 API 请求失败: status=429 reason=RATE_LIMIT message={:?}",
+            "x".repeat(600)
+        );
+
+        let response = map_provider_error(noisy_error);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["error"]["type"], "api_error");
+        assert_eq!(json["error"]["message"], "上游 API 调用失败，请稍后重试。");
+    }
+
+    #[tokio::test]
+    async fn test_map_provider_error_returns_503_for_runtime_leader_refresh_errors() {
+        let response = map_provider_error(anyhow::Error::new(RuntimeRefreshLeaderRequiredError {
+            instance_id: "pod-a".to_string(),
+            leader_id: Some("pod-b".to_string()),
+        }));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["error"]["type"], "service_unavailable");
+        assert_eq!(
+            json["error"]["message"],
+            "Shared credential refresh must be handled by the runtime leader. Retry later or route this request to the leader."
+        );
     }
 }

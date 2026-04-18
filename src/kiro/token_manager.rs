@@ -8,16 +8,17 @@ use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tokio::sync::{oneshot, Mutex as TokioMutex, Notify};
+use tokio::sync::{Mutex as TokioMutex, Notify, oneshot};
 
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
-use crate::http_client::{build_client, ProxyConfig};
+use crate::common::logging::summarize_upstream_error;
+use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
@@ -26,13 +27,13 @@ use crate::kiro::model::token_refresh::{
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::{Config, RequestWeightingConfig};
 use crate::state::{
-    current_epoch_ms, DispatchLeaseReservationStatus, DispatchRuntimeBucketPolicy,
-    DispatchRuntimeCredential, DispatchRuntimeSnapshot, PersistedDispatchConfig,
-    RuntimeCoordinationStatus, StateChangeKind, StateChangeRevisions, StateStore, StatsEntryRecord,
-    StatsMergeRecord,
+    DispatchLeaseReservationStatus, DispatchRuntimeBucketPolicy, DispatchRuntimeCredential,
+    DispatchRuntimeSnapshot, PersistedDispatchConfig, RuntimeCoordinationStatus, StateChangeKind,
+    StateChangeRevisions, StateStore, StatsEntryRecord, StatsMergeRecord, current_epoch_ms,
 };
 
 const DEFAULT_REQUEST_WEIGHT: f64 = 1.0;
+const UPSTREAM_ERROR_EXCERPT_CHARS: usize = 240;
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -223,6 +224,8 @@ async fn refresh_social_token(
     let status = response.status();
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
+        let error_summary =
+            summarize_upstream_error(status.as_u16(), &body_text, UPSTREAM_ERROR_EXCERPT_CHARS);
 
         // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
         if status.as_u16() == 400
@@ -230,7 +233,10 @@ async fn refresh_social_token(
             && body_text.contains("Invalid refresh token provided")
         {
             return Err(RefreshTokenInvalidError {
-                message: format!("Social refreshToken 已失效 (invalid_grant): {}", body_text),
+                message: format!(
+                    "Social refreshToken 已失效 (invalid_grant): {}",
+                    error_summary
+                ),
             }
             .into());
         }
@@ -242,7 +248,7 @@ async fn refresh_social_token(
             500..=599 => "服务器错误，AWS OAuth 服务暂时不可用",
             _ => "Token 刷新失败",
         };
-        bail!("{}: {} {}", error_msg, status, body_text);
+        bail!("{}: {}", error_msg, error_summary);
     }
 
     let data: RefreshResponse = response.json().await?;
@@ -319,6 +325,8 @@ async fn refresh_idc_token(
     let status = response.status();
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
+        let error_summary =
+            summarize_upstream_error(status.as_u16(), &body_text, UPSTREAM_ERROR_EXCERPT_CHARS);
 
         // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
         if status.as_u16() == 400
@@ -326,7 +334,7 @@ async fn refresh_idc_token(
             && body_text.contains("Invalid refresh token provided")
         {
             return Err(RefreshTokenInvalidError {
-                message: format!("IdC refreshToken 已失效 (invalid_grant): {}", body_text),
+                message: format!("IdC refreshToken 已失效 (invalid_grant): {}", error_summary),
             }
             .into());
         }
@@ -338,7 +346,7 @@ async fn refresh_idc_token(
             500..=599 => "服务器错误，AWS OIDC 服务暂时不可用",
             _ => "IdC Token 刷新失败",
         };
-        bail!("{}: {} {}", error_msg, status, body_text);
+        bail!("{}: {}", error_msg, error_summary);
     }
 
     let data: IdcRefreshResponse = response.json().await?;
@@ -415,6 +423,8 @@ pub(crate) async fn get_usage_limits(
     let status = response.status();
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
+        let error_summary =
+            summarize_upstream_error(status.as_u16(), &body_text, UPSTREAM_ERROR_EXCERPT_CHARS);
         let error_msg = match status.as_u16() {
             401 => "认证失败，Token 无效或已过期",
             403 => "权限不足，无法获取使用额度",
@@ -422,7 +432,7 @@ pub(crate) async fn get_usage_limits(
             500..=599 => "服务器错误，AWS 服务暂时不可用",
             _ => "获取使用额度失败",
         };
-        bail!("{}: {} {}", error_msg, status, body_text);
+        bail!("{}: {}", error_msg, error_summary);
     }
 
     let data: UsageLimitsResponse = response.json().await?;
@@ -1122,6 +1132,36 @@ impl MultiTokenManager {
     /// 获取可用凭据数量
     pub fn available_count(&self) -> usize {
         self.entries.lock().iter().filter(|e| !e.disabled).count()
+    }
+
+    pub fn should_fast_fail_runtime_leader_refresh(&self) -> bool {
+        self.shared_dispatch_runtime_enabled()
+            && self.state_store.runtime_coordination_enabled()
+            && self.available_count() <= 1
+    }
+
+    pub fn leader_http_base_url_for_single_shared_credential_mode(
+        &self,
+    ) -> anyhow::Result<Option<String>> {
+        if !self.should_fast_fail_runtime_leader_refresh() {
+            return Ok(None);
+        }
+
+        let Some(mut status) = self.runtime_refresh_coordination_status()? else {
+            return Ok(None);
+        };
+
+        if !status.is_leader && status.leader_http_base_url.is_none() {
+            if let Some(updated_status) = self.state_store.runtime_coordination_tick()? {
+                status = updated_status;
+            }
+        }
+
+        if status.is_leader {
+            return Ok(None);
+        }
+
+        Ok(status.leader_http_base_url)
     }
 
     fn dispatch_config(&self) -> DispatchConfig {
@@ -5239,8 +5279,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_multi_token_manager_acquire_context_balanced_retries_until_bad_credential_disabled(
-    ) {
+    async fn test_multi_token_manager_acquire_context_balanced_retries_until_bad_credential_disabled()
+     {
         let mut config = Config::default();
         config.load_balancing_mode = "balanced".to_string();
 

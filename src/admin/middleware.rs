@@ -3,17 +3,17 @@
 use std::sync::Arc;
 
 use axum::{
-    body::{to_bytes, Body, Bytes},
+    body::{Body, Bytes, to_bytes},
     extract::{OriginalUri, State},
     http::{
-        header::{ACCEPT, CONTENT_TYPE},
         HeaderMap, Method, Request, StatusCode, Uri,
+        header::{ACCEPT, CONTENT_TYPE},
     },
     middleware::Next,
     response::{IntoResponse, Json, Response},
 };
 use reqwest::Client;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 use super::service::{AdminService, AdminWriteRoute};
 use super::types::AdminErrorResponse;
@@ -199,7 +199,7 @@ impl AdminState {
                         err
                     ))),
                 )
-                    .into_response()
+                    .into_response();
             }
         };
         let buffered_request = BufferedAdminRequest::from_request_parts(parts, body);

@@ -1203,26 +1203,34 @@ mod tests {
 
     #[test]
     fn test_map_model_sonnet() {
-        assert!(map_model("claude-sonnet-4-20250514")
-            .unwrap()
-            .contains("sonnet"));
-        assert!(map_model("claude-3-5-sonnet-20241022")
-            .unwrap()
-            .contains("sonnet"));
+        assert!(
+            map_model("claude-sonnet-4-20250514")
+                .unwrap()
+                .contains("sonnet")
+        );
+        assert!(
+            map_model("claude-3-5-sonnet-20241022")
+                .unwrap()
+                .contains("sonnet")
+        );
     }
 
     #[test]
     fn test_map_model_opus() {
-        assert!(map_model("claude-opus-4-20250514")
-            .unwrap()
-            .contains("opus"));
+        assert!(
+            map_model("claude-opus-4-20250514")
+                .unwrap()
+                .contains("opus")
+        );
     }
 
     #[test]
     fn test_map_model_haiku() {
-        assert!(map_model("claude-haiku-4-20250514")
-            .unwrap()
-            .contains("haiku"));
+        assert!(
+            map_model("claude-haiku-4-20250514")
+                .unwrap()
+                .contains("haiku")
+        );
     }
 
     #[test]
@@ -1857,9 +1865,10 @@ mod tests {
 
         // 测试孤立的 tool_use（有 tool_use 但没有对应的 tool_result）
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
-        assistant_msg =
-            assistant_msg.with_tool_uses(vec![ToolUseEntry::new("tool-orphan", "read")
-                .with_input(serde_json::json!({"path": "/test.txt"}))]);
+        assistant_msg = assistant_msg.with_tool_uses(vec![
+            ToolUseEntry::new("tool-orphan", "read")
+                .with_input(serde_json::json!({"path": "/test.txt"})),
+        ]);
 
         let history = vec![
             Message::User(HistoryUserMessage::new(
@@ -1888,8 +1897,10 @@ mod tests {
 
         // 测试正常配对的情况
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
-        assistant_msg = assistant_msg.with_tool_uses(vec![ToolUseEntry::new("tool-1", "read")
-            .with_input(serde_json::json!({"path": "/test.txt"}))]);
+        assistant_msg = assistant_msg.with_tool_uses(vec![
+            ToolUseEntry::new("tool-1", "read")
+                .with_input(serde_json::json!({"path": "/test.txt"})),
+        ]);
 
         let history = vec![
             Message::User(HistoryUserMessage::new(
@@ -1951,8 +1962,10 @@ mod tests {
         // 测试历史中已配对的 tool_use 不应该被报告为孤立
         // 场景：多轮对话中，之前的 tool_use 已经在历史中有对应的 tool_result
         let mut assistant_msg1 = AssistantMessage::new("I'll read the file.");
-        assistant_msg1 = assistant_msg1.with_tool_uses(vec![ToolUseEntry::new("tool-1", "read")
-            .with_input(serde_json::json!({"path": "/test.txt"}))]);
+        assistant_msg1 = assistant_msg1.with_tool_uses(vec![
+            ToolUseEntry::new("tool-1", "read")
+                .with_input(serde_json::json!({"path": "/test.txt"})),
+        ]);
 
         // 构建历史中的 user 消息，包含 tool_result
         let mut user_msg_with_result = UserMessage::new("", "claude-sonnet-4.5");
@@ -1995,8 +2008,10 @@ mod tests {
 
         // 测试重复的 tool_result（历史中已配对，当前消息又发送了相同的 tool_result）
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
-        assistant_msg = assistant_msg.with_tool_uses(vec![ToolUseEntry::new("tool-1", "read")
-            .with_input(serde_json::json!({"path": "/test.txt"}))]);
+        assistant_msg = assistant_msg.with_tool_uses(vec![
+            ToolUseEntry::new("tool-1", "read")
+                .with_input(serde_json::json!({"path": "/test.txt"})),
+        ]);
 
         // 历史中已有 tool_result
         let mut user_msg_with_result = UserMessage::new("", "claude-sonnet-4.5");
@@ -2139,7 +2154,7 @@ mod tests {
         // 测试移除所有 tool_use 后，tool_uses 变为 None
         let mut assistant_msg = AssistantMessage::new("I'll use a tool.");
         assistant_msg = assistant_msg.with_tool_uses(vec![
-            ToolUseEntry::new("tool-1", "read").with_input(serde_json::json!({}))
+            ToolUseEntry::new("tool-1", "read").with_input(serde_json::json!({})),
         ]);
 
         let mut history = vec![
@@ -2711,11 +2726,12 @@ mod tests {
             Message::User(user) => {
                 assert_eq!(user.user_input_message.content, "");
                 assert_eq!(user.user_input_message.images.len(), 10);
-                assert!(user
-                    .user_input_message
-                    .user_input_message_context
-                    .tool_results
-                    .is_empty());
+                assert!(
+                    user.user_input_message
+                        .user_input_message_context
+                        .tool_results
+                        .is_empty()
+                );
             }
             other => panic!(
                 "history[0] should be synthetic image chunk user, got {:?}",
@@ -3047,11 +3063,12 @@ mod tests {
             Message::User(user) => {
                 assert_eq!(user.user_input_message.content, "");
                 assert_eq!(user.user_input_message.images.len(), 10);
-                assert!(user
-                    .user_input_message
-                    .user_input_message_context
-                    .tool_results
-                    .is_empty());
+                assert!(
+                    user.user_input_message
+                        .user_input_message_context
+                        .tool_results
+                        .is_empty()
+                );
             }
             other => panic!(
                 "history[4] should be synthetic image chunk user, got {:?}",

@@ -6,7 +6,7 @@
 
 use bytes::Bytes;
 use futures::stream::BoxStream;
-use futures::{stream, StreamExt};
+use futures::{StreamExt, stream};
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use uuid::Uuid;
 
-use crate::http_client::{build_client, ProxyConfig};
+use crate::common::logging::summarize_upstream_error;
+use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::{CallLease, MultiTokenManager, RuntimeRefreshLeaderRequiredError};
@@ -30,6 +31,7 @@ const REAL_OPUS_4_7_UNSUPPORTED_COOLDOWN: Duration = Duration::from_secs(30);
 const SLOW_UPSTREAM_HEADERS_MS: u128 = 3_000;
 const SLOW_FIRST_CHUNK_MS: u128 = 3_000;
 const SLOW_HEADERS_TO_FIRST_CHUNK_MS: u128 = 1_000;
+const ERROR_BODY_EXCERPT_CHARS: usize = 240;
 
 /// Kiro API Provider
 ///
@@ -320,6 +322,11 @@ impl KiroProvider {
         self.token_manager.request_weighting_config_snapshot()
     }
 
+    pub fn leader_message_forward_target(&self) -> anyhow::Result<Option<String>> {
+        self.token_manager
+            .leader_http_base_url_for_single_shared_credential_mode()
+    }
+
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
     fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
         let effective = credentials.effective_proxy(self.global_proxy.as_ref());
@@ -384,6 +391,10 @@ impl KiroProvider {
             }
         }
         request_body.to_string()
+    }
+
+    fn summarize_error_body(status: reqwest::StatusCode, body: &str) -> String {
+        summarize_upstream_error(status.as_u16(), body, ERROR_BODY_EXCERPT_CHARS)
     }
 
     /// 发送非流式 API 请求
@@ -543,20 +554,21 @@ impl KiroProvider {
 
             // 失败响应
             let body = response.text().await.unwrap_or_default();
+            let error_summary = Self::summarize_error_body(status, &body);
 
             // 402 额度用尽
             if status.as_u16() == 402 && Self::is_monthly_request_limit(&body) {
                 let has_available = self.token_manager.report_quota_exhausted(ctx_id);
                 if !has_available {
-                    anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
+                    anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {}", error_summary);
                 }
-                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                last_error = Some(anyhow::anyhow!("MCP 请求失败: {}", error_summary));
                 continue;
             }
 
             // 400 Bad Request
             if status.as_u16() == 400 {
-                anyhow::bail!("MCP 请求失败: {} {}", status, body);
+                anyhow::bail!("MCP 请求失败: {}", error_summary);
             }
 
             // 401/403 凭据问题
@@ -607,9 +619,9 @@ impl KiroProvider {
 
                 let has_available = self.token_manager.report_failure(ctx_id);
                 if !has_available {
-                    anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
+                    anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {}", error_summary);
                 }
-                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                last_error = Some(anyhow::anyhow!("MCP 请求失败: {}", error_summary));
                 continue;
             }
 
@@ -619,13 +631,14 @@ impl KiroProvider {
                     self.token_manager.report_rate_limited(ctx_id);
                 }
                 tracing::warn!(
-                    "MCP 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
-                    attempt + 1,
+                    credential_id = ctx_id,
+                    attempt = attempt + 1,
                     max_retries,
-                    status,
-                    body
+                    status_code = status.as_u16(),
+                    error_summary = %error_summary,
+                    "MCP 请求失败（上游瞬态错误）"
                 );
-                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                last_error = Some(anyhow::anyhow!("MCP 请求失败: {}", error_summary));
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
                 }
@@ -634,11 +647,19 @@ impl KiroProvider {
 
             // 其他 4xx
             if status.is_client_error() {
-                anyhow::bail!("MCP 请求失败: {} {}", status, body);
+                anyhow::bail!("MCP 请求失败: {}", error_summary);
             }
 
             // 兜底
-            last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+            tracing::warn!(
+                credential_id = ctx_id,
+                attempt = attempt + 1,
+                max_retries,
+                status_code = status.as_u16(),
+                error_summary = %error_summary,
+                "MCP 请求失败（未知错误）"
+            );
+            last_error = Some(anyhow::anyhow!("MCP 请求失败: {}", error_summary));
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
             }
@@ -853,32 +874,37 @@ impl KiroProvider {
 
             // 失败响应：读取 body 用于日志/错误信息
             let body = response.text().await.unwrap_or_default();
+            let error_summary = Self::summarize_error_body(status, &body);
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
             if status.as_u16() == 402 && Self::is_monthly_request_limit(&body) {
                 tracing::warn!(
-                    "API 请求失败（额度已用尽，禁用凭据并切换，尝试 {}/{}）: {} {}",
-                    attempt + 1,
+                    request_id = %request_id,
+                    api_type,
+                    model = model.as_deref().unwrap_or("unknown"),
+                    credential_id = ctx_id,
+                    attempt = attempt + 1,
                     max_retries,
-                    status,
-                    body
+                    region = %region,
+                    stream = is_stream,
+                    status_code = status.as_u16(),
+                    error_summary = %error_summary,
+                    "API 请求失败（额度已用尽，禁用凭据并切换）"
                 );
 
                 let has_available = self.token_manager.report_quota_exhausted(ctx_id);
                 if !has_available {
                     anyhow::bail!(
-                        "{} API 请求失败（所有凭据已用尽）: {} {}",
+                        "{} API 请求失败（所有凭据已用尽）: {}",
                         api_type,
-                        status,
-                        body
+                        error_summary
                     );
                 }
 
                 last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
+                    "{} API 请求失败: {}",
                     api_type,
-                    status,
-                    body
+                    error_summary
                 ));
                 continue;
             }
@@ -887,11 +913,17 @@ impl KiroProvider {
             if status.as_u16() == 400 {
                 if Self::should_failover_real_opus_4_7(model.as_deref(), &body) {
                     tracing::warn!(
-                        "API 请求失败（真实 Opus 4.7 当前凭据不支持，尝试 {}/{}）: {} {}",
-                        attempt + 1,
+                        request_id = %request_id,
+                        api_type,
+                        model = model.as_deref().unwrap_or("unknown"),
+                        credential_id = ctx_id,
+                        attempt = attempt + 1,
                         max_retries,
-                        status,
-                        body
+                        region = %region,
+                        stream = is_stream,
+                        status_code = status.as_u16(),
+                        error_summary = %error_summary,
+                        "API 请求失败（真实 Opus 4.7 当前凭据不支持）"
                     );
 
                     let has_available = self.token_manager.defer_model_unsupported_credential(
@@ -900,33 +932,37 @@ impl KiroProvider {
                     );
                     if !has_available {
                         anyhow::bail!(
-                            "{} API 请求失败（所有候选凭据当前均被上游拒绝真实 claude-opus-4.7，模型可能尚未正式开放）: {} {}",
+                            "{} API 请求失败（所有候选凭据当前均被上游拒绝真实 claude-opus-4.7，模型可能尚未正式开放）: {}",
                             api_type,
-                            status,
-                            body
+                            error_summary
                         );
                     }
 
                     last_error = Some(anyhow::anyhow!(
-                        "{} API 请求失败: {} {}",
+                        "{} API 请求失败: {}",
                         api_type,
-                        status,
-                        body
+                        error_summary
                     ));
                     continue;
                 }
 
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                anyhow::bail!("{} API 请求失败: {}", api_type, error_summary);
             }
 
             // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
             if matches!(status.as_u16(), 401 | 403) {
                 tracing::warn!(
-                    "API 请求失败（可能为凭据错误，尝试 {}/{}）: {} {}",
-                    attempt + 1,
+                    request_id = %request_id,
+                    api_type,
+                    model = model.as_deref().unwrap_or("unknown"),
+                    credential_id = ctx_id,
+                    attempt = attempt + 1,
                     max_retries,
-                    status,
-                    body
+                    region = %region,
+                    stream = is_stream,
+                    status_code = status.as_u16(),
+                    error_summary = %error_summary,
+                    "API 请求失败（可能为凭据错误）"
                 );
 
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
@@ -976,18 +1012,16 @@ impl KiroProvider {
                 let has_available = self.token_manager.report_failure(ctx_id);
                 if !has_available {
                     anyhow::bail!(
-                        "{} API 请求失败（所有凭据已用尽）: {} {}",
+                        "{} API 请求失败（所有凭据已用尽）: {}",
                         api_type,
-                        status,
-                        body
+                        error_summary
                     );
                 }
 
                 last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
+                    "{} API 请求失败: {}",
                     api_type,
-                    status,
-                    body
+                    error_summary
                 ));
                 continue;
             }
@@ -999,17 +1033,22 @@ impl KiroProvider {
                     self.token_manager.report_rate_limited(ctx_id);
                 }
                 tracing::warn!(
-                    "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
-                    attempt + 1,
+                    request_id = %request_id,
+                    api_type,
+                    model = model.as_deref().unwrap_or("unknown"),
+                    credential_id = ctx_id,
+                    attempt = attempt + 1,
                     max_retries,
-                    status,
-                    body
+                    region = %region,
+                    stream = is_stream,
+                    status_code = status.as_u16(),
+                    error_summary = %error_summary,
+                    "API 请求失败（上游瞬态错误）"
                 );
                 last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
+                    "{} API 请求失败: {}",
                     api_type,
-                    status,
-                    body
+                    error_summary
                 ));
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
@@ -1019,22 +1058,27 @@ impl KiroProvider {
 
             // 其他 4xx - 通常为请求/配置问题：直接返回，不计入凭据失败
             if status.is_client_error() {
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                anyhow::bail!("{} API 请求失败: {}", api_type, error_summary);
             }
 
             // 兜底：当作可重试的瞬态错误处理（不切换凭据）
             tracing::warn!(
-                "API 请求失败（未知错误，尝试 {}/{}）: {} {}",
-                attempt + 1,
+                request_id = %request_id,
+                api_type,
+                model = model.as_deref().unwrap_or("unknown"),
+                credential_id = ctx_id,
+                attempt = attempt + 1,
                 max_retries,
-                status,
-                body
+                region = %region,
+                stream = is_stream,
+                status_code = status.as_u16(),
+                error_summary = %error_summary,
+                "API 请求失败（未知错误）"
             );
             last_error = Some(anyhow::anyhow!(
-                "{} API 请求失败: {} {}",
+                "{} API 请求失败: {}",
                 api_type,
-                status,
-                body
+                error_summary
             ));
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
@@ -1066,6 +1110,11 @@ impl KiroProvider {
 
         if let Err(sync_err) = self.token_manager.sync_external_state_if_changed() {
             tracing::warn!("leader 刷新交接重试前同步外部状态失败: {}", sync_err);
+        }
+
+        if self.token_manager.should_fast_fail_runtime_leader_refresh() {
+            tracing::warn!("单共享账号需由 leader 刷新凭据，停止本地等待重试: {}", err);
+            return false;
         }
 
         if attempt + 1 >= max_retries {
