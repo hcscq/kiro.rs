@@ -3,10 +3,177 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/com
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
+import { Switch } from '@/components/ui/switch'
 import { toast } from 'sonner'
 import { useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import { Save, AlertCircle } from 'lucide-react'
+import type { RequestWeightingConfig } from '@/types/api'
+
+type RequestWeightingNumericField = Exclude<keyof RequestWeightingConfig, 'enabled'>
+
+type RequestWeightingInputState = Record<RequestWeightingNumericField, string>
+
+const DEFAULT_REQUEST_WEIGHTING: RequestWeightingConfig = {
+  enabled: true,
+  baseWeight: 1,
+  maxWeight: 3,
+  toolsBonus: 0.5,
+  largeMaxTokensThreshold: 4000,
+  largeMaxTokensBonus: 0.5,
+  largeInputTokensThreshold: 8000,
+  largeInputTokensBonus: 0.5,
+  veryLargeInputTokensThreshold: 20000,
+  veryLargeInputTokensBonus: 0.5,
+  thinkingBonus: 0.5,
+  heavyThinkingBudgetThreshold: 16000,
+  heavyThinkingBudgetBonus: 0.5,
+}
+
+const REQUEST_WEIGHTING_FIELD_SECTIONS: Array<{
+  title: string
+  description: string
+  fields: Array<{
+    key: RequestWeightingNumericField
+    label: string
+    step: string
+    min: string
+    placeholder: string
+    hint: string
+  }>
+}> = [
+  {
+    title: '权重基线',
+    description: '决定所有请求的基础消耗以及单次请求可放大的上限。',
+    fields: [
+      {
+        key: 'baseWeight',
+        label: '基础权重',
+        step: '0.1',
+        min: '0.1',
+        placeholder: '轻请求通常保持 1.0',
+        hint: '每个请求至少消耗多少 bucket 配额。',
+      },
+      {
+        key: 'maxWeight',
+        label: '最大权重',
+        step: '0.1',
+        min: '0.1',
+        placeholder: '避免重请求无限放大',
+        hint: '最终权重会被 clamp 到这个上限。',
+      },
+    ],
+  },
+  {
+    title: '大请求判定',
+    description: '针对大 `maxTokens` 和大输入量请求，额外增加一次请求的令牌消耗。',
+    fields: [
+      {
+        key: 'largeMaxTokensThreshold',
+        label: '大 maxTokens 阈值',
+        step: '1',
+        min: '0',
+        placeholder: '例如 4000',
+        hint: '请求声明的 `max_tokens` 超过此值时增加权重。',
+      },
+      {
+        key: 'largeMaxTokensBonus',
+        label: '大 maxTokens 加权',
+        step: '0.1',
+        min: '0',
+        placeholder: '例如 0.5',
+        hint: '命中大 `max_tokens` 阈值后额外增加的权重。',
+      },
+      {
+        key: 'largeInputTokensThreshold',
+        label: '大输入阈值',
+        step: '1',
+        min: '0',
+        placeholder: '例如 8000',
+        hint: '估算输入 token 超过此值时增加权重。',
+      },
+      {
+        key: 'largeInputTokensBonus',
+        label: '大输入加权',
+        step: '0.1',
+        min: '0',
+        placeholder: '例如 0.5',
+        hint: '命中大输入阈值后额外增加的权重。',
+      },
+      {
+        key: 'veryLargeInputTokensThreshold',
+        label: '超大输入阈值',
+        step: '1',
+        min: '0',
+        placeholder: '例如 20000',
+        hint: '更重的代码/上下文请求超过此值时再次增加权重。',
+      },
+      {
+        key: 'veryLargeInputTokensBonus',
+        label: '超大输入加权',
+        step: '0.1',
+        min: '0',
+        placeholder: '例如 0.5',
+        hint: '命中超大输入阈值后额外增加的权重。',
+      },
+    ],
+  },
+  {
+    title: '工具与 Thinking',
+    description: '针对带工具、开启 thinking 或 thinking budget 很高的请求做附加权重。',
+    fields: [
+      {
+        key: 'toolsBonus',
+        label: 'Tools 加权',
+        step: '0.1',
+        min: '0',
+        placeholder: '例如 0.5',
+        hint: '请求带 `tools` 时增加的权重。',
+      },
+      {
+        key: 'thinkingBonus',
+        label: 'Thinking 加权',
+        step: '0.1',
+        min: '0',
+        placeholder: '例如 0.5',
+        hint: '请求启用 thinking 时增加的权重。',
+      },
+      {
+        key: 'heavyThinkingBudgetThreshold',
+        label: '重 thinking 阈值',
+        step: '1',
+        min: '0',
+        placeholder: '例如 16000',
+        hint: 'thinking budget 超过此值时，判定为更重的请求。',
+      },
+      {
+        key: 'heavyThinkingBudgetBonus',
+        label: '重 thinking 加权',
+        step: '0.1',
+        min: '0',
+        placeholder: '例如 0.5',
+        hint: '命中重 thinking 阈值后额外增加的权重。',
+      },
+    ],
+  },
+]
+
+function createRequestWeightingInputs(config: RequestWeightingConfig): RequestWeightingInputState {
+  return {
+    baseWeight: String(config.baseWeight),
+    maxWeight: String(config.maxWeight),
+    toolsBonus: String(config.toolsBonus),
+    largeMaxTokensThreshold: String(config.largeMaxTokensThreshold),
+    largeMaxTokensBonus: String(config.largeMaxTokensBonus),
+    largeInputTokensThreshold: String(config.largeInputTokensThreshold),
+    largeInputTokensBonus: String(config.largeInputTokensBonus),
+    veryLargeInputTokensThreshold: String(config.veryLargeInputTokensThreshold),
+    veryLargeInputTokensBonus: String(config.veryLargeInputTokensBonus),
+    thinkingBonus: String(config.thinkingBonus),
+    heavyThinkingBudgetThreshold: String(config.heavyThinkingBudgetThreshold),
+    heavyThinkingBudgetBonus: String(config.heavyThinkingBudgetBonus),
+  }
+}
 
 export function SettingsPage() {
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
@@ -21,6 +188,10 @@ export function SettingsPage() {
   const [rateLimitRefillMinPerSecondInput, setRateLimitRefillMinPerSecondInput] = useState('0.2')
   const [rateLimitRefillRecoveryStepInput, setRateLimitRefillRecoveryStepInput] = useState('0.1')
   const [rateLimitRefillBackoffFactorInput, setRateLimitRefillBackoffFactorInput] = useState('0.5')
+  const [requestWeightingEnabled, setRequestWeightingEnabled] = useState(DEFAULT_REQUEST_WEIGHTING.enabled)
+  const [requestWeightingInputs, setRequestWeightingInputs] = useState<RequestWeightingInputState>(
+    () => createRequestWeightingInputs(DEFAULT_REQUEST_WEIGHTING)
+  )
 
   useEffect(() => {
     if (!loadBalancingData) {
@@ -35,17 +206,20 @@ export function SettingsPage() {
     setRateLimitRefillMinPerSecondInput(String(loadBalancingData.rateLimitRefillMinPerSecond))
     setRateLimitRefillRecoveryStepInput(String(loadBalancingData.rateLimitRefillRecoveryStepPerSuccess))
     setRateLimitRefillBackoffFactorInput(String(loadBalancingData.rateLimitRefillBackoffFactor))
-  }, [
-    loadBalancingData?.queueMaxSize,
-    loadBalancingData?.queueMaxWaitMs,
-    loadBalancingData?.rateLimitCooldownMs,
-    loadBalancingData?.defaultMaxConcurrency,
-    loadBalancingData?.rateLimitBucketCapacity,
-    loadBalancingData?.rateLimitRefillPerSecond,
-    loadBalancingData?.rateLimitRefillMinPerSecond,
-    loadBalancingData?.rateLimitRefillRecoveryStepPerSuccess,
-    loadBalancingData?.rateLimitRefillBackoffFactor,
-  ])
+    const requestWeighting = loadBalancingData.requestWeighting ?? DEFAULT_REQUEST_WEIGHTING
+    setRequestWeightingEnabled(requestWeighting.enabled)
+    setRequestWeightingInputs(createRequestWeightingInputs(requestWeighting))
+  }, [loadBalancingData])
+
+  const handleRequestWeightingInputChange = (
+    key: RequestWeightingNumericField,
+    value: string
+  ) => {
+    setRequestWeightingInputs((prev) => ({
+      ...prev,
+      [key]: value,
+    }))
+  }
 
   const handleSaveQueueSettings = () => {
     const parsedQueueMaxSize = queueMaxSizeInput.trim() === '' ? 0 : parseInt(queueMaxSizeInput, 10)
@@ -57,6 +231,21 @@ export function SettingsPage() {
     const parsedRateLimitRefillMinPerSecond = rateLimitRefillMinPerSecondInput.trim() === '' ? 0 : Number.parseFloat(rateLimitRefillMinPerSecondInput)
     const parsedRateLimitRefillRecoveryStep = rateLimitRefillRecoveryStepInput.trim() === '' ? 0 : Number.parseFloat(rateLimitRefillRecoveryStepInput)
     const parsedRateLimitRefillBackoffFactor = rateLimitRefillBackoffFactorInput.trim() === '' ? 0 : Number.parseFloat(rateLimitRefillBackoffFactorInput)
+    const parsedRequestWeighting: RequestWeightingConfig = {
+      enabled: requestWeightingEnabled,
+      baseWeight: requestWeightingInputs.baseWeight.trim() === '' ? 0 : Number.parseFloat(requestWeightingInputs.baseWeight),
+      maxWeight: requestWeightingInputs.maxWeight.trim() === '' ? 0 : Number.parseFloat(requestWeightingInputs.maxWeight),
+      toolsBonus: requestWeightingInputs.toolsBonus.trim() === '' ? 0 : Number.parseFloat(requestWeightingInputs.toolsBonus),
+      largeMaxTokensThreshold: requestWeightingInputs.largeMaxTokensThreshold.trim() === '' ? 0 : parseInt(requestWeightingInputs.largeMaxTokensThreshold, 10),
+      largeMaxTokensBonus: requestWeightingInputs.largeMaxTokensBonus.trim() === '' ? 0 : Number.parseFloat(requestWeightingInputs.largeMaxTokensBonus),
+      largeInputTokensThreshold: requestWeightingInputs.largeInputTokensThreshold.trim() === '' ? 0 : parseInt(requestWeightingInputs.largeInputTokensThreshold, 10),
+      largeInputTokensBonus: requestWeightingInputs.largeInputTokensBonus.trim() === '' ? 0 : Number.parseFloat(requestWeightingInputs.largeInputTokensBonus),
+      veryLargeInputTokensThreshold: requestWeightingInputs.veryLargeInputTokensThreshold.trim() === '' ? 0 : parseInt(requestWeightingInputs.veryLargeInputTokensThreshold, 10),
+      veryLargeInputTokensBonus: requestWeightingInputs.veryLargeInputTokensBonus.trim() === '' ? 0 : Number.parseFloat(requestWeightingInputs.veryLargeInputTokensBonus),
+      thinkingBonus: requestWeightingInputs.thinkingBonus.trim() === '' ? 0 : Number.parseFloat(requestWeightingInputs.thinkingBonus),
+      heavyThinkingBudgetThreshold: requestWeightingInputs.heavyThinkingBudgetThreshold.trim() === '' ? 0 : parseInt(requestWeightingInputs.heavyThinkingBudgetThreshold, 10),
+      heavyThinkingBudgetBonus: requestWeightingInputs.heavyThinkingBudgetBonus.trim() === '' ? 0 : Number.parseFloat(requestWeightingInputs.heavyThinkingBudgetBonus),
+    }
 
     if (
       Number.isNaN(parsedQueueMaxSize) ||
@@ -97,6 +286,38 @@ export function SettingsPage() {
       return
     }
 
+    const requestWeightingValues = [
+      parsedRequestWeighting.baseWeight,
+      parsedRequestWeighting.maxWeight,
+      parsedRequestWeighting.toolsBonus,
+      parsedRequestWeighting.largeMaxTokensThreshold,
+      parsedRequestWeighting.largeMaxTokensBonus,
+      parsedRequestWeighting.largeInputTokensThreshold,
+      parsedRequestWeighting.largeInputTokensBonus,
+      parsedRequestWeighting.veryLargeInputTokensThreshold,
+      parsedRequestWeighting.veryLargeInputTokensBonus,
+      parsedRequestWeighting.thinkingBonus,
+      parsedRequestWeighting.heavyThinkingBudgetThreshold,
+      parsedRequestWeighting.heavyThinkingBudgetBonus,
+    ]
+
+    if (
+      requestWeightingValues.some((value) => Number.isNaN(value) || value < 0)
+    ) {
+      toast.error('轻/重请求加权参数必须是大于等于 0 的数字')
+      return
+    }
+
+    if (parsedRequestWeighting.baseWeight <= 0) {
+      toast.error('基础权重必须大于 0')
+      return
+    }
+
+    if (parsedRequestWeighting.maxWeight < parsedRequestWeighting.baseWeight) {
+      toast.error('最大权重不能小于基础权重')
+      return
+    }
+
     setLoadBalancingMode(
       {
         queueMaxSize: parsedQueueMaxSize,
@@ -108,6 +329,7 @@ export function SettingsPage() {
         rateLimitRefillMinPerSecond: parsedRateLimitRefillMinPerSecond,
         rateLimitRefillRecoveryStepPerSuccess: parsedRateLimitRefillRecoveryStep,
         rateLimitRefillBackoffFactor: parsedRateLimitRefillBackoffFactor,
+        requestWeighting: parsedRequestWeighting,
       },
       {
         onSuccess: () => {
@@ -308,14 +530,70 @@ export function SettingsPage() {
               </div>
             </div>
           </div>
-          
+
+          <div className="space-y-4 md:col-span-2">
+            <h3 className="text-sm font-semibold flex items-center text-primary">轻 / 重请求加权</h3>
+            <div className="space-y-4 rounded-lg bg-muted/30 p-4">
+              <div className="flex flex-col gap-4 rounded-lg border bg-background/70 p-4 md:flex-row md:items-center md:justify-between">
+                <div className="space-y-1">
+                  <div className="text-sm font-medium">按请求复杂度动态消耗 bucket</div>
+                  <p className="text-sm text-muted-foreground">
+                    适配“轻请求 / 重代码请求”混跑。启用后，`tools`、`thinking`、大输入和高 `maxTokens`
+                    请求会消耗更多本地 bucket 配额。
+                  </p>
+                </div>
+                <div className="flex items-center gap-3">
+                  <Badge variant={requestWeightingEnabled ? 'secondary' : 'outline'}>
+                    {requestWeightingEnabled ? '已启用' : '已禁用'}
+                  </Badge>
+                  <Switch
+                    checked={requestWeightingEnabled}
+                    onCheckedChange={setRequestWeightingEnabled}
+                    aria-label="切换轻重请求加权"
+                  />
+                </div>
+              </div>
+
+              {REQUEST_WEIGHTING_FIELD_SECTIONS.map((section) => (
+                <div key={section.title} className="space-y-3 rounded-lg border bg-background/50 p-4">
+                  <div className="space-y-1">
+                    <div className="text-sm font-medium">{section.title}</div>
+                    <p className="text-sm text-muted-foreground">{section.description}</p>
+                  </div>
+                  <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+                    {section.fields.map((field) => (
+                      <div key={field.key} className="space-y-2">
+                        <label className="text-sm font-medium" htmlFor={field.key}>
+                          {field.label}
+                        </label>
+                        <Input
+                          id={field.key}
+                          type="number"
+                          min={field.min}
+                          step={field.step}
+                          value={requestWeightingInputs[field.key]}
+                          onChange={(e) => handleRequestWeightingInputChange(field.key, e.target.value)}
+                          placeholder={field.placeholder}
+                        />
+                        <p className="text-xs text-muted-foreground">{field.hint}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
         </CardContent>
 
         <div className="px-6 py-4 bg-muted/20 border-t flex items-center justify-between flex-wrap gap-4 rounded-b-lg">
           <div className="flex text-sm text-muted-foreground max-w-2xl gap-2">
             <AlertCircle className="h-5 w-5 shrink-0 text-yellow-600 dark:text-yellow-500" />
             <p>
-              `defaultMaxConcurrency` 是未单独设置账号维度的默认回退并发上限。推荐初始化组合: <code className="bg-muted px-1 rounded">queueMaxWaitMs=2000</code>、<code className="bg-muted px-1 rounded">queueMaxSize=峰值2倍</code>、<code className="bg-muted px-1 rounded">rateLimitCooldownMs=3000</code>。
+              `defaultMaxConcurrency` 是未单独设置账号维度的默认回退并发上限。当前推荐组合是
+              <code className="bg-muted px-1 rounded">queueMaxWaitMs=5000</code>、
+              <code className="bg-muted px-1 rounded">rateLimitBucketCapacity=4</code>、
+              <code className="bg-muted px-1 rounded">rateLimitRefillPerSecond=1</code>，
+              再配合上面的 `requestWeighting` 让重代码/重 thinking 请求多消耗一些 bucket。
             </p>
           </div>
           <Button

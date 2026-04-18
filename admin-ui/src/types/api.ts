@@ -107,6 +107,22 @@ export interface AddCredentialResponse {
   email?: string
 }
 
+export interface RequestWeightingConfig {
+  enabled: boolean
+  baseWeight: number
+  maxWeight: number
+  toolsBonus: number
+  largeMaxTokensThreshold: number
+  largeMaxTokensBonus: number
+  largeInputTokensThreshold: number
+  largeInputTokensBonus: number
+  veryLargeInputTokensThreshold: number
+  veryLargeInputTokensBonus: number
+  thinkingBonus: number
+  heavyThinkingBudgetThreshold: number
+  heavyThinkingBudgetBonus: number
+}
+
 export interface LoadBalancingConfigResponse {
   mode: 'priority' | 'balanced'
   queueMaxSize: number
@@ -118,6 +134,7 @@ export interface LoadBalancingConfigResponse {
   rateLimitRefillMinPerSecond: number
   rateLimitRefillRecoveryStepPerSuccess: number
   rateLimitRefillBackoffFactor: number
+  requestWeighting: RequestWeightingConfig
   waitingRequests: number
 }
 
@@ -132,4 +149,5 @@ export interface UpdateLoadBalancingConfigRequest {
   rateLimitRefillMinPerSecond?: number
   rateLimitRefillRecoveryStepPerSuccess?: number
   rateLimitRefillBackoffFactor?: number
+  requestWeighting?: RequestWeightingConfig
 }
