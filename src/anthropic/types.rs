@@ -1,5 +1,6 @@
 //! Anthropic API 类型定义
 
+use crate::model::config::RequestWeightingConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -130,6 +131,55 @@ pub struct MessagesRequest {
     pub output_config: Option<OutputConfig>,
     /// Claude Code 请求中的 metadata，包含 session 信息
     pub metadata: Option<Metadata>,
+}
+
+impl MessagesRequest {
+    pub fn request_weight(&self, estimated_input_tokens: Option<i32>) -> f64 {
+        self.request_weight_with_config(&RequestWeightingConfig::default(), estimated_input_tokens)
+    }
+
+    pub fn request_weight_with_config(
+        &self,
+        config: &RequestWeightingConfig,
+        estimated_input_tokens: Option<i32>,
+    ) -> f64 {
+        if !config.enabled {
+            return 1.0;
+        }
+
+        let mut weight = config.base_weight;
+
+        if self.tools.as_ref().is_some_and(|tools| !tools.is_empty()) || self.tool_choice.is_some()
+        {
+            weight += config.tools_bonus;
+        }
+
+        if self.max_tokens >= config.large_max_tokens_threshold {
+            weight += config.large_max_tokens_bonus;
+        }
+
+        if let Some(input_tokens) = estimated_input_tokens {
+            if input_tokens >= config.very_large_input_tokens_threshold {
+                weight += config.very_large_input_tokens_bonus;
+            } else if input_tokens >= config.large_input_tokens_threshold {
+                weight += config.large_input_tokens_bonus;
+            }
+        }
+
+        if let Some(thinking) = &self.thinking {
+            if thinking.is_enabled() {
+                weight += config.thinking_bonus;
+                if thinking.budget_tokens >= config.heavy_thinking_budget_threshold {
+                    weight += config.heavy_thinking_budget_bonus;
+                }
+            }
+        }
+
+        weight.clamp(
+            config.base_weight,
+            config.max_weight.max(config.base_weight),
+        )
+    }
 }
 
 /// 反序列化 system 字段，支持字符串或数组格式
@@ -286,4 +336,76 @@ pub struct CountTokensRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CountTokensResponse {
     pub input_tokens: i32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::config::RequestWeightingConfig;
+    use serde_json::json;
+
+    fn sample_request() -> MessagesRequest {
+        MessagesRequest {
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: json!("hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn test_messages_request_weight_defaults_to_light_request() {
+        let request = sample_request();
+        assert!((request.request_weight(Some(512)) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_messages_request_weight_clamps_heavy_request_to_max() {
+        let mut request = sample_request();
+        request.max_tokens = 8_192;
+        request.tools = Some(vec![Tool {
+            tool_type: None,
+            name: "edit".to_string(),
+            description: "edit files".to_string(),
+            input_schema: HashMap::new(),
+            max_uses: None,
+        }]);
+        request.thinking = Some(Thinking {
+            thinking_type: "enabled".to_string(),
+            display: None,
+            budget_tokens: 20_000,
+        });
+
+        assert!((request.request_weight(Some(24_000)) - 3.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_messages_request_weight_can_be_disabled_by_config() {
+        let mut request = sample_request();
+        request.max_tokens = 8_192;
+        request.tool_choice = Some(json!({"type": "auto"}));
+        request.thinking = Some(Thinking {
+            thinking_type: "enabled".to_string(),
+            display: None,
+            budget_tokens: 20_000,
+        });
+
+        let config = RequestWeightingConfig {
+            enabled: false,
+            ..RequestWeightingConfig::default()
+        };
+
+        assert!(
+            (request.request_weight_with_config(&config, Some(24_000)) - 1.0).abs() < f64::EPSILON
+        );
+    }
 }

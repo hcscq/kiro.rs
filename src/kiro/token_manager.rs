@@ -8,28 +8,31 @@ use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex as TokioMutex, Notify, oneshot};
+use tokio::sync::{oneshot, Mutex as TokioMutex, Notify};
 
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant};
 
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::{build_client, ProxyConfig};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
-use crate::model::config::Config;
+use crate::model::config::{Config, RequestWeightingConfig};
 use crate::state::{
-    DispatchLeaseReservationStatus, DispatchRuntimeBucketPolicy, DispatchRuntimeCredential,
-    DispatchRuntimeSnapshot, PersistedDispatchConfig, RuntimeCoordinationStatus, StateChangeKind,
-    StateChangeRevisions, StateStore, StatsEntryRecord, StatsMergeRecord, current_epoch_ms,
+    current_epoch_ms, DispatchLeaseReservationStatus, DispatchRuntimeBucketPolicy,
+    DispatchRuntimeCredential, DispatchRuntimeSnapshot, PersistedDispatchConfig,
+    RuntimeCoordinationStatus, StateChangeKind, StateChangeRevisions, StateStore, StatsEntryRecord,
+    StatsMergeRecord,
 };
+
+const DEFAULT_REQUEST_WEIGHT: f64 = 1.0;
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -517,26 +520,38 @@ impl AdaptiveTokenBucket {
         }
     }
 
-    fn has_available_token(&mut self, now: Instant) -> bool {
-        self.refill(now);
-        self.tokens >= 1.0
+    fn requested_tokens(&self, requested_tokens: f64) -> f64 {
+        let requested_tokens = if requested_tokens.is_finite() && requested_tokens > 0.0 {
+            requested_tokens
+        } else {
+            DEFAULT_REQUEST_WEIGHT
+        };
+
+        requested_tokens.min(self.policy.capacity.max(0.0))
     }
 
-    fn consume(&mut self, now: Instant) -> bool {
-        if !self.has_available_token(now) {
+    fn has_available_token(&mut self, now: Instant, requested_tokens: f64) -> bool {
+        self.refill(now);
+        self.tokens >= self.requested_tokens(requested_tokens)
+    }
+
+    fn consume(&mut self, now: Instant, requested_tokens: f64) -> bool {
+        let requested_tokens = self.requested_tokens(requested_tokens);
+        if !self.has_available_token(now, requested_tokens) {
             return false;
         }
-        self.tokens = (self.tokens - 1.0).max(0.0);
+        self.tokens = (self.tokens - requested_tokens).max(0.0);
         true
     }
 
-    fn ready_at(&mut self, now: Instant) -> Option<Instant> {
+    fn ready_at(&mut self, now: Instant, requested_tokens: f64) -> Option<Instant> {
+        let requested_tokens = self.requested_tokens(requested_tokens);
         self.refill(now);
-        if self.tokens >= 1.0 {
+        if self.tokens >= requested_tokens {
             return None;
         }
 
-        let missing_tokens = 1.0 - self.tokens;
+        let missing_tokens = requested_tokens - self.tokens;
         let wait_seconds = missing_tokens / self.current_refill_per_second;
         Some(now + StdDuration::from_secs_f64(wait_seconds.max(0.0)))
     }
@@ -687,6 +702,7 @@ pub struct LoadBalancingConfigSnapshot {
     pub rate_limit_refill_min_per_second: f64,
     pub rate_limit_refill_recovery_step_per_success: f64,
     pub rate_limit_refill_backoff_factor: f64,
+    pub request_weighting: RequestWeightingConfig,
     pub waiting_requests: usize,
 }
 
@@ -709,6 +725,7 @@ struct DispatchConfig {
     rate_limit_refill_min_per_second: f64,
     rate_limit_refill_recovery_step_per_success: f64,
     rate_limit_refill_backoff_factor: f64,
+    request_weighting: RequestWeightingConfig,
 }
 
 impl DispatchConfig {
@@ -753,6 +770,7 @@ impl DispatchConfig {
             rate_limit_refill_backoff_factor: normalize_backoff(
                 config.rate_limit_refill_backoff_factor,
             ),
+            request_weighting: config.request_weighting.clone(),
         }
     }
 
@@ -1196,18 +1214,29 @@ impl MultiTokenManager {
     }
 
     fn bucket_is_ready(entry: &CredentialEntry) -> bool {
-        entry
-            .rate_limit_bucket
-            .as_ref()
-            .map_or(true, |bucket| bucket.tokens >= 1.0)
+        Self::bucket_is_ready_for(entry, DEFAULT_REQUEST_WEIGHT)
+    }
+
+    fn bucket_is_ready_for(entry: &CredentialEntry, request_weight: f64) -> bool {
+        entry.rate_limit_bucket.as_ref().map_or(true, |bucket| {
+            bucket.tokens >= bucket.requested_tokens(request_weight)
+        })
     }
 
     fn combined_ready_at(entry: &mut CredentialEntry, now: Instant) -> Option<Instant> {
+        Self::combined_ready_at_for(entry, now, DEFAULT_REQUEST_WEIGHT)
+    }
+
+    fn combined_ready_at_for(
+        entry: &mut CredentialEntry,
+        now: Instant,
+        request_weight: f64,
+    ) -> Option<Instant> {
         let cooldown_ready_at = entry.rate_limit_cooldown_until.filter(|until| *until > now);
         let bucket_ready_at = entry
             .rate_limit_bucket
             .as_mut()
-            .and_then(|bucket| bucket.ready_at(now));
+            .and_then(|bucket| bucket.ready_at(now, request_weight));
 
         match (cooldown_ready_at, bucket_ready_at) {
             (Some(cooldown_ready_at), Some(bucket_ready_at)) => {
@@ -1219,12 +1248,13 @@ impl MultiTokenManager {
         }
     }
 
-    fn update_min_ready_at(
+    fn update_min_ready_at_for(
         current: &mut Option<Instant>,
         entry: &mut CredentialEntry,
         now: Instant,
+        request_weight: f64,
     ) {
-        if let Some(ready_at) = Self::combined_ready_at(entry, now) {
+        if let Some(ready_at) = Self::combined_ready_at_for(entry, now, request_weight) {
             *current = Some(match *current {
                 Some(existing) => existing.min(ready_at),
                 None => ready_at,
@@ -1232,17 +1262,18 @@ impl MultiTokenManager {
         }
     }
 
-    fn next_ready_at(
+    fn next_ready_at_for(
         entries: &mut [CredentialEntry],
         model_requirement: ModelRequirement,
         now: Instant,
+        request_weight: f64,
     ) -> Option<Instant> {
         entries
             .iter_mut()
             .filter(|entry| {
                 !entry.disabled && Self::is_model_supported(&entry.credentials, model_requirement)
             })
-            .filter_map(|entry| Self::combined_ready_at(entry, now))
+            .filter_map(|entry| Self::combined_ready_at_for(entry, now, request_weight))
             .min()
     }
 
@@ -1338,6 +1369,8 @@ impl MultiTokenManager {
         {
             anyhow::bail!("rateLimitRefillMinPerSecond 不能大于 rateLimitRefillPerSecond");
         }
+
+        dispatch.request_weighting.validate()?;
 
         Ok(())
     }
@@ -1534,6 +1567,7 @@ impl MultiTokenManager {
     fn reserve_next_credential(
         &self,
         model: Option<&str>,
+        request_weight: f64,
     ) -> Result<(u64, KiroCredentials, CallLease), ReservationFailure> {
         let dispatch = self.dispatch_config();
         let mode = dispatch.mode;
@@ -1569,7 +1603,7 @@ impl MultiTokenManager {
             has_supported = true;
 
             let is_dispatchable = !Self::is_rate_limited(entry, now)
-                && Self::bucket_is_ready(entry)
+                && Self::bucket_is_ready_for(entry, request_weight)
                 && Self::has_capacity(
                     &entry.credentials,
                     entry.active_requests,
@@ -1577,7 +1611,7 @@ impl MultiTokenManager {
                 );
 
             if !is_dispatchable {
-                Self::update_min_ready_at(&mut next_ready_at, entry, now);
+                Self::update_min_ready_at_for(&mut next_ready_at, entry, now, request_weight);
                 continue;
             }
 
@@ -1637,10 +1671,11 @@ impl MultiTokenManager {
             entry
                 .rate_limit_bucket
                 .as_mut()
-                .map_or(true, |bucket| bucket.consume(now))
+                .map_or(true, |bucket| bucket.consume(now, request_weight))
         };
         if !token_consumed {
-            let next_ready_at = Self::next_ready_at(&mut entries, model_requirement, now);
+            let next_ready_at =
+                Self::next_ready_at_for(&mut entries, model_requirement, now, request_weight);
             return Err(ReservationFailure::AllTemporarilyUnavailable { next_ready_at });
         }
         let entry = &mut entries[entry_index];
@@ -1686,19 +1721,36 @@ impl MultiTokenManager {
         })
     }
 
-    fn shared_snapshot_ready_at(
+    fn shared_bucket_is_ready(snapshot: &DispatchRuntimeSnapshot) -> bool {
+        Self::shared_bucket_is_ready_for(snapshot, DEFAULT_REQUEST_WEIGHT)
+    }
+
+    fn shared_bucket_is_ready_for(snapshot: &DispatchRuntimeSnapshot, request_weight: f64) -> bool {
+        match snapshot.requested_bucket_tokens(request_weight) {
+            Some(requested_tokens) => snapshot
+                .bucket_tokens
+                .is_some_and(|tokens| tokens >= requested_tokens),
+            None => true,
+        }
+    }
+
+    fn shared_snapshot_ready_at_for(
         snapshot: &DispatchRuntimeSnapshot,
         now: Instant,
         now_epoch_ms: u64,
+        request_weight: f64,
     ) -> Option<Instant> {
-        snapshot.next_ready_at_epoch_ms.map(|ready_at_epoch_ms| {
-            now + StdDuration::from_millis(ready_at_epoch_ms.saturating_sub(now_epoch_ms))
-        })
+        snapshot
+            .next_ready_at_epoch_ms_for(request_weight, now_epoch_ms)
+            .map(|ready_at_epoch_ms| {
+                now + StdDuration::from_millis(ready_at_epoch_ms.saturating_sub(now_epoch_ms))
+            })
     }
 
     fn reserve_next_credential_shared(
         &self,
         model: Option<&str>,
+        request_weight: f64,
     ) -> Result<(u64, KiroCredentials, CallLease), ReservationFailure> {
         let dispatch = self.dispatch_config();
         let model_requirement = Self::model_requirement(model);
@@ -1752,7 +1804,7 @@ impl MultiTokenManager {
                     let is_dispatchable = runtime
                         .cooldown_until_epoch_ms
                         .map_or(true, |until| until <= now_epoch_ms)
-                        && runtime.bucket_tokens.map_or(true, |tokens| tokens >= 1.0)
+                        && Self::shared_bucket_is_ready_for(&runtime, request_weight)
                         && Self::has_capacity(
                             &entry.credentials,
                             runtime.active_requests,
@@ -1760,9 +1812,12 @@ impl MultiTokenManager {
                         );
 
                     if !is_dispatchable {
-                        if let Some(ready_at) =
-                            Self::shared_snapshot_ready_at(&runtime, now, now_epoch_ms)
-                        {
+                        if let Some(ready_at) = Self::shared_snapshot_ready_at_for(
+                            &runtime,
+                            now,
+                            now_epoch_ms,
+                            request_weight,
+                        ) {
                             next_ready_at = Some(match next_ready_at {
                                 Some(existing) => existing.min(ready_at),
                                 None => ready_at,
@@ -1857,6 +1912,7 @@ impl MultiTokenManager {
                     &shared_lease_id,
                     selected_max_concurrency,
                     selected_bucket_policy,
+                    request_weight,
                     current_epoch_ms(),
                     SHARED_DISPATCH_LEASE_TTL_MS,
                 )
@@ -1899,9 +1955,12 @@ impl MultiTokenManager {
                 ));
             }
 
-            if let Some(ready_at) =
-                Self::shared_snapshot_ready_at(&reservation.snapshot, now, now_epoch_ms)
-            {
+            if let Some(ready_at) = Self::shared_snapshot_ready_at_for(
+                &reservation.snapshot,
+                now,
+                now_epoch_ms,
+                request_weight,
+            ) {
                 fallback_next_ready_at = Some(match fallback_next_ready_at {
                     Some(existing) => existing.min(ready_at),
                     None => ready_at,
@@ -1925,6 +1984,20 @@ impl MultiTokenManager {
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
     pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
+        self.acquire_context_with_weight(model, DEFAULT_REQUEST_WEIGHT)
+            .await
+    }
+
+    pub async fn acquire_context_with_weight(
+        &self,
+        model: Option<&str>,
+        request_weight: f64,
+    ) -> anyhow::Result<CallContext> {
+        let request_weight = if request_weight.is_finite() && request_weight > 0.0 {
+            request_weight
+        } else {
+            DEFAULT_REQUEST_WEIGHT
+        };
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -1951,9 +2024,9 @@ impl MultiTokenManager {
             }
 
             let (id, credentials, lease) = match if self.shared_dispatch_runtime_enabled() {
-                self.reserve_next_credential_shared(model)
+                self.reserve_next_credential_shared(model, request_weight)
             } else {
-                self.reserve_next_credential(model)
+                self.reserve_next_credential(model, request_weight)
             } {
                 Ok(selection) => {
                     wait_queue_guard = None;
@@ -3199,7 +3272,7 @@ impl MultiTokenManager {
                     runtime
                         .cooldown_until_epoch_ms
                         .map_or(true, |until| until <= now_epoch_ms)
-                        && runtime.bucket_tokens.map_or(true, |tokens| tokens >= 1.0)
+                        && Self::shared_bucket_is_ready(&runtime)
                         && Self::has_capacity(
                             &e.credentials,
                             runtime.active_requests,
@@ -3831,8 +3904,13 @@ impl MultiTokenManager {
             rate_limit_refill_recovery_step_per_success: dispatch
                 .rate_limit_refill_recovery_step_per_success,
             rate_limit_refill_backoff_factor: dispatch.rate_limit_refill_backoff_factor,
+            request_weighting: dispatch.request_weighting.clone(),
             waiting_requests: self.queue_depth(),
         }
+    }
+
+    pub fn request_weighting_config_snapshot(&self) -> RequestWeightingConfig {
+        self.dispatch_config().request_weighting
     }
 
     /// 获取负载均衡模式（Admin API）
@@ -3854,6 +3932,7 @@ impl MultiTokenManager {
                 rate_limit_refill_recovery_step_per_success: dispatch
                     .rate_limit_refill_recovery_step_per_success,
                 rate_limit_refill_backoff_factor: dispatch.rate_limit_refill_backoff_factor,
+                request_weighting: dispatch.request_weighting.clone(),
             })?;
         self.try_bump_state_change_revision(StateChangeKind::DispatchConfig);
         Ok(())
@@ -3863,6 +3942,7 @@ impl MultiTokenManager {
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
         self.set_load_balancing_config(
             Some(mode),
+            None,
             None,
             None,
             None,
@@ -3888,6 +3968,7 @@ impl MultiTokenManager {
         rate_limit_refill_min_per_second: Option<f64>,
         rate_limit_refill_recovery_step_per_success: Option<f64>,
         rate_limit_refill_backoff_factor: Option<f64>,
+        request_weighting: Option<RequestWeightingConfig>,
     ) -> anyhow::Result<()> {
         let previous = self.dispatch_config();
         let mut next = previous.clone();
@@ -3930,6 +4011,9 @@ impl MultiTokenManager {
         if let Some(rate_limit_refill_backoff_factor) = rate_limit_refill_backoff_factor {
             next.rate_limit_refill_backoff_factor = rate_limit_refill_backoff_factor;
         }
+        if let Some(request_weighting) = request_weighting {
+            next.request_weighting = request_weighting;
+        }
 
         Self::validate_dispatch_rate_limit_config(&next)?;
 
@@ -3962,7 +4046,7 @@ impl MultiTokenManager {
 
         self.availability_notify.notify_waiters();
         tracing::info!(
-            "调度配置已更新: mode={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, defaultMaxConcurrency={:?}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}",
+            "调度配置已更新: mode={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, defaultMaxConcurrency={:?}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}, requestWeightingEnabled={}, requestWeightingBaseWeight={}, requestWeightingMaxWeight={}",
             next.mode,
             next.queue_max_size,
             next.queue_max_wait_ms,
@@ -3972,7 +4056,10 @@ impl MultiTokenManager {
             next.rate_limit_refill_per_second,
             next.rate_limit_refill_min_per_second,
             next.rate_limit_refill_recovery_step_per_success,
-            next.rate_limit_refill_backoff_factor
+            next.rate_limit_refill_backoff_factor,
+            next.request_weighting.enabled,
+            next.request_weighting.base_weight,
+            next.request_weighting.max_weight
         );
         Ok(())
     }
@@ -4385,6 +4472,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_acquire_context_with_weight_distinguishes_heavy_and_light_requests() {
+        let mut config = Config::default();
+        config.rate_limit_cooldown_ms = 0;
+        config.rate_limit_bucket_capacity = 3.0;
+        config.rate_limit_refill_per_second = 0.2;
+        config.rate_limit_refill_min_per_second = 0.2;
+        config.rate_limit_refill_recovery_step_per_success = 0.0;
+        config.rate_limit_refill_backoff_factor = 0.5;
+
+        let credential = available_credential(0);
+        let manager = MultiTokenManager::new(config, vec![credential], None, None, false).unwrap();
+
+        let heavy = manager
+            .acquire_context_with_weight(None, 2.0)
+            .await
+            .unwrap();
+        drop(heavy);
+
+        let err = manager
+            .acquire_context_with_weight(None, 2.0)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("token bucket") || err.contains("等待可用凭据"),
+            "重请求应被 bucket 阻塞，实际: {}",
+            err
+        );
+
+        let light = manager
+            .acquire_context_with_weight(None, 1.0)
+            .await
+            .unwrap();
+        assert_eq!(light.id, 1);
+    }
+
+    #[tokio::test]
     async fn test_shared_dispatch_runtime_enforces_global_max_concurrency_when_test_redis_is_set() {
         let Some(config) = shared_runtime_test_config() else {
             return;
@@ -4482,6 +4607,54 @@ mod tests {
             entry.next_ready_in_ms.unwrap_or_default() > 0,
             "共享 bucket 不可用时应暴露下次可调度时间"
         );
+    }
+
+    #[tokio::test]
+    async fn test_shared_dispatch_runtime_respects_weighted_bucket_when_test_redis_is_set() {
+        let Some(mut config) = shared_runtime_test_config() else {
+            return;
+        };
+        config.rate_limit_cooldown_ms = 0;
+        config.rate_limit_bucket_capacity = 3.0;
+        config.rate_limit_refill_per_second = 0.2;
+        config.rate_limit_refill_min_per_second = 0.2;
+        config.rate_limit_refill_recovery_step_per_success = 0.0;
+        config.rate_limit_refill_backoff_factor = 0.5;
+
+        let credential_id = unique_credential_id();
+        let mut credential = available_credential(0);
+        credential.id = Some(credential_id);
+
+        let manager_a =
+            MultiTokenManager::new(config.clone(), vec![credential.clone()], None, None, false)
+                .unwrap();
+        let manager_b =
+            MultiTokenManager::new(config, vec![credential], None, None, false).unwrap();
+
+        let heavy = manager_a
+            .acquire_context_with_weight(None, 2.0)
+            .await
+            .unwrap();
+        assert_eq!(heavy.id, credential_id);
+        drop(heavy);
+
+        let err = manager_b
+            .acquire_context_with_weight(None, 2.0)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("token bucket") || err.contains("等待可用凭据"),
+            "跨 manager 的重请求应看到共享 bucket 剩余不足，实际: {}",
+            err
+        );
+
+        let light = manager_b
+            .acquire_context_with_weight(None, 1.0)
+            .await
+            .unwrap();
+        assert_eq!(light.id, credential_id);
     }
 
     #[tokio::test]
@@ -4814,6 +4987,11 @@ mod tests {
             rate_limit_refill_min_per_second: 0.3,
             rate_limit_refill_recovery_step_per_success: 0.15,
             rate_limit_refill_backoff_factor: 0.6,
+            request_weighting: RequestWeightingConfig {
+                max_weight: 4.0,
+                tools_bonus: 1.0,
+                ..RequestWeightingConfig::default()
+            },
         };
 
         assert!(manager.apply_dispatch_config_from_state(&persisted));
@@ -4829,6 +5007,8 @@ mod tests {
         assert_eq!(snapshot.rate_limit_refill_min_per_second, 0.3);
         assert_eq!(snapshot.rate_limit_refill_recovery_step_per_success, 0.15);
         assert_eq!(snapshot.rate_limit_refill_backoff_factor, 0.6);
+        assert_eq!(snapshot.request_weighting.max_weight, 4.0);
+        assert_eq!(snapshot.request_weighting.tools_bonus, 1.0);
 
         assert!(!manager.apply_dispatch_config_from_state(&persisted));
     }
@@ -4940,6 +5120,7 @@ mod tests {
                 Some(1.2),
                 None,
                 None,
+                None,
             )
             .unwrap_err()
             .to_string();
@@ -4978,6 +5159,11 @@ mod tests {
                 Some(0.3),
                 Some(0.15),
                 Some(0.6),
+                Some(RequestWeightingConfig {
+                    max_weight: 4.0,
+                    tools_bonus: 1.0,
+                    ..RequestWeightingConfig::default()
+                }),
             )
             .unwrap();
 
@@ -4992,6 +5178,8 @@ mod tests {
         assert_eq!(persisted.rate_limit_refill_min_per_second, 0.3);
         assert_eq!(persisted.rate_limit_refill_recovery_step_per_success, 0.15);
         assert_eq!(persisted.rate_limit_refill_backoff_factor, 0.6);
+        assert_eq!(persisted.request_weighting.max_weight, 4.0);
+        assert_eq!(persisted.request_weighting.tools_bonus, 1.0);
         assert_eq!(manager.get_load_balancing_mode(), "balanced");
 
         std::fs::remove_file(&config_path).unwrap();
@@ -5051,8 +5239,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_multi_token_manager_acquire_context_balanced_retries_until_bad_credential_disabled()
-     {
+    async fn test_multi_token_manager_acquire_context_balanced_retries_until_bad_credential_disabled(
+    ) {
         let mut config = Config::default();
         config.load_balancing_mode = "balanced".to_string();
 

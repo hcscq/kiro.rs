@@ -6,7 +6,7 @@
 
 use bytes::Bytes;
 use futures::stream::BoxStream;
-use futures::{StreamExt, stream};
+use futures::{stream, StreamExt};
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -14,11 +14,11 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use uuid::Uuid;
 
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::{build_client, ProxyConfig};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::{CallLease, MultiTokenManager, RuntimeRefreshLeaderRequiredError};
-use crate::model::config::TlsBackend;
+use crate::model::config::{RequestWeightingConfig, TlsBackend};
 use parking_lot::Mutex;
 
 /// 每个凭据的最大重试次数
@@ -52,10 +52,31 @@ pub struct ManagedResponse {
     trace: Option<ResponseTrace>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RequestOptions {
     pub omit_agent_mode_header: bool,
     pub request_id: Option<String>,
+    pub request_weight: f64,
+}
+
+impl Default for RequestOptions {
+    fn default() -> Self {
+        Self {
+            omit_agent_mode_header: false,
+            request_id: None,
+            request_weight: 1.0,
+        }
+    }
+}
+
+impl RequestOptions {
+    fn normalized_request_weight(&self) -> f64 {
+        if self.request_weight.is_finite() && self.request_weight > 0.0 {
+            self.request_weight
+        } else {
+            1.0
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -293,6 +314,10 @@ impl KiroProvider {
             client_cache: Mutex::new(cache),
             tls_backend,
         }
+    }
+
+    pub fn request_weighting_config(&self) -> RequestWeightingConfig {
+        self.token_manager.request_weighting_config_snapshot()
     }
 
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
@@ -644,6 +669,7 @@ impl KiroProvider {
             .request_id
             .clone()
             .unwrap_or_else(|| format!("kirors-{}", Uuid::new_v4().simple()));
+        let request_weight = options.normalized_request_weight();
         let overall_started_at = Instant::now();
 
         // 尝试从请求体中提取模型信息
@@ -658,7 +684,11 @@ impl KiroProvider {
         for attempt in 0..max_retries {
             let attempt_started_at = Instant::now();
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
+            let ctx = match self
+                .token_manager
+                .acquire_context_with_weight(model.as_deref(), request_weight)
+                .await
+            {
                 Ok(c) => c,
                 Err(err) => {
                     if self
@@ -725,6 +755,7 @@ impl KiroProvider {
                 max_retries,
                 region = %region,
                 stream = is_stream,
+                request_weight,
                 acquire_context_ms,
                 omit_agent_mode_header = options.omit_agent_mode_header,
                 invocation_id = %invocation_id,
@@ -744,6 +775,7 @@ impl KiroProvider {
                         max_retries,
                         region = %region,
                         stream = is_stream,
+                        request_weight,
                         acquire_context_ms,
                         upstream_wait_ms = upstream_request_started_at.elapsed().as_millis(),
                         error = %e,

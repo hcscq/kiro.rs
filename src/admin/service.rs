@@ -334,6 +334,7 @@ impl AdminService {
             rate_limit_refill_recovery_step_per_success: snapshot
                 .rate_limit_refill_recovery_step_per_success,
             rate_limit_refill_backoff_factor: snapshot.rate_limit_refill_backoff_factor,
+            request_weighting: snapshot.request_weighting,
             waiting_requests: snapshot.waiting_requests,
         })
     }
@@ -355,6 +356,7 @@ impl AdminService {
             && req.rate_limit_refill_min_per_second.is_none()
             && req.rate_limit_refill_recovery_step_per_success.is_none()
             && req.rate_limit_refill_backoff_factor.is_none()
+            && req.request_weighting.is_none()
         {
             return self.get_load_balancing_mode();
         }
@@ -378,6 +380,7 @@ impl AdminService {
                 req.rate_limit_refill_min_per_second,
                 req.rate_limit_refill_recovery_step_per_success,
                 req.rate_limit_refill_backoff_factor,
+                req.request_weighting,
             )
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 

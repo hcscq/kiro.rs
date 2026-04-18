@@ -341,14 +341,23 @@ pub async fn post_messages(
 
     // 检查是否启用了thinking
     let thinking_enabled = request_thinking_enabled(&payload);
+    let request_weighting = provider.request_weighting_config();
 
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
-        payload.system,
-        payload.messages,
-        payload.tools,
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
     ) as i32;
+    let request_weight = payload.request_weight_with_config(&request_weighting, Some(input_tokens));
+
+    tracing::debug!(
+        request_id = %request_id,
+        input_tokens,
+        request_weight,
+        "已完成请求轻重分级"
+    );
 
     let tool_name_map = conversion_result.tool_name_map;
 
@@ -364,6 +373,7 @@ pub async fn post_messages(
             RequestOptions {
                 omit_agent_mode_header: probe.omit_agent_mode_header,
                 request_id: Some(request_id.clone()),
+                request_weight,
             },
         )
         .await
@@ -378,6 +388,7 @@ pub async fn post_messages(
             RequestOptions {
                 omit_agent_mode_header: probe.omit_agent_mode_header,
                 request_id: Some(request_id),
+                request_weight,
             },
         )
         .await
@@ -901,14 +912,23 @@ pub async fn post_messages_cc(
 
     // 检查是否启用了thinking
     let thinking_enabled = request_thinking_enabled(&payload);
+    let request_weighting = provider.request_weighting_config();
 
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
-        payload.system,
-        payload.messages,
-        payload.tools,
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
     ) as i32;
+    let request_weight = payload.request_weight_with_config(&request_weighting, Some(input_tokens));
+
+    tracing::debug!(
+        request_id = %request_id,
+        input_tokens,
+        request_weight,
+        "已完成请求轻重分级"
+    );
 
     let tool_name_map = conversion_result.tool_name_map;
 
@@ -924,6 +944,7 @@ pub async fn post_messages_cc(
             RequestOptions {
                 omit_agent_mode_header: probe.omit_agent_mode_header,
                 request_id: Some(request_id.clone()),
+                request_weight,
             },
         )
         .await
@@ -938,6 +959,7 @@ pub async fn post_messages_cc(
             RequestOptions {
                 omit_agent_mode_header: probe.omit_agent_mode_header,
                 request_id: Some(request_id),
+                request_weight,
             },
         )
         .await

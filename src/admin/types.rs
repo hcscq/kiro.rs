@@ -1,5 +1,6 @@
 //! Admin API 类型定义
 
+use crate::model::config::RequestWeightingConfig;
 use serde::{Deserialize, Serialize};
 
 // ============ 凭据状态 ============
@@ -256,6 +257,8 @@ pub struct LoadBalancingModeResponse {
     pub rate_limit_refill_recovery_step_per_success: f64,
     /// 遭遇 429 时的回填速率衰减系数（0.05-1）
     pub rate_limit_refill_backoff_factor: f64,
+    /// 轻/重请求的本地令牌消耗权重规则
+    pub request_weighting: RequestWeightingConfig,
     /// 当前正在排队的请求数
     pub waiting_requests: usize,
 }
@@ -284,6 +287,8 @@ pub struct SetLoadBalancingModeRequest {
     pub rate_limit_refill_recovery_step_per_success: Option<f64>,
     /// 遭遇 429 时的回填速率衰减系数（0.05-1）
     pub rate_limit_refill_backoff_factor: Option<f64>,
+    /// 轻/重请求的本地令牌消耗权重规则
+    pub request_weighting: Option<RequestWeightingConfig>,
 }
 
 // ============ 通用响应 ============

@@ -3,6 +3,135 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestWeightingConfig {
+    #[serde(default = "default_request_weighting_enabled")]
+    pub enabled: bool,
+
+    #[serde(default = "default_request_weighting_base_weight")]
+    pub base_weight: f64,
+
+    #[serde(default = "default_request_weighting_max_weight")]
+    pub max_weight: f64,
+
+    #[serde(default = "default_request_weighting_tools_bonus")]
+    pub tools_bonus: f64,
+
+    #[serde(default = "default_request_weighting_large_max_tokens_threshold")]
+    pub large_max_tokens_threshold: i32,
+
+    #[serde(default = "default_request_weighting_large_max_tokens_bonus")]
+    pub large_max_tokens_bonus: f64,
+
+    #[serde(default = "default_request_weighting_large_input_tokens_threshold")]
+    pub large_input_tokens_threshold: i32,
+
+    #[serde(default = "default_request_weighting_large_input_tokens_bonus")]
+    pub large_input_tokens_bonus: f64,
+
+    #[serde(default = "default_request_weighting_very_large_input_tokens_threshold")]
+    pub very_large_input_tokens_threshold: i32,
+
+    #[serde(default = "default_request_weighting_very_large_input_tokens_bonus")]
+    pub very_large_input_tokens_bonus: f64,
+
+    #[serde(default = "default_request_weighting_thinking_bonus")]
+    pub thinking_bonus: f64,
+
+    #[serde(default = "default_request_weighting_heavy_thinking_budget_threshold")]
+    pub heavy_thinking_budget_threshold: i32,
+
+    #[serde(default = "default_request_weighting_heavy_thinking_budget_bonus")]
+    pub heavy_thinking_budget_bonus: f64,
+}
+
+impl Default for RequestWeightingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_request_weighting_enabled(),
+            base_weight: default_request_weighting_base_weight(),
+            max_weight: default_request_weighting_max_weight(),
+            tools_bonus: default_request_weighting_tools_bonus(),
+            large_max_tokens_threshold: default_request_weighting_large_max_tokens_threshold(),
+            large_max_tokens_bonus: default_request_weighting_large_max_tokens_bonus(),
+            large_input_tokens_threshold: default_request_weighting_large_input_tokens_threshold(),
+            large_input_tokens_bonus: default_request_weighting_large_input_tokens_bonus(),
+            very_large_input_tokens_threshold:
+                default_request_weighting_very_large_input_tokens_threshold(),
+            very_large_input_tokens_bonus: default_request_weighting_very_large_input_tokens_bonus(
+            ),
+            thinking_bonus: default_request_weighting_thinking_bonus(),
+            heavy_thinking_budget_threshold:
+                default_request_weighting_heavy_thinking_budget_threshold(),
+            heavy_thinking_budget_bonus: default_request_weighting_heavy_thinking_budget_bonus(),
+        }
+    }
+}
+
+impl RequestWeightingConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for (name, value) in [
+            ("requestWeighting.baseWeight", self.base_weight),
+            ("requestWeighting.maxWeight", self.max_weight),
+            ("requestWeighting.toolsBonus", self.tools_bonus),
+            (
+                "requestWeighting.largeMaxTokensBonus",
+                self.large_max_tokens_bonus,
+            ),
+            (
+                "requestWeighting.largeInputTokensBonus",
+                self.large_input_tokens_bonus,
+            ),
+            (
+                "requestWeighting.veryLargeInputTokensBonus",
+                self.very_large_input_tokens_bonus,
+            ),
+            ("requestWeighting.thinkingBonus", self.thinking_bonus),
+            (
+                "requestWeighting.heavyThinkingBudgetBonus",
+                self.heavy_thinking_budget_bonus,
+            ),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                anyhow::bail!("{name} 必须是大于等于 0 的有限数字");
+            }
+        }
+
+        for (name, value) in [
+            (
+                "requestWeighting.largeMaxTokensThreshold",
+                self.large_max_tokens_threshold,
+            ),
+            (
+                "requestWeighting.largeInputTokensThreshold",
+                self.large_input_tokens_threshold,
+            ),
+            (
+                "requestWeighting.veryLargeInputTokensThreshold",
+                self.very_large_input_tokens_threshold,
+            ),
+            (
+                "requestWeighting.heavyThinkingBudgetThreshold",
+                self.heavy_thinking_budget_threshold,
+            ),
+        ] {
+            if value < 0 {
+                anyhow::bail!("{name} 必须大于等于 0");
+            }
+        }
+
+        if self.base_weight <= 0.0 {
+            anyhow::bail!("requestWeighting.baseWeight 必须大于 0");
+        }
+        if self.max_weight < self.base_weight {
+            anyhow::bail!("requestWeighting.maxWeight 不能小于 requestWeighting.baseWeight");
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum TlsBackend {
@@ -172,6 +301,10 @@ pub struct Config {
     #[serde(default = "default_rate_limit_refill_backoff_factor")]
     pub rate_limit_refill_backoff_factor: f64,
 
+    /// 轻/重请求的本地令牌消耗权重规则
+    #[serde(default)]
+    pub request_weighting: RequestWeightingConfig,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -254,6 +387,58 @@ fn default_state_hot_path_sync_min_interval_ms() -> u64 {
     25
 }
 
+fn default_request_weighting_enabled() -> bool {
+    true
+}
+
+fn default_request_weighting_base_weight() -> f64 {
+    1.0
+}
+
+fn default_request_weighting_max_weight() -> f64 {
+    3.0
+}
+
+fn default_request_weighting_tools_bonus() -> f64 {
+    0.5
+}
+
+fn default_request_weighting_large_max_tokens_threshold() -> i32 {
+    4_000
+}
+
+fn default_request_weighting_large_max_tokens_bonus() -> f64 {
+    0.5
+}
+
+fn default_request_weighting_large_input_tokens_threshold() -> i32 {
+    8_000
+}
+
+fn default_request_weighting_large_input_tokens_bonus() -> f64 {
+    0.5
+}
+
+fn default_request_weighting_very_large_input_tokens_threshold() -> i32 {
+    20_000
+}
+
+fn default_request_weighting_very_large_input_tokens_bonus() -> f64 {
+    0.5
+}
+
+fn default_request_weighting_thinking_bonus() -> f64 {
+    0.5
+}
+
+fn default_request_weighting_heavy_thinking_budget_threshold() -> i32 {
+    16_000
+}
+
+fn default_request_weighting_heavy_thinking_budget_bonus() -> f64 {
+    0.5
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -293,6 +478,7 @@ impl Default for Config {
             rate_limit_refill_recovery_step_per_success:
                 default_rate_limit_refill_recovery_step_per_success(),
             rate_limit_refill_backoff_factor: default_rate_limit_refill_backoff_factor(),
+            request_weighting: RequestWeightingConfig::default(),
             config_path: None,
         }
     }
@@ -360,6 +546,8 @@ impl Config {
             anyhow::bail!("stateRedisHeartbeatIntervalSecs 必须小于 stateRedisLeaderLeaseTtlSecs");
         }
 
+        self.request_weighting.validate()?;
+
         Ok(())
     }
 
@@ -426,7 +614,7 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::{Config, RequestWeightingConfig};
 
     #[test]
     fn validate_rejects_invalid_redis_runtime_coordination_timing() {
@@ -445,5 +633,19 @@ mod tests {
         config.instance_id = Some("kiro-a".to_string());
 
         assert_eq!(config.resolved_instance_id(), "kiro-a");
+    }
+
+    #[test]
+    fn validate_rejects_request_weighting_max_below_base() {
+        let mut config = Config::default();
+        config.request_weighting = RequestWeightingConfig {
+            base_weight: 2.0,
+            max_weight: 1.5,
+            ..RequestWeightingConfig::default()
+        };
+
+        let err = config.validate().unwrap_err().to_string();
+
+        assert!(err.contains("requestWeighting.maxWeight"));
     }
 }

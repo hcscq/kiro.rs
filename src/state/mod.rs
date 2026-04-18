@@ -14,7 +14,7 @@ use tokio::runtime::RuntimeFlavor;
 
 use crate::admin::types::BalanceResponse;
 use crate::kiro::model::credentials::{CredentialsConfig, KiroCredentials};
-use crate::model::config::{Config, StateBackendKind};
+use crate::model::config::{Config, RequestWeightingConfig, StateBackendKind};
 
 const STATS_FILE_NAME: &str = "kiro_stats.json";
 const BALANCE_CACHE_FILE_NAME: &str = "kiro_balance_cache.json";
@@ -68,6 +68,14 @@ local bucket_enabled = ARGV[5] == '1'
 local capacity = tonumber(ARGV[6])
 local refill_per_second = tonumber(ARGV[7])
 local min_refill_per_second = tonumber(ARGV[8])
+local requested_tokens = tonumber(ARGV[9])
+
+if not requested_tokens or requested_tokens <= 0 then
+  requested_tokens = 1.0
+end
+if bucket_enabled and capacity and capacity > 0 then
+  requested_tokens = math.min(requested_tokens, capacity)
+end
 
 redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now_ms)
 
@@ -175,8 +183,8 @@ local next_ready_at_ms = ''
 if cooldown_until_ms and cooldown_until_ms > now_ms then
   next_ready_at_ms = tostring(cooldown_until_ms)
 end
-if bucket_enabled and bucket_tokens and bucket_tokens < 1.0 then
-  local wait_seconds = (1.0 - bucket_tokens) / bucket_current_refill_per_second
+if bucket_enabled and bucket_tokens and bucket_tokens < requested_tokens then
+  local wait_seconds = (requested_tokens - bucket_tokens) / bucket_current_refill_per_second
   local bucket_ready_at_ms = now_ms + math.ceil(wait_seconds * 1000.0)
   if next_ready_at_ms == '' or bucket_ready_at_ms > tonumber(next_ready_at_ms) then
     next_ready_at_ms = tostring(bucket_ready_at_ms)
@@ -184,7 +192,7 @@ if bucket_enabled and bucket_tokens and bucket_tokens < 1.0 then
 end
 
 if (cooldown_until_ms and cooldown_until_ms > now_ms)
-  or (bucket_enabled and bucket_tokens and bucket_tokens < 1.0)
+  or (bucket_enabled and bucket_tokens and bucket_tokens < requested_tokens)
   or (max_concurrency >= 0 and active_requests >= max_concurrency) then
   if bucket_enabled then
     redis.call(
@@ -221,7 +229,7 @@ if (cooldown_until_ms and cooldown_until_ms > now_ms)
 end
 
 if bucket_enabled then
-  bucket_tokens = math.max(0.0, bucket_tokens - 1.0)
+  bucket_tokens = math.max(0.0, bucket_tokens - requested_tokens)
   redis.call(
     'HSET',
     KEYS[1],
@@ -642,6 +650,59 @@ pub struct DispatchRuntimeSnapshot {
     pub next_ready_at_epoch_ms: Option<u64>,
 }
 
+impl DispatchRuntimeSnapshot {
+    fn normalized_request_weight(request_weight: f64) -> f64 {
+        if request_weight.is_finite() && request_weight > 0.0 {
+            request_weight
+        } else {
+            1.0
+        }
+    }
+
+    pub fn requested_bucket_tokens(&self, request_weight: f64) -> Option<f64> {
+        self.bucket_capacity
+            .map(|capacity| Self::normalized_request_weight(request_weight).min(capacity.max(0.0)))
+    }
+
+    pub fn next_ready_at_epoch_ms_for(
+        &self,
+        request_weight: f64,
+        now_epoch_ms: u64,
+    ) -> Option<u64> {
+        let cooldown_ready_at = self
+            .cooldown_until_epoch_ms
+            .filter(|until| *until > now_epoch_ms);
+        let bucket_ready_at = match (
+            self.bucket_tokens,
+            self.requested_bucket_tokens(request_weight),
+            self.bucket_current_refill_per_second,
+        ) {
+            (Some(tokens), Some(requested_tokens), Some(refill_per_second))
+                if requested_tokens > 0.0
+                    && refill_per_second > 0.0
+                    && tokens < requested_tokens =>
+            {
+                let wait_ms = ((requested_tokens - tokens) / refill_per_second * 1000.0)
+                    .ceil()
+                    .max(0.0) as u64;
+                Some(now_epoch_ms.saturating_add(wait_ms))
+            }
+            _ => self
+                .next_ready_at_epoch_ms
+                .filter(|ready_at| *ready_at > now_epoch_ms),
+        };
+
+        match (cooldown_ready_at, bucket_ready_at) {
+            (Some(cooldown_ready_at), Some(bucket_ready_at)) => {
+                Some(cooldown_ready_at.max(bucket_ready_at))
+            }
+            (Some(cooldown_ready_at), None) => Some(cooldown_ready_at),
+            (None, Some(bucket_ready_at)) => Some(bucket_ready_at),
+            (None, None) => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchLeaseReservationStatus {
     Reserved,
@@ -666,6 +727,8 @@ pub struct PersistedDispatchConfig {
     pub rate_limit_refill_min_per_second: f64,
     pub rate_limit_refill_recovery_step_per_success: f64,
     pub rate_limit_refill_backoff_factor: f64,
+    #[serde(default)]
+    pub request_weighting: RequestWeightingConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -696,6 +759,7 @@ impl PersistedDispatchConfig {
             rate_limit_refill_recovery_step_per_success: config
                 .rate_limit_refill_recovery_step_per_success,
             rate_limit_refill_backoff_factor: config.rate_limit_refill_backoff_factor,
+            request_weighting: config.request_weighting.clone(),
         }
     }
 
@@ -711,6 +775,7 @@ impl PersistedDispatchConfig {
         config.rate_limit_refill_recovery_step_per_success =
             self.rate_limit_refill_recovery_step_per_success;
         config.rate_limit_refill_backoff_factor = self.rate_limit_refill_backoff_factor;
+        config.request_weighting = self.request_weighting.clone();
     }
 }
 
@@ -943,6 +1008,7 @@ impl StateStore {
         lease_id: &str,
         max_concurrency: Option<usize>,
         bucket_policy: Option<DispatchRuntimeBucketPolicy>,
+        requested_tokens: f64,
         now_epoch_ms: u64,
         lease_ttl_ms: u64,
     ) -> anyhow::Result<Option<DispatchLeaseReservation>> {
@@ -954,6 +1020,7 @@ impl StateStore {
                     lease_id,
                     max_concurrency,
                     bucket_policy,
+                    requested_tokens,
                     now_epoch_ms,
                     lease_ttl_ms,
                 )
@@ -1007,7 +1074,9 @@ impl StateStore {
     ) -> anyhow::Result<Option<DispatchRuntimeSnapshot>> {
         self.dispatch_runtime_backend
             .as_ref()
-            .map(|backend| backend.record_rate_limited(id, bucket_policy, cooldown_ms, now_epoch_ms))
+            .map(|backend| {
+                backend.record_rate_limited(id, bucket_policy, cooldown_ms, now_epoch_ms)
+            })
             .transpose()
     }
 
@@ -1925,7 +1994,9 @@ impl DispatchRuntimeRecord {
         });
 
         let next_ready_at_epoch_ms = match (cooldown_until_epoch_ms, bucket_ready_at_epoch_ms) {
-            (Some(cooldown_until), Some(bucket_ready_at)) => Some(cooldown_until.max(bucket_ready_at)),
+            (Some(cooldown_until), Some(bucket_ready_at)) => {
+                Some(cooldown_until.max(bucket_ready_at))
+            }
             (Some(cooldown_until), None) => Some(cooldown_until),
             (None, Some(bucket_ready_at)) => Some(bucket_ready_at),
             (None, None) => None,
@@ -1961,9 +2032,7 @@ impl DispatchRuntimeRecord {
         let mut current_refill_per_second = self
             .bucket_current_refill_per_second
             .unwrap_or(policy.refill_per_second);
-        let last_refill_at_epoch_ms = self
-            .bucket_last_refill_at_epoch_ms
-            .unwrap_or(now_epoch_ms);
+        let last_refill_at_epoch_ms = self.bucket_last_refill_at_epoch_ms.unwrap_or(now_epoch_ms);
         let stored_capacity = self
             .bucket_capacity
             .filter(|value| *value > 0.0)
@@ -2044,33 +2113,31 @@ impl RedisDispatchRuntimeBackend {
         let namespace = self.namespace.clone();
         let credentials = credentials.to_vec();
 
-        run_blocking_state_op(move || -> anyhow::Result<HashMap<u64, DispatchRuntimeSnapshot>> {
-            let mut connection = client.get_connection().context("连接 Redis 调度热态失败")?;
-            let mut snapshots = HashMap::with_capacity(credentials.len());
+        run_blocking_state_op(
+            move || -> anyhow::Result<HashMap<u64, DispatchRuntimeSnapshot>> {
+                let mut connection = client.get_connection().context("连接 Redis 调度热态失败")?;
+                let mut snapshots = HashMap::with_capacity(credentials.len());
 
-            for credential in credentials {
-                let state_key = format!(
-                    "{}:credential:{}:{}",
-                    namespace, credential.id, REDIS_DISPATCH_RUNTIME_STATE_KEY_SUFFIX
-                );
-                let leases_key = format!(
-                    "{}:credential:{}:{}",
-                    namespace, credential.id, REDIS_DISPATCH_RUNTIME_LEASES_KEY_SUFFIX
-                );
-                let record = Self::load_record(
-                    &mut connection,
-                    &state_key,
-                    &leases_key,
-                    now_epoch_ms,
-                )?;
-                snapshots.insert(
-                    credential.id,
-                    record.normalize(credential.bucket_policy, now_epoch_ms),
-                );
-            }
+                for credential in credentials {
+                    let state_key = format!(
+                        "{}:credential:{}:{}",
+                        namespace, credential.id, REDIS_DISPATCH_RUNTIME_STATE_KEY_SUFFIX
+                    );
+                    let leases_key = format!(
+                        "{}:credential:{}:{}",
+                        namespace, credential.id, REDIS_DISPATCH_RUNTIME_LEASES_KEY_SUFFIX
+                    );
+                    let record =
+                        Self::load_record(&mut connection, &state_key, &leases_key, now_epoch_ms)?;
+                    snapshots.insert(
+                        credential.id,
+                        record.normalize(credential.bucket_policy, now_epoch_ms),
+                    );
+                }
 
-            Ok(snapshots)
-        })
+                Ok(snapshots)
+            },
+        )
     }
 
     fn try_reserve_lease(
@@ -2079,6 +2146,7 @@ impl RedisDispatchRuntimeBackend {
         lease_id: &str,
         max_concurrency: Option<usize>,
         bucket_policy: Option<DispatchRuntimeBucketPolicy>,
+        requested_tokens: f64,
         now_epoch_ms: u64,
         lease_ttl_ms: u64,
     ) -> anyhow::Result<DispatchLeaseReservation> {
@@ -2106,6 +2174,7 @@ impl RedisDispatchRuntimeBackend {
                 .arg(capacity)
                 .arg(refill_per_second)
                 .arg(min_refill_per_second)
+                .arg(requested_tokens)
                 .invoke(&mut connection)
                 .with_context(|| format!("更新 Redis 调度占位失败: {state_key}"))?;
             Self::parse_reservation_response(response)
@@ -2268,7 +2337,8 @@ impl RedisDispatchRuntimeBackend {
     ) -> anyhow::Result<DispatchRuntimeSnapshot> {
         let client = self.client.clone();
         let state_key = self.state_key(id);
-        let (bucket_enabled, capacity, refill_per_second, _) = Self::bucket_script_args(bucket_policy);
+        let (bucket_enabled, capacity, refill_per_second, _) =
+            Self::bucket_script_args(bucket_policy);
 
         run_blocking_state_op(move || -> anyhow::Result<DispatchRuntimeSnapshot> {
             let mut connection = client.get_connection().context("连接 Redis 调度热态失败")?;
@@ -2405,15 +2475,18 @@ impl RedisDispatchRuntimeBackend {
     }
 
     fn parse_optional_u64(raw: Option<&Option<String>>) -> Option<u64> {
-        raw.and_then(|value| value.as_deref()).and_then(Self::parse_string_u64)
+        raw.and_then(|value| value.as_deref())
+            .and_then(Self::parse_string_u64)
     }
 
     fn parse_optional_u32(raw: Option<&Option<String>>) -> Option<u32> {
-        raw.and_then(|value| value.as_deref()).and_then(Self::parse_string_u32)
+        raw.and_then(|value| value.as_deref())
+            .and_then(Self::parse_string_u32)
     }
 
     fn parse_optional_f64(raw: Option<&Option<String>>) -> Option<f64> {
-        raw.and_then(|value| value.as_deref()).and_then(Self::parse_string_f64)
+        raw.and_then(|value| value.as_deref())
+            .and_then(Self::parse_string_f64)
     }
 
     fn parse_string_u64(raw: &str) -> Option<u64> {
@@ -2600,6 +2673,11 @@ mod tests {
             rate_limit_refill_min_per_second: 0.4,
             rate_limit_refill_recovery_step_per_success: 0.2,
             rate_limit_refill_backoff_factor: 0.7,
+            request_weighting: RequestWeightingConfig {
+                max_weight: 4.0,
+                tools_bonus: 1.0,
+                ..RequestWeightingConfig::default()
+            },
         };
 
         store.persist_dispatch_config(&dispatch).unwrap();

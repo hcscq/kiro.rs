@@ -19,8 +19,8 @@ use std::{
     },
 };
 
-use axum::{http::StatusCode, routing::get, Json, Router};
 use anyhow::Context;
+use axum::{http::StatusCode, routing::get, Json, Router};
 use chrono::Utc;
 use clap::Parser;
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
@@ -288,8 +288,9 @@ fn export_file_state(
 
     let primary_config = config_for_primary_state_export(&source_config);
     let credentials_path_buf = PathBuf::from(credentials_path);
-    let primary_state_store = StateStore::from_config(&primary_config, Some(credentials_path_buf.clone()))
-        .context("初始化 PostgreSQL 状态存储失败")?;
+    let primary_state_store =
+        StateStore::from_config(&primary_config, Some(credentials_path_buf.clone()))
+            .context("初始化 PostgreSQL 状态存储失败")?;
 
     let persisted_credentials = primary_state_store.load_credentials()?;
     if persisted_credentials.credentials.is_empty() {
@@ -331,10 +332,16 @@ fn export_file_state(
     }
 
     let rollback_config = build_file_rollback_config(&source_config, &dispatch);
-    write_json_pretty(&rollback_config_path, &rollback_config, export_args.overwrite)?;
+    write_json_pretty(
+        &rollback_config_path,
+        &rollback_config,
+        export_args.overwrite,
+    )?;
 
-    let file_state_store =
-        StateStore::file(Some(rollback_config_path.clone()), Some(credentials_output_path.clone()));
+    let file_state_store = StateStore::file(
+        Some(rollback_config_path.clone()),
+        Some(credentials_output_path.clone()),
+    );
     if !file_state_store.persist_credentials(&credentials, true)? {
         anyhow::bail!("写入导出凭据失败");
     }
@@ -878,6 +885,7 @@ fn log_runtime_coordination_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::config::RequestWeightingConfig;
 
     #[test]
     fn build_file_rollback_config_switches_to_file_backend() {
@@ -901,6 +909,11 @@ mod tests {
             rate_limit_refill_min_per_second: 0.3,
             rate_limit_refill_recovery_step_per_success: 0.2,
             rate_limit_refill_backoff_factor: 0.4,
+            request_weighting: RequestWeightingConfig {
+                max_weight: 4.0,
+                tools_bonus: 1.0,
+                ..RequestWeightingConfig::default()
+            },
         };
 
         let rollback = build_file_rollback_config(&config, &dispatch);
@@ -918,5 +931,7 @@ mod tests {
         assert_eq!(rollback.rate_limit_refill_min_per_second, 0.3);
         assert_eq!(rollback.rate_limit_refill_recovery_step_per_success, 0.2);
         assert_eq!(rollback.rate_limit_refill_backoff_factor, 0.4);
+        assert_eq!(rollback.request_weighting.max_weight, 4.0);
+        assert_eq!(rollback.request_weighting.tools_bonus, 1.0);
     }
 }

@@ -216,6 +216,7 @@ GitHub Actions 镜像构建：
 | `rateLimitRefillMinPerSecond` | number | `0.2` | 遭遇 `429` 后允许降到的最小回填速率（token/s） |
 | `rateLimitRefillRecoveryStepPerSuccess` | number | `0.1` | 每次成功请求后恢复的回填速率增量（token/s） |
 | `rateLimitRefillBackoffFactor` | number | `0.5` | 遭遇 `429` 时当前回填速率的衰减系数，范围 `[0.05, 1]` |
+| `requestWeighting` | object | 推荐默认启用 | 轻/重请求加权配置。默认会按 `tools`、`thinking`、`maxTokens`、估算输入 tokens 自动提高单次请求的 bucket 消耗，适配“轻请求/重代码请求”混跑 |
 
 完整配置示例：
 
@@ -254,9 +255,33 @@ GitHub Actions 镜像构建：
    "rateLimitRefillPerSecond": 1.0,
    "rateLimitRefillMinPerSecond": 0.2,
    "rateLimitRefillRecoveryStepPerSuccess": 0.1,
-   "rateLimitRefillBackoffFactor": 0.5
+   "rateLimitRefillBackoffFactor": 0.5,
+   "requestWeighting": {
+      "enabled": true,
+      "baseWeight": 1.0,
+      "maxWeight": 3.0,
+      "toolsBonus": 0.5,
+      "largeMaxTokensThreshold": 4000,
+      "largeMaxTokensBonus": 0.5,
+      "largeInputTokensThreshold": 8000,
+      "largeInputTokensBonus": 0.5,
+      "veryLargeInputTokensThreshold": 20000,
+      "veryLargeInputTokensBonus": 0.5,
+      "thinkingBonus": 0.5,
+      "heavyThinkingBudgetThreshold": 16000,
+      "heavyThinkingBudgetBonus": 0.5
+   }
 }
 ```
+
+`requestWeighting` 默认规则：
+- 轻请求消耗 `1.0`
+- 带工具调用会额外增加 `0.5`
+- `thinking` 开启会额外增加 `0.5`
+- `thinking.budgetTokens >= 16000` 再额外增加 `0.5`
+- `maxTokens >= 4000` 额外增加 `0.5`
+- 估算输入 tokens >= `8000` / `20000` 时分别额外增加 `0.5`
+- 最终权重限制在 `1.0..=3.0`
 
 ### 外部状态存储
 
@@ -429,6 +454,7 @@ kiro-rs \
 - `queueMaxSize` / `queueMaxWaitMs` 可为瞬时超并发请求提供短暂排队，减少尖峰时直接失败
 - `rateLimitCooldownMs` 可控制单账号触发上游 `429` 后的固定冷却时长；设为 `0` 可关闭该机制
 - `rateLimitBucketCapacity` / `rateLimitRefillPerSecond` 可限制单账号单位时间内的发放速率，适合给“真实承载能力偏弱”的账号单独降速
+- `requestWeighting` 会让重代码/重 thinking 请求比轻请求消耗更多本地 bucket 配额，减少轻重流量互相挤占
 - 遭遇 `429` 时，本地会清空该账号 bucket，并按 `rateLimitRefillBackoffFactor` 下调当前回填速率；成功请求后再按 `rateLimitRefillRecoveryStepPerSuccess` 逐步恢复
 - 单凭据最多重试 3 次，单请求最多重试 9 次
 - 自动故障转移到下一个可用凭据
