@@ -99,6 +99,7 @@ interface ModelSelectorProps {
   description?: string
   placeholder?: string
   disabled?: boolean
+  hideHeader?: boolean
 }
 
 export function ModelSelector({
@@ -109,6 +110,7 @@ export function ModelSelector({
   description,
   placeholder = '筛选模型名称或 ID',
   disabled = false,
+  hideHeader = false,
 }: ModelSelectorProps) {
   const [keyword, setKeyword] = useState('')
   const [customEntry, setCustomEntry] = useState('')
@@ -162,10 +164,12 @@ export function ModelSelector({
 
   return (
     <div className="space-y-2">
-      <div className="flex items-center justify-between gap-2">
-        <label className="text-sm font-medium">{label}</label>
-        <Badge variant="outline">{selectedValues.length} 已选</Badge>
-      </div>
+      {!hideHeader && (
+        <div className="flex items-center justify-between gap-2">
+          <label className="text-sm font-medium">{label}</label>
+          <Badge variant="outline">{selectedValues.length} 已选</Badge>
+        </div>
+      )}
       <div className="space-y-3 rounded-lg border border-input bg-background p-3">
         {selectedValues.length > 0 ? (
           <div className="flex flex-wrap gap-2">

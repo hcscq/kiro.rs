@@ -66,6 +66,26 @@ function formatRestrictionExpiresAt(expiresAt: string): string {
   return date.toLocaleString('zh-CN', { hour12: false })
 }
 
+function summarizeSelectedModels(
+  values: string[],
+  modelCatalog: ModelCatalogItem[]
+): string {
+  if (values.length === 0) {
+    return '未设置'
+  }
+
+  const displayNameMap = new Map(
+    modelCatalog.map((model) => [model.policyId, model.displayName] as const)
+  )
+  const labels = values.slice(0, 2).map((value) => displayNameMap.get(value) ?? value)
+
+  if (values.length <= 2) {
+    return labels.join('、')
+  }
+
+  return `${labels.join('、')} 等 ${values.length} 项`
+}
+
 export function CredentialCard({
   credential,
   onViewBalance,
@@ -283,6 +303,9 @@ export function CredentialCard({
       }
     )
   }
+
+  const allowedModelsSummary = summarizeSelectedModels(allowedModelsValue, modelCatalog)
+  const blockedModelsSummary = summarizeSelectedModels(blockedModelsValue, modelCatalog)
 
   return (
     <>
@@ -703,14 +726,14 @@ export function CredentialCard({
       </Card>
 
       <Dialog open={showModelPolicyDialog} onOpenChange={setShowModelPolicyDialog}>
-        <DialogContent className="sm:max-w-3xl">
+        <DialogContent className="sm:max-w-3xl max-h-[85vh] flex flex-col">
           <DialogHeader>
             <DialogTitle>编辑模型策略</DialogTitle>
             <DialogDescription>
               账号类型策略先命中，再叠加此账号自己的允许/禁用列表。运行时临时限制可在这里一并清空。
             </DialogDescription>
           </DialogHeader>
-          <div className="space-y-4">
+          <div className="flex-1 space-y-4 overflow-y-auto pr-1">
             <AccountTypeInput
               id={`account-type-${credential.id}`}
               label="账号类型"
@@ -720,19 +743,49 @@ export function CredentialCard({
               placeholder="优先选择已有类型，也可直接新建"
             />
 
-            <ModelSelector
-              label="账号级额外允许模型"
-              selectedValues={allowedModelsValue}
-              onChange={setAllowedModelsValue}
-              options={modelCatalog}
-            />
+            <div className="grid gap-4 lg:grid-cols-2">
+              <details className="rounded-lg border border-input bg-muted/10 p-3">
+                <summary className="cursor-pointer">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="space-y-1">
+                      <div className="text-sm font-medium">账号级额外允许模型</div>
+                      <p className="text-xs text-muted-foreground">{allowedModelsSummary}</p>
+                    </div>
+                    <Badge variant="outline">{allowedModelsValue.length} 已选</Badge>
+                  </div>
+                </summary>
+                <div className="mt-3">
+                  <ModelSelector
+                    label="账号级额外允许模型"
+                    selectedValues={allowedModelsValue}
+                    onChange={setAllowedModelsValue}
+                    options={modelCatalog}
+                    hideHeader
+                  />
+                </div>
+              </details>
 
-            <ModelSelector
-              label="账号级额外禁用模型"
-              selectedValues={blockedModelsValue}
-              onChange={setBlockedModelsValue}
-              options={modelCatalog}
-            />
+              <details className="rounded-lg border border-input bg-muted/10 p-3">
+                <summary className="cursor-pointer">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="space-y-1">
+                      <div className="text-sm font-medium">账号级额外禁用模型</div>
+                      <p className="text-xs text-muted-foreground">{blockedModelsSummary}</p>
+                    </div>
+                    <Badge variant="outline">{blockedModelsValue.length} 已选</Badge>
+                  </div>
+                </summary>
+                <div className="mt-3">
+                  <ModelSelector
+                    label="账号级额外禁用模型"
+                    selectedValues={blockedModelsValue}
+                    onChange={setBlockedModelsValue}
+                    options={modelCatalog}
+                    hideHeader
+                  />
+                </div>
+              </details>
+            </div>
 
             <div className="flex items-center gap-2 rounded-lg border border-dashed p-3">
               <Checkbox
