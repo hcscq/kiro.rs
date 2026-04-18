@@ -9,9 +9,9 @@ use super::{
     handlers::{
         add_credential, delete_credential, force_refresh_token, get_all_credentials,
         get_credential_balance, get_load_balancing_mode, get_model_capabilities_config,
-        reset_failure_count, set_credential_disabled, set_credential_max_concurrency,
-        set_credential_model_policy, set_credential_priority, set_credential_rate_limit_config,
-        set_load_balancing_mode, set_model_capabilities_config,
+        get_model_catalog, reset_failure_count, set_credential_disabled,
+        set_credential_max_concurrency, set_credential_model_policy, set_credential_priority,
+        set_credential_rate_limit_config, set_load_balancing_mode, set_model_capabilities_config,
     },
     middleware::{AdminState, admin_auth_middleware, admin_write_routing_middleware},
 };
@@ -33,6 +33,7 @@ use super::{
 /// - `GET /config/load-balancing` - 获取负载均衡与等待队列配置
 /// - `PUT /config/load-balancing` - 设置负载均衡与等待队列配置
 /// - `GET /config/model-capabilities` - 获取账号类型模型策略
+/// - `GET /config/model-catalog` - 获取内置模型目录
 /// - `PUT /config/model-capabilities` - 设置账号类型模型策略
 ///
 /// # 认证
@@ -71,6 +72,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/config/model-capabilities",
             get(get_model_capabilities_config).put(set_model_capabilities_config),
         )
+        .route("/config/model-catalog", get(get_model_catalog))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_write_routing_middleware,

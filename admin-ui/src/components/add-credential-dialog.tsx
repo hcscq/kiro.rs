@@ -1,5 +1,10 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { toast } from 'sonner'
+import {
+  AccountTypeInput,
+  ModelSelector,
+  collectAccountTypeSuggestions,
+} from '@/components/model-policy-controls'
 import {
   Dialog,
   DialogContent,
@@ -9,7 +14,12 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { useAddCredential } from '@/hooks/use-credentials'
+import {
+  useAddCredential,
+  useCredentials,
+  useModelCapabilitiesConfig,
+  useModelCatalog,
+} from '@/hooks/use-credentials'
 import { extractErrorMessage } from '@/lib/utils'
 
 interface AddCredentialDialogProps {
@@ -32,13 +42,26 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [rateLimitRefillPerSecond, setRateLimitRefillPerSecond] = useState('')
   const [machineId, setMachineId] = useState('')
   const [accountType, setAccountType] = useState('')
-  const [allowedModels, setAllowedModels] = useState('')
-  const [blockedModels, setBlockedModels] = useState('')
+  const [allowedModels, setAllowedModels] = useState<string[]>([])
+  const [blockedModels, setBlockedModels] = useState<string[]>([])
   const [proxyUrl, setProxyUrl] = useState('')
   const [proxyUsername, setProxyUsername] = useState('')
   const [proxyPassword, setProxyPassword] = useState('')
 
   const { mutate, isPending } = useAddCredential()
+  const { data: credentialsData } = useCredentials()
+  const { data: modelCapabilitiesData } = useModelCapabilitiesConfig()
+  const { data: modelCatalogData } = useModelCatalog()
+
+  const accountTypeSuggestions = useMemo(
+    () =>
+      collectAccountTypeSuggestions(
+        credentialsData?.credentials,
+        modelCapabilitiesData?.accountTypePolicies
+      ),
+    [credentialsData?.credentials, modelCapabilitiesData?.accountTypePolicies]
+  )
+  const modelCatalog = modelCatalogData?.models ?? []
 
   const resetForm = () => {
     setRefreshToken('')
@@ -53,18 +76,12 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setRateLimitRefillPerSecond('')
     setMachineId('')
     setAccountType('')
-    setAllowedModels('')
-    setBlockedModels('')
+    setAllowedModels([])
+    setBlockedModels([])
     setProxyUrl('')
     setProxyUsername('')
     setProxyPassword('')
   }
-
-  const parseModelList = (value: string) =>
-    value
-      .split(/[,\n]/)
-      .map((item) => item.trim())
-      .filter(Boolean)
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
@@ -98,8 +115,6 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     const parsedRateLimitRefillPerSecond = rateLimitRefillPerSecond.trim()
       ? Number.parseFloat(rateLimitRefillPerSecond)
       : undefined
-    const parsedAllowedModels = parseModelList(allowedModels)
-    const parsedBlockedModels = parseModelList(blockedModels)
     if (
       parsedRateLimitBucketCapacity !== undefined &&
       (!Number.isFinite(parsedRateLimitBucketCapacity) || parsedRateLimitBucketCapacity < 0)
@@ -129,8 +144,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         rateLimitRefillPerSecond: parsedRateLimitRefillPerSecond,
         machineId: machineId.trim() || undefined,
         accountType: accountType.trim() || undefined,
-        allowedModels: parsedAllowedModels.length ? parsedAllowedModels : undefined,
-        blockedModels: parsedBlockedModels.length ? parsedBlockedModels : undefined,
+        allowedModels: allowedModels.length ? allowedModels : undefined,
+        blockedModels: blockedModels.length ? blockedModels : undefined,
         proxyUrl: proxyUrl.trim() || undefined,
         proxyUsername: proxyUsername.trim() || undefined,
         proxyPassword: proxyPassword.trim() || undefined,
@@ -150,7 +165,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-lg max-h-[85vh] flex flex-col">
+      <DialogContent className="sm:max-w-3xl max-h-[85vh] flex flex-col">
         <DialogHeader>
           <DialogTitle>添加凭据</DialogTitle>
         </DialogHeader>
@@ -331,57 +346,34 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               </p>
             </div>
 
-            <div className="space-y-2">
-              <label htmlFor="accountType" className="text-sm font-medium">
-                账号类型
-              </label>
-              <Input
-                id="accountType"
-                placeholder="例如 pro-plus / power / reseller-a"
-                value={accountType}
-                onChange={(e) => setAccountType(e.target.value)}
-                disabled={isPending}
-              />
-              <p className="text-xs text-muted-foreground">
-                可选。会命中全局账号类型模型策略，再叠加此账号自己的允许/拒绝列表
-              </p>
-            </div>
+            <AccountTypeInput
+              id="accountType"
+              label="账号类型"
+              value={accountType}
+              onChange={setAccountType}
+              suggestions={accountTypeSuggestions}
+              placeholder="优先从已有账号类型中选择，也可直接新建"
+              description="可选。先命中账号类型默认策略，再叠加此账号自己的允许/拒绝列表。"
+              disabled={isPending}
+            />
 
-            <div className="space-y-2">
-              <label htmlFor="allowedModels" className="text-sm font-medium">
-                账号级额外允许模型
-              </label>
-              <textarea
-                id="allowedModels"
-                rows={3}
-                value={allowedModels}
-                onChange={(e) => setAllowedModels(e.target.value)}
-                disabled={isPending}
-                placeholder="每行一个或逗号分隔，例如 claude-opus-4-6"
-                className="flex min-h-[72px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
-              />
-              <p className="text-xs text-muted-foreground">
-                如果账号类型已有允许列表，这里会追加额外允许项
-              </p>
-            </div>
+            <ModelSelector
+              label="账号级额外允许模型"
+              selectedValues={allowedModels}
+              onChange={setAllowedModels}
+              options={modelCatalog}
+              description="建议优先从候选列表多选；如果目标模型尚未收录，可在下方手动补充。"
+              disabled={isPending}
+            />
 
-            <div className="space-y-2">
-              <label htmlFor="blockedModels" className="text-sm font-medium">
-                账号级额外禁用模型
-              </label>
-              <textarea
-                id="blockedModels"
-                rows={3}
-                value={blockedModels}
-                onChange={(e) => setBlockedModels(e.target.value)}
-                disabled={isPending}
-                placeholder="每行一个或逗号分隔，例如 claude-opus-4-7"
-                className="flex min-h-[72px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
-              />
-              <p className="text-xs text-muted-foreground">
-                显式禁用优先级最高，可用于覆盖账号类型默认策略
-              </p>
-            </div>
+            <ModelSelector
+              label="账号级额外禁用模型"
+              selectedValues={blockedModels}
+              onChange={setBlockedModels}
+              options={modelCatalog}
+              description="显式禁用优先级最高，可用于覆盖账号类型默认策略。"
+              disabled={isPending}
+            />
 
             {/* 代理配置 */}
             <div className="space-y-2">

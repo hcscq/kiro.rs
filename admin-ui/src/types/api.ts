@@ -93,6 +93,16 @@ export interface ModelSupportPolicy {
   blockedModels: string[]
 }
 
+export interface ModelCatalogItem {
+  apiId: string
+  policyId: string
+  displayName: string
+}
+
+export interface ModelCatalogResponse {
+  models: ModelCatalogItem[]
+}
+
 export interface SetCredentialModelPolicyRequest {
   accountType?: string | null
   allowedModels?: string[] | null

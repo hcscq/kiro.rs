@@ -11,6 +11,7 @@ import type {
   AddCredentialRequest,
   AddCredentialResponse,
   LoadBalancingConfigResponse,
+  ModelCatalogResponse,
   ModelCapabilitiesConfigResponse,
   UpdateLoadBalancingConfigRequest,
   UpdateModelCapabilitiesConfigRequest,
@@ -151,6 +152,11 @@ export async function setLoadBalancingMode(
 
 export async function getModelCapabilitiesConfig(): Promise<ModelCapabilitiesConfigResponse> {
   const { data } = await api.get<ModelCapabilitiesConfigResponse>('/config/model-capabilities')
+  return data
+}
+
+export async function getModelCatalog(): Promise<ModelCatalogResponse> {
+  const { data } = await api.get<ModelCatalogResponse>('/config/model-catalog')
   return data
 }
 

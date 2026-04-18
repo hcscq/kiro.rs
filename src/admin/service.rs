@@ -8,14 +8,15 @@ use parking_lot::Mutex;
 
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
+use crate::model::model_catalog::built_in_model_catalog;
 use crate::state::{CachedBalanceRecord, RuntimeCoordinationStatus, StateChangeKind};
 
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
     CredentialsStatusResponse, LoadBalancingModeResponse, ModelCapabilitiesConfigResponse,
-    SetCredentialModelPolicyRequest, SetLoadBalancingModeRequest,
-    SetModelCapabilitiesConfigRequest,
+    ModelCatalogItemResponse, ModelCatalogResponse, SetCredentialModelPolicyRequest,
+    SetLoadBalancingModeRequest, SetModelCapabilitiesConfigRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -374,6 +375,19 @@ impl AdminService {
         Ok(ModelCapabilitiesConfigResponse {
             account_type_policies: self.token_manager.account_type_policies_snapshot(),
         })
+    }
+
+    pub fn get_model_catalog(&self) -> ModelCatalogResponse {
+        ModelCatalogResponse {
+            models: built_in_model_catalog()
+                .iter()
+                .map(|item| ModelCatalogItemResponse {
+                    api_id: item.api_id.to_string(),
+                    policy_id: item.policy_id.to_string(),
+                    display_name: item.display_name.to_string(),
+                })
+                .collect(),
+        }
     }
 
     /// 设置负载均衡模式

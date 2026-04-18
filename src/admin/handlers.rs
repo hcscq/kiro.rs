@@ -202,6 +202,12 @@ pub async fn get_model_capabilities_config(State(state): State<AdminState>) -> i
     }
 }
 
+/// GET /api/admin/config/model-catalog
+/// 获取内置模型目录
+pub async fn get_model_catalog(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_model_catalog()).into_response()
+}
+
 /// PUT /api/admin/config/load-balancing
 /// 设置负载均衡与等待队列配置
 pub async fn set_load_balancing_mode(

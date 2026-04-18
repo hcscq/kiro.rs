@@ -1,6 +1,10 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
 import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2 } from 'lucide-react'
+import {
+  AccountTypeInput,
+  ModelSelector,
+} from '@/components/model-policy-controls'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -15,7 +19,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import type { CredentialStatusItem, BalanceResponse } from '@/types/api'
+import type { CredentialStatusItem, BalanceResponse, ModelCatalogItem } from '@/types/api'
 import {
   useSetDisabled,
   useSetCredentialModelPolicy,
@@ -34,6 +38,8 @@ interface CredentialCardProps {
   onToggleSelect: () => void
   balance: BalanceResponse | null
   loadingBalance: boolean
+  accountTypeSuggestions: string[]
+  modelCatalog: ModelCatalogItem[]
 }
 
 function formatLastUsed(lastUsedAt: string | null): string {
@@ -52,13 +58,6 @@ function formatLastUsed(lastUsedAt: string | null): string {
   return `${days} 天前`
 }
 
-function parseModelList(value: string): string[] {
-  return value
-    .split(/[,\n]/)
-    .map((item) => item.trim())
-    .filter(Boolean)
-}
-
 function formatRestrictionExpiresAt(expiresAt: string): string {
   const date = new Date(expiresAt)
   if (Number.isNaN(date.getTime())) {
@@ -74,6 +73,8 @@ export function CredentialCard({
   onToggleSelect,
   balance,
   loadingBalance,
+  accountTypeSuggestions,
+  modelCatalog,
 }: CredentialCardProps) {
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
@@ -96,12 +97,8 @@ export function CredentialCard({
   )
   const [showModelPolicyDialog, setShowModelPolicyDialog] = useState(false)
   const [accountTypeValue, setAccountTypeValue] = useState(credential.accountType ?? '')
-  const [allowedModelsValue, setAllowedModelsValue] = useState(
-    credential.allowedModels?.join('\n') ?? ''
-  )
-  const [blockedModelsValue, setBlockedModelsValue] = useState(
-    credential.blockedModels?.join('\n') ?? ''
-  )
+  const [allowedModelsValue, setAllowedModelsValue] = useState(credential.allowedModels ?? [])
+  const [blockedModelsValue, setBlockedModelsValue] = useState(credential.blockedModels ?? [])
   const [clearRuntimeModelRestrictions, setClearRuntimeModelRestrictions] = useState(false)
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
 
@@ -258,23 +255,20 @@ export function CredentialCard({
 
   const openModelPolicyDialog = () => {
     setAccountTypeValue(credential.accountType ?? '')
-    setAllowedModelsValue(credential.allowedModels?.join('\n') ?? '')
-    setBlockedModelsValue(credential.blockedModels?.join('\n') ?? '')
+    setAllowedModelsValue(credential.allowedModels ?? [])
+    setBlockedModelsValue(credential.blockedModels ?? [])
     setClearRuntimeModelRestrictions(false)
     setShowModelPolicyDialog(true)
   }
 
   const handleModelPolicySave = () => {
-    const parsedAllowedModels = parseModelList(allowedModelsValue)
-    const parsedBlockedModels = parseModelList(blockedModelsValue)
-
     setModelPolicy.mutate(
       {
         id: credential.id,
         payload: {
           accountType: accountTypeValue.trim() ? accountTypeValue.trim() : null,
-          allowedModels: parsedAllowedModels.length ? parsedAllowedModels : null,
-          blockedModels: parsedBlockedModels.length ? parsedBlockedModels : null,
+          allowedModels: allowedModelsValue.length ? allowedModelsValue : null,
+          blockedModels: blockedModelsValue.length ? blockedModelsValue : null,
           clearRuntimeModelRestrictions,
         },
       },
@@ -709,7 +703,7 @@ export function CredentialCard({
       </Card>
 
       <Dialog open={showModelPolicyDialog} onOpenChange={setShowModelPolicyDialog}>
-        <DialogContent className="sm:max-w-xl">
+        <DialogContent className="sm:max-w-3xl">
           <DialogHeader>
             <DialogTitle>编辑模型策略</DialogTitle>
             <DialogDescription>
@@ -717,45 +711,28 @@ export function CredentialCard({
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4">
-            <div className="space-y-2">
-              <label htmlFor={`account-type-${credential.id}`} className="text-sm font-medium">
-                账号类型
-              </label>
-              <Input
-                id={`account-type-${credential.id}`}
-                value={accountTypeValue}
-                onChange={(e) => setAccountTypeValue(e.target.value)}
-                placeholder="例如 pro-plus / power / reseller-a"
-              />
-            </div>
+            <AccountTypeInput
+              id={`account-type-${credential.id}`}
+              label="账号类型"
+              value={accountTypeValue}
+              onChange={setAccountTypeValue}
+              suggestions={accountTypeSuggestions}
+              placeholder="优先选择已有类型，也可直接新建"
+            />
 
-            <div className="space-y-2">
-              <label htmlFor={`allowed-models-${credential.id}`} className="text-sm font-medium">
-                账号级额外允许模型
-              </label>
-              <textarea
-                id={`allowed-models-${credential.id}`}
-                rows={4}
-                value={allowedModelsValue}
-                onChange={(e) => setAllowedModelsValue(e.target.value)}
-                placeholder="每行一个或逗号分隔，例如 claude-opus-4-6"
-                className="flex min-h-[96px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
-              />
-            </div>
+            <ModelSelector
+              label="账号级额外允许模型"
+              selectedValues={allowedModelsValue}
+              onChange={setAllowedModelsValue}
+              options={modelCatalog}
+            />
 
-            <div className="space-y-2">
-              <label htmlFor={`blocked-models-${credential.id}`} className="text-sm font-medium">
-                账号级额外禁用模型
-              </label>
-              <textarea
-                id={`blocked-models-${credential.id}`}
-                rows={4}
-                value={blockedModelsValue}
-                onChange={(e) => setBlockedModelsValue(e.target.value)}
-                placeholder="每行一个或逗号分隔，例如 claude-opus-4-7"
-                className="flex min-h-[96px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
-              />
-            </div>
+            <ModelSelector
+              label="账号级额外禁用模型"
+              selectedValues={blockedModelsValue}
+              onChange={setBlockedModelsValue}
+              options={modelCatalog}
+            />
 
             <div className="flex items-center gap-2 rounded-lg border border-dashed p-3">
               <Checkbox

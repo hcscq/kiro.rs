@@ -12,6 +12,7 @@ import {
   addCredential,
   deleteCredential,
   getLoadBalancingMode,
+  getModelCatalog,
   setLoadBalancingMode,
   getModelCapabilitiesConfig,
   setModelCapabilitiesConfig,
@@ -181,6 +182,14 @@ export function useModelCapabilitiesConfig() {
   return useQuery({
     queryKey: ['modelCapabilities'],
     queryFn: getModelCapabilitiesConfig,
+  })
+}
+
+export function useModelCatalog() {
+  return useQuery({
+    queryKey: ['modelCatalog'],
+    queryFn: getModelCatalog,
+    staleTime: Infinity,
   })
 }
 

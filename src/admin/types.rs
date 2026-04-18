@@ -349,6 +349,20 @@ pub struct ModelCapabilitiesConfigResponse {
     pub account_type_policies: BTreeMap<String, ModelSupportPolicy>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCatalogItemResponse {
+    pub api_id: String,
+    pub policy_id: String,
+    pub display_name: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCatalogResponse {
+    pub models: Vec<ModelCatalogItemResponse>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetModelCapabilitiesConfigRequest {

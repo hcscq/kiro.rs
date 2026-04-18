@@ -12,7 +12,15 @@ import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
-import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode } from '@/hooks/use-credentials'
+import { collectAccountTypeSuggestions } from '@/components/model-policy-controls'
+import {
+  useCredentials,
+  useDeleteCredential,
+  useResetFailure,
+  useLoadBalancingMode,
+  useModelCapabilitiesConfig,
+  useModelCatalog,
+} from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { cn, extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse, CredentialStatusItem } from '@/types/api'
@@ -151,7 +159,14 @@ export function Dashboard() {
   const { mutate: deleteCredential } = useDeleteCredential()
   const { mutate: resetFailure } = useResetFailure()
   const { data: loadBalancingData } = useLoadBalancingMode()
+  const { data: modelCapabilitiesData } = useModelCapabilitiesConfig()
+  const { data: modelCatalogData } = useModelCatalog()
   const credentials = data?.credentials || []
+  const accountTypeSuggestions = collectAccountTypeSuggestions(
+    credentials,
+    modelCapabilitiesData?.accountTypePolicies
+  )
+  const modelCatalog = modelCatalogData?.models ?? []
   const levelOptions = [
     { value: ALL_LEVELS, label: '全部' },
     ...Array.from(new Set(credentials.map(credential => normalizeSubscriptionTitle(credential) ?? UNKNOWN_LEVEL)))
@@ -965,12 +980,14 @@ export function Dashboard() {
                     key={credential.id}
                     credential={credential}
                     onViewBalance={handleViewBalance}
-                    selected={selectedIds.has(credential.id)}
-                    onToggleSelect={() => toggleSelect(credential.id)}
-                    balance={balanceMap.get(credential.id) || null}
-                    loadingBalance={loadingBalanceIds.has(credential.id)}
-                  />
-                ))}
+                  selected={selectedIds.has(credential.id)}
+                  onToggleSelect={() => toggleSelect(credential.id)}
+                  balance={balanceMap.get(credential.id) || null}
+                  loadingBalance={loadingBalanceIds.has(credential.id)}
+                  accountTypeSuggestions={accountTypeSuggestions}
+                  modelCatalog={modelCatalog}
+                />
+              ))}
               </div>
 
               {/* 分页控件 */}
