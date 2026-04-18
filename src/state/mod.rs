@@ -2689,6 +2689,27 @@ mod tests {
     }
 
     #[test]
+    fn persisted_dispatch_config_defaults_request_weighting_to_enabled_when_missing() {
+        let dispatch: PersistedDispatchConfig = serde_json::from_str(
+            r#"{
+                "mode":"balanced",
+                "queue_max_size":16,
+                "queue_max_wait_ms":1500,
+                "rate_limit_cooldown_ms":5000,
+                "default_max_concurrency":3,
+                "rate_limit_bucket_capacity":6.0,
+                "rate_limit_refill_per_second":1.5,
+                "rate_limit_refill_min_per_second":0.4,
+                "rate_limit_refill_recovery_step_per_success":0.2,
+                "rate_limit_refill_backoff_factor":0.7
+            }"#,
+        )
+        .unwrap();
+
+        assert!(dispatch.request_weighting.enabled);
+    }
+
+    #[test]
     fn state_store_from_config_rejects_postgres_without_url() {
         let mut config = Config::default();
         config.state_backend = StateBackendKind::Postgres;

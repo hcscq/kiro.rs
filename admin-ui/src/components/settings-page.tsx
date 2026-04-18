@@ -17,17 +17,17 @@ type RequestWeightingInputState = Record<RequestWeightingNumericField, string>
 const DEFAULT_REQUEST_WEIGHTING: RequestWeightingConfig = {
   enabled: true,
   baseWeight: 1,
-  maxWeight: 3,
-  toolsBonus: 0.5,
-  largeMaxTokensThreshold: 4000,
-  largeMaxTokensBonus: 0.5,
-  largeInputTokensThreshold: 8000,
-  largeInputTokensBonus: 0.5,
-  veryLargeInputTokensThreshold: 20000,
-  veryLargeInputTokensBonus: 0.5,
-  thinkingBonus: 0.5,
-  heavyThinkingBudgetThreshold: 16000,
-  heavyThinkingBudgetBonus: 0.5,
+  maxWeight: 2.5,
+  toolsBonus: 0.4,
+  largeMaxTokensThreshold: 8000,
+  largeMaxTokensBonus: 0.25,
+  largeInputTokensThreshold: 12000,
+  largeInputTokensBonus: 0.25,
+  veryLargeInputTokensThreshold: 24000,
+  veryLargeInputTokensBonus: 0.35,
+  thinkingBonus: 0.35,
+  heavyThinkingBudgetThreshold: 24000,
+  heavyThinkingBudgetBonus: 0.35,
 }
 
 const REQUEST_WEIGHTING_FIELD_SECTIONS: Array<{
@@ -183,11 +183,11 @@ export function SettingsPage() {
   const [queueMaxWaitMsInput, setQueueMaxWaitMsInput] = useState('0')
   const [rateLimitCooldownMsInput, setRateLimitCooldownMsInput] = useState('2000')
   const [defaultMaxConcurrencyInput, setDefaultMaxConcurrencyInput] = useState('')
-  const [rateLimitBucketCapacityInput, setRateLimitBucketCapacityInput] = useState('3')
-  const [rateLimitRefillPerSecondInput, setRateLimitRefillPerSecondInput] = useState('1')
-  const [rateLimitRefillMinPerSecondInput, setRateLimitRefillMinPerSecondInput] = useState('0.2')
-  const [rateLimitRefillRecoveryStepInput, setRateLimitRefillRecoveryStepInput] = useState('0.1')
-  const [rateLimitRefillBackoffFactorInput, setRateLimitRefillBackoffFactorInput] = useState('0.5')
+  const [rateLimitBucketCapacityInput, setRateLimitBucketCapacityInput] = useState('6')
+  const [rateLimitRefillPerSecondInput, setRateLimitRefillPerSecondInput] = useState('2')
+  const [rateLimitRefillMinPerSecondInput, setRateLimitRefillMinPerSecondInput] = useState('1')
+  const [rateLimitRefillRecoveryStepInput, setRateLimitRefillRecoveryStepInput] = useState('0.25')
+  const [rateLimitRefillBackoffFactorInput, setRateLimitRefillBackoffFactorInput] = useState('0.75')
   const [requestWeightingEnabled, setRequestWeightingEnabled] = useState(DEFAULT_REQUEST_WEIGHTING.enabled)
   const [requestWeightingInputs, setRequestWeightingInputs] = useState<RequestWeightingInputState>(
     () => createRequestWeightingInputs(DEFAULT_REQUEST_WEIGHTING)
@@ -591,8 +591,9 @@ export function SettingsPage() {
             <p>
               `defaultMaxConcurrency` 是未单独设置账号维度的默认回退并发上限。当前推荐组合是
               <code className="bg-muted px-1 rounded">queueMaxWaitMs=5000</code>、
-              <code className="bg-muted px-1 rounded">rateLimitBucketCapacity=4</code>、
-              <code className="bg-muted px-1 rounded">rateLimitRefillPerSecond=1</code>，
+              <code className="bg-muted px-1 rounded">rateLimitBucketCapacity=6</code>、
+              <code className="bg-muted px-1 rounded">rateLimitRefillPerSecond=2</code>、
+              <code className="bg-muted px-1 rounded">rateLimitRefillMinPerSecond=1</code>，
               再配合上面的 `requestWeighting` 让重代码/重 thinking 请求多消耗一些 bucket。
             </p>
           </div>

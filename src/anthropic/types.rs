@@ -369,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn test_messages_request_weight_clamps_heavy_request_to_max() {
+    fn test_messages_request_weight_defaults_to_light_request_when_disabled() {
         let mut request = sample_request();
         request.max_tokens = 8_192;
         request.tools = Some(vec![Tool {
@@ -385,7 +385,41 @@ mod tests {
             budget_tokens: 20_000,
         });
 
-        assert!((request.request_weight(Some(24_000)) - 3.0).abs() < f64::EPSILON);
+        let config = RequestWeightingConfig {
+            enabled: false,
+            ..RequestWeightingConfig::default()
+        };
+
+        assert!(
+            (request.request_weight_with_config(&config, Some(24_000)) - 1.0).abs() < f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn test_messages_request_weight_clamps_heavy_request_to_max_when_enabled() {
+        let mut request = sample_request();
+        request.max_tokens = 8_192;
+        request.tools = Some(vec![Tool {
+            tool_type: None,
+            name: "edit".to_string(),
+            description: "edit files".to_string(),
+            input_schema: HashMap::new(),
+            max_uses: None,
+        }]);
+        request.thinking = Some(Thinking {
+            thinking_type: "enabled".to_string(),
+            display: None,
+            budget_tokens: 32_000,
+        });
+
+        let config = RequestWeightingConfig {
+            enabled: true,
+            ..RequestWeightingConfig::default()
+        };
+
+        assert!(
+            (request.request_weight_with_config(&config, Some(32_000)) - 2.5).abs() < f64::EPSILON
+        );
     }
 
     #[test]

@@ -356,23 +356,23 @@ fn default_rate_limit_cooldown_ms() -> u64 {
 }
 
 fn default_rate_limit_bucket_capacity() -> f64 {
-    3.0
+    6.0
 }
 
 fn default_rate_limit_refill_per_second() -> f64 {
-    1.0
+    2.0
 }
 
 fn default_rate_limit_refill_min_per_second() -> f64 {
-    0.2
+    1.0
 }
 
 fn default_rate_limit_refill_recovery_step_per_success() -> f64 {
-    0.1
+    0.25
 }
 
 fn default_rate_limit_refill_backoff_factor() -> f64 {
-    0.5
+    0.75
 }
 
 fn default_state_redis_heartbeat_interval_secs() -> u64 {
@@ -396,47 +396,47 @@ fn default_request_weighting_base_weight() -> f64 {
 }
 
 fn default_request_weighting_max_weight() -> f64 {
-    3.0
+    2.5
 }
 
 fn default_request_weighting_tools_bonus() -> f64 {
-    0.5
+    0.4
 }
 
 fn default_request_weighting_large_max_tokens_threshold() -> i32 {
-    4_000
-}
-
-fn default_request_weighting_large_max_tokens_bonus() -> f64 {
-    0.5
-}
-
-fn default_request_weighting_large_input_tokens_threshold() -> i32 {
     8_000
 }
 
+fn default_request_weighting_large_max_tokens_bonus() -> f64 {
+    0.25
+}
+
+fn default_request_weighting_large_input_tokens_threshold() -> i32 {
+    12_000
+}
+
 fn default_request_weighting_large_input_tokens_bonus() -> f64 {
-    0.5
+    0.25
 }
 
 fn default_request_weighting_very_large_input_tokens_threshold() -> i32 {
-    20_000
+    24_000
 }
 
 fn default_request_weighting_very_large_input_tokens_bonus() -> f64 {
-    0.5
+    0.35
 }
 
 fn default_request_weighting_thinking_bonus() -> f64 {
-    0.5
+    0.35
 }
 
 fn default_request_weighting_heavy_thinking_budget_threshold() -> i32 {
-    16_000
+    24_000
 }
 
 fn default_request_weighting_heavy_thinking_budget_bonus() -> f64 {
-    0.5
+    0.35
 }
 
 impl Default for Config {
@@ -647,5 +647,19 @@ mod tests {
         let err = config.validate().unwrap_err().to_string();
 
         assert!(err.contains("requestWeighting.maxWeight"));
+    }
+
+    #[test]
+    fn request_weighting_defaults_to_enabled_and_tuned_for_weighted_bucket() {
+        let config = Config::default();
+
+        assert!(config.request_weighting.enabled);
+        assert!((config.rate_limit_bucket_capacity - 6.0).abs() < f64::EPSILON);
+        assert!((config.rate_limit_refill_per_second - 2.0).abs() < f64::EPSILON);
+        assert!((config.rate_limit_refill_min_per_second - 1.0).abs() < f64::EPSILON);
+        assert!((config.rate_limit_refill_recovery_step_per_success - 0.25).abs() < f64::EPSILON);
+        assert!((config.rate_limit_refill_backoff_factor - 0.75).abs() < f64::EPSILON);
+        assert!((config.request_weighting.max_weight - 2.5).abs() < f64::EPSILON);
+        assert!((config.request_weighting.tools_bonus - 0.4).abs() < f64::EPSILON);
     }
 }

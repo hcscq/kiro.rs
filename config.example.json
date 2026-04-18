@@ -15,11 +15,26 @@
   "loadBalancingMode": "balanced",
   "defaultMaxConcurrency": 3,
   "queueMaxSize": 16,
-  "queueMaxWaitMs": 1500,
+  "queueMaxWaitMs": 5000,
   "rateLimitCooldownMs": 2000,
-  "rateLimitBucketCapacity": 3.0,
-  "rateLimitRefillPerSecond": 1.0,
-  "rateLimitRefillMinPerSecond": 0.2,
-  "rateLimitRefillRecoveryStepPerSuccess": 0.1,
-  "rateLimitRefillBackoffFactor": 0.5
+  "rateLimitBucketCapacity": 6.0,
+  "rateLimitRefillPerSecond": 2.0,
+  "rateLimitRefillMinPerSecond": 1.0,
+  "rateLimitRefillRecoveryStepPerSuccess": 0.25,
+  "rateLimitRefillBackoffFactor": 0.75,
+  "requestWeighting": {
+    "enabled": true,
+    "baseWeight": 1.0,
+    "maxWeight": 2.5,
+    "toolsBonus": 0.4,
+    "largeMaxTokensThreshold": 8000,
+    "largeMaxTokensBonus": 0.25,
+    "largeInputTokensThreshold": 12000,
+    "largeInputTokensBonus": 0.25,
+    "veryLargeInputTokensThreshold": 24000,
+    "veryLargeInputTokensBonus": 0.35,
+    "thinkingBonus": 0.35,
+    "heavyThinkingBudgetThreshold": 24000,
+    "heavyThinkingBudgetBonus": 0.35
+  }
 }

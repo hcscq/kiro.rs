@@ -211,12 +211,12 @@ GitHub Actions 镜像构建：
 | `queueMaxSize` | number | `0` | 等待队列最大长度；`0` 表示禁用等待队列 |
 | `queueMaxWaitMs` | number | `0` | 单请求最大排队等待时间（毫秒）；`0` 表示禁用等待队列 |
 | `rateLimitCooldownMs` | number | `2000` | 单账号触发上游 `429` 后的冷却时间（毫秒）；`0` 表示禁用 429 冷却 |
-| `rateLimitBucketCapacity` | number | `3.0` | 单账号 token bucket 容量；`<= 0` 表示禁用 token bucket |
-| `rateLimitRefillPerSecond` | number | `1.0` | 单账号 token bucket 基础回填速率（token/s）；`<= 0` 表示禁用 token bucket |
-| `rateLimitRefillMinPerSecond` | number | `0.2` | 遭遇 `429` 后允许降到的最小回填速率（token/s） |
-| `rateLimitRefillRecoveryStepPerSuccess` | number | `0.1` | 每次成功请求后恢复的回填速率增量（token/s） |
-| `rateLimitRefillBackoffFactor` | number | `0.5` | 遭遇 `429` 时当前回填速率的衰减系数，范围 `[0.05, 1]` |
-| `requestWeighting` | object | 推荐默认启用 | 轻/重请求加权配置。默认会按 `tools`、`thinking`、`maxTokens`、估算输入 tokens 自动提高单次请求的 bucket 消耗，适配“轻请求/重代码请求”混跑 |
+| `rateLimitBucketCapacity` | number | `6.0` | 单账号 token bucket 容量；默认允许连续承接两次以上重请求，`<= 0` 表示禁用 token bucket |
+| `rateLimitRefillPerSecond` | number | `2.0` | 单账号 token bucket 基础回填速率（token/s）；默认与轻/重请求加权联动调优，`<= 0` 表示禁用 token bucket |
+| `rateLimitRefillMinPerSecond` | number | `1.0` | 遭遇 `429` 后允许降到的最小回填速率（token/s） |
+| `rateLimitRefillRecoveryStepPerSuccess` | number | `0.25` | 每次成功请求后恢复的回填速率增量（token/s） |
+| `rateLimitRefillBackoffFactor` | number | `0.75` | 遭遇 `429` 时当前回填速率的衰减系数，范围 `[0.05, 1]` |
+| `requestWeighting` | object | 默认开启 | 轻/重请求加权配置。默认值已按单号/少号场景收敛：重请求会多消耗 bucket，但不会像旧参数那样过快把桶打空 |
 
 完整配置示例：
 
@@ -249,39 +249,40 @@ GitHub Actions 镜像构建：
    "loadBalancingMode": "balanced",
    "defaultMaxConcurrency": 3,
    "queueMaxSize": 16,
-   "queueMaxWaitMs": 1500,
+   "queueMaxWaitMs": 5000,
    "rateLimitCooldownMs": 2000,
-   "rateLimitBucketCapacity": 3.0,
-   "rateLimitRefillPerSecond": 1.0,
-   "rateLimitRefillMinPerSecond": 0.2,
-   "rateLimitRefillRecoveryStepPerSuccess": 0.1,
-   "rateLimitRefillBackoffFactor": 0.5,
+   "rateLimitBucketCapacity": 6.0,
+   "rateLimitRefillPerSecond": 2.0,
+   "rateLimitRefillMinPerSecond": 1.0,
+   "rateLimitRefillRecoveryStepPerSuccess": 0.25,
+   "rateLimitRefillBackoffFactor": 0.75,
    "requestWeighting": {
       "enabled": true,
       "baseWeight": 1.0,
-      "maxWeight": 3.0,
-      "toolsBonus": 0.5,
-      "largeMaxTokensThreshold": 4000,
-      "largeMaxTokensBonus": 0.5,
-      "largeInputTokensThreshold": 8000,
-      "largeInputTokensBonus": 0.5,
-      "veryLargeInputTokensThreshold": 20000,
-      "veryLargeInputTokensBonus": 0.5,
-      "thinkingBonus": 0.5,
-      "heavyThinkingBudgetThreshold": 16000,
-      "heavyThinkingBudgetBonus": 0.5
+      "maxWeight": 2.5,
+      "toolsBonus": 0.4,
+      "largeMaxTokensThreshold": 8000,
+      "largeMaxTokensBonus": 0.25,
+      "largeInputTokensThreshold": 12000,
+      "largeInputTokensBonus": 0.25,
+      "veryLargeInputTokensThreshold": 24000,
+      "veryLargeInputTokensBonus": 0.35,
+      "thinkingBonus": 0.35,
+      "heavyThinkingBudgetThreshold": 24000,
+      "heavyThinkingBudgetBonus": 0.35
    }
 }
 ```
 
 `requestWeighting` 默认规则：
 - 轻请求消耗 `1.0`
-- 带工具调用会额外增加 `0.5`
-- `thinking` 开启会额外增加 `0.5`
-- `thinking.budgetTokens >= 16000` 再额外增加 `0.5`
-- `maxTokens >= 4000` 额外增加 `0.5`
-- 估算输入 tokens >= `8000` / `20000` 时分别额外增加 `0.5`
-- 最终权重限制在 `1.0..=3.0`
+- 带工具调用会额外增加 `0.4`
+- `thinking` 开启会额外增加 `0.35`
+- `thinking.budgetTokens >= 24000` 再额外增加 `0.35`
+- `maxTokens >= 8000` 额外增加 `0.25`
+- 估算输入 tokens >= `12000` / `24000` 时分别额外增加 `0.25` / `0.35`
+- 最终权重限制在 `1.0..=2.5`
+- 同时默认 bucket 也会提升到 `capacity=6`、`refill=2`、`minRefill=1`，避免重请求默认把单号拖死
 
 ### 外部状态存储
 
@@ -454,7 +455,7 @@ kiro-rs \
 - `queueMaxSize` / `queueMaxWaitMs` 可为瞬时超并发请求提供短暂排队，减少尖峰时直接失败
 - `rateLimitCooldownMs` 可控制单账号触发上游 `429` 后的固定冷却时长；设为 `0` 可关闭该机制
 - `rateLimitBucketCapacity` / `rateLimitRefillPerSecond` 可限制单账号单位时间内的发放速率，适合给“真实承载能力偏弱”的账号单独降速
-- `requestWeighting` 会让重代码/重 thinking 请求比轻请求消耗更多本地 bucket 配额，减少轻重流量互相挤占
+- `requestWeighting` 默认开启，但默认曲线已经压平；重代码/重 thinking 请求会比轻请求多消耗一些 bucket 配额，同时默认 bucket 与 429 退避参数已同步调优
 - 遭遇 `429` 时，本地会清空该账号 bucket，并按 `rateLimitRefillBackoffFactor` 下调当前回填速率；成功请求后再按 `rateLimitRefillRecoveryStepPerSuccess` 逐步恢复
 - 单凭据最多重试 3 次，单请求最多重试 9 次
 - 自动故障转移到下一个可用凭据
