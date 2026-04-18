@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, type ReactNode } from 'react'
 import { toast } from 'sonner'
 import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2 } from 'lucide-react'
 import {
@@ -30,6 +30,7 @@ import {
   useDeleteCredential,
   useForceRefreshToken,
 } from '@/hooks/use-credentials'
+import { cn } from '@/lib/utils'
 
 interface CredentialCardProps {
   credential: CredentialStatusItem
@@ -84,6 +85,23 @@ function summarizeSelectedModels(
   }
 
   return `${labels.join('、')} 等 ${values.length} 项`
+}
+
+function InfoTile({
+  label,
+  className,
+  children,
+}: {
+  label: string
+  className?: string
+  children: ReactNode
+}) {
+  return (
+    <div className={cn('rounded-lg border bg-muted/20 px-3 py-2.5', className)}>
+      <div className="text-xs text-muted-foreground">{label}</div>
+      <div className="mt-1 text-sm font-medium leading-snug">{children}</div>
+    </div>
+  )
 }
 
 export function CredentialCard({
@@ -306,6 +324,52 @@ export function CredentialCard({
 
   const allowedModelsSummary = summarizeSelectedModels(allowedModelsValue, modelCatalog)
   const blockedModelsSummary = summarizeSelectedModels(blockedModelsValue, modelCatalog)
+  const rateLimitOverrideSummary = [
+    credential.rateLimitBucketCapacityOverride === undefined ||
+    credential.rateLimitBucketCapacityOverride === null
+      ? 'Bucket 跟随全局'
+      : credential.rateLimitBucketCapacityOverride === 0
+        ? 'Bucket 已禁用'
+        : `Bucket=${credential.rateLimitBucketCapacityOverride}`,
+    credential.rateLimitRefillPerSecondOverride === undefined ||
+    credential.rateLimitRefillPerSecondOverride === null
+      ? '回填跟随全局'
+      : credential.rateLimitRefillPerSecondOverride === 0
+        ? '回填已禁用'
+        : `回填=${credential.rateLimitRefillPerSecondOverride} token/s`,
+  ].join(' / ')
+  const policySummary = `允许 ${credential.allowedModels?.length ?? 0} 项 / 禁用 ${credential.blockedModels?.length ?? 0} 项`
+  const hasRuntimeRestrictions = (credential.runtimeModelRestrictions?.length ?? 0) > 0
+  const balanceSummary = loadingBalance
+    ? null
+    : balance
+      ? `${balance.remaining.toFixed(2)} / ${balance.usageLimit.toFixed(2)}`
+      : '未知'
+  const balancePercentRemaining = balance ? `${(100 - balance.usagePercentage).toFixed(1)}% 剩余` : null
+  const subscriptionLabel = credential.subscriptionTitle || balance?.subscriptionTitle || '未知'
+  const bucketSummary =
+    credential.rateLimitBucketCapacity !== undefined && credential.rateLimitBucketCapacity !== null
+      ? `${(credential.rateLimitBucketTokens ?? 0).toFixed(2)} / ${credential.rateLimitBucketCapacity.toFixed(2)}`
+      : null
+  const refillSummary =
+    credential.rateLimitRefillPerSecond !== undefined && credential.rateLimitRefillPerSecond !== null
+      ? `${credential.rateLimitRefillPerSecond.toFixed(2)}${
+          credential.rateLimitRefillBasePerSecond !== undefined &&
+          credential.rateLimitRefillBasePerSecond !== null
+            ? ` / ${credential.rateLimitRefillBasePerSecond.toFixed(2)}`
+            : ''
+        } token/s`
+      : null
+  const cooldownSummary =
+    credential.cooldownRemainingMs && credential.cooldownRemainingMs > 0
+      ? `${(credential.cooldownRemainingMs / 1000).toFixed(1)}s`
+      : null
+  const nextReadySummary =
+    credential.nextReadyInMs !== undefined &&
+    credential.nextReadyInMs !== null &&
+    credential.nextReadyInMs > 0
+      ? `${(credential.nextReadyInMs / 1000).toFixed(1)}s`
+      : null
 
   return (
     <>
@@ -341,23 +405,22 @@ export function CredentialCard({
           </div>
         </CardHeader>
         <CardContent className="space-y-4">
-          {/* 信息网格 */}
-          <div className="grid grid-cols-2 gap-4 text-sm">
-            <div>
-              <span className="text-muted-foreground">优先级：</span>
+          {/* 信息摘要 */}
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+            <InfoTile label="优先级">
               {editingPriority ? (
-                <div className="inline-flex items-center gap-1 ml-1">
+                <div className="flex flex-wrap items-center gap-1">
                   <Input
                     type="number"
                     value={priorityValue}
                     onChange={(e) => setPriorityValue(e.target.value)}
-                    className="w-16 h-7 text-sm"
+                    className="h-8 w-20 text-sm"
                     min="0"
                   />
                   <Button
                     size="sm"
                     variant="ghost"
-                    className="h-7 w-7 p-0"
+                    className="h-8 w-8 p-0"
                     onClick={handlePriorityChange}
                     disabled={setPriority.isPending}
                   >
@@ -366,7 +429,7 @@ export function CredentialCard({
                   <Button
                     size="sm"
                     variant="ghost"
-                    className="h-7 w-7 p-0"
+                    className="h-8 w-8 p-0"
                     onClick={() => {
                       setEditingPriority(false)
                       setPriorityValue(String(credential.priority))
@@ -377,30 +440,30 @@ export function CredentialCard({
                 </div>
               ) : (
                 <span
-                  className="font-medium cursor-pointer hover:underline ml-1"
+                  className="cursor-pointer hover:underline"
                   onClick={() => setEditingPriority(true)}
                 >
                   {credential.priority}
-                  <span className="text-xs text-muted-foreground ml-1">(点击编辑)</span>
+                  <span className="ml-1 text-xs text-muted-foreground">(点击编辑)</span>
                 </span>
               )}
-            </div>
-            <div>
-              <span className="text-muted-foreground">并发上限：</span>
+            </InfoTile>
+
+            <InfoTile label="并发上限">
               {editingMaxConcurrency ? (
-                <div className="inline-flex items-center gap-1 ml-1">
+                <div className="flex flex-wrap items-center gap-1">
                   <Input
                     type="number"
                     value={maxConcurrencyValue}
                     onChange={(e) => setMaxConcurrencyValue(e.target.value)}
-                    className="w-20 h-7 text-sm"
+                    className="h-8 w-24 text-sm"
                     min="1"
                     placeholder="不限"
                   />
                   <Button
                     size="sm"
                     variant="ghost"
-                    className="h-7 w-7 p-0"
+                    className="h-8 w-8 p-0"
                     onClick={handleMaxConcurrencyChange}
                     disabled={setMaxConcurrency.isPending}
                   >
@@ -409,7 +472,7 @@ export function CredentialCard({
                   <Button
                     size="sm"
                     variant="ghost"
-                    className="h-7 w-7 p-0"
+                    className="h-8 w-8 p-0"
                     onClick={() => {
                       setEditingMaxConcurrency(false)
                       setMaxConcurrencyValue(
@@ -422,221 +485,167 @@ export function CredentialCard({
                 </div>
               ) : (
                 <span
-                  className="font-medium cursor-pointer hover:underline ml-1"
+                  className="cursor-pointer hover:underline"
                   onClick={() => setEditingMaxConcurrency(true)}
                 >
                   {credential.maxConcurrency ?? '不限'}
-                  <span className="text-xs text-muted-foreground ml-1">(点击编辑)</span>
+                  <span className="ml-1 text-xs text-muted-foreground">(点击编辑)</span>
                 </span>
               )}
-            </div>
-            <div className="col-span-2">
-              <span className="text-muted-foreground">凭据级限速覆盖：</span>
-              {editingRateLimitConfig ? (
-                <div className="mt-2 flex flex-wrap items-center gap-2">
-                  <Input
-                    type="number"
-                    value={bucketCapacityValue}
-                    onChange={(e) => setBucketCapacityValue(e.target.value)}
-                    className="w-28 h-7 text-sm"
-                    min="0"
-                    step="0.1"
-                    placeholder="容量"
-                  />
-                  <Input
-                    type="number"
-                    value={refillPerSecondValue}
-                    onChange={(e) => setRefillPerSecondValue(e.target.value)}
-                    className="w-32 h-7 text-sm"
-                    min="0"
-                    step="0.1"
-                    placeholder="回填 token/s"
-                  />
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    className="h-7 w-7 p-0"
-                    onClick={handleRateLimitConfigChange}
-                    disabled={setRateLimitConfig.isPending}
-                  >
-                    ✓
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    className="h-7 w-7 p-0"
-                    onClick={() => {
-                      setEditingRateLimitConfig(false)
-                      setBucketCapacityValue(
-                        credential.rateLimitBucketCapacityOverride !== undefined &&
-                        credential.rateLimitBucketCapacityOverride !== null
-                          ? String(credential.rateLimitBucketCapacityOverride)
-                          : ''
-                      )
-                      setRefillPerSecondValue(
-                        credential.rateLimitRefillPerSecondOverride !== undefined &&
-                        credential.rateLimitRefillPerSecondOverride !== null
-                          ? String(credential.rateLimitRefillPerSecondOverride)
-                          : ''
-                      )
-                    }}
-                  >
-                    ✕
-                  </Button>
-                  <span className="text-xs text-muted-foreground">
-                    留空跟随全局，0 为仅禁用该账号
-                  </span>
+            </InfoTile>
+
+            <InfoTile label="订阅与用量">
+              <div className="space-y-1">
+                <div>{loadingBalance && !credential.subscriptionTitle ? <Loader2 className="h-4 w-4 animate-spin" /> : subscriptionLabel}</div>
+                <div className="text-xs font-normal text-muted-foreground">
+                  剩余：
+                  {loadingBalance ? (
+                    <span className="ml-1 inline-flex items-center gap-1">
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                      加载中
+                    </span>
+                  ) : (
+                    <>
+                      <span className="ml-1">{balanceSummary}</span>
+                      {balancePercentRemaining && <span className="ml-1">({balancePercentRemaining})</span>}
+                    </>
+                  )}
                 </div>
-              ) : (
-                <span
-                  className="font-medium cursor-pointer hover:underline ml-1"
+              </div>
+            </InfoTile>
+
+            <InfoTile label="最后调用">
+              {formatLastUsed(credential.lastUsedAt)}
+            </InfoTile>
+          </div>
+
+          <div className="rounded-lg border border-dashed px-3 py-2.5">
+            <div className="flex flex-wrap items-start justify-between gap-2">
+              <div className="min-w-0 flex-1">
+                <div className="text-xs text-muted-foreground">凭据级限速覆盖</div>
+                {!editingRateLimitConfig && (
+                  <div className="mt-1 text-sm font-medium leading-snug">
+                    {rateLimitOverrideSummary}
+                  </div>
+                )}
+              </div>
+              {!editingRateLimitConfig && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-7 px-2 text-xs"
                   onClick={() => setEditingRateLimitConfig(true)}
                 >
-                  {credential.rateLimitBucketCapacityOverride === undefined ||
-                  credential.rateLimitBucketCapacityOverride === null
-                    ? 'Bucket 跟随全局'
-                    : credential.rateLimitBucketCapacityOverride === 0
-                      ? 'Bucket 已禁用'
-                      : `Bucket=${credential.rateLimitBucketCapacityOverride}`}
-                  {' / '}
-                  {credential.rateLimitRefillPerSecondOverride === undefined ||
-                  credential.rateLimitRefillPerSecondOverride === null
-                    ? '回填跟随全局'
-                    : credential.rateLimitRefillPerSecondOverride === 0
-                      ? '回填已禁用'
-                      : `回填=${credential.rateLimitRefillPerSecondOverride} token/s`}
-                  <span className="text-xs text-muted-foreground ml-1">(点击编辑)</span>
-                </span>
+                  编辑
+                </Button>
               )}
             </div>
-            <div>
-              <span className="text-muted-foreground">失败次数：</span>
-              <span className={credential.failureCount > 0 ? 'text-red-500 font-medium' : ''}>
-                {credential.failureCount}
-              </span>
-            </div>
-            <div>
-              <span className="text-muted-foreground">刷新失败：</span>
-              <span className={credential.refreshFailureCount > 0 ? 'text-red-500 font-medium' : ''}>
-                {credential.refreshFailureCount}
-              </span>
-            </div>
-            <div>
-              <span className="text-muted-foreground">订阅等级：</span>
-              <span className="font-medium">
-                {credential.subscriptionTitle ? credential.subscriptionTitle : loadingBalance ? (
-                  <Loader2 className="inline w-3 h-3 animate-spin" />
-                ) : balance?.subscriptionTitle || '未知'}
-              </span>
-            </div>
-            <div>
-              <span className="text-muted-foreground">成功次数：</span>
-              <span className="font-medium">{credential.successCount}</span>
-            </div>
-            <div>
-              <span className="text-muted-foreground">当前并发：</span>
-              <span className="font-medium">
-                {credential.inFlight}
-                {credential.maxConcurrency ? ` / ${credential.maxConcurrency}` : ''}
-              </span>
-            </div>
-            {credential.rateLimitBucketCapacity !== undefined && credential.rateLimitBucketCapacity !== null && (
-              <div>
-                <span className="text-muted-foreground">Bucket：</span>
-                <span className="font-medium">
-                  {(credential.rateLimitBucketTokens ?? 0).toFixed(2)} / {credential.rateLimitBucketCapacity.toFixed(2)}
+            {editingRateLimitConfig && (
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                <Input
+                  type="number"
+                  value={bucketCapacityValue}
+                  onChange={(e) => setBucketCapacityValue(e.target.value)}
+                  className="h-8 w-28 text-sm"
+                  min="0"
+                  step="0.1"
+                  placeholder="容量"
+                />
+                <Input
+                  type="number"
+                  value={refillPerSecondValue}
+                  onChange={(e) => setRefillPerSecondValue(e.target.value)}
+                  className="h-8 w-32 text-sm"
+                  min="0"
+                  step="0.1"
+                  placeholder="回填 token/s"
+                />
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-8 w-8 p-0"
+                  onClick={handleRateLimitConfigChange}
+                  disabled={setRateLimitConfig.isPending}
+                >
+                  ✓
+                </Button>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-8 w-8 p-0"
+                  onClick={() => {
+                    setEditingRateLimitConfig(false)
+                    setBucketCapacityValue(
+                      credential.rateLimitBucketCapacityOverride !== undefined &&
+                      credential.rateLimitBucketCapacityOverride !== null
+                        ? String(credential.rateLimitBucketCapacityOverride)
+                        : ''
+                    )
+                    setRefillPerSecondValue(
+                      credential.rateLimitRefillPerSecondOverride !== undefined &&
+                      credential.rateLimitRefillPerSecondOverride !== null
+                        ? String(credential.rateLimitRefillPerSecondOverride)
+                        : ''
+                    )
+                  }}
+                >
+                  ✕
+                </Button>
+                <span className="text-xs text-muted-foreground">
+                  留空跟随全局，0 为仅禁用该账号
                 </span>
-              </div>
-            )}
-            {credential.cooldownRemainingMs && credential.cooldownRemainingMs > 0 && (
-              <div>
-                <span className="text-muted-foreground">429 冷却：</span>
-                <span className="font-medium text-amber-600">
-                  {(credential.cooldownRemainingMs / 1000).toFixed(1)}s
-                </span>
-              </div>
-            )}
-            {(credential.rateLimitRefillPerSecond !== undefined && credential.rateLimitRefillPerSecond !== null) && (
-              <div>
-                <span className="text-muted-foreground">当前回填：</span>
-                <span className="font-medium">
-                  {credential.rateLimitRefillPerSecond.toFixed(2)}
-                  {credential.rateLimitRefillBasePerSecond !== undefined && credential.rateLimitRefillBasePerSecond !== null
-                    ? ` / ${credential.rateLimitRefillBasePerSecond.toFixed(2)}`
-                    : ''}
-                  {' '}token/s
-                </span>
-              </div>
-            )}
-            {credential.rateLimitHitStreak > 0 && (
-              <div>
-                <span className="text-muted-foreground">连续 429：</span>
-                <span className="font-medium text-amber-600">{credential.rateLimitHitStreak}</span>
-              </div>
-            )}
-            {credential.nextReadyInMs !== undefined && credential.nextReadyInMs !== null && credential.nextReadyInMs > 0 && (
-              <div>
-                <span className="text-muted-foreground">下次可调度：</span>
-                <span className="font-medium">
-                  {(credential.nextReadyInMs / 1000).toFixed(1)}s
-                </span>
-              </div>
-            )}
-            <div className="col-span-2">
-              <span className="text-muted-foreground">最后调用：</span>
-              <span className="font-medium">{formatLastUsed(credential.lastUsedAt)}</span>
-            </div>
-            <div className="col-span-2">
-              <span className="text-muted-foreground">账号类型：</span>
-              <span className="font-medium ml-1">{credential.accountType || '未设置'}</span>
-            </div>
-            <div className="col-span-2">
-              <span className="text-muted-foreground">模型策略：</span>
-              <span className="font-medium ml-1">
-                允许 {credential.allowedModels?.length ?? 0} 项 / 禁用 {credential.blockedModels?.length ?? 0} 项
-              </span>
-            </div>
-            {(credential.runtimeModelRestrictions?.length ?? 0) > 0 && (
-              <div className="col-span-2 space-y-2">
-                <span className="text-muted-foreground">运行时临时限制：</span>
-                <div className="flex flex-wrap gap-2">
-                  {credential.runtimeModelRestrictions?.map((restriction) => (
-                    <Badge key={`${restriction.model}-${restriction.expiresAt}`} variant="outline">
-                      {restriction.model} 至 {formatRestrictionExpiresAt(restriction.expiresAt)}
-                    </Badge>
-                  ))}
-                </div>
-              </div>
-            )}
-            <div className="col-span-2">
-              <span className="text-muted-foreground">剩余用量：</span>
-              {loadingBalance ? (
-                <span className="text-sm ml-1">
-                  <Loader2 className="inline w-3 h-3 animate-spin" /> 加载中...
-                </span>
-              ) : balance ? (
-                <span className="font-medium ml-1">
-                  {balance.remaining.toFixed(2)} / {balance.usageLimit.toFixed(2)}
-                  <span className="text-xs text-muted-foreground ml-1">
-                    ({(100 - balance.usagePercentage).toFixed(1)}% 剩余)
-                  </span>
-                </span>
-              ) : (
-                <span className="text-sm text-muted-foreground ml-1">未知</span>
-              )}
-            </div>
-            {credential.hasProxy && (
-              <div className="col-span-2">
-                <span className="text-muted-foreground">代理：</span>
-                <span className="font-medium">{credential.proxyUrl}</span>
-              </div>
-            )}
-            {credential.hasProfileArn && (
-              <div className="col-span-2">
-                <Badge variant="secondary">有 Profile ARN</Badge>
               </div>
             )}
           </div>
+
+          <div className="flex flex-wrap gap-2">
+            <Badge variant={credential.failureCount > 0 ? 'destructive' : 'outline'}>
+              失败 {credential.failureCount}
+            </Badge>
+            <Badge variant={credential.refreshFailureCount > 0 ? 'destructive' : 'outline'}>
+              刷新失败 {credential.refreshFailureCount}
+            </Badge>
+            <Badge variant="outline">成功 {credential.successCount}</Badge>
+            <Badge variant="outline">
+              并发 {credential.inFlight}{credential.maxConcurrency ? ` / ${credential.maxConcurrency}` : ''}
+            </Badge>
+            <Badge variant="secondary" className="max-w-full break-all">
+              账号类型 {credential.accountType || '未设置'}
+            </Badge>
+            <Badge variant="secondary">{policySummary}</Badge>
+            {bucketSummary && <Badge variant="outline">Bucket {bucketSummary}</Badge>}
+            {refillSummary && <Badge variant="outline">回填 {refillSummary}</Badge>}
+            {cooldownSummary && <Badge variant="warning">429 冷却 {cooldownSummary}</Badge>}
+            {credential.rateLimitHitStreak > 0 && (
+              <Badge variant="warning">连续 429 {credential.rateLimitHitStreak}</Badge>
+            )}
+            {nextReadySummary && <Badge variant="outline">下次可调度 {nextReadySummary}</Badge>}
+            {credential.hasProxy && <Badge variant="outline">已配置代理</Badge>}
+            {credential.hasProfileArn && <Badge variant="secondary">有 Profile ARN</Badge>}
+          </div>
+
+          {hasRuntimeRestrictions && (
+            <div className="space-y-2 rounded-lg border border-dashed border-amber-300 bg-amber-50/40 px-3 py-2.5">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="text-xs text-muted-foreground">运行时临时限制</div>
+                <Badge variant="warning">{credential.runtimeModelRestrictions?.length ?? 0} 条</Badge>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {credential.runtimeModelRestrictions?.map((restriction) => (
+                  <Badge key={`${restriction.model}-${restriction.expiresAt}`} variant="outline">
+                    {restriction.model} 至 {formatRestrictionExpiresAt(restriction.expiresAt)}
+                  </Badge>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {credential.hasProxy && credential.proxyUrl && (
+            <div className="text-xs text-muted-foreground">
+              代理地址：
+              <span className="ml-1 break-all text-foreground">{credential.proxyUrl}</span>
+            </div>
+          )}
 
           {/* 操作按钮 */}
           <div className="flex flex-wrap gap-2 pt-2 border-t">
