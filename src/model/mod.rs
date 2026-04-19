@@ -1,5 +1,6 @@
 //! 应用配置模型
 
+pub mod account_type_preset;
 pub mod arg;
 pub mod config;
 pub mod model_catalog;

@@ -9,6 +9,7 @@ import type {
   CredentialStatusItem,
   ModelCatalogItem,
   ModelSupportPolicy,
+  StandardAccountTypePreset,
 } from '@/types/api'
 
 function splitCustomEntries(value: string): string[] {
@@ -20,7 +21,8 @@ function splitCustomEntries(value: string): string[] {
 
 export function collectAccountTypeSuggestions(
   credentials: CredentialStatusItem[] | undefined,
-  accountTypePolicies: Record<string, ModelSupportPolicy> | undefined
+  accountTypePolicies: Record<string, ModelSupportPolicy> | undefined,
+  standardAccountTypePresets: StandardAccountTypePreset[] | undefined = []
 ): string[] {
   const values = new Set<string>()
 
@@ -28,6 +30,10 @@ export function collectAccountTypeSuggestions(
     const accountType = credential.accountType?.trim()
     if (accountType) {
       values.add(accountType)
+    }
+    const standardAccountType = credential.standardAccountType?.trim()
+    if (standardAccountType) {
+      values.add(standardAccountType)
     }
   }
 
@@ -38,7 +44,70 @@ export function collectAccountTypeSuggestions(
     }
   }
 
+  for (const preset of standardAccountTypePresets ?? []) {
+    const normalized = preset.id.trim()
+    if (normalized) {
+      values.add(normalized)
+    }
+  }
+
   return Array.from(values).sort((left, right) => left.localeCompare(right, 'zh-CN'))
+}
+
+function normalizeAccountTypeValue(value: string): string {
+  return value.trim().toLowerCase()
+}
+
+function isDerivedFromPreset(value: string, presetId: string): boolean {
+  const normalizedValue = normalizeAccountTypeValue(value)
+  const normalizedPresetId = normalizeAccountTypeValue(presetId)
+  return (
+    normalizedValue.startsWith(`${normalizedPresetId}-`) ||
+    normalizedValue.startsWith(`${normalizedPresetId}_`)
+  )
+}
+
+export function findStandardAccountTypePreset(
+  value: string,
+  standardAccountTypePresets: StandardAccountTypePreset[] | undefined
+): { preset: StandardAccountTypePreset; derived: boolean } | null {
+  const normalizedValue = normalizeAccountTypeValue(value)
+  if (!normalizedValue) {
+    return null
+  }
+
+  for (const preset of standardAccountTypePresets ?? []) {
+    const normalizedPresetId = normalizeAccountTypeValue(preset.id)
+    if (normalizedValue === normalizedPresetId) {
+      return { preset, derived: false }
+    }
+    if (isDerivedFromPreset(normalizedValue, normalizedPresetId)) {
+      return { preset, derived: true }
+    }
+  }
+
+  return null
+}
+
+export function nextDerivedAccountType(
+  presetId: string,
+  existingValues: Iterable<string>
+): string {
+  const existing = new Set(
+    Array.from(existingValues)
+      .map((value) => normalizeAccountTypeValue(value))
+      .filter(Boolean)
+  )
+  const base = `${normalizeAccountTypeValue(presetId)}-custom`
+  if (!existing.has(base)) {
+    return base
+  }
+
+  let suffix = 2
+  while (existing.has(`${base}-${suffix}`)) {
+    suffix += 1
+  }
+  return `${base}-${suffix}`
 }
 
 interface AccountTypeInputProps {
@@ -46,6 +115,7 @@ interface AccountTypeInputProps {
   value: string
   onChange: (value: string) => void
   suggestions: string[]
+  standardAccountTypePresets?: StandardAccountTypePreset[]
   placeholder?: string
   description?: string
   disabled?: boolean
@@ -60,6 +130,7 @@ export function AccountTypeInput({
   value,
   onChange,
   suggestions,
+  standardAccountTypePresets = [],
   placeholder,
   description,
   disabled = false,
@@ -68,20 +139,35 @@ export function AccountTypeInput({
   const fallbackId = useId()
   const inputId = id ?? fallbackId
   const [useCustomValue, setUseCustomValue] = useState(false)
+  const standardPresetMap = useMemo(
+    () =>
+      new Map(
+        standardAccountTypePresets.map((preset) => [
+          normalizeAccountTypeValue(preset.id),
+          preset,
+        ] as const)
+      ),
+    [standardAccountTypePresets]
+  )
 
   const normalizedSuggestions = useMemo(() => {
-    return Array.from(
+    const standardValues = standardAccountTypePresets
+      .map((preset) => normalizeAccountTypeValue(preset.id))
+      .filter(Boolean)
+    const customValues = Array.from(
       new Set(
         suggestions
-          .map((suggestion) => suggestion.trim())
-          .filter(Boolean)
+          .map((suggestion) => normalizeAccountTypeValue(suggestion))
+          .filter((suggestion) => suggestion && !standardPresetMap.has(suggestion))
       )
     ).sort((left, right) => left.localeCompare(right, 'zh-CN'))
-  }, [suggestions])
+    return [...standardValues, ...customValues]
+  }, [standardAccountTypePresets, standardPresetMap, suggestions])
 
-  const trimmedValue = value.trim()
+  const trimmedValue = normalizeAccountTypeValue(value)
   const matchesSuggestion = trimmedValue !== '' && normalizedSuggestions.includes(trimmedValue)
   const canSelectSuggestion = normalizedSuggestions.length > 0
+  const matchedPreset = findStandardAccountTypePreset(trimmedValue, standardAccountTypePresets)
 
   useEffect(() => {
     if (!canSelectSuggestion) {
@@ -139,12 +225,14 @@ export function AccountTypeInput({
             className={nativeSelectClassName}
           >
             <option value="">未设置</option>
-            {normalizedSuggestions.map((suggestion) => (
-              <option key={suggestion} value={suggestion}>
-                {suggestion}
-              </option>
-            ))}
-          </select>
+              {normalizedSuggestions.map((suggestion) => (
+                <option key={suggestion} value={suggestion}>
+                  {standardPresetMap.has(suggestion)
+                    ? `${standardPresetMap.get(suggestion)?.displayName} (${suggestion})`
+                    : suggestion}
+                </option>
+              ))}
+            </select>
         ) : (
           <div className="space-y-2">
             <Input
@@ -166,6 +254,42 @@ export function AccountTypeInput({
           <p className="text-xs text-muted-foreground">
             当前值是未收录类型，切换到“自定义类型”后可继续编辑。
           </p>
+        )}
+
+        {standardAccountTypePresets.length > 0 && (
+          <div className="space-y-2 rounded-lg border border-dashed bg-muted/20 p-3">
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-xs font-medium text-muted-foreground">内置标准类型</div>
+              <Badge variant="outline">{standardAccountTypePresets.length} 个预设</Badge>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {standardAccountTypePresets.map((preset) => {
+                const active = trimmedValue === normalizeAccountTypeValue(preset.id)
+                return (
+                  <Button
+                    key={preset.id}
+                    type="button"
+                    size="sm"
+                    variant={active ? 'secondary' : 'outline'}
+                    onClick={() => {
+                      onChange(preset.id)
+                      setUseCustomValue(false)
+                    }}
+                    disabled={disabled}
+                  >
+                    {preset.displayName}
+                  </Button>
+                )
+              })}
+            </div>
+            {matchedPreset && (
+              <p className="text-xs text-muted-foreground">
+                {matchedPreset.derived
+                  ? `当前值看起来是基于 ${matchedPreset.preset.displayName} 的衍生类型。它不会自动继承预设策略，请在模型策略页单独配置。`
+                  : matchedPreset.preset.description}
+              </p>
+            )}
+          </div>
         )}
       </div>
 

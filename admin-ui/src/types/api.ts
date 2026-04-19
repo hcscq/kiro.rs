@@ -20,6 +20,7 @@ export interface CredentialStatusItem {
   email?: string
   subscriptionTitle?: string | null
   accountType?: string | null
+  standardAccountType?: string | null
   allowedModels?: string[]
   blockedModels?: string[]
   runtimeModelRestrictions?: RuntimeModelRestriction[]
@@ -91,6 +92,14 @@ export interface RuntimeModelRestriction {
 export interface ModelSupportPolicy {
   allowedModels: string[]
   blockedModels: string[]
+}
+
+export interface StandardAccountTypePreset {
+  id: string
+  displayName: string
+  description: string
+  subscriptionTitleExamples: string[]
+  recommendedPolicy?: ModelSupportPolicy | null
 }
 
 export interface ModelCatalogItem {
@@ -188,6 +197,7 @@ export interface UpdateLoadBalancingConfigRequest {
 
 export interface ModelCapabilitiesConfigResponse {
   accountTypePolicies: Record<string, ModelSupportPolicy>
+  standardAccountTypePresets: StandardAccountTypePreset[]
 }
 
 export interface UpdateModelCapabilitiesConfigRequest {

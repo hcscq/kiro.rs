@@ -3,6 +3,7 @@ import { toast } from 'sonner'
 import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2 } from 'lucide-react'
 import {
   AccountTypeInput,
+  findStandardAccountTypePreset,
   ModelSelector,
 } from '@/components/model-policy-controls'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -19,7 +20,12 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import type { CredentialStatusItem, BalanceResponse, ModelCatalogItem } from '@/types/api'
+import type {
+  CredentialStatusItem,
+  BalanceResponse,
+  ModelCatalogItem,
+  StandardAccountTypePreset,
+} from '@/types/api'
 import {
   useSetDisabled,
   useSetCredentialModelPolicy,
@@ -40,6 +46,7 @@ interface CredentialCardProps {
   balance: BalanceResponse | null
   loadingBalance: boolean
   accountTypeSuggestions: string[]
+  standardAccountTypePresets: StandardAccountTypePreset[]
   modelCatalog: ModelCatalogItem[]
 }
 
@@ -112,6 +119,7 @@ export function CredentialCard({
   balance,
   loadingBalance,
   accountTypeSuggestions,
+  standardAccountTypePresets,
   modelCatalog,
 }: CredentialCardProps) {
   const [editingPriority, setEditingPriority] = useState(false)
@@ -370,6 +378,9 @@ export function CredentialCard({
     credential.nextReadyInMs > 0
       ? `${(credential.nextReadyInMs / 1000).toFixed(1)}s`
       : null
+  const recognizedStandardAccountType = credential.standardAccountType
+    ? findStandardAccountTypePreset(credential.standardAccountType, standardAccountTypePresets)
+    : null
 
   return (
     <>
@@ -612,6 +623,11 @@ export function CredentialCard({
             <Badge variant="secondary" className="max-w-full break-all">
               账号类型 {credential.accountType || '未设置'}
             </Badge>
+            {recognizedStandardAccountType && (
+              <Badge variant="outline" className="max-w-full break-all">
+                标准档位 {recognizedStandardAccountType.preset.displayName}
+              </Badge>
+            )}
             <Badge variant="secondary">{policySummary}</Badge>
             {bucketSummary && <Badge variant="outline">Bucket {bucketSummary}</Badge>}
             {refillSummary && <Badge variant="outline">回填 {refillSummary}</Badge>}
@@ -749,6 +765,7 @@ export function CredentialCard({
               value={accountTypeValue}
               onChange={setAccountTypeValue}
               suggestions={accountTypeSuggestions}
+              standardAccountTypePresets={standardAccountTypePresets}
               placeholder="优先选择已有类型，也可直接新建"
             />
 

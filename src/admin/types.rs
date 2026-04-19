@@ -62,6 +62,9 @@ pub struct CredentialStatusItem {
     /// 账号类型
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_type: Option<String>,
+    /// 由订阅标题识别出的标准账号类型
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub standard_account_type: Option<String>,
     /// 账号级额外允许模型
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub allowed_models: Vec<String>,
@@ -345,8 +348,21 @@ pub struct SetLoadBalancingModeRequest {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct StandardAccountTypePresetResponse {
+    pub id: String,
+    pub display_name: String,
+    pub description: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub subscription_title_examples: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recommended_policy: Option<ModelSupportPolicy>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ModelCapabilitiesConfigResponse {
     pub account_type_policies: BTreeMap<String, ModelSupportPolicy>,
+    pub standard_account_type_presets: Vec<StandardAccountTypePresetResponse>,
 }
 
 #[derive(Debug, Serialize)]

@@ -162,9 +162,11 @@ export function Dashboard() {
   const { data: modelCapabilitiesData } = useModelCapabilitiesConfig()
   const { data: modelCatalogData } = useModelCatalog()
   const credentials = data?.credentials || []
+  const standardAccountTypePresets = modelCapabilitiesData?.standardAccountTypePresets ?? []
   const accountTypeSuggestions = collectAccountTypeSuggestions(
     credentials,
-    modelCapabilitiesData?.accountTypePolicies
+    modelCapabilitiesData?.accountTypePolicies,
+    standardAccountTypePresets
   )
   const modelCatalog = modelCatalogData?.models ?? []
   const levelOptions = [
@@ -239,6 +241,8 @@ export function Dashboard() {
           credential.email,
           credential.id.toString(),
           normalizeSubscriptionTitle(credential),
+          credential.accountType,
+          credential.standardAccountType,
           credential.proxyUrl,
           credential.disabledReason,
         ]
@@ -985,6 +989,7 @@ export function Dashboard() {
                   balance={balanceMap.get(credential.id) || null}
                   loadingBalance={loadingBalanceIds.has(credential.id)}
                   accountTypeSuggestions={accountTypeSuggestions}
+                  standardAccountTypePresets={standardAccountTypePresets}
                   modelCatalog={modelCatalog}
                 />
               ))}

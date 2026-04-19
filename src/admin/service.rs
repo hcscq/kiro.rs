@@ -8,6 +8,9 @@ use parking_lot::Mutex;
 
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
+use crate::model::account_type_preset::{
+    built_in_account_type_presets, infer_standard_account_type_id,
+};
 use crate::model::model_catalog::built_in_model_catalog;
 use crate::state::{CachedBalanceRecord, RuntimeCoordinationStatus, StateChangeKind};
 
@@ -17,6 +20,7 @@ use super::types::{
     CredentialsStatusResponse, LoadBalancingModeResponse, ModelCapabilitiesConfigResponse,
     ModelCatalogItemResponse, ModelCatalogResponse, SetCredentialModelPolicyRequest,
     SetLoadBalancingModeRequest, SetModelCapabilitiesConfigRequest,
+    StandardAccountTypePresetResponse,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -74,40 +78,50 @@ impl AdminService {
         let mut credentials: Vec<CredentialStatusItem> = snapshot
             .entries
             .into_iter()
-            .map(|entry| CredentialStatusItem {
-                id: entry.id,
-                priority: entry.priority,
-                disabled: entry.disabled,
-                failure_count: entry.failure_count,
-                is_current: entry.id == current_id,
-                expires_at: entry.expires_at,
-                auth_method: entry.auth_method,
-                has_profile_arn: entry.has_profile_arn,
-                refresh_token_hash: entry.refresh_token_hash,
-                email: entry.email,
-                subscription_title: entry.subscription_title,
-                account_type: entry.account_type,
-                allowed_models: entry.allowed_models,
-                blocked_models: entry.blocked_models,
-                runtime_model_restrictions: entry.runtime_model_restrictions,
-                imported_at: entry.imported_at,
-                success_count: entry.success_count,
-                last_used_at: entry.last_used_at.clone(),
-                in_flight: entry.active_requests,
-                max_concurrency: entry.max_concurrency,
-                has_proxy: entry.has_proxy,
-                proxy_url: entry.proxy_url,
-                refresh_failure_count: entry.refresh_failure_count,
-                disabled_reason: entry.disabled_reason,
-                cooldown_remaining_ms: entry.cooldown_remaining_ms,
-                rate_limit_bucket_tokens: entry.rate_limit_bucket_tokens,
-                rate_limit_bucket_capacity: entry.rate_limit_bucket_capacity,
-                rate_limit_bucket_capacity_override: entry.rate_limit_bucket_capacity_override,
-                rate_limit_refill_per_second: entry.rate_limit_refill_per_second,
-                rate_limit_refill_per_second_override: entry.rate_limit_refill_per_second_override,
-                rate_limit_refill_base_per_second: entry.rate_limit_refill_base_per_second,
-                rate_limit_hit_streak: entry.rate_limit_hit_streak,
-                next_ready_in_ms: entry.next_ready_in_ms,
+            .map(|entry| {
+                let standard_account_type = entry
+                    .subscription_title
+                    .as_deref()
+                    .and_then(infer_standard_account_type_id)
+                    .map(|value| value.to_string());
+
+                CredentialStatusItem {
+                    id: entry.id,
+                    priority: entry.priority,
+                    disabled: entry.disabled,
+                    failure_count: entry.failure_count,
+                    is_current: entry.id == current_id,
+                    expires_at: entry.expires_at,
+                    auth_method: entry.auth_method,
+                    has_profile_arn: entry.has_profile_arn,
+                    refresh_token_hash: entry.refresh_token_hash,
+                    email: entry.email,
+                    subscription_title: entry.subscription_title,
+                    account_type: entry.account_type,
+                    standard_account_type,
+                    allowed_models: entry.allowed_models,
+                    blocked_models: entry.blocked_models,
+                    runtime_model_restrictions: entry.runtime_model_restrictions,
+                    imported_at: entry.imported_at,
+                    success_count: entry.success_count,
+                    last_used_at: entry.last_used_at.clone(),
+                    in_flight: entry.active_requests,
+                    max_concurrency: entry.max_concurrency,
+                    has_proxy: entry.has_proxy,
+                    proxy_url: entry.proxy_url,
+                    refresh_failure_count: entry.refresh_failure_count,
+                    disabled_reason: entry.disabled_reason,
+                    cooldown_remaining_ms: entry.cooldown_remaining_ms,
+                    rate_limit_bucket_tokens: entry.rate_limit_bucket_tokens,
+                    rate_limit_bucket_capacity: entry.rate_limit_bucket_capacity,
+                    rate_limit_bucket_capacity_override: entry.rate_limit_bucket_capacity_override,
+                    rate_limit_refill_per_second: entry.rate_limit_refill_per_second,
+                    rate_limit_refill_per_second_override: entry
+                        .rate_limit_refill_per_second_override,
+                    rate_limit_refill_base_per_second: entry.rate_limit_refill_base_per_second,
+                    rate_limit_hit_streak: entry.rate_limit_hit_streak,
+                    next_ready_in_ms: entry.next_ready_in_ms,
+                }
             })
             .collect();
 
@@ -374,6 +388,20 @@ impl AdminService {
         self.sync_runtime_state_for_read()?;
         Ok(ModelCapabilitiesConfigResponse {
             account_type_policies: self.token_manager.account_type_policies_snapshot(),
+            standard_account_type_presets: built_in_account_type_presets()
+                .iter()
+                .map(|preset| StandardAccountTypePresetResponse {
+                    id: preset.id.to_string(),
+                    display_name: preset.display_name.to_string(),
+                    description: preset.description.to_string(),
+                    subscription_title_examples: preset
+                        .subscription_title_examples
+                        .iter()
+                        .map(|value| (*value).to_string())
+                        .collect(),
+                    recommended_policy: preset.recommended_policy(),
+                })
+                .collect(),
         })
     }
 

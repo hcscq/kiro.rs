@@ -8,6 +8,7 @@ import {
   AccountTypeInput,
   ModelSelector,
   collectAccountTypeSuggestions,
+  nextDerivedAccountType,
 } from '@/components/model-policy-controls'
 import {
   useCredentials,
@@ -16,7 +17,7 @@ import {
   useSetModelCapabilitiesConfig,
 } from '@/hooks/use-credentials'
 import { extractErrorMessage } from '@/lib/utils'
-import type { ModelSupportPolicy } from '@/types/api'
+import type { ModelSupportPolicy, StandardAccountTypePreset } from '@/types/api'
 
 interface AccountTypePolicyRow {
   id: string
@@ -82,6 +83,34 @@ function policiesFromRows(rows: AccountTypePolicyRow[]): Record<string, ModelSup
   return policies
 }
 
+function summarizeModelValues(values: string[], modelLabelMap: Map<string, string>): string {
+  if (values.length === 0) {
+    return '未设置'
+  }
+
+  const labels = values.slice(0, 2).map((value) => modelLabelMap.get(value) ?? value)
+  if (values.length <= 2) {
+    return labels.join('、')
+  }
+
+  return `${labels.join('、')} 等 ${values.length} 项`
+}
+
+function summarizeRecommendedPolicy(
+  preset: StandardAccountTypePreset,
+  modelLabelMap: Map<string, string>
+): string {
+  const recommendedPolicy = preset.recommendedPolicy
+  if (!recommendedPolicy) {
+    return '默认不附加模型限制，适合作为标准主力类型或衍生类型基线。'
+  }
+
+  return [
+    `允许：${summarizeModelValues(recommendedPolicy.allowedModels, modelLabelMap)}`,
+    `禁用：${summarizeModelValues(recommendedPolicy.blockedModels, modelLabelMap)}`,
+  ].join(' / ')
+}
+
 export function ModelPoliciesPage() {
   const { data: credentialsData } = useCredentials()
   const { data: modelCapabilitiesData, isLoading: isLoadingCapabilities } = useModelCapabilitiesConfig()
@@ -93,11 +122,17 @@ export function ModelPoliciesPage() {
   const [modelCapabilitiesJson, setModelCapabilitiesJson] = useState('{\n  \n}')
 
   const modelCatalog = modelCatalogData?.models ?? []
+  const standardAccountTypePresets = modelCapabilitiesData?.standardAccountTypePresets ?? []
+  const modelLabelMap = useMemo(
+    () => new Map(modelCatalog.map((model) => [model.policyId, model.displayName] as const)),
+    [modelCatalog]
+  )
   const accountTypeSuggestions = useMemo(() => {
     const values = new Set(
       collectAccountTypeSuggestions(
         credentialsData?.credentials,
-        modelCapabilitiesData?.accountTypePolicies
+        modelCapabilitiesData?.accountTypePolicies,
+        standardAccountTypePresets
       )
     )
     for (const row of policyRows) {
@@ -107,7 +142,12 @@ export function ModelPoliciesPage() {
       }
     }
     return Array.from(values).sort((left, right) => left.localeCompare(right, 'zh-CN'))
-  }, [credentialsData?.credentials, modelCapabilitiesData?.accountTypePolicies, policyRows])
+  }, [
+    credentialsData?.credentials,
+    modelCapabilitiesData?.accountTypePolicies,
+    policyRows,
+    standardAccountTypePresets,
+  ])
 
   useEffect(() => {
     if (!modelCapabilitiesData) {
@@ -173,6 +213,30 @@ export function ModelPoliciesPage() {
     )
   }
 
+  const appendPresetRow = (preset: StandardAccountTypePreset, derived: boolean) => {
+    if (!derived && !preset.recommendedPolicy) {
+      toast.error(
+        `${preset.displayName} 默认不附加模型限制，可直接在凭据卡片中使用该类型名，或复制为衍生类型后再补充规则`
+      )
+      return
+    }
+
+    const existingAccountTypes = policyRows.map((row) => row.accountType)
+    const nextAccountType = derived
+      ? nextDerivedAccountType(preset.id, existingAccountTypes)
+      : preset.id
+
+    if (!derived && policyRows.some((row) => row.accountType.trim().toLowerCase() === preset.id)) {
+      toast.error(`账号类型 ${preset.id} 已存在，可直接编辑现有规则或复制为衍生类型`)
+      return
+    }
+
+    setPolicyRows((prev) => [
+      ...prev,
+      createPolicyRow(nextAccountType, preset.recommendedPolicy ?? { allowedModels: [], blockedModels: [] }),
+    ])
+  }
+
   return (
     <div className="space-y-6">
       <div className="flex flex-col gap-2">
@@ -196,6 +260,66 @@ export function ModelPoliciesPage() {
               生效顺序是“账号类型默认策略”先命中，再叠加“单账号允许/禁用模型”，最后再考虑运行时临时限制。
               显式禁用始终优先，适合表达“这一类账号明确不支持某模型”。
             </p>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card className="border-muted shadow-sm">
+        <CardHeader>
+          <CardTitle>标准账号类型预设</CardTitle>
+          <CardDescription>
+            先复用系统内置标准类型，再按业务需要复制出 `power-custom`、`pro-plus-canary` 这类衍生类型。
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="text-sm text-muted-foreground">
+            标准类型用于统一账号池基线；衍生类型用于灰度、金丝雀、渠道隔离等场景，复制后可继续编辑模型限制。
+          </div>
+          <div className="grid gap-4 xl:grid-cols-2">
+            {standardAccountTypePresets.map((preset) => (
+              <div key={preset.id} className="space-y-3 rounded-lg border bg-muted/20 p-4">
+                <div className="flex flex-wrap items-center gap-2">
+                  <Badge variant="secondary">{preset.displayName}</Badge>
+                  <Badge variant="outline">{preset.id}</Badge>
+                  {preset.recommendedPolicy ? (
+                    <Badge variant="outline">含推荐基线</Badge>
+                  ) : (
+                    <Badge variant="outline">无默认限制</Badge>
+                  )}
+                </div>
+                <div className="space-y-1">
+                  <p className="text-sm">{preset.description}</p>
+                  {preset.subscriptionTitleExamples.length > 0 && (
+                    <p className="text-xs text-muted-foreground">
+                      识别示例：{preset.subscriptionTitleExamples.join('、')}
+                    </p>
+                  )}
+                  <p className="text-xs text-muted-foreground">
+                    推荐策略：{summarizeRecommendedPolicy(preset, modelLabelMap)}
+                  </p>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {preset.recommendedPolicy && (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => appendPresetRow(preset, false)}
+                    >
+                      复制为标准类型
+                    </Button>
+                  )}
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => appendPresetRow(preset, true)}
+                  >
+                    复制为衍生类型
+                  </Button>
+                </div>
+              </div>
+            ))}
           </div>
         </CardContent>
       </Card>
@@ -259,8 +383,9 @@ export function ModelPoliciesPage() {
                       )
                     }
                     suggestions={accountTypeSuggestions}
+                    standardAccountTypePresets={standardAccountTypePresets}
                     placeholder="输入新的账号类型，例如 reseller-a"
-                    description="通常建议用 power / pro-plus / reseller-a 这类稳定命名。保存时会自动标准化为小写。"
+                    description="优先复用内置标准类型；若要灰度或隔离流量，建议从标准类型复制出 `power-custom` 这类衍生类型。保存时会自动标准化为小写。"
                   />
 
                   <div className="grid gap-4 xl:grid-cols-2">

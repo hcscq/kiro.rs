@@ -57,11 +57,17 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     () =>
       collectAccountTypeSuggestions(
         credentialsData?.credentials,
-        modelCapabilitiesData?.accountTypePolicies
+        modelCapabilitiesData?.accountTypePolicies,
+        modelCapabilitiesData?.standardAccountTypePresets
       ),
-    [credentialsData?.credentials, modelCapabilitiesData?.accountTypePolicies]
+    [
+      credentialsData?.credentials,
+      modelCapabilitiesData?.accountTypePolicies,
+      modelCapabilitiesData?.standardAccountTypePresets,
+    ]
   )
   const modelCatalog = modelCatalogData?.models ?? []
+  const standardAccountTypePresets = modelCapabilitiesData?.standardAccountTypePresets ?? []
 
   const resetForm = () => {
     setRefreshToken('')
@@ -352,8 +358,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               value={accountType}
               onChange={setAccountType}
               suggestions={accountTypeSuggestions}
+              standardAccountTypePresets={standardAccountTypePresets}
               placeholder="优先从已有账号类型中选择，也可直接新建"
-              description="可选。先命中账号类型默认策略，再叠加此账号自己的允许/拒绝列表。"
+              description="可选。优先选择内置标准类型；若需特殊灰度，可使用 `power-custom`、`pro-plus-canary` 这类衍生命名。"
               disabled={isPending}
             />
 
