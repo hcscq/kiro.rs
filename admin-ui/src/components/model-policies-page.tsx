@@ -105,9 +105,12 @@ function summarizeRecommendedPolicy(
     return '默认不附加模型限制，适合作为标准主力类型或衍生类型基线。'
   }
 
+  const allowedModels = recommendedPolicy.allowedModels ?? []
+  const blockedModels = recommendedPolicy.blockedModels ?? []
+
   return [
-    `允许：${summarizeModelValues(recommendedPolicy.allowedModels, modelLabelMap)}`,
-    `禁用：${summarizeModelValues(recommendedPolicy.blockedModels, modelLabelMap)}`,
+    `允许：${summarizeModelValues(allowedModels, modelLabelMap)}`,
+    `禁用：${summarizeModelValues(blockedModels, modelLabelMap)}`,
   ].join(' / ')
 }
 
@@ -276,50 +279,54 @@ export function ModelPoliciesPage() {
             标准类型用于统一账号池基线；衍生类型用于灰度、金丝雀、渠道隔离等场景，复制后可继续编辑模型限制。
           </div>
           <div className="grid gap-4 xl:grid-cols-2">
-            {standardAccountTypePresets.map((preset) => (
-              <div key={preset.id} className="space-y-3 rounded-lg border bg-muted/20 p-4">
-                <div className="flex flex-wrap items-center gap-2">
-                  <Badge variant="secondary">{preset.displayName}</Badge>
-                  <Badge variant="outline">{preset.id}</Badge>
-                  {preset.recommendedPolicy ? (
-                    <Badge variant="outline">含推荐基线</Badge>
-                  ) : (
-                    <Badge variant="outline">无默认限制</Badge>
-                  )}
-                </div>
-                <div className="space-y-1">
-                  <p className="text-sm">{preset.description}</p>
-                  {preset.subscriptionTitleExamples.length > 0 && (
+            {standardAccountTypePresets.map((preset) => {
+              const subscriptionTitleExamples = preset.subscriptionTitleExamples ?? []
+
+              return (
+                <div key={preset.id} className="space-y-3 rounded-lg border bg-muted/20 p-4">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge variant="secondary">{preset.displayName}</Badge>
+                    <Badge variant="outline">{preset.id}</Badge>
+                    {preset.recommendedPolicy ? (
+                      <Badge variant="outline">含推荐基线</Badge>
+                    ) : (
+                      <Badge variant="outline">无默认限制</Badge>
+                    )}
+                  </div>
+                  <div className="space-y-1">
+                    <p className="text-sm">{preset.description}</p>
+                    {subscriptionTitleExamples.length > 0 && (
+                      <p className="text-xs text-muted-foreground">
+                        识别示例：{subscriptionTitleExamples.join('、')}
+                      </p>
+                    )}
                     <p className="text-xs text-muted-foreground">
-                      识别示例：{preset.subscriptionTitleExamples.join('、')}
+                      推荐策略：{summarizeRecommendedPolicy(preset, modelLabelMap)}
                     </p>
-                  )}
-                  <p className="text-xs text-muted-foreground">
-                    推荐策略：{summarizeRecommendedPolicy(preset, modelLabelMap)}
-                  </p>
-                </div>
-                <div className="flex flex-wrap gap-2">
-                  {preset.recommendedPolicy && (
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    {preset.recommendedPolicy && (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={() => appendPresetRow(preset, false)}
+                      >
+                        复制为标准类型
+                      </Button>
+                    )}
                     <Button
                       type="button"
                       variant="outline"
                       size="sm"
-                      onClick={() => appendPresetRow(preset, false)}
+                      onClick={() => appendPresetRow(preset, true)}
                     >
-                      复制为标准类型
+                      复制为衍生类型
                     </Button>
-                  )}
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    onClick={() => appendPresetRow(preset, true)}
-                  >
-                    复制为衍生类型
-                  </Button>
+                  </div>
                 </div>
-              </div>
-            ))}
+              )
+            })}
           </div>
         </CardContent>
       </Card>

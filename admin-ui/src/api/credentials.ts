@@ -13,6 +13,8 @@ import type {
   LoadBalancingConfigResponse,
   ModelCatalogResponse,
   ModelCapabilitiesConfigResponse,
+  ModelSupportPolicy,
+  StandardAccountTypePreset,
   UpdateLoadBalancingConfigRequest,
   UpdateModelCapabilitiesConfigRequest,
 } from '@/types/api'
@@ -33,6 +35,59 @@ api.interceptors.request.use((config) => {
   }
   return config
 })
+
+function normalizeStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return []
+  }
+
+  return value.filter((item): item is string => typeof item === 'string')
+}
+
+function normalizeModelSupportPolicy(
+  policy: ModelSupportPolicy | null | undefined
+): ModelSupportPolicy {
+  return {
+    allowedModels: normalizeStringArray(policy?.allowedModels),
+    blockedModels: normalizeStringArray(policy?.blockedModels),
+  }
+}
+
+function normalizeStandardAccountTypePreset(
+  preset: StandardAccountTypePreset | null | undefined
+): StandardAccountTypePreset {
+  return {
+    id: typeof preset?.id === 'string' ? preset.id : '',
+    displayName: typeof preset?.displayName === 'string' ? preset.displayName : '',
+    description: typeof preset?.description === 'string' ? preset.description : '',
+    subscriptionTitleExamples: normalizeStringArray(preset?.subscriptionTitleExamples),
+    recommendedPolicy: preset?.recommendedPolicy
+      ? normalizeModelSupportPolicy(preset.recommendedPolicy)
+      : null,
+  }
+}
+
+function normalizeModelCapabilitiesConfigResponse(
+  value: ModelCapabilitiesConfigResponse
+): ModelCapabilitiesConfigResponse {
+  const accountTypePolicies = Object.fromEntries(
+    Object.entries(value?.accountTypePolicies ?? {}).map(([accountType, policy]) => [
+      accountType,
+      normalizeModelSupportPolicy(policy),
+    ])
+  )
+
+  const standardAccountTypePresets = Array.isArray(value?.standardAccountTypePresets)
+    ? value.standardAccountTypePresets
+        .map((preset) => normalizeStandardAccountTypePreset(preset))
+        .filter((preset) => preset.id)
+    : []
+
+  return {
+    accountTypePolicies,
+    standardAccountTypePresets,
+  }
+}
 
 // 获取所有凭据状态
 export async function getCredentials(): Promise<CredentialsStatusResponse> {
@@ -152,7 +207,7 @@ export async function setLoadBalancingMode(
 
 export async function getModelCapabilitiesConfig(): Promise<ModelCapabilitiesConfigResponse> {
   const { data } = await api.get<ModelCapabilitiesConfigResponse>('/config/model-capabilities')
-  return data
+  return normalizeModelCapabilitiesConfigResponse(data)
 }
 
 export async function getModelCatalog(): Promise<ModelCatalogResponse> {
@@ -167,5 +222,5 @@ export async function setModelCapabilitiesConfig(
     '/config/model-capabilities',
     payload
   )
-  return data
+  return normalizeModelCapabilitiesConfigResponse(data)
 }
