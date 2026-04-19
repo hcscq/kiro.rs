@@ -1,6 +1,6 @@
 //! Anthropic API 中间件
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     body::{Body, Bytes, to_bytes},
@@ -84,7 +84,11 @@ impl AppState {
         Self {
             api_key: api_key.into(),
             kiro_provider: None,
-            client: Client::new(),
+            client: Client::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(600))
+                .build()
+                .expect("failed to build leader forwarding client"),
         }
     }
 

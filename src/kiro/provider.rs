@@ -9,6 +9,7 @@ use futures::stream::BoxStream;
 use futures::{StreamExt, stream};
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -27,6 +28,9 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
+const DEFAULT_UPSTREAM_TIMEOUT_SECS: u64 = 720;
+const STREAM_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(240);
+const STREAM_TOTAL_WALL_CLOCK_BUDGET: Duration = Duration::from_secs(540);
 const SLOW_UPSTREAM_HEADERS_MS: u128 = 3_000;
 const SLOW_FIRST_CHUNK_MS: u128 = 3_000;
 const SLOW_HEADERS_TO_FIRST_CHUNK_MS: u128 = 1_000;
@@ -79,6 +83,60 @@ impl RequestOptions {
         }
     }
 }
+
+#[derive(Debug, Clone)]
+pub struct PublicProviderError {
+    status_code: u16,
+    error_type: &'static str,
+    public_message: String,
+    log_message: String,
+}
+
+impl PublicProviderError {
+    pub fn invalid_request(
+        log_message: impl Into<String>,
+        public_message: impl Into<String>,
+    ) -> Self {
+        Self {
+            status_code: 400,
+            error_type: "invalid_request_error",
+            public_message: public_message.into(),
+            log_message: log_message.into(),
+        }
+    }
+
+    pub fn gateway_timeout(
+        log_message: impl Into<String>,
+        public_message: impl Into<String>,
+    ) -> Self {
+        Self {
+            status_code: 504,
+            error_type: "api_error",
+            public_message: public_message.into(),
+            log_message: log_message.into(),
+        }
+    }
+
+    pub fn status_code(&self) -> u16 {
+        self.status_code
+    }
+
+    pub fn error_type(&self) -> &'static str {
+        self.error_type
+    }
+
+    pub fn public_message(&self) -> &str {
+        &self.public_message
+    }
+}
+
+impl fmt::Display for PublicProviderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.log_message)
+    }
+}
+
+impl std::error::Error for PublicProviderError {}
 
 #[derive(Debug, Clone)]
 struct ResponseTrace {
@@ -305,7 +363,8 @@ impl KiroProvider {
         let tls_backend = token_manager.config().tls_backend;
         // 预热：构建全局代理对应的 Client
         let initial_client =
-            build_client(proxy.as_ref(), 720, tls_backend).expect("创建 HTTP 客户端失败");
+            build_client(proxy.as_ref(), DEFAULT_UPSTREAM_TIMEOUT_SECS, tls_backend)
+                .expect("创建 HTTP 客户端失败");
         let mut cache = HashMap::new();
         cache.insert(proxy.clone(), initial_client);
 
@@ -337,7 +396,11 @@ impl KiroProvider {
         if let Some(client) = cache.get(&effective) {
             return Ok(client.clone());
         }
-        let client = build_client(effective.as_ref(), 720, self.tls_backend)?;
+        let client = build_client(
+            effective.as_ref(),
+            DEFAULT_UPSTREAM_TIMEOUT_SECS,
+            self.tls_backend,
+        )?;
         cache.insert(effective, client.clone());
         Ok(client)
     }
@@ -398,6 +461,46 @@ impl KiroProvider {
 
     fn summarize_error_body(status: reqwest::StatusCode, body: &str) -> String {
         summarize_upstream_error(status.as_u16(), body, ERROR_BODY_EXCERPT_CHARS)
+    }
+
+    fn invalid_request_public_message(body: &str) -> String {
+        if body.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
+            return "Context window is full. Reduce conversation history, system prompt, or tools."
+                .to_string();
+        }
+        if body.contains("Input is too long") {
+            return "Input is too long. Reduce the size of your messages.".to_string();
+        }
+        if body.contains("Improperly formed request") {
+            return "Upstream rejected the request as malformed. Review message ordering, tool payloads, and oversized inputs.".to_string();
+        }
+        "Upstream rejected the request as invalid. Review the request payload and try again."
+            .to_string()
+    }
+
+    fn stream_timeout_public_message() -> &'static str {
+        "Upstream stream exceeded the retry time budget before a usable response was produced."
+    }
+
+    fn remaining_stream_budget(
+        overall_started_at: Instant,
+        api_type: &str,
+        request_id: &str,
+    ) -> anyhow::Result<Duration> {
+        STREAM_TOTAL_WALL_CLOCK_BUDGET
+            .checked_sub(overall_started_at.elapsed())
+            .ok_or_else(|| {
+                anyhow::Error::new(PublicProviderError::gateway_timeout(
+                    format!(
+                        "{} API 请求超时: request_id={} total_elapsed_ms={} exceeded stream budget {}ms",
+                        api_type,
+                        request_id,
+                        overall_started_at.elapsed().as_millis(),
+                        STREAM_TOTAL_WALL_CLOCK_BUDGET.as_millis()
+                    ),
+                    Self::stream_timeout_public_message(),
+                ))
+            })
     }
 
     /// 发送非流式 API 请求
@@ -706,6 +809,15 @@ impl KiroProvider {
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(retry_cap);
 
         for attempt in 0..max_retries {
+            let stream_budget_remaining = if is_stream {
+                Some(Self::remaining_stream_budget(
+                    overall_started_at,
+                    api_type,
+                    &request_id,
+                )?)
+            } else {
+                None
+            };
             let attempt_started_at = Instant::now();
             // 获取调用上下文（绑定 index、credentials、token）
             let ctx = match self
@@ -769,6 +881,10 @@ impl KiroProvider {
             if !options.omit_agent_mode_header {
                 request = request.header("x-amzn-kiro-agent-mode", "vibe");
             }
+            if let Some(remaining_budget) = stream_budget_remaining {
+                let attempt_timeout = remaining_budget.min(STREAM_ATTEMPT_TIMEOUT);
+                request = request.timeout(attempt_timeout);
+            }
 
             tracing::info!(
                 request_id = %request_id,
@@ -781,6 +897,12 @@ impl KiroProvider {
                 stream = is_stream,
                 request_weight,
                 acquire_context_ms,
+                stream_budget_remaining_ms = stream_budget_remaining
+                    .map(|value| value.as_millis())
+                    .unwrap_or(0),
+                stream_attempt_timeout_ms = stream_budget_remaining
+                    .map(|value| value.min(STREAM_ATTEMPT_TIMEOUT).as_millis())
+                    .unwrap_or(0),
                 omit_agent_mode_header = options.omit_agent_mode_header,
                 invocation_id = %invocation_id,
                 "开始调用上游 Kiro API"
@@ -801,13 +923,31 @@ impl KiroProvider {
                         stream = is_stream,
                         request_weight,
                         acquire_context_ms,
+                        total_elapsed_ms = overall_started_at.elapsed().as_millis(),
                         upstream_wait_ms = upstream_request_started_at.elapsed().as_millis(),
                         error = %e,
                         "API 请求发送失败"
                     );
                     // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
                     // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
-                    last_error = Some(e.into());
+                    if e.is_timeout() {
+                        last_error = Some(anyhow::Error::new(
+                            PublicProviderError::gateway_timeout(
+                                format!(
+                                    "{} API 请求超时: request_id={} attempt={} total_elapsed_ms={} upstream_wait_ms={} error={}",
+                                    api_type,
+                                    request_id,
+                                    attempt + 1,
+                                    overall_started_at.elapsed().as_millis(),
+                                    upstream_request_started_at.elapsed().as_millis(),
+                                    e
+                                ),
+                                Self::stream_timeout_public_message(),
+                            ),
+                        ));
+                    } else {
+                        last_error = Some(e.into());
+                    }
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
                     }
@@ -892,6 +1032,7 @@ impl KiroProvider {
                     stream = is_stream,
                     status_code = status.as_u16(),
                     error_summary = %error_summary,
+                    total_elapsed_ms = overall_started_at.elapsed().as_millis(),
                     "API 请求失败（额度已用尽，禁用凭据并切换）"
                 );
 
@@ -927,6 +1068,7 @@ impl KiroProvider {
                         stream = is_stream,
                         status_code = status.as_u16(),
                         error_summary = %error_summary,
+                        total_elapsed_ms = overall_started_at.elapsed().as_millis(),
                         "API 请求失败（当前凭据不支持该模型）"
                     );
 
@@ -951,7 +1093,10 @@ impl KiroProvider {
                     continue;
                 }
 
-                anyhow::bail!("{} API 请求失败: {}", api_type, error_summary);
+                return Err(anyhow::Error::new(PublicProviderError::invalid_request(
+                    format!("{} API 请求失败: {}", api_type, error_summary),
+                    Self::invalid_request_public_message(&body),
+                )));
             }
 
             // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
@@ -967,6 +1112,7 @@ impl KiroProvider {
                     stream = is_stream,
                     status_code = status.as_u16(),
                     error_summary = %error_summary,
+                    total_elapsed_ms = overall_started_at.elapsed().as_millis(),
                     "API 请求失败（可能为凭据错误）"
                 );
 
@@ -1048,6 +1194,7 @@ impl KiroProvider {
                     stream = is_stream,
                     status_code = status.as_u16(),
                     error_summary = %error_summary,
+                    total_elapsed_ms = overall_started_at.elapsed().as_millis(),
                     "API 请求失败（上游瞬态错误）"
                 );
                 last_error = Some(anyhow::anyhow!(
@@ -1078,6 +1225,7 @@ impl KiroProvider {
                 stream = is_stream,
                 status_code = status.as_u16(),
                 error_summary = %error_summary,
+                total_elapsed_ms = overall_started_at.elapsed().as_millis(),
                 "API 请求失败（未知错误）"
             );
             last_error = Some(anyhow::anyhow!(
@@ -1301,5 +1449,32 @@ mod tests {
         let result = KiroProvider::inject_profile_arn(body, &arn);
         // 解析失败时原样返回
         assert_eq!(result, "not-valid-json");
+    }
+
+    #[test]
+    fn test_invalid_request_public_message_special_cases_improper_form() {
+        let message = KiroProvider::invalid_request_public_message(
+            r#"{"message":"Improperly formed request."}"#,
+        );
+        assert_eq!(
+            message,
+            "Upstream rejected the request as malformed. Review message ordering, tool payloads, and oversized inputs."
+        );
+    }
+
+    #[test]
+    fn test_remaining_stream_budget_exhausted_returns_public_timeout_error() {
+        let started_at = Instant::now() - STREAM_TOTAL_WALL_CLOCK_BUDGET - Duration::from_millis(1);
+        let err =
+            KiroProvider::remaining_stream_budget(started_at, "流式", "kirors-test").unwrap_err();
+        let public = err
+            .downcast_ref::<PublicProviderError>()
+            .expect("expected public provider error");
+        assert_eq!(public.status_code(), 504);
+        assert_eq!(public.error_type(), "api_error");
+        assert_eq!(
+            public.public_message(),
+            "Upstream stream exceeded the retry time budget before a usable response was produced."
+        );
     }
 }

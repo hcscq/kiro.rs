@@ -34,7 +34,7 @@ use super::types::{
     OutputConfig, Thinking,
 };
 use super::websearch;
-use crate::kiro::provider::RequestOptions;
+use crate::kiro::provider::{PublicProviderError, RequestOptions};
 
 fn request_id_from_headers(headers: &HeaderMap) -> String {
     headers
@@ -76,6 +76,24 @@ fn map_provider_error(err: Error) -> Response {
             Json(ErrorResponse::new(
                 "service_unavailable",
                 "Shared credential refresh must be handled by the runtime leader. Retry later or route this request to the leader.",
+            )),
+        )
+            .into_response();
+    }
+
+    if let Some(public_err) = err.downcast_ref::<PublicProviderError>() {
+        let status =
+            StatusCode::from_u16(public_err.status_code()).unwrap_or(StatusCode::BAD_GATEWAY);
+        if status.is_client_error() {
+            tracing::warn!(error = %err_summary, "Kiro API 调用失败（客户端请求错误）");
+        } else {
+            tracing::error!(error = %err_summary, "Kiro API 调用失败（公开错误映射）");
+        }
+        return (
+            status,
+            Json(ErrorResponse::new(
+                public_err.error_type(),
+                public_err.public_message(),
             )),
         )
             .into_response();
@@ -1043,6 +1061,7 @@ mod tests {
         request_thinking_enabled,
     };
     use crate::anthropic::types::{Message, MessagesRequest, Thinking};
+    use crate::kiro::provider::PublicProviderError;
     use crate::kiro::token_manager::RuntimeRefreshLeaderRequiredError;
     use axum::{body::to_bytes, http::StatusCode};
 
@@ -1127,6 +1146,26 @@ mod tests {
 
         assert_eq!(json["error"]["type"], "api_error");
         assert_eq!(json["error"]["message"], "上游 API 调用失败，请稍后重试。");
+    }
+
+    #[tokio::test]
+    async fn test_map_provider_error_preserves_public_invalid_request_mapping() {
+        let response = map_provider_error(anyhow::Error::new(
+            PublicProviderError::invalid_request(
+                "非流式 API 请求失败: status=400 body_len=54 message=\"Improperly formed request.\"",
+                "Upstream rejected the request as malformed. Review message ordering, tool payloads, and oversized inputs.",
+            ),
+        ));
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+        assert_eq!(
+            json["error"]["message"],
+            "Upstream rejected the request as malformed. Review message ordering, tool payloads, and oversized inputs."
+        );
     }
 
     #[tokio::test]
