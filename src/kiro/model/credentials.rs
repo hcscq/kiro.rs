@@ -8,11 +8,12 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
+use crate::model::account_type_preset::infer_standard_account_type_id;
 use crate::http_client::ProxyConfig;
 use crate::model::config::Config;
 use crate::model::model_policy::{
-    ModelSupportPolicy, RuntimeModelRestriction, normalize_account_type, normalize_model_entries,
-    normalize_model_selector,
+    AccountTypeDispatchPolicy, ModelSupportPolicy, RuntimeModelRestriction,
+    normalize_account_type, normalize_model_entries, normalize_model_selector,
 };
 
 /// Kiro OAuth 凭证
@@ -318,7 +319,22 @@ impl KiroCredentials {
         &self,
         default_limit: Option<u32>,
     ) -> Option<usize> {
+        self.effective_max_concurrency_with_policy(default_limit, None)
+    }
+
+    /// 获取有效的并发上限，并考虑账号类型调度策略。
+    ///
+    /// 优先级：凭据级 maxConcurrency > 账号类型调度策略 > 全局默认值。
+    pub fn effective_max_concurrency_with_policy(
+        &self,
+        default_limit: Option<u32>,
+        account_type_dispatch_policy: Option<&AccountTypeDispatchPolicy>,
+    ) -> Option<usize> {
         self.max_concurrency
+            .or_else(|| {
+                account_type_dispatch_policy
+                    .and_then(AccountTypeDispatchPolicy::effective_max_concurrency)
+            })
             .or(default_limit)
             .and_then(|limit| usize::try_from(limit).ok())
             .filter(|limit| *limit > 0)
@@ -376,6 +392,27 @@ impl KiroCredentials {
         self.account_type
             .as_ref()
             .and_then(|account_type| policies.get(account_type))
+            .or_else(|| {
+                self.subscription_title
+                    .as_deref()
+                    .and_then(infer_standard_account_type_id)
+                    .and_then(|account_type| policies.get(account_type))
+            })
+    }
+
+    pub fn account_type_dispatch_policy<'a>(
+        &'a self,
+        policies: &'a std::collections::BTreeMap<String, AccountTypeDispatchPolicy>,
+    ) -> Option<&'a AccountTypeDispatchPolicy> {
+        self.account_type
+            .as_ref()
+            .and_then(|account_type| policies.get(account_type))
+            .or_else(|| {
+                self.subscription_title
+                    .as_deref()
+                    .and_then(infer_standard_account_type_id)
+                    .and_then(|account_type| policies.get(account_type))
+            })
     }
 
     pub fn policy_allows_model(
@@ -607,6 +644,62 @@ mod tests {
         let json = r#"{"refreshToken":"test","maxConcurrency":3}"#;
         let creds = KiroCredentials::from_json(json).unwrap();
         assert_eq!(creds.effective_max_concurrency(), Some(3));
+    }
+
+    #[test]
+    fn test_effective_max_concurrency_falls_back_to_account_type_dispatch_policy() {
+        let mut creds = KiroCredentials::default();
+        creds.subscription_title = Some("KIRO POWER".to_string());
+
+        let policy = AccountTypeDispatchPolicy {
+            max_concurrency: Some(20),
+            rate_limit_bucket_capacity: Some(0.0),
+            rate_limit_refill_per_second: Some(0.0),
+        };
+
+        assert_eq!(
+            creds.effective_max_concurrency_with_policy(Some(3), Some(&policy)),
+            Some(20)
+        );
+    }
+
+    #[test]
+    fn test_account_type_policy_falls_back_to_inferred_standard_account_type() {
+        let mut creds = KiroCredentials::default();
+        creds.subscription_title = Some("KIRO POWER".to_string());
+
+        let mut policies = std::collections::BTreeMap::new();
+        policies.insert(
+            "power".to_string(),
+            ModelSupportPolicy {
+                allowed_models: vec!["claude-sonnet-4.6".to_string()],
+                blocked_models: vec![],
+            },
+        );
+
+        assert!(creds.account_type_policy(&policies).is_some());
+    }
+
+    #[test]
+    fn test_account_type_dispatch_policy_falls_back_to_inferred_standard_account_type() {
+        let mut creds = KiroCredentials::default();
+        creds.subscription_title = Some("KIRO POWER".to_string());
+
+        let mut policies = std::collections::BTreeMap::new();
+        policies.insert(
+            "power".to_string(),
+            AccountTypeDispatchPolicy {
+                max_concurrency: Some(20),
+                rate_limit_bucket_capacity: Some(0.0),
+                rate_limit_refill_per_second: Some(0.0),
+            },
+        );
+
+        assert_eq!(
+            creds.account_type_dispatch_policy(&policies)
+                .and_then(AccountTypeDispatchPolicy::effective_max_concurrency),
+            Some(20)
+        );
     }
 
     #[test]

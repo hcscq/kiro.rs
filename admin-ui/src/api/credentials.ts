@@ -13,6 +13,7 @@ import type {
   LoadBalancingConfigResponse,
   ModelCatalogResponse,
   ModelCapabilitiesConfigResponse,
+  AccountTypeDispatchPolicy,
   ModelSupportPolicy,
   StandardAccountTypePreset,
   UpdateLoadBalancingConfigRequest,
@@ -53,6 +54,23 @@ function normalizeModelSupportPolicy(
   }
 }
 
+function normalizeAccountTypeDispatchPolicy(
+  policy: AccountTypeDispatchPolicy | null | undefined
+): AccountTypeDispatchPolicy {
+  return {
+    maxConcurrency:
+      typeof policy?.maxConcurrency === 'number' ? policy.maxConcurrency : null,
+    rateLimitBucketCapacity:
+      typeof policy?.rateLimitBucketCapacity === 'number'
+        ? policy.rateLimitBucketCapacity
+        : null,
+    rateLimitRefillPerSecond:
+      typeof policy?.rateLimitRefillPerSecond === 'number'
+        ? policy.rateLimitRefillPerSecond
+        : null,
+  }
+}
+
 function normalizeStandardAccountTypePreset(
   preset: StandardAccountTypePreset | null | undefined
 ): StandardAccountTypePreset {
@@ -63,6 +81,9 @@ function normalizeStandardAccountTypePreset(
     subscriptionTitleExamples: normalizeStringArray(preset?.subscriptionTitleExamples),
     recommendedPolicy: preset?.recommendedPolicy
       ? normalizeModelSupportPolicy(preset.recommendedPolicy)
+      : null,
+    recommendedDispatchPolicy: preset?.recommendedDispatchPolicy
+      ? normalizeAccountTypeDispatchPolicy(preset.recommendedDispatchPolicy)
       : null,
   }
 }
@@ -76,6 +97,12 @@ function normalizeModelCapabilitiesConfigResponse(
       normalizeModelSupportPolicy(policy),
     ])
   )
+  const accountTypeDispatchPolicies = Object.fromEntries(
+    Object.entries(value?.accountTypeDispatchPolicies ?? {}).map(([accountType, policy]) => [
+      accountType,
+      normalizeAccountTypeDispatchPolicy(policy),
+    ])
+  )
 
   const standardAccountTypePresets = Array.isArray(value?.standardAccountTypePresets)
     ? value.standardAccountTypePresets
@@ -85,6 +112,7 @@ function normalizeModelCapabilitiesConfigResponse(
 
   return {
     accountTypePolicies,
+    accountTypeDispatchPolicies,
     standardAccountTypePresets,
   }
 }

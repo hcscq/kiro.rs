@@ -208,6 +208,7 @@ GitHub Actions 镜像构建：
 | `stateHotPathSyncMinIntervalMs` | number | `25` | 数据面热路径检查共享状态修订号的最小间隔（毫秒，`0` 表示每次请求都检查） |
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
 | `defaultMaxConcurrency` | number | - | 全局默认单账号并发上限；仅在凭据未单独配置 `maxConcurrency` 时生效，留空或 <= 0 表示不限制 |
+| `accountTypeDispatchPolicies` | object | - | 账号类型默认调度策略；可按 `power` / `pro-plus` 等类型统一覆盖 `maxConcurrency`、`rateLimitBucketCapacity`、`rateLimitRefillPerSecond` |
 | `queueMaxSize` | number | `0` | 等待队列最大长度；`0` 表示禁用等待队列 |
 | `queueMaxWaitMs` | number | `0` | 单请求最大排队等待时间（毫秒）；`0` 表示禁用等待队列 |
 | `rateLimitCooldownMs` | number | `2000` | 单账号触发上游 `429` 后的冷却时间（毫秒）；`0` 表示禁用 429 冷却 |
@@ -248,6 +249,13 @@ GitHub Actions 镜像构建：
    "stateHotPathSyncMinIntervalMs": 25,
    "loadBalancingMode": "balanced",
    "defaultMaxConcurrency": 3,
+   "accountTypeDispatchPolicies": {
+      "power": {
+         "maxConcurrency": 20,
+         "rateLimitBucketCapacity": 0,
+         "rateLimitRefillPerSecond": 0
+      }
+   },
    "queueMaxSize": 16,
    "queueMaxWaitMs": 5000,
    "rateLimitCooldownMs": 2000,
@@ -451,6 +459,7 @@ kiro-rs \
 - 按 `priority` 字段排序，数字越小优先级越高（默认为 0）
 - `balanced` 模式会优先选择当前并发较低的账号；如果并发相同，再参考历史成功次数和 `priority`
 - `defaultMaxConcurrency` 可为所有未单独配置 `maxConcurrency` 的账号设置统一并发上限，适合快速收敛单号过载
+- `accountTypeDispatchPolicies` 可把同类账号的实测承载能力固化成统一调度策略；当前 `power` 预设建议 `maxConcurrency=20` 且关闭本地 bucket 覆盖
 - `maxConcurrency` 可限制单账号最大并发，请求达到上限后会自动切到其他可用账号
 - `queueMaxSize` / `queueMaxWaitMs` 可为瞬时超并发请求提供短暂排队，减少尖峰时直接失败
 - `rateLimitCooldownMs` 可控制单账号触发上游 `429` 后的固定冷却时长；设为 `0` 可关闭该机制
@@ -600,11 +609,14 @@ RUST_LOG=debug ./target/release/kiro-rs
 | `*opus*`（其他） | `claude-opus-4.6` |
 | `*haiku*` | `claude-haiku-4.5` |
 
-### 账号模型能力策略
+### 账号类型统一策略
 
 - 支持给单个账号配置 `accountType`、`allowedModels`、`blockedModels`
 - 支持通过全局 `accountTypePolicies` 为同类型账号统一设置默认模型能力
-- 最终生效顺序：账号类型策略 + 账号级允许/禁用 + 运行时探测到的临时限制
+- 支持通过全局 `accountTypeDispatchPolicies` 为同类型账号统一设置默认调度能力（`maxConcurrency`、bucket 覆盖）
+- 当账号未显式填写 `accountType` 时，会回退到 `subscriptionTitle` 推断出的标准类型（如 `KIRO POWER -> power`），方便直接对标准档位整池生效
+- 模型能力最终生效顺序：账号类型策略 + 账号级允许/禁用 + 运行时探测到的临时限制
+- 调度能力最终生效顺序：凭据级 `maxConcurrency` / bucket 覆盖 > 账号类型调度策略 > 全局默认调度配置
 - `/v1/models` 会按当前启用账号的能力并集动态过滤，不再固定返回全量静态列表
 
 ## Admin（可选）
@@ -623,8 +635,8 @@ RUST_LOG=debug ./target/release/kiro-rs
   - `GET /api/admin/credentials/:id/balance` - 获取凭据余额
   - `GET /api/admin/config/load-balancing` - 获取当前负载均衡、默认并发和限流配置
   - `PUT /api/admin/config/load-balancing` - 更新负载均衡、默认并发和限流配置
-  - `GET /api/admin/config/model-capabilities` - 获取账号类型模型策略
-  - `PUT /api/admin/config/model-capabilities` - 更新账号类型模型策略
+  - `GET /api/admin/config/model-capabilities` - 获取账号类型模型/调度策略
+  - `PUT /api/admin/config/model-capabilities` - 更新账号类型模型/调度策略
 
 - **Admin UI**
   - `GET /admin` - 访问管理页面（需要在编译前构建 `admin-ui/dist`）

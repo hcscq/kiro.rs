@@ -15,7 +15,10 @@ use tokio::runtime::RuntimeFlavor;
 use crate::admin::types::BalanceResponse;
 use crate::kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use crate::model::config::{Config, RequestWeightingConfig, StateBackendKind};
-use crate::model::model_policy::{ModelSupportPolicy, normalize_account_type_policies};
+use crate::model::model_policy::{
+    AccountTypeDispatchPolicy, ModelSupportPolicy, normalize_account_type_dispatch_policies,
+    normalize_account_type_policies,
+};
 
 const STATS_FILE_NAME: &str = "kiro_stats.json";
 const BALANCE_CACHE_FILE_NAME: &str = "kiro_balance_cache.json";
@@ -732,6 +735,8 @@ pub struct PersistedDispatchConfig {
     pub request_weighting: RequestWeightingConfig,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub account_type_policies: BTreeMap<String, ModelSupportPolicy>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub account_type_dispatch_policies: BTreeMap<String, AccountTypeDispatchPolicy>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -752,6 +757,8 @@ impl PersistedDispatchConfig {
     pub fn from_config(config: &Config) -> Self {
         let mut account_type_policies = config.account_type_policies.clone();
         normalize_account_type_policies(&mut account_type_policies);
+        let mut account_type_dispatch_policies = config.account_type_dispatch_policies.clone();
+        normalize_account_type_dispatch_policies(&mut account_type_dispatch_policies);
         Self {
             mode: config.load_balancing_mode.clone(),
             queue_max_size: config.queue_max_size,
@@ -766,6 +773,7 @@ impl PersistedDispatchConfig {
             rate_limit_refill_backoff_factor: config.rate_limit_refill_backoff_factor,
             request_weighting: config.request_weighting.clone(),
             account_type_policies,
+            account_type_dispatch_policies,
         }
     }
 
@@ -783,6 +791,7 @@ impl PersistedDispatchConfig {
         config.rate_limit_refill_backoff_factor = self.rate_limit_refill_backoff_factor;
         config.request_weighting = self.request_weighting.clone();
         config.account_type_policies = self.account_type_policies.clone();
+        config.account_type_dispatch_policies = self.account_type_dispatch_policies.clone();
     }
 }
 
@@ -2686,6 +2695,7 @@ mod tests {
                 ..RequestWeightingConfig::default()
             },
             account_type_policies: BTreeMap::new(),
+            account_type_dispatch_policies: BTreeMap::new(),
         };
 
         store.persist_dispatch_config(&dispatch).unwrap();

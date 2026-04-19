@@ -52,5 +52,12 @@
         "claude-opus-4.7"
       ]
     }
+  },
+  "accountTypeDispatchPolicies": {
+    "power": {
+      "maxConcurrency": 20,
+      "rateLimitBucketCapacity": 0,
+      "rateLimitRefillPerSecond": 0
+    }
   }
 }

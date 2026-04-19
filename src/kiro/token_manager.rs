@@ -27,7 +27,8 @@ use crate::kiro::model::token_refresh::{
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::{Config, RequestWeightingConfig};
 use crate::model::model_policy::{
-    ModelSupportPolicy, normalize_account_type_policies, normalize_model_selector,
+    AccountTypeDispatchPolicy, ModelSupportPolicy, normalize_account_type_dispatch_policies,
+    normalize_account_type_policies, normalize_model_selector,
 };
 use crate::state::{
     DispatchLeaseReservationStatus, DispatchRuntimeBucketPolicy, DispatchRuntimeCredential,
@@ -752,6 +753,7 @@ struct DispatchConfig {
     rate_limit_refill_backoff_factor: f64,
     request_weighting: RequestWeightingConfig,
     account_type_policies: BTreeMap<String, ModelSupportPolicy>,
+    account_type_dispatch_policies: BTreeMap<String, AccountTypeDispatchPolicy>,
 }
 
 impl DispatchConfig {
@@ -772,6 +774,8 @@ impl DispatchConfig {
         };
         let mut account_type_policies = config.account_type_policies.clone();
         normalize_account_type_policies(&mut account_type_policies);
+        let mut account_type_dispatch_policies = config.account_type_dispatch_policies.clone();
+        normalize_account_type_dispatch_policies(&mut account_type_dispatch_policies);
 
         Self {
             mode: config.load_balancing_mode.clone(),
@@ -800,6 +804,7 @@ impl DispatchConfig {
             ),
             request_weighting: config.request_weighting.clone(),
             account_type_policies,
+            account_type_dispatch_policies,
         }
     }
 
@@ -818,12 +823,35 @@ impl DispatchConfig {
         credentials.account_type_policy(&self.account_type_policies)
     }
 
+    fn account_type_dispatch_policy_for<'a>(
+        &'a self,
+        credentials: &'a KiroCredentials,
+    ) -> Option<&'a AccountTypeDispatchPolicy> {
+        credentials.account_type_dispatch_policy(&self.account_type_dispatch_policies)
+    }
+
+    fn effective_max_concurrency_for(&self, credentials: &KiroCredentials) -> Option<usize> {
+        credentials.effective_max_concurrency_with_policy(
+            self.default_max_concurrency,
+            self.account_type_dispatch_policy_for(credentials),
+        )
+    }
+
     fn bucket_policy_for(&self, credentials: &KiroCredentials) -> Option<TokenBucketPolicy> {
+        let account_type_dispatch_policy = self.account_type_dispatch_policy_for(credentials);
         let capacity = credentials
             .rate_limit_bucket_capacity_override()
+            .or_else(|| {
+                account_type_dispatch_policy
+                    .and_then(AccountTypeDispatchPolicy::rate_limit_bucket_capacity_override)
+            })
             .unwrap_or(self.rate_limit_bucket_capacity);
         let refill_per_second = credentials
             .rate_limit_refill_per_second_override()
+            .or_else(|| {
+                account_type_dispatch_policy
+                    .and_then(AccountTypeDispatchPolicy::rate_limit_refill_per_second_override)
+            })
             .unwrap_or(self.rate_limit_refill_per_second);
 
         if !capacity.is_finite()
@@ -1248,11 +1276,11 @@ impl MultiTokenManager {
     }
 
     fn has_capacity(
+        dispatch: &DispatchConfig,
         credentials: &KiroCredentials,
         active_requests: usize,
-        default_max_concurrency: Option<u32>,
     ) -> bool {
-        match credentials.effective_max_concurrency_with_default(default_max_concurrency) {
+        match dispatch.effective_max_concurrency_for(credentials) {
             Some(limit) => active_requests < limit,
             None => true,
         }
@@ -1698,11 +1726,7 @@ impl MultiTokenManager {
 
             let is_dispatchable = !Self::is_rate_limited(entry, now)
                 && Self::bucket_is_ready_for(entry, request_weight)
-                && Self::has_capacity(
-                    &entry.credentials,
-                    entry.active_requests,
-                    dispatch.default_max_concurrency,
-                );
+                && Self::has_capacity(&dispatch, &entry.credentials, entry.active_requests);
 
             if !is_dispatchable {
                 Self::update_min_ready_at_for(&mut next_ready_at, entry, now, request_weight);
@@ -1788,7 +1812,10 @@ impl MultiTokenManager {
             entry.active_requests,
             entry
                 .credentials
-                .effective_max_concurrency_with_default(dispatch.default_max_concurrency)
+                .effective_max_concurrency_with_policy(
+                    dispatch.default_max_concurrency,
+                    dispatch.account_type_dispatch_policy_for(&entry.credentials),
+                )
                 .map(|limit| format!("/{}", limit))
                 .unwrap_or_default()
         );
@@ -1910,11 +1937,7 @@ impl MultiTokenManager {
                         .cooldown_until_epoch_ms
                         .map_or(true, |until| until <= now_epoch_ms)
                         && Self::shared_bucket_is_ready_for(&runtime, request_weight)
-                        && Self::has_capacity(
-                            &entry.credentials,
-                            runtime.active_requests,
-                            dispatch.default_max_concurrency,
-                        );
+                        && Self::has_capacity(&dispatch, &entry.credentials, runtime.active_requests);
 
                     if !is_dispatchable {
                         if let Some(ready_at) = Self::shared_snapshot_ready_at_for(
@@ -1948,9 +1971,7 @@ impl MultiTokenManager {
                             selected_id = Some(entry.id);
                             selected_credentials = Some(entry.credentials.clone());
                             selected_max_concurrency =
-                                entry.credentials.effective_max_concurrency_with_default(
-                                    dispatch.default_max_concurrency,
-                                );
+                                dispatch.effective_max_concurrency_for(&entry.credentials);
                             selected_bucket_policy =
                                 dispatch.shared_bucket_policy_for(&entry.credentials);
                         }
@@ -1973,9 +1994,7 @@ impl MultiTokenManager {
                         selected_id = Some(entry.id);
                         selected_credentials = Some(entry.credentials.clone());
                         selected_max_concurrency =
-                            entry.credentials.effective_max_concurrency_with_default(
-                                dispatch.default_max_concurrency,
-                            );
+                            dispatch.effective_max_concurrency_for(&entry.credentials);
                         selected_bucket_policy =
                             dispatch.shared_bucket_policy_for(&entry.credentials);
                     }
@@ -2048,7 +2067,10 @@ impl MultiTokenManager {
                     selected_id,
                     reservation.snapshot.active_requests,
                     selected_credentials
-                        .effective_max_concurrency_with_default(dispatch.default_max_concurrency)
+                        .effective_max_concurrency_with_policy(
+                            dispatch.default_max_concurrency,
+                            dispatch.account_type_dispatch_policy_for(&selected_credentials),
+                        )
                         .map(|limit| format!("/{}", limit))
                         .unwrap_or_default()
                 );
@@ -2561,6 +2583,7 @@ impl MultiTokenManager {
             || previous.rate_limit_refill_recovery_step_per_success
                 != next.rate_limit_refill_recovery_step_per_success
             || previous.rate_limit_refill_backoff_factor != next.rate_limit_refill_backoff_factor
+            || previous.account_type_dispatch_policies != next.account_type_dispatch_policies
         {
             self.reconfigure_rate_limit_runtime(&next);
         }
@@ -3393,19 +3416,11 @@ impl MultiTokenManager {
                         .cooldown_until_epoch_ms
                         .map_or(true, |until| until <= now_epoch_ms)
                         && Self::shared_bucket_is_ready(&runtime)
-                        && Self::has_capacity(
-                            &e.credentials,
-                            runtime.active_requests,
-                            dispatch.default_max_concurrency,
-                        )
+                        && Self::has_capacity(&dispatch, &e.credentials, runtime.active_requests)
                 } else {
                     !Self::is_rate_limited(e, now)
                         && Self::bucket_is_ready(e)
-                        && Self::has_capacity(
-                            &e.credentials,
-                            e.active_requests,
-                            dispatch.default_max_concurrency,
-                        )
+                        && Self::has_capacity(&dispatch, &e.credentials, e.active_requests)
                 }
             })
             .count();
@@ -3476,8 +3491,9 @@ impl MultiTokenManager {
                         active_requests,
                         max_concurrency: e
                             .credentials
-                            .effective_max_concurrency_with_default(
+                            .effective_max_concurrency_with_policy(
                                 dispatch.default_max_concurrency,
+                                dispatch.account_type_dispatch_policy_for(&e.credentials),
                             )
                             .and_then(|limit| u32::try_from(limit).ok()),
                         has_proxy: e.credentials.proxy_url.is_some(),
@@ -4092,6 +4108,12 @@ impl MultiTokenManager {
         self.dispatch_config().account_type_policies
     }
 
+    pub fn account_type_dispatch_policies_snapshot(
+        &self,
+    ) -> BTreeMap<String, AccountTypeDispatchPolicy> {
+        self.dispatch_config().account_type_dispatch_policies
+    }
+
     pub fn supports_model(&self, model: &str) -> bool {
         let dispatch = self.dispatch_config();
         let requirement = Self::model_requirement(Some(model));
@@ -4127,6 +4149,7 @@ impl MultiTokenManager {
                 rate_limit_refill_backoff_factor: dispatch.rate_limit_refill_backoff_factor,
                 request_weighting: dispatch.request_weighting.clone(),
                 account_type_policies: dispatch.account_type_policies.clone(),
+                account_type_dispatch_policies: dispatch.account_type_dispatch_policies.clone(),
             })?;
         self.try_bump_state_change_revision(StateChangeKind::DispatchConfig);
         Ok(())
@@ -4154,9 +4177,33 @@ impl MultiTokenManager {
         mut account_type_policies: BTreeMap<String, ModelSupportPolicy>,
     ) -> anyhow::Result<()> {
         crate::model::model_policy::normalize_account_type_policies(&mut account_type_policies);
+        self.set_account_type_strategy_config(Some(account_type_policies), None)
+    }
+
+    pub fn set_account_type_dispatch_policies(
+        &self,
+        mut account_type_dispatch_policies: BTreeMap<String, AccountTypeDispatchPolicy>,
+    ) -> anyhow::Result<()> {
+        crate::model::model_policy::normalize_account_type_dispatch_policies(
+            &mut account_type_dispatch_policies,
+        );
+        self.set_account_type_strategy_config(None, Some(account_type_dispatch_policies))
+    }
+
+    pub fn set_account_type_strategy_config(
+        &self,
+        account_type_policies: Option<BTreeMap<String, ModelSupportPolicy>>,
+        account_type_dispatch_policies: Option<BTreeMap<String, AccountTypeDispatchPolicy>>,
+    ) -> anyhow::Result<()> {
         let previous = self.dispatch_config();
         let mut next = previous.clone();
-        next.account_type_policies = account_type_policies;
+
+        if let Some(account_type_policies) = account_type_policies {
+            next.account_type_policies = account_type_policies;
+        }
+        if let Some(account_type_dispatch_policies) = account_type_dispatch_policies {
+            next.account_type_dispatch_policies = account_type_dispatch_policies;
+        }
 
         if previous == next {
             return Ok(());
@@ -4170,6 +4217,9 @@ impl MultiTokenManager {
             return Err(err);
         }
 
+        if previous.account_type_dispatch_policies != next.account_type_dispatch_policies {
+            self.reconfigure_rate_limit_runtime(&next);
+        }
         self.availability_notify.notify_waiters();
         Ok(())
     }
@@ -4259,6 +4309,7 @@ impl MultiTokenManager {
             || previous.rate_limit_refill_recovery_step_per_success
                 != next.rate_limit_refill_recovery_step_per_success
             || previous.rate_limit_refill_backoff_factor != next.rate_limit_refill_backoff_factor
+            || previous.account_type_dispatch_policies != next.account_type_dispatch_policies
         {
             self.reconfigure_rate_limit_runtime(&next);
         }
@@ -4487,6 +4538,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ctx.id, 2);
+    }
+
+    #[test]
+    fn test_standard_account_type_dispatch_policy_applies_without_explicit_account_type() {
+        let mut config = Config::default();
+        config.default_max_concurrency = Some(3);
+        config.account_type_dispatch_policies.insert(
+            "power".to_string(),
+            AccountTypeDispatchPolicy {
+                max_concurrency: Some(20),
+                rate_limit_bucket_capacity: Some(0.0),
+                rate_limit_refill_per_second: Some(0.0),
+            },
+        );
+
+        let mut cred = available_credential(0);
+        cred.subscription_title = Some("KIRO POWER".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+
+        assert_eq!(entry.max_concurrency, Some(20));
+        assert_eq!(entry.rate_limit_bucket_capacity, None);
+        assert_eq!(entry.rate_limit_refill_per_second, None);
     }
 
     #[test]
@@ -5307,6 +5383,7 @@ mod tests {
                 ..RequestWeightingConfig::default()
             },
             account_type_policies: BTreeMap::new(),
+            account_type_dispatch_policies: BTreeMap::new(),
         };
 
         assert!(manager.apply_dispatch_config_from_state(&persisted));

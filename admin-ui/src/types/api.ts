@@ -94,12 +94,19 @@ export interface ModelSupportPolicy {
   blockedModels: string[]
 }
 
+export interface AccountTypeDispatchPolicy {
+  maxConcurrency?: number | null
+  rateLimitBucketCapacity?: number | null
+  rateLimitRefillPerSecond?: number | null
+}
+
 export interface StandardAccountTypePreset {
   id: string
   displayName: string
   description: string
   subscriptionTitleExamples: string[]
   recommendedPolicy?: ModelSupportPolicy | null
+  recommendedDispatchPolicy?: AccountTypeDispatchPolicy | null
 }
 
 export interface ModelCatalogItem {
@@ -197,9 +204,11 @@ export interface UpdateLoadBalancingConfigRequest {
 
 export interface ModelCapabilitiesConfigResponse {
   accountTypePolicies: Record<string, ModelSupportPolicy>
+  accountTypeDispatchPolicies: Record<string, AccountTypeDispatchPolicy>
   standardAccountTypePresets: StandardAccountTypePreset[]
 }
 
 export interface UpdateModelCapabilitiesConfigRequest {
   accountTypePolicies?: Record<string, ModelSupportPolicy>
+  accountTypeDispatchPolicies?: Record<string, AccountTypeDispatchPolicy>
 }

@@ -4,7 +4,10 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::model_policy::{ModelSupportPolicy, normalize_account_type_policies};
+use super::model_policy::{
+    AccountTypeDispatchPolicy, ModelSupportPolicy, normalize_account_type_dispatch_policies,
+    normalize_account_type_policies,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -312,6 +315,10 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub account_type_policies: BTreeMap<String, ModelSupportPolicy>,
 
+    /// 账号类型默认调度策略
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub account_type_dispatch_policies: BTreeMap<String, AccountTypeDispatchPolicy>,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -487,6 +494,7 @@ impl Default for Config {
             rate_limit_refill_backoff_factor: default_rate_limit_refill_backoff_factor(),
             request_weighting: RequestWeightingConfig::default(),
             account_type_policies: BTreeMap::new(),
+            account_type_dispatch_policies: BTreeMap::new(),
             config_path: None,
         }
     }
@@ -562,6 +570,7 @@ impl Config {
 
     fn normalize(&mut self) {
         normalize_account_type_policies(&mut self.account_type_policies);
+        normalize_account_type_dispatch_policies(&mut self.account_type_dispatch_policies);
     }
 
     pub fn resolved_instance_id(&self) -> String {

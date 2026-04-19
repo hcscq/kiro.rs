@@ -388,6 +388,9 @@ impl AdminService {
         self.sync_runtime_state_for_read()?;
         Ok(ModelCapabilitiesConfigResponse {
             account_type_policies: self.token_manager.account_type_policies_snapshot(),
+            account_type_dispatch_policies: self
+                .token_manager
+                .account_type_dispatch_policies_snapshot(),
             standard_account_type_presets: built_in_account_type_presets()
                 .iter()
                 .map(|preset| StandardAccountTypePresetResponse {
@@ -400,6 +403,7 @@ impl AdminService {
                         .map(|value| (*value).to_string())
                         .collect(),
                     recommended_policy: preset.recommended_policy(),
+                    recommended_dispatch_policy: preset.recommended_dispatch_policy(),
                 })
                 .collect(),
         })
@@ -472,12 +476,15 @@ impl AdminService {
     ) -> Result<ModelCapabilitiesConfigResponse, AdminServiceError> {
         self.ensure_runtime_write_leader()?;
 
-        let Some(account_type_policies) = req.account_type_policies else {
+        if req.account_type_policies.is_none() && req.account_type_dispatch_policies.is_none() {
             return self.get_model_capabilities_config();
-        };
+        }
 
         self.token_manager
-            .set_account_type_policies(account_type_policies)
+            .set_account_type_strategy_config(
+                req.account_type_policies,
+                req.account_type_dispatch_policies,
+            )
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
         self.get_model_capabilities_config()

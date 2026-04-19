@@ -12,6 +12,17 @@ pub struct ModelSupportPolicy {
     pub blocked_models: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountTypeDispatchPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_bucket_capacity: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_refill_per_second: Option<f64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeModelRestriction {
@@ -45,6 +56,34 @@ impl ModelSupportPolicy {
         self.blocked_models
             .iter()
             .any(|entry| matches_model_entry(entry, selector))
+    }
+}
+
+impl AccountTypeDispatchPolicy {
+    pub fn normalize(&mut self) {
+        self.max_concurrency = self.max_concurrency.filter(|limit| *limit > 0);
+        self.rate_limit_bucket_capacity =
+            normalize_non_negative_finite(self.rate_limit_bucket_capacity);
+        self.rate_limit_refill_per_second =
+            normalize_non_negative_finite(self.rate_limit_refill_per_second);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.max_concurrency.is_none()
+            && self.rate_limit_bucket_capacity.is_none()
+            && self.rate_limit_refill_per_second.is_none()
+    }
+
+    pub fn effective_max_concurrency(&self) -> Option<u32> {
+        self.max_concurrency.filter(|limit| *limit > 0)
+    }
+
+    pub fn rate_limit_bucket_capacity_override(&self) -> Option<f64> {
+        normalize_non_negative_finite(self.rate_limit_bucket_capacity)
+    }
+
+    pub fn rate_limit_refill_per_second_override(&self) -> Option<f64> {
+        normalize_non_negative_finite(self.rate_limit_refill_per_second)
     }
 }
 
@@ -145,8 +184,30 @@ pub fn normalize_account_type_policies(
     normalized
 }
 
+pub fn normalize_account_type_dispatch_policies(
+    policies: &mut BTreeMap<String, AccountTypeDispatchPolicy>,
+) -> BTreeMap<String, AccountTypeDispatchPolicy> {
+    let mut normalized = BTreeMap::new();
+    for (key, mut policy) in std::mem::take(policies) {
+        let Some(account_type) = normalize_account_type(&key) else {
+            continue;
+        };
+        policy.normalize();
+        if policy.is_empty() {
+            continue;
+        }
+        normalized.insert(account_type, policy);
+    }
+    *policies = normalized.clone();
+    normalized
+}
+
 pub fn matches_model_entry(entry: &str, selector: &NormalizedModelSelector) -> bool {
     entry == selector.exact || entry == selector.family
+}
+
+fn normalize_non_negative_finite(value: Option<f64>) -> Option<f64> {
+    value.filter(|value| value.is_finite() && *value >= 0.0)
 }
 
 fn normalize_known_model_alias(model: &str) -> String {
@@ -164,9 +225,11 @@ mod tests {
     use chrono::{Duration, Utc};
 
     use super::{
-        ModelSupportPolicy, RuntimeModelRestriction, matches_model_entry, normalize_account_type,
+        AccountTypeDispatchPolicy, ModelSupportPolicy, RuntimeModelRestriction,
+        matches_model_entry, normalize_account_type, normalize_account_type_dispatch_policies,
         normalize_model_entries, normalize_model_selector, normalize_model_token,
     };
+    use std::collections::BTreeMap;
 
     #[test]
     fn normalize_model_token_keeps_known_aliases_consistent() {
@@ -240,5 +303,60 @@ mod tests {
         policy.normalize();
 
         assert!(policy.is_empty());
+    }
+
+    #[test]
+    fn account_type_dispatch_policy_preserves_zero_bucket_override() {
+        let mut policy = AccountTypeDispatchPolicy {
+            max_concurrency: Some(20),
+            rate_limit_bucket_capacity: Some(0.0),
+            rate_limit_refill_per_second: Some(0.0),
+        };
+
+        policy.normalize();
+
+        assert_eq!(policy.effective_max_concurrency(), Some(20));
+        assert_eq!(policy.rate_limit_bucket_capacity_override(), Some(0.0));
+        assert_eq!(policy.rate_limit_refill_per_second_override(), Some(0.0));
+    }
+
+    #[test]
+    fn normalize_account_type_dispatch_policies_drops_empty_entries() {
+        let mut policies = BTreeMap::from([
+            (
+                " POWER ".to_string(),
+                AccountTypeDispatchPolicy {
+                    max_concurrency: Some(20),
+                    rate_limit_bucket_capacity: Some(0.0),
+                    rate_limit_refill_per_second: Some(0.0),
+                },
+            ),
+            (
+                "   ".to_string(),
+                AccountTypeDispatchPolicy {
+                    max_concurrency: Some(8),
+                    rate_limit_bucket_capacity: None,
+                    rate_limit_refill_per_second: None,
+                },
+            ),
+            (
+                "free".to_string(),
+                AccountTypeDispatchPolicy {
+                    max_concurrency: None,
+                    rate_limit_bucket_capacity: None,
+                    rate_limit_refill_per_second: None,
+                },
+            ),
+        ]);
+
+        let normalized = normalize_account_type_dispatch_policies(&mut policies);
+
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(
+            normalized
+                .get("power")
+                .and_then(AccountTypeDispatchPolicy::effective_max_concurrency),
+            Some(20)
+        );
     }
 }

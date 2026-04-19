@@ -1,6 +1,6 @@
-use super::model_policy::ModelSupportPolicy;
+use super::model_policy::{AccountTypeDispatchPolicy, ModelSupportPolicy};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BuiltInAccountTypePreset {
     pub id: &'static str,
     pub display_name: &'static str,
@@ -8,6 +8,9 @@ pub struct BuiltInAccountTypePreset {
     pub subscription_title_examples: &'static [&'static str],
     pub recommended_allowed_models: &'static [&'static str],
     pub recommended_blocked_models: &'static [&'static str],
+    pub recommended_max_concurrency: Option<u32>,
+    pub recommended_rate_limit_bucket_capacity: Option<f64>,
+    pub recommended_rate_limit_refill_per_second: Option<f64>,
 }
 
 impl BuiltInAccountTypePreset {
@@ -27,6 +30,16 @@ impl BuiltInAccountTypePreset {
 
         (!policy.is_empty()).then_some(policy)
     }
+
+    pub fn recommended_dispatch_policy(&self) -> Option<AccountTypeDispatchPolicy> {
+        let policy = AccountTypeDispatchPolicy {
+            max_concurrency: self.recommended_max_concurrency,
+            rate_limit_bucket_capacity: self.recommended_rate_limit_bucket_capacity,
+            rate_limit_refill_per_second: self.recommended_rate_limit_refill_per_second,
+        };
+
+        (!policy.is_empty()).then_some(policy)
+    }
 }
 
 const BUILT_IN_ACCOUNT_TYPE_PRESETS: [BuiltInAccountTypePreset; 6] = [
@@ -41,6 +54,9 @@ const BUILT_IN_ACCOUNT_TYPE_PRESETS: [BuiltInAccountTypePreset; 6] = [
             "claude-opus-4.6",
             "claude-opus-4.5-20251101",
         ],
+        recommended_max_concurrency: None,
+        recommended_rate_limit_bucket_capacity: None,
+        recommended_rate_limit_refill_per_second: None,
     },
     BuiltInAccountTypePreset {
         id: "pro",
@@ -49,14 +65,20 @@ const BUILT_IN_ACCOUNT_TYPE_PRESETS: [BuiltInAccountTypePreset; 6] = [
         subscription_title_examples: &["KIRO PRO"],
         recommended_allowed_models: &[],
         recommended_blocked_models: &["claude-opus-4.7"],
+        recommended_max_concurrency: None,
+        recommended_rate_limit_bucket_capacity: None,
+        recommended_rate_limit_refill_per_second: None,
     },
     BuiltInAccountTypePreset {
         id: "power",
         display_name: "KIRO Power",
-        description: "Power 档位建议默认停留在 Opus 4.6 及以下，避免被新模型探测流量反复击穿。",
+        description: "Power 档位实测单卡可稳定承接更高并发。建议保留 Opus 4.6 及以下，并用账号类型调度策略关闭本地 bucket 覆盖、并发上限提升到 20。",
         subscription_title_examples: &["KIRO POWER"],
         recommended_allowed_models: &[],
         recommended_blocked_models: &["claude-opus-4.7"],
+        recommended_max_concurrency: Some(20),
+        recommended_rate_limit_bucket_capacity: Some(0.0),
+        recommended_rate_limit_refill_per_second: Some(0.0),
     },
     BuiltInAccountTypePreset {
         id: "pro-plus",
@@ -65,6 +87,9 @@ const BUILT_IN_ACCOUNT_TYPE_PRESETS: [BuiltInAccountTypePreset; 6] = [
         subscription_title_examples: &["KIRO PRO+"],
         recommended_allowed_models: &[],
         recommended_blocked_models: &[],
+        recommended_max_concurrency: None,
+        recommended_rate_limit_bucket_capacity: None,
+        recommended_rate_limit_refill_per_second: None,
     },
     BuiltInAccountTypePreset {
         id: "max",
@@ -73,6 +98,9 @@ const BUILT_IN_ACCOUNT_TYPE_PRESETS: [BuiltInAccountTypePreset; 6] = [
         subscription_title_examples: &["KIRO MAX"],
         recommended_allowed_models: &[],
         recommended_blocked_models: &[],
+        recommended_max_concurrency: None,
+        recommended_rate_limit_bucket_capacity: None,
+        recommended_rate_limit_refill_per_second: None,
     },
     BuiltInAccountTypePreset {
         id: "ultra",
@@ -81,6 +109,9 @@ const BUILT_IN_ACCOUNT_TYPE_PRESETS: [BuiltInAccountTypePreset; 6] = [
         subscription_title_examples: &["KIRO ULTRA"],
         recommended_allowed_models: &[],
         recommended_blocked_models: &[],
+        recommended_max_concurrency: None,
+        recommended_rate_limit_bucket_capacity: None,
+        recommended_rate_limit_refill_per_second: None,
     },
 ];
 
@@ -157,8 +188,15 @@ mod tests {
         let free = find_built_in_account_type_preset("free").unwrap();
         assert!(free.recommended_policy().is_some());
 
+        let power = find_built_in_account_type_preset("power").unwrap();
+        let dispatch = power.recommended_dispatch_policy().unwrap();
+        assert_eq!(dispatch.max_concurrency, Some(20));
+        assert_eq!(dispatch.rate_limit_bucket_capacity, Some(0.0));
+        assert_eq!(dispatch.rate_limit_refill_per_second, Some(0.0));
+
         let pro_plus = find_built_in_account_type_preset("pro-plus").unwrap();
         assert!(pro_plus.recommended_policy().is_none());
+        assert!(pro_plus.recommended_dispatch_policy().is_none());
 
         assert_eq!(built_in_account_type_presets().len(), 6);
     }

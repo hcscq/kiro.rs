@@ -925,6 +925,7 @@ mod tests {
                 ..RequestWeightingConfig::default()
             },
             account_type_policies: std::collections::BTreeMap::new(),
+            account_type_dispatch_policies: std::collections::BTreeMap::new(),
         };
 
         let rollback = build_file_rollback_config(&config, &dispatch);

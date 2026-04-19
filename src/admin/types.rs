@@ -3,7 +3,9 @@
 use std::collections::BTreeMap;
 
 use crate::model::config::RequestWeightingConfig;
-use crate::model::model_policy::{ModelSupportPolicy, RuntimeModelRestriction};
+use crate::model::model_policy::{
+    AccountTypeDispatchPolicy, ModelSupportPolicy, RuntimeModelRestriction,
+};
 use serde::{Deserialize, Deserializer, Serialize};
 
 fn deserialize_optional_nullable<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
@@ -356,12 +358,15 @@ pub struct StandardAccountTypePresetResponse {
     pub subscription_title_examples: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recommended_policy: Option<ModelSupportPolicy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recommended_dispatch_policy: Option<AccountTypeDispatchPolicy>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelCapabilitiesConfigResponse {
     pub account_type_policies: BTreeMap<String, ModelSupportPolicy>,
+    pub account_type_dispatch_policies: BTreeMap<String, AccountTypeDispatchPolicy>,
     pub standard_account_type_presets: Vec<StandardAccountTypePresetResponse>,
 }
 
@@ -383,6 +388,7 @@ pub struct ModelCatalogResponse {
 #[serde(rename_all = "camelCase")]
 pub struct SetModelCapabilitiesConfigRequest {
     pub account_type_policies: Option<BTreeMap<String, ModelSupportPolicy>>,
+    pub account_type_dispatch_policies: Option<BTreeMap<String, AccountTypeDispatchPolicy>>,
 }
 
 // ============ 通用响应 ============
