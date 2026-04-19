@@ -72,11 +72,11 @@ const BUILT_IN_ACCOUNT_TYPE_PRESETS: [BuiltInAccountTypePreset; 6] = [
     BuiltInAccountTypePreset {
         id: "power",
         display_name: "KIRO Power",
-        description: "Power 档位实测单卡可稳定承接更高并发。建议保留 Opus 4.6 及以下，并用账号类型调度策略关闭本地 bucket 覆盖、并发上限提升到 20。",
+        description: "Power 档位实测单卡可稳定承接更高并发。建议保留 Opus 4.6 及以下，并用账号类型调度策略关闭本地 bucket 覆盖、并发上限提升到 32。",
         subscription_title_examples: &["KIRO POWER"],
         recommended_allowed_models: &[],
         recommended_blocked_models: &["claude-opus-4.7"],
-        recommended_max_concurrency: Some(20),
+        recommended_max_concurrency: Some(32),
         recommended_rate_limit_bucket_capacity: Some(0.0),
         recommended_rate_limit_refill_per_second: Some(0.0),
     },
@@ -190,7 +190,7 @@ mod tests {
 
         let power = find_built_in_account_type_preset("power").unwrap();
         let dispatch = power.recommended_dispatch_policy().unwrap();
-        assert_eq!(dispatch.max_concurrency, Some(20));
+        assert_eq!(dispatch.max_concurrency, Some(32));
         assert_eq!(dispatch.rate_limit_bucket_capacity, Some(0.0));
         assert_eq!(dispatch.rate_limit_refill_per_second, Some(0.0));
 

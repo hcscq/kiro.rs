@@ -55,7 +55,7 @@
   },
   "accountTypeDispatchPolicies": {
     "power": {
-      "maxConcurrency": 20,
+      "maxConcurrency": 32,
       "rateLimitBucketCapacity": 0,
       "rateLimitRefillPerSecond": 0
     }

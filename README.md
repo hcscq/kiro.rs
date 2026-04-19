@@ -251,7 +251,7 @@ GitHub Actions 镜像构建：
    "defaultMaxConcurrency": 3,
    "accountTypeDispatchPolicies": {
       "power": {
-         "maxConcurrency": 20,
+         "maxConcurrency": 32,
          "rateLimitBucketCapacity": 0,
          "rateLimitRefillPerSecond": 0
       }
@@ -459,7 +459,7 @@ kiro-rs \
 - 按 `priority` 字段排序，数字越小优先级越高（默认为 0）
 - `balanced` 模式会优先选择当前并发较低的账号；如果并发相同，再参考历史成功次数和 `priority`
 - `defaultMaxConcurrency` 可为所有未单独配置 `maxConcurrency` 的账号设置统一并发上限，适合快速收敛单号过载
-- `accountTypeDispatchPolicies` 可把同类账号的实测承载能力固化成统一调度策略；当前 `power` 预设建议 `maxConcurrency=20` 且关闭本地 bucket 覆盖
+- `accountTypeDispatchPolicies` 可把同类账号的实测承载能力固化成统一调度策略；当前 `power` 预设建议 `maxConcurrency=32` 且关闭本地 bucket 覆盖
 - `maxConcurrency` 可限制单账号最大并发，请求达到上限后会自动切到其他可用账号
 - `queueMaxSize` / `queueMaxWaitMs` 可为瞬时超并发请求提供短暂排队，减少尖峰时直接失败
 - `rateLimitCooldownMs` 可控制单账号触发上游 `429` 后的固定冷却时长；设为 `0` 可关闭该机制

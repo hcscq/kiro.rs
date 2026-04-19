@@ -652,14 +652,14 @@ mod tests {
         creds.subscription_title = Some("KIRO POWER".to_string());
 
         let policy = AccountTypeDispatchPolicy {
-            max_concurrency: Some(20),
+            max_concurrency: Some(32),
             rate_limit_bucket_capacity: Some(0.0),
             rate_limit_refill_per_second: Some(0.0),
         };
 
         assert_eq!(
             creds.effective_max_concurrency_with_policy(Some(3), Some(&policy)),
-            Some(20)
+            Some(32)
         );
     }
 
@@ -689,7 +689,7 @@ mod tests {
         policies.insert(
             "power".to_string(),
             AccountTypeDispatchPolicy {
-                max_concurrency: Some(20),
+                max_concurrency: Some(32),
                 rate_limit_bucket_capacity: Some(0.0),
                 rate_limit_refill_per_second: Some(0.0),
             },
@@ -698,7 +698,7 @@ mod tests {
         assert_eq!(
             creds.account_type_dispatch_policy(&policies)
                 .and_then(AccountTypeDispatchPolicy::effective_max_concurrency),
-            Some(20)
+            Some(32)
         );
     }
 

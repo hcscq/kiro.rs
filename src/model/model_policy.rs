@@ -326,7 +326,7 @@ mod tests {
             (
                 " POWER ".to_string(),
                 AccountTypeDispatchPolicy {
-                    max_concurrency: Some(20),
+                    max_concurrency: Some(32),
                     rate_limit_bucket_capacity: Some(0.0),
                     rate_limit_refill_per_second: Some(0.0),
                 },
@@ -356,7 +356,7 @@ mod tests {
             normalized
                 .get("power")
                 .and_then(AccountTypeDispatchPolicy::effective_max_concurrency),
-            Some(20)
+            Some(32)
         );
     }
 }

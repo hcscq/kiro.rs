@@ -4547,7 +4547,7 @@ mod tests {
         config.account_type_dispatch_policies.insert(
             "power".to_string(),
             AccountTypeDispatchPolicy {
-                max_concurrency: Some(20),
+                max_concurrency: Some(32),
                 rate_limit_bucket_capacity: Some(0.0),
                 rate_limit_refill_per_second: Some(0.0),
             },
@@ -4560,7 +4560,7 @@ mod tests {
         let snapshot = manager.snapshot();
         let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
 
-        assert_eq!(entry.max_concurrency, Some(20));
+        assert_eq!(entry.max_concurrency, Some(32));
         assert_eq!(entry.rate_limit_bucket_capacity, None);
         assert_eq!(entry.rate_limit_refill_per_second, None);
     }
