@@ -114,11 +114,21 @@ enum WebSearchOutcome {
 
 /// 检查请求是否为纯 WebSearch 请求
 ///
-/// 条件：tools 有且只有一个，且该工具是 Anthropic/Kiro WebSearch 声明
+/// 条件：
+/// 1. tools 有且只有一个，且该工具是 Anthropic/Kiro WebSearch 声明
+/// 2. 当前消息里能直接提取出文本查询
+///
+/// 如果最后一条 user turn 只有 tool_result / image 等非文本内容，说明这是一次
+/// 工具调用后的 continuation，而不是“直接发起一次 web search”，应回落到普通
+/// Anthropic -> Kiro 转换链路处理。
 pub fn has_web_search_tool(req: &MessagesRequest) -> bool {
     req.tools
         .as_ref()
-        .is_some_and(|tools| tools.len() == 1 && tools.first().is_some_and(is_web_search_tool))
+        .is_some_and(|tools| {
+            tools.len() == 1
+                && tools.first().is_some_and(is_web_search_tool)
+                && extract_search_query(req).is_some()
+        })
 }
 
 fn is_web_search_tool(tool: &Tool) -> bool {
@@ -856,6 +866,54 @@ mod tests {
         };
 
         // 多个工具时不应该被识别为纯 websearch 请求
+        assert!(!has_web_search_tool(&req));
+    }
+
+    #[test]
+    fn test_has_web_search_tool_rejects_tool_result_only_current_turn() {
+        use crate::anthropic::types::{Message, Tool};
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!("search for rust latest version"),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([{
+                        "type": "tool_use",
+                        "id": "toolu_web_01",
+                        "name": "web_search",
+                        "input": {"query": "rust latest version"}
+                    }]),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!([{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_web_01",
+                        "content": "Rust 1.90"
+                    }]),
+                },
+            ],
+            stream: true,
+            system: None,
+            tools: Some(vec![Tool {
+                tool_type: Some("web_search_20250305".to_string()),
+                name: "web_search".to_string(),
+                description: String::new(),
+                input_schema: Default::default(),
+                max_uses: Some(8),
+            }]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
         assert!(!has_web_search_tool(&req));
     }
 
