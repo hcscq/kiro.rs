@@ -24,7 +24,8 @@ use super::{
         request_body_budget_exhausted_response, request_body_budget_reservation_bytes,
     },
     extractor::{
-        MAX_ANTHROPIC_BODY_SIZE_BYTES, content_length_header_value, request_body_too_large_response,
+        BufferedAnthropicBody, MAX_ANTHROPIC_BODY_SIZE_BYTES, content_length_header_value,
+        request_body_too_large_response,
     },
     types::ErrorResponse,
 };
@@ -77,6 +78,7 @@ impl BufferedAnthropicRequest {
     }
 
     fn into_axum_request(self) -> Request<Body> {
+        let buffered_body = BufferedAnthropicBody::new(self.body.clone());
         let mut request = Request::builder()
             .method(self.method)
             .uri(self.uri)
@@ -85,6 +87,7 @@ impl BufferedAnthropicRequest {
                 panic!("failed to rebuild anthropic request for local handling: {err}");
             });
         *request.headers_mut() = self.headers;
+        request.extensions_mut().insert(buffered_body);
         if let Some(original_uri) = self.original_uri {
             request.extensions_mut().insert(OriginalUri(original_uri));
         }
@@ -552,8 +555,7 @@ mod tests {
         })
         .to_string();
         let request_size = body.len() as u64;
-        let state =
-            AppState::new("test-key").with_request_body_budget_limit_bytes(request_size * 2);
+        let state = AppState::new("test-key").with_request_body_budget_limit_bytes(request_size);
         let app = Router::new()
             .route(
                 "/v1/messages",

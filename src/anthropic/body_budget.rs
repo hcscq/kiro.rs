@@ -129,7 +129,7 @@ pub(crate) fn request_body_budget_reservation_bytes(
 ) -> Option<u64> {
     let normalized_path = path.trim_end_matches('/');
     let multiplier = match normalized_path {
-        "/messages" | "/v1/messages" | "/cc/v1/messages" => 2,
+        "/messages" | "/v1/messages" | "/cc/v1/messages" => 1,
         "/messages/count_tokens" | "/v1/messages/count_tokens" | "/cc/v1/messages/count_tokens" => {
             1
         }
@@ -138,4 +138,29 @@ pub(crate) fn request_body_budget_reservation_bytes(
 
     let base_bytes = content_length_header.unwrap_or(MAX_ANTHROPIC_BODY_SIZE_BYTES as u64);
     Some(base_bytes.saturating_mul(multiplier))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::request_body_budget_reservation_bytes;
+
+    #[test]
+    fn message_routes_reserve_single_buffer() {
+        assert_eq!(
+            request_body_budget_reservation_bytes("/v1/messages", Some(1024)),
+            Some(1024)
+        );
+        assert_eq!(
+            request_body_budget_reservation_bytes("/messages", Some(2048)),
+            Some(2048)
+        );
+    }
+
+    #[test]
+    fn count_tokens_routes_keep_single_buffer_reservation() {
+        assert_eq!(
+            request_body_budget_reservation_bytes("/v1/messages/count_tokens", Some(512)),
+            Some(512)
+        );
+    }
 }

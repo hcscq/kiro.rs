@@ -1215,6 +1215,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_map_provider_error_preserves_public_413_mapping() {
+        let response =
+            map_provider_error(anyhow::Error::new(PublicProviderError::request_too_large(
+                "非流式 API 请求失败: status=413 body_excerpt=\"Input is too long\"",
+                "Input is too long. Reduce the size of your messages.",
+            )));
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+        assert_eq!(
+            json["error"]["message"],
+            "Input is too long. Reduce the size of your messages."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_map_provider_error_preserves_public_422_mapping() {
+        let response = map_provider_error(anyhow::Error::new(
+            PublicProviderError::unprocessable_entity(
+                "流式 API 请求失败: status=422 body_excerpt=\"Improperly formed request.\"",
+                "Upstream rejected the request as malformed. Review message ordering, tool payloads, and oversized inputs.",
+            ),
+        ));
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+        assert_eq!(
+            json["error"]["message"],
+            "Upstream rejected the request as malformed. Review message ordering, tool payloads, and oversized inputs."
+        );
+    }
+
+    #[tokio::test]
     async fn test_map_provider_error_returns_503_for_runtime_leader_refresh_errors() {
         let response = map_provider_error(anyhow::Error::new(RuntimeRefreshLeaderRequiredError {
             instance_id: "pod-a".to_string(),

@@ -19,6 +19,19 @@ use super::types::ErrorResponse;
 /// Anthropic 兼容消息接口允许的最大请求体大小。
 pub(crate) const MAX_ANTHROPIC_BODY_SIZE_BYTES: usize = 50 * 1024 * 1024;
 
+#[derive(Debug, Clone)]
+pub(crate) struct BufferedAnthropicBody(Bytes);
+
+impl BufferedAnthropicBody {
+    pub(crate) fn new(bytes: Bytes) -> Self {
+        Self(bytes)
+    }
+
+    fn into_bytes(self) -> Bytes {
+        self.0
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct AnthropicJson<T> {
     inner: T,
@@ -67,9 +80,14 @@ where
             return Err(missing_json_content_type_response());
         }
 
-        let bytes = Bytes::from_request(req, state)
-            .await
-            .map_err(bytes_rejection_response)?;
+        let bytes =
+            if let Some(buffered_body) = req.extensions().get::<BufferedAnthropicBody>().cloned() {
+                buffered_body.into_bytes()
+            } else {
+                Bytes::from_request(req, state)
+                    .await
+                    .map_err(bytes_rejection_response)?
+            };
         let body_len = bytes.len();
 
         match JsonExtractor::<T>::from_bytes(&bytes) {
@@ -175,8 +193,15 @@ fn json_rejection_response(rejection: JsonRejection) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{AnthropicJson, MAX_ANTHROPIC_BODY_SIZE_BYTES};
-    use axum::{Router, extract::DefaultBodyLimit, http::StatusCode, routing::post};
+    use super::{AnthropicJson, BufferedAnthropicBody, MAX_ANTHROPIC_BODY_SIZE_BYTES};
+    use axum::{
+        Router,
+        body::Body,
+        extract::{DefaultBodyLimit, FromRequest},
+        http::{Request, StatusCode},
+        routing::post,
+    };
+    use bytes::Bytes;
     use serde::Deserialize;
     use tokio::net::TcpListener;
 
@@ -224,5 +249,27 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn extractor_reuses_buffered_body_extension() {
+        let payload = br#"{"value":"hello"}"#;
+        let mut request = Request::builder()
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header("content-length", payload.len().to_string())
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(BufferedAnthropicBody::new(Bytes::copy_from_slice(payload)));
+
+        let parsed = AnthropicJson::<EchoRequest>::from_request(request, &())
+            .await
+            .expect("extractor should parse buffered body");
+
+        assert_eq!(parsed.body_len(), payload.len());
+        assert_eq!(parsed.content_length_header(), Some(payload.len() as u64));
+        assert_eq!(parsed.value, "hello");
     }
 }

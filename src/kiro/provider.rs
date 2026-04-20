@@ -105,6 +105,30 @@ impl PublicProviderError {
         }
     }
 
+    pub fn request_too_large(
+        log_message: impl Into<String>,
+        public_message: impl Into<String>,
+    ) -> Self {
+        Self {
+            status_code: 413,
+            error_type: "invalid_request_error",
+            public_message: public_message.into(),
+            log_message: log_message.into(),
+        }
+    }
+
+    pub fn unprocessable_entity(
+        log_message: impl Into<String>,
+        public_message: impl Into<String>,
+    ) -> Self {
+        Self {
+            status_code: 422,
+            error_type: "invalid_request_error",
+            public_message: public_message.into(),
+            log_message: log_message.into(),
+        }
+    }
+
     pub fn gateway_timeout(
         log_message: impl Into<String>,
         public_message: impl Into<String>,
@@ -143,6 +167,7 @@ struct ResponseTrace {
     request_id: String,
     api_type: &'static str,
     model: Option<String>,
+    request_body_bytes: usize,
     credential_id: u64,
     attempt: usize,
     max_retries: usize,
@@ -256,6 +281,7 @@ impl ResponseTrace {
             request_id = %self.request_id,
             api_type = self.api_type,
             model = self.model_label(),
+            request_body_bytes = self.request_body_bytes,
             credential_id = self.credential_id,
             attempt = self.attempt,
             max_retries = self.max_retries,
@@ -278,6 +304,7 @@ impl ResponseTrace {
         let request_id = &self.request_id;
         let api_type = self.api_type;
         let model = self.model_label();
+        let request_body_bytes = self.request_body_bytes;
         let credential_id = self.credential_id;
         let attempt = self.attempt;
         let max_retries = self.max_retries;
@@ -289,6 +316,7 @@ impl ResponseTrace {
                 request_id = %request_id,
                 api_type,
                 model,
+                request_body_bytes,
                 credential_id,
                 attempt,
                 max_retries,
@@ -305,6 +333,7 @@ impl ResponseTrace {
                 request_id = %request_id,
                 api_type,
                 model,
+                request_body_bytes,
                 credential_id,
                 attempt,
                 max_retries,
@@ -324,6 +353,7 @@ impl ResponseTrace {
             request_id = %self.request_id,
             api_type = self.api_type,
             model = self.model_label(),
+            request_body_bytes = self.request_body_bytes,
             credential_id = self.credential_id,
             attempt = self.attempt,
             max_retries = self.max_retries,
@@ -342,6 +372,7 @@ impl ResponseTrace {
             request_id = %self.request_id,
             api_type = self.api_type,
             model = self.model_label(),
+            request_body_bytes = self.request_body_bytes,
             credential_id = self.credential_id,
             attempt = self.attempt,
             max_retries = self.max_retries,
@@ -480,6 +511,53 @@ impl KiroProvider {
         }
         "Upstream rejected the request as invalid. Review the request payload and try again."
             .to_string()
+    }
+
+    fn request_too_large_public_message(body: &str) -> String {
+        if body.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
+            return "Context window is full. Reduce conversation history, system prompt, or tools."
+                .to_string();
+        }
+        if body.contains("Input is too long") {
+            return "Input is too long. Reduce the size of your messages.".to_string();
+        }
+        "Upstream rejected the request because the payload is too large. Reduce conversation history, attachments, or tool payloads and try again.".to_string()
+    }
+
+    fn unprocessable_public_message(body: &str) -> String {
+        if body.contains("Improperly formed request") {
+            return "Upstream rejected the request as malformed. Review message ordering, tool payloads, and oversized inputs.".to_string();
+        }
+        "Upstream could not process the request payload. Review message ordering, tool payloads, and schema compatibility.".to_string()
+    }
+
+    fn public_client_error_for_status(
+        status: reqwest::StatusCode,
+        api_type: &str,
+        error_summary: &str,
+        body: &str,
+    ) -> Option<PublicProviderError> {
+        match status.as_u16() {
+            413 => Some(PublicProviderError::request_too_large(
+                format!(
+                    "{} API 请求失败: status={} {}",
+                    api_type,
+                    status.as_u16(),
+                    error_summary
+                ),
+                Self::request_too_large_public_message(body),
+            )),
+            422 => Some(PublicProviderError::unprocessable_entity(
+                format!(
+                    "{} API 请求失败: status={} {}",
+                    api_type,
+                    status.as_u16(),
+                    error_summary
+                ),
+                Self::unprocessable_public_message(body),
+            )),
+            _ => None,
+        }
     }
 
     fn stream_timeout_public_message() -> &'static str {
@@ -867,6 +945,7 @@ impl KiroProvider {
 
             // 注入实际凭据的 profile_arn 到请求体
             let body = Self::inject_profile_arn(request_body, &credentials.profile_arn);
+            let request_body_bytes = body.len();
 
             // 发送请求
             let mut request = self
@@ -899,6 +978,7 @@ impl KiroProvider {
                 max_retries,
                 region = %region,
                 stream = is_stream,
+                request_body_bytes,
                 request_weight,
                 acquire_context_ms,
                 stream_budget_remaining_ms = stream_budget_remaining
@@ -925,6 +1005,7 @@ impl KiroProvider {
                         max_retries,
                         region = %region,
                         stream = is_stream,
+                        request_body_bytes,
                         request_weight,
                         acquire_context_ms,
                         total_elapsed_ms = overall_started_at.elapsed().as_millis(),
@@ -976,6 +1057,7 @@ impl KiroProvider {
                     max_retries,
                     region = %region,
                     stream = is_stream,
+                    request_body_bytes,
                     status_code = status.as_u16(),
                     acquire_context_ms,
                     upstream_headers_ms,
@@ -992,6 +1074,7 @@ impl KiroProvider {
                     max_retries,
                     region = %region,
                     stream = is_stream,
+                    request_body_bytes,
                     status_code = status.as_u16(),
                     acquire_context_ms,
                     upstream_headers_ms,
@@ -1007,6 +1090,7 @@ impl KiroProvider {
                     request_id: request_id.clone(),
                     api_type,
                     model: model.clone(),
+                    request_body_bytes,
                     credential_id: ctx_id,
                     attempt: attempt + 1,
                     max_retries,
@@ -1034,6 +1118,7 @@ impl KiroProvider {
                     max_retries,
                     region = %region,
                     stream = is_stream,
+                    request_body_bytes,
                     status_code = status.as_u16(),
                     error_summary = %error_summary,
                     total_elapsed_ms = overall_started_at.elapsed().as_millis(),
@@ -1070,6 +1155,7 @@ impl KiroProvider {
                         max_retries,
                         region = %region,
                         stream = is_stream,
+                        request_body_bytes,
                         status_code = status.as_u16(),
                         error_summary = %error_summary,
                         total_elapsed_ms = overall_started_at.elapsed().as_millis(),
@@ -1123,6 +1209,7 @@ impl KiroProvider {
                     max_retries,
                     region = %region,
                     stream = is_stream,
+                    request_body_bytes,
                     status_code = status.as_u16(),
                     error_summary = %error_summary,
                     total_elapsed_ms = overall_started_at.elapsed().as_millis(),
@@ -1205,6 +1292,7 @@ impl KiroProvider {
                     max_retries,
                     region = %region,
                     stream = is_stream,
+                    request_body_bytes,
                     status_code = status.as_u16(),
                     error_summary = %error_summary,
                     total_elapsed_ms = overall_started_at.elapsed().as_millis(),
@@ -1222,6 +1310,27 @@ impl KiroProvider {
             }
 
             // 其他 4xx - 通常为请求/配置问题：直接返回，不计入凭据失败
+            if let Some(public_error) =
+                Self::public_client_error_for_status(status, api_type, &error_summary, &body)
+            {
+                tracing::warn!(
+                    request_id = %request_id,
+                    api_type,
+                    model = model.as_deref().unwrap_or("unknown"),
+                    credential_id = ctx_id,
+                    attempt = attempt + 1,
+                    max_retries,
+                    region = %region,
+                    stream = is_stream,
+                    request_body_bytes,
+                    status_code = status.as_u16(),
+                    error_summary = %error_summary,
+                    total_elapsed_ms = overall_started_at.elapsed().as_millis(),
+                    "API 请求失败（明确映射的客户端错误）"
+                );
+                return Err(anyhow::Error::new(public_error));
+            }
+
             if status.is_client_error() {
                 anyhow::bail!("{} API 请求失败: {}", api_type, error_summary);
             }
@@ -1236,6 +1345,7 @@ impl KiroProvider {
                 max_retries,
                 region = %region,
                 stream = is_stream,
+                request_body_bytes,
                 status_code = status.as_u16(),
                 error_summary = %error_summary,
                 total_elapsed_ms = overall_started_at.elapsed().as_millis(),
@@ -1472,6 +1582,69 @@ mod tests {
         assert_eq!(
             message,
             "Upstream rejected the request as malformed. Review message ordering, tool payloads, and oversized inputs."
+        );
+    }
+
+    #[test]
+    fn test_request_too_large_public_message_special_cases_input_too_long() {
+        let message =
+            KiroProvider::request_too_large_public_message(r#"{"message":"Input is too long"}"#);
+        assert_eq!(
+            message,
+            "Input is too long. Reduce the size of your messages."
+        );
+    }
+
+    #[test]
+    fn test_unprocessable_public_message_special_cases_improper_form() {
+        let message = KiroProvider::unprocessable_public_message(
+            r#"{"message":"Improperly formed request."}"#,
+        );
+        assert_eq!(
+            message,
+            "Upstream rejected the request as malformed. Review message ordering, tool payloads, and oversized inputs."
+        );
+    }
+
+    #[test]
+    fn test_public_client_error_for_status_maps_413() {
+        let public_error = KiroProvider::public_client_error_for_status(
+            reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+            "非流式",
+            "body_excerpt=\"Input is too long\"",
+            r#"{"message":"Input is too long"}"#,
+        )
+        .expect("expected mapped public error");
+        assert_eq!(public_error.status_code(), 413);
+        assert_eq!(public_error.error_type(), "invalid_request_error");
+        assert_eq!(
+            public_error.public_message(),
+            "Input is too long. Reduce the size of your messages."
+        );
+        assert_eq!(
+            public_error.to_string(),
+            "非流式 API 请求失败: status=413 body_excerpt=\"Input is too long\""
+        );
+    }
+
+    #[test]
+    fn test_public_client_error_for_status_maps_422() {
+        let public_error = KiroProvider::public_client_error_for_status(
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "流式",
+            "body_excerpt=\"Improperly formed request.\"",
+            r#"{"message":"Improperly formed request."}"#,
+        )
+        .expect("expected mapped public error");
+        assert_eq!(public_error.status_code(), 422);
+        assert_eq!(public_error.error_type(), "invalid_request_error");
+        assert_eq!(
+            public_error.public_message(),
+            "Upstream rejected the request as malformed. Review message ordering, tool payloads, and oversized inputs."
+        );
+        assert_eq!(
+            public_error.to_string(),
+            "流式 API 请求失败: status=422 body_excerpt=\"Improperly formed request.\""
         );
     }
 
