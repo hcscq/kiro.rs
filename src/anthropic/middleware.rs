@@ -18,11 +18,19 @@ use reqwest::Client;
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 
-use super::types::ErrorResponse;
+use super::{
+    body_budget::{
+        InflightBodyBudget, InflightBodyBudgetPermit, load_budget_from_env,
+        request_body_budget_exhausted_response, request_body_budget_reservation_bytes,
+    },
+    extractor::{
+        MAX_ANTHROPIC_BODY_SIZE_BYTES, content_length_header_value, request_body_too_large_response,
+    },
+    types::ErrorResponse,
+};
 
 const ANTHROPIC_FORWARDED_HEADER: &str = "x-kiro-anthropic-forwarded";
 pub(crate) const ANTHROPIC_RUNTIME_LEADER_REQUIRED_HEADER: &str = "x-kiro-runtime-leader-required";
-const MAX_FORWARDED_ANTHROPIC_BODY_BYTES: usize = 50 * 1024 * 1024;
 
 #[derive(Clone)]
 struct BufferedAnthropicRequest {
@@ -93,6 +101,7 @@ pub struct AppState {
     /// 内部使用 MultiTokenManager，已支持线程安全的多凭据管理
     pub kiro_provider: Option<Arc<KiroProvider>>,
     client: Client,
+    request_body_budget: Option<Arc<InflightBodyBudget>>,
 }
 
 impl AppState {
@@ -106,12 +115,19 @@ impl AppState {
                 .timeout(Duration::from_secs(600))
                 .build()
                 .expect("failed to build leader forwarding client"),
+            request_body_budget: load_budget_from_env(),
         }
     }
 
     /// 设置 KiroProvider
     pub fn with_kiro_provider(mut self, provider: KiroProvider) -> Self {
         self.kiro_provider = Some(Arc::new(provider));
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_request_body_budget_limit_bytes(mut self, limit_bytes: u64) -> Self {
+        self.request_body_budget = InflightBodyBudget::new(limit_bytes);
         self
     }
 
@@ -262,17 +278,17 @@ impl AppState {
         next: Next,
     ) -> Response {
         let (parts, body) = request.into_parts();
-        let body = match to_bytes(body, MAX_FORWARDED_ANTHROPIC_BODY_BYTES).await {
+        let content_length_header = content_length_header_value(&parts.headers);
+        let body = match to_bytes(body, MAX_ANTHROPIC_BODY_SIZE_BYTES).await {
             Ok(body) => body,
             Err(err) => {
-                return (
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    Json(ErrorResponse::new(
-                        "invalid_request_error",
-                        format!("Failed to read request body for leader forwarding: {err}"),
-                    )),
-                )
-                    .into_response();
+                tracing::warn!(
+                    error = %err,
+                    body_limit_bytes = MAX_ANTHROPIC_BODY_SIZE_BYTES,
+                    content_length_header = ?content_length_header,
+                    "Anthropic request body exceeds size limit while buffering for leader fallback"
+                );
+                return request_body_too_large_response();
             }
         };
         let buffered_request = BufferedAnthropicRequest::from_request_parts(parts, body);
@@ -286,6 +302,36 @@ impl AppState {
 
         strip_internal_routing_headers(&mut local_response);
         local_response
+    }
+
+    fn acquire_request_body_budget(
+        &self,
+        path: &str,
+        content_length_header: Option<u64>,
+    ) -> Result<Option<InflightBodyBudgetPermit>, Response> {
+        let Some(budget) = &self.request_body_budget else {
+            return Ok(None);
+        };
+        let Some(reservation_bytes) =
+            request_body_budget_reservation_bytes(path, content_length_header)
+        else {
+            return Ok(None);
+        };
+
+        match budget.try_acquire(reservation_bytes) {
+            Some(permit) => Ok(Some(permit)),
+            None => {
+                tracing::warn!(
+                    path,
+                    budget_limit_bytes = budget.limit_bytes(),
+                    budget_used_bytes = budget.used_bytes(),
+                    budget_reservation_bytes = reservation_bytes,
+                    content_length_header = ?content_length_header,
+                    "Anthropic request rejected by in-flight body budget"
+                );
+                Err(request_body_budget_exhausted_response())
+            }
+        }
     }
 }
 
@@ -320,6 +366,12 @@ pub async fn message_routing_middleware(
         .get::<OriginalUri>()
         .map(|value| value.0.path().to_string())
         .unwrap_or_else(|| request.uri().path().to_string());
+    let content_length_header = content_length_header_value(request.headers());
+
+    let _budget_permit = match state.acquire_request_body_budget(&path, content_length_header) {
+        Ok(permit) => permit,
+        Err(response) => return response,
+    };
 
     if !requires_leader_message_routing(request.method(), &path) {
         return next.run(request).await;
@@ -352,17 +404,17 @@ pub async fn message_routing_middleware(
 
     if let Some(leader_http_base_url) = preemptive_leader_http_base_url {
         let (parts, body) = request.into_parts();
-        let body = match to_bytes(body, MAX_FORWARDED_ANTHROPIC_BODY_BYTES).await {
+        let content_length_header = content_length_header_value(&parts.headers);
+        let body = match to_bytes(body, MAX_ANTHROPIC_BODY_SIZE_BYTES).await {
             Ok(body) => body,
             Err(err) => {
-                return (
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    Json(ErrorResponse::new(
-                        "invalid_request_error",
-                        format!("Failed to read request body for leader forwarding: {err}"),
-                    )),
-                )
-                    .into_response();
+                tracing::warn!(
+                    error = %err,
+                    body_limit_bytes = MAX_ANTHROPIC_BODY_SIZE_BYTES,
+                    content_length_header = ?content_length_header,
+                    "Anthropic request body exceeds size limit while buffering for leader forwarding"
+                );
+                return request_body_too_large_response();
             }
         };
 
@@ -432,12 +484,23 @@ pub fn cors_layer() -> tower_http::cors::CorsLayer {
 #[cfg(test)]
 mod tests {
     use super::{
-        ANTHROPIC_RUNTIME_LEADER_REQUIRED_HEADER, requires_leader_message_routing,
+        ANTHROPIC_RUNTIME_LEADER_REQUIRED_HEADER, AppState, auth_middleware,
+        message_routing_middleware, requires_leader_message_routing,
         response_requires_runtime_leader_forwarding, strip_internal_routing_headers,
     };
     use axum::{
+        Router,
         body::Body,
         http::{Method, Response, StatusCode},
+        middleware,
+        routing::post,
+    };
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::{
+        net::TcpListener,
+        sync::Notify,
+        time::{Duration, timeout},
     };
 
     #[test]
@@ -472,5 +535,113 @@ mod tests {
         assert!(response_requires_runtime_leader_forwarding(&response));
         strip_internal_routing_headers(&mut response);
         assert!(!response_requires_runtime_leader_forwarding(&response));
+    }
+
+    #[tokio::test]
+    async fn request_body_budget_middleware_rejects_concurrent_large_requests() {
+        let started = std::sync::Arc::new(Notify::new());
+        let release = std::sync::Arc::new(Notify::new());
+        let call_count = std::sync::Arc::new(AtomicUsize::new(0));
+        let body = json!({
+            "model": "claude-sonnet-4",
+            "max_tokens": 32,
+            "messages": [{
+                "role": "user",
+                "content": "x".repeat(512),
+            }]
+        })
+        .to_string();
+        let request_size = body.len() as u64;
+        let state =
+            AppState::new("test-key").with_request_body_budget_limit_bytes(request_size * 2);
+        let app = Router::new()
+            .route(
+                "/v1/messages",
+                post({
+                    let started = started.clone();
+                    let release = release.clone();
+                    let call_count = call_count.clone();
+                    move || {
+                        let started = started.clone();
+                        let release = release.clone();
+                        let call_count = call_count.clone();
+                        async move {
+                            let call_index = call_count.fetch_add(1, Ordering::SeqCst);
+                            if call_index == 0 {
+                                started.notify_one();
+                                release.notified().await;
+                            }
+                            StatusCode::NO_CONTENT
+                        }
+                    }
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                message_routing_middleware,
+            ))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ))
+            .with_state(state);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let first = tokio::spawn({
+            let body = body.clone();
+            async move {
+                reqwest::Client::new()
+                    .post(format!("http://{addr}/v1/messages"))
+                    .header("x-api-key", "test-key")
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .send()
+                    .await
+                    .unwrap()
+            }
+        });
+
+        timeout(Duration::from_secs(5), started.notified())
+            .await
+            .expect("first request should reach handler");
+
+        let second = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .header("x-api-key", "test-key")
+            .header("content-type", "application/json")
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let json: serde_json::Value = second.json().await.unwrap();
+        assert_eq!(json["error"]["type"], "service_unavailable");
+        assert_eq!(
+            json["error"]["message"],
+            "Anthropic request buffering budget is exhausted. Retry later or reduce concurrent large uploads."
+        );
+
+        release.notify_waiters();
+
+        let first = first.await.unwrap();
+        assert_eq!(first.status(), StatusCode::NO_CONTENT);
+
+        let third = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .header("x-api-key", "test-key")
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(third.status(), StatusCode::NO_CONTENT);
+
+        server.abort();
     }
 }

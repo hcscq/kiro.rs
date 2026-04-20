@@ -11,7 +11,6 @@ use crate::model::model_catalog::built_in_model_catalog;
 use crate::token;
 use anyhow::Error;
 use axum::{
-    Json as JsonExtractor,
     body::Body,
     extract::State,
     http::{HeaderMap, HeaderValue, StatusCode, header},
@@ -25,6 +24,7 @@ use tokio::time::interval;
 use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request_with_probe};
+use super::extractor::AnthropicJson;
 use super::middleware::{ANTHROPIC_RUNTIME_LEADER_REQUIRED_HEADER, AppState};
 use super::probe::parse_upstream_probe;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
@@ -35,6 +35,8 @@ use super::types::{
 };
 use super::websearch;
 use crate::kiro::provider::{PublicProviderError, RequestOptions};
+
+const LARGE_ANTHROPIC_REQUEST_WARN_THRESHOLD_BYTES: usize = 16 * 1024 * 1024;
 
 fn request_id_from_headers(headers: &HeaderMap) -> String {
     headers
@@ -196,17 +198,31 @@ pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
 pub async fn post_messages(
     State(state): State<AppState>,
     headers: HeaderMap,
-    JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
+    payload: AnthropicJson<MessagesRequest>,
 ) -> Response {
+    let body_bytes = payload.body_len();
+    let content_length_header = payload.content_length_header();
     let request_id = request_id_from_headers(&headers);
     tracing::info!(
         request_id = %request_id,
         model = %payload.model,
         max_tokens = %payload.max_tokens,
         stream = %payload.stream,
+        body_bytes,
+        content_length_header = ?content_length_header,
         message_count = %payload.messages.len(),
         "Received POST /v1/messages request"
     );
+    if body_bytes >= LARGE_ANTHROPIC_REQUEST_WARN_THRESHOLD_BYTES {
+        tracing::warn!(
+            request_id = %request_id,
+            model = %payload.model,
+            body_bytes,
+            content_length_header = ?content_length_header,
+            "Large Anthropic request body observed"
+        );
+    }
+    let mut payload = payload.into_inner();
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
@@ -741,14 +757,25 @@ fn request_thinking_enabled(payload: &MessagesRequest) -> bool {
 /// POST /v1/messages/count_tokens
 ///
 /// 计算消息的 token 数量
-pub async fn count_tokens(
-    JsonExtractor(payload): JsonExtractor<CountTokensRequest>,
-) -> impl IntoResponse {
+pub async fn count_tokens(payload: AnthropicJson<CountTokensRequest>) -> impl IntoResponse {
+    let body_bytes = payload.body_len();
+    let content_length_header = payload.content_length_header();
     tracing::info!(
         model = %payload.model,
+        body_bytes,
+        content_length_header = ?content_length_header,
         message_count = %payload.messages.len(),
         "Received POST /v1/messages/count_tokens request"
     );
+    if body_bytes >= LARGE_ANTHROPIC_REQUEST_WARN_THRESHOLD_BYTES {
+        tracing::warn!(
+            model = %payload.model,
+            body_bytes,
+            content_length_header = ?content_length_header,
+            "Large Anthropic count_tokens request body observed"
+        );
+    }
+    let payload = payload.into_inner();
 
     let total_tokens = token::count_all_tokens(
         payload.model,
@@ -770,17 +797,31 @@ pub async fn count_tokens(
 pub async fn post_messages_cc(
     State(state): State<AppState>,
     headers: HeaderMap,
-    JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
+    payload: AnthropicJson<MessagesRequest>,
 ) -> Response {
+    let body_bytes = payload.body_len();
+    let content_length_header = payload.content_length_header();
     let request_id = request_id_from_headers(&headers);
     tracing::info!(
         request_id = %request_id,
         model = %payload.model,
         max_tokens = %payload.max_tokens,
         stream = %payload.stream,
+        body_bytes,
+        content_length_header = ?content_length_header,
         message_count = %payload.messages.len(),
         "Received POST /cc/v1/messages request"
     );
+    if body_bytes >= LARGE_ANTHROPIC_REQUEST_WARN_THRESHOLD_BYTES {
+        tracing::warn!(
+            request_id = %request_id,
+            model = %payload.model,
+            body_bytes,
+            content_length_header = ?content_length_header,
+            "Large Claude Code compatible request body observed"
+        );
+    }
+    let mut payload = payload.into_inner();
 
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {

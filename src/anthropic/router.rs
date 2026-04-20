@@ -10,12 +10,10 @@ use axum::{
 use crate::kiro::provider::KiroProvider;
 
 use super::{
+    extractor::MAX_ANTHROPIC_BODY_SIZE_BYTES,
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
     middleware::{AppState, auth_middleware, cors_layer, message_routing_middleware},
 };
-
-/// 请求体最大大小限制 (50MB)
-const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 
 /// 创建 Anthropic API 路由
 ///
@@ -75,6 +73,6 @@ pub fn create_router_with_provider(
         .nest("/v1", v1_routes)
         .nest("/cc/v1", cc_v1_routes)
         .layer(cors_layer())
-        .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
+        .layer(DefaultBodyLimit::max(MAX_ANTHROPIC_BODY_SIZE_BYTES))
         .with_state(state)
 }
