@@ -111,6 +111,34 @@ function InfoTile({
   )
 }
 
+function formatDispatchSourceLabel(
+  source: CredentialStatusItem['maxConcurrencySource'] | CredentialStatusItem['rateLimitBucketCapacitySource']
+): string | null {
+  switch (source) {
+    case 'credential':
+      return '凭据显式覆盖'
+    case 'account-type':
+      return '账号类型策略'
+    case 'global-default':
+      return '全局默认'
+    default:
+      return null
+  }
+}
+
+function formatAccountTypeSourceLabel(
+  source: CredentialStatusItem['accountTypeSource']
+): string | null {
+  switch (source) {
+    case 'credential':
+      return '显式账号类型'
+    case 'subscription-title':
+      return '按订阅档位推断'
+    default:
+      return null
+  }
+}
+
 export function CredentialCard({
   credential,
   onViewBalance,
@@ -126,7 +154,7 @@ export function CredentialCard({
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [editingMaxConcurrency, setEditingMaxConcurrency] = useState(false)
   const [maxConcurrencyValue, setMaxConcurrencyValue] = useState(
-    credential.maxConcurrency ? String(credential.maxConcurrency) : ''
+    credential.maxConcurrencyOverride ? String(credential.maxConcurrencyOverride) : ''
   )
   const [editingRateLimitConfig, setEditingRateLimitConfig] = useState(false)
   const [bucketCapacityValue, setBucketCapacityValue] = useState(
@@ -332,16 +360,18 @@ export function CredentialCard({
 
   const allowedModelsSummary = summarizeSelectedModels(allowedModelsValue, modelCatalog)
   const blockedModelsSummary = summarizeSelectedModels(blockedModelsValue, modelCatalog)
+  const maxConcurrencySourceLabel = formatDispatchSourceLabel(credential.maxConcurrencySource)
+  const accountTypeSourceLabel = formatAccountTypeSourceLabel(credential.accountTypeSource)
   const rateLimitOverrideSummary = [
     credential.rateLimitBucketCapacityOverride === undefined ||
     credential.rateLimitBucketCapacityOverride === null
-      ? 'Bucket 跟随全局'
+      ? `Bucket 跟随${formatDispatchSourceLabel(credential.rateLimitBucketCapacitySource) ?? '全局默认'}`
       : credential.rateLimitBucketCapacityOverride === 0
         ? 'Bucket 已禁用'
         : `Bucket=${credential.rateLimitBucketCapacityOverride}`,
     credential.rateLimitRefillPerSecondOverride === undefined ||
     credential.rateLimitRefillPerSecondOverride === null
-      ? '回填跟随全局'
+      ? `回填跟随${formatDispatchSourceLabel(credential.rateLimitRefillPerSecondSource) ?? '全局默认'}`
       : credential.rateLimitRefillPerSecondOverride === 0
         ? '回填已禁用'
         : `回填=${credential.rateLimitRefillPerSecondOverride} token/s`,
@@ -487,7 +517,9 @@ export function CredentialCard({
                     onClick={() => {
                       setEditingMaxConcurrency(false)
                       setMaxConcurrencyValue(
-                        credential.maxConcurrency ? String(credential.maxConcurrency) : ''
+                        credential.maxConcurrencyOverride
+                          ? String(credential.maxConcurrencyOverride)
+                          : ''
                       )
                     }}
                   >
@@ -495,13 +527,23 @@ export function CredentialCard({
                   </Button>
                 </div>
               ) : (
-                <span
-                  className="cursor-pointer hover:underline"
-                  onClick={() => setEditingMaxConcurrency(true)}
-                >
-                  {credential.maxConcurrency ?? '不限'}
-                  <span className="ml-1 text-xs text-muted-foreground">(点击编辑)</span>
-                </span>
+                <>
+                  <span
+                    className="cursor-pointer hover:underline"
+                    onClick={() => setEditingMaxConcurrency(true)}
+                  >
+                    {credential.maxConcurrency ?? '不限'}
+                    <span className="ml-1 text-xs text-muted-foreground">(点击编辑)</span>
+                  </span>
+                  {maxConcurrencySourceLabel && (
+                    <div className="mt-1 text-xs font-normal text-muted-foreground">
+                      {credential.maxConcurrencyOverride !== undefined &&
+                      credential.maxConcurrencyOverride !== null
+                        ? `显式覆盖：${credential.maxConcurrencyOverride}`
+                        : `来源：${maxConcurrencySourceLabel}`}
+                    </div>
+                  )}
+                </>
               )}
             </InfoTile>
 
@@ -621,8 +663,18 @@ export function CredentialCard({
               并发 {credential.inFlight}{credential.maxConcurrency ? ` / ${credential.maxConcurrency}` : ''}
             </Badge>
             <Badge variant="secondary" className="max-w-full break-all">
-              账号类型 {credential.accountType || '未设置'}
+              生效类型 {credential.resolvedAccountType || '未设置'}
             </Badge>
+            {accountTypeSourceLabel && (
+              <Badge variant="outline" className="max-w-full break-all">
+                {accountTypeSourceLabel}
+              </Badge>
+            )}
+            {credential.accountType && (
+              <Badge variant="secondary" className="max-w-full break-all">
+                显式类型 {credential.accountType}
+              </Badge>
+            )}
             {recognizedStandardAccountType && (
               <Badge variant="outline" className="max-w-full break-all">
                 标准档位 {recognizedStandardAccountType.preset.displayName}

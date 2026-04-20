@@ -20,6 +20,8 @@ export interface CredentialStatusItem {
   email?: string
   subscriptionTitle?: string | null
   accountType?: string | null
+  resolvedAccountType?: string | null
+  accountTypeSource?: 'credential' | 'subscription-title' | null
   standardAccountType?: string | null
   allowedModels?: string[]
   blockedModels?: string[]
@@ -30,6 +32,8 @@ export interface CredentialStatusItem {
   lastUsedAt: string | null
   inFlight: number
   maxConcurrency?: number | null
+  maxConcurrencyOverride?: number | null
+  maxConcurrencySource?: 'credential' | 'account-type' | 'global-default' | null
   hasProxy: boolean
   proxyUrl?: string
   refreshFailureCount: number
@@ -38,8 +42,10 @@ export interface CredentialStatusItem {
   rateLimitBucketTokens?: number | null
   rateLimitBucketCapacity?: number | null
   rateLimitBucketCapacityOverride?: number | null
+  rateLimitBucketCapacitySource?: 'credential' | 'account-type' | 'global-default' | null
   rateLimitRefillPerSecond?: number | null
   rateLimitRefillPerSecondOverride?: number | null
+  rateLimitRefillPerSecondSource?: 'credential' | 'account-type' | 'global-default' | null
   rateLimitRefillBasePerSecond?: number | null
   rateLimitHitStreak: number
   nextReadyInMs?: number | null

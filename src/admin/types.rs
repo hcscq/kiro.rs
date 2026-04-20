@@ -64,6 +64,12 @@ pub struct CredentialStatusItem {
     /// 账号类型
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_type: Option<String>,
+    /// 当前命中的账号类型（显式账号类型或标准档位推断）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_account_type: Option<String>,
+    /// 当前账号类型来源
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_type_source: Option<String>,
     /// 由订阅标题识别出的标准账号类型
     #[serde(skip_serializing_if = "Option::is_none")]
     pub standard_account_type: Option<String>,
@@ -85,8 +91,14 @@ pub struct CredentialStatusItem {
     pub last_used_at: Option<String>,
     /// 当前运行中的请求数
     pub in_flight: usize,
-    /// 单账号并发上限（空表示不限制）
+    /// 当前生效的单账号并发上限（空表示不限制）
     pub max_concurrency: Option<u32>,
+    /// 凭据级显式并发覆盖
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrency_override: Option<u32>,
+    /// 当前并发上限来源
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrency_source: Option<String>,
     /// 是否配置了凭据级代理
     pub has_proxy: bool,
     /// 代理 URL（用于前端展示）
@@ -109,12 +121,18 @@ pub struct CredentialStatusItem {
     /// 凭据级 bucket 容量覆盖
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit_bucket_capacity_override: Option<f64>,
+    /// 当前 bucket 容量来源
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_bucket_capacity_source: Option<String>,
     /// 当前生效回填速率（token/s）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit_refill_per_second: Option<f64>,
     /// 凭据级回填速率覆盖
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit_refill_per_second_override: Option<f64>,
+    /// 当前回填速率来源
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_refill_per_second_source: Option<String>,
     /// 配置的基础回填速率（token/s）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit_refill_base_per_second: Option<f64>,

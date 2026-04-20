@@ -6,6 +6,7 @@ import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { cn } from '@/lib/utils'
 import type {
+  AccountTypeDispatchPolicy,
   CredentialStatusItem,
   ModelCatalogItem,
   ModelSupportPolicy,
@@ -22,6 +23,7 @@ function splitCustomEntries(value: string): string[] {
 export function collectAccountTypeSuggestions(
   credentials: CredentialStatusItem[] | undefined,
   accountTypePolicies: Record<string, ModelSupportPolicy> | undefined,
+  accountTypeDispatchPolicies: Record<string, AccountTypeDispatchPolicy> | undefined,
   standardAccountTypePresets: StandardAccountTypePreset[] | undefined = []
 ): string[] {
   const values = new Set<string>()
@@ -38,6 +40,13 @@ export function collectAccountTypeSuggestions(
   }
 
   for (const accountType of Object.keys(accountTypePolicies ?? {})) {
+    const normalized = accountType.trim()
+    if (normalized) {
+      values.add(normalized)
+    }
+  }
+
+  for (const accountType of Object.keys(accountTypeDispatchPolicies ?? {})) {
     const normalized = accountType.trim()
     if (normalized) {
       values.add(normalized)

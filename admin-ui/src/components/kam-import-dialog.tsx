@@ -23,6 +23,10 @@ interface KamAccount {
   email?: string
   userId?: string | null
   nickname?: string
+  accountType?: string
+  maxConcurrency?: number
+  rateLimitBucketCapacity?: number
+  rateLimitRefillPerSecond?: number
   credentials: {
     refreshToken: string
     clientId?: string
@@ -63,6 +67,15 @@ function normalizeKamAccount(item: unknown): unknown {
         : typeof obj.label === 'string'
           ? (obj.label as string)
           : undefined
+    const accountType = typeof obj.accountType === 'string' ? obj.accountType : undefined
+    const maxConcurrency =
+      typeof obj.maxConcurrency === 'number' ? obj.maxConcurrency : undefined
+    const rateLimitBucketCapacity =
+      typeof obj.rateLimitBucketCapacity === 'number' ? obj.rateLimitBucketCapacity : undefined
+    const rateLimitRefillPerSecond =
+      typeof obj.rateLimitRefillPerSecond === 'number'
+        ? obj.rateLimitRefillPerSecond
+        : undefined
     const status = typeof obj.status === 'string' ? obj.status : undefined
     const machineId = typeof obj.machineId === 'string' ? obj.machineId : undefined
     const clientId = typeof obj.clientId === 'string' ? obj.clientId : undefined
@@ -75,6 +88,10 @@ function normalizeKamAccount(item: unknown): unknown {
       email,
       userId,
       nickname,
+      accountType,
+      maxConcurrency,
+      rateLimitBucketCapacity,
+      rateLimitRefillPerSecond,
       status,
       machineId,
       credentials: {
@@ -274,6 +291,27 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             throw new Error('idc 模式需要同时提供 clientId 和 clientSecret')
           }
 
+          if (
+            account.maxConcurrency !== undefined &&
+            (!Number.isInteger(account.maxConcurrency) || account.maxConcurrency <= 0)
+          ) {
+            throw new Error('maxConcurrency 必须是大于 0 的整数')
+          }
+          if (
+            account.rateLimitBucketCapacity !== undefined &&
+            (!Number.isFinite(account.rateLimitBucketCapacity) ||
+              account.rateLimitBucketCapacity < 0)
+          ) {
+            throw new Error('rateLimitBucketCapacity 必须是大于等于 0 的数字')
+          }
+          if (
+            account.rateLimitRefillPerSecond !== undefined &&
+            (!Number.isFinite(account.rateLimitRefillPerSecond) ||
+              account.rateLimitRefillPerSecond < 0)
+          ) {
+            throw new Error('rateLimitRefillPerSecond 必须是大于等于 0 的数字')
+          }
+
           const addedCred = await addCredential({
             refreshToken: token,
             authMethod,
@@ -281,6 +319,17 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             clientId,
             clientSecret,
             machineId: account.machineId?.trim() || undefined,
+            accountType: account.accountType?.trim() || undefined,
+            maxConcurrency:
+              typeof account.maxConcurrency === 'number' ? account.maxConcurrency : undefined,
+            rateLimitBucketCapacity:
+              typeof account.rateLimitBucketCapacity === 'number'
+                ? account.rateLimitBucketCapacity
+                : undefined,
+            rateLimitRefillPerSecond:
+              typeof account.rateLimitRefillPerSecond === 'number'
+                ? account.rateLimitRefillPerSecond
+                : undefined,
           })
 
           addedCredId = addedCred.credentialId
@@ -416,7 +465,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           <div className="space-y-2">
             <label className="text-sm font-medium">KAM 导出 JSON</label>
             <textarea
-              placeholder={'粘贴 Kiro Account Manager 导出的 JSON\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "us-east-1"\n  }\n]\n\n（可选的 authMethod 字段会被忽略，系统会根据 clientId/clientSecret 自动判断）\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "us-east-1"\n      }\n    }\n  ]\n}'}
+              placeholder={'粘贴 Kiro Account Manager 导出的 JSON\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "us-east-1",\n    "accountType": "power",\n    "maxConcurrency": 20\n  }\n]\n\n（可选的 authMethod 字段会被忽略，系统会根据 clientId/clientSecret 自动判断）\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "us-east-1"\n      }\n    }\n  ]\n}'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}

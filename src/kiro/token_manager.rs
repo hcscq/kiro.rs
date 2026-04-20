@@ -642,6 +642,12 @@ pub struct CredentialEntrySnapshot {
     /// 账号类型
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_type: Option<String>,
+    /// 当前命中的账号类型（显式账号类型或由订阅标题推断）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_account_type: Option<String>,
+    /// 当前账号类型来源：credential / subscription-title
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_type_source: Option<String>,
     /// 账号级额外允许模型
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub allowed_models: Vec<String>,
@@ -660,8 +666,14 @@ pub struct CredentialEntrySnapshot {
     pub last_used_at: Option<String>,
     /// 当前运行中的请求数
     pub active_requests: usize,
-    /// 单账号并发上限（空表示不限制）
+    /// 当前生效的单账号并发上限（空表示不限制）
     pub max_concurrency: Option<u32>,
+    /// 凭据级显式并发覆盖
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrency_override: Option<u32>,
+    /// 当前并发上限来源：credential / account-type / global-default
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrency_source: Option<String>,
     /// 是否配置了凭据级代理
     pub has_proxy: bool,
     /// 代理 URL（用于前端展示）
@@ -684,12 +696,18 @@ pub struct CredentialEntrySnapshot {
     /// 凭据级 bucket 容量覆盖
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit_bucket_capacity_override: Option<f64>,
+    /// 当前 bucket 容量来源：credential / account-type / global-default
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_bucket_capacity_source: Option<String>,
     /// 当前生效回填速率（token/s）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit_refill_per_second: Option<f64>,
     /// 凭据级回填速率覆盖
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit_refill_per_second_override: Option<f64>,
+    /// 当前回填速率来源：credential / account-type / global-default
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_refill_per_second_source: Option<String>,
     /// 配置的基础回填速率（token/s）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit_refill_base_per_second: Option<f64>,
@@ -835,6 +853,42 @@ impl DispatchConfig {
             self.default_max_concurrency,
             self.account_type_dispatch_policy_for(credentials),
         )
+    }
+
+    fn effective_max_concurrency_source_for(
+        &self,
+        credentials: &KiroCredentials,
+    ) -> Option<String> {
+        credentials
+            .effective_max_concurrency_source(
+                self.default_max_concurrency,
+                self.account_type_dispatch_policy_for(credentials),
+            )
+            .map(|source| source.as_str().to_string())
+    }
+
+    fn rate_limit_bucket_capacity_source_for(
+        &self,
+        credentials: &KiroCredentials,
+    ) -> Option<String> {
+        credentials
+            .effective_rate_limit_bucket_capacity_source(
+                self.rate_limit_bucket_capacity,
+                self.account_type_dispatch_policy_for(credentials),
+            )
+            .map(|source| source.as_str().to_string())
+    }
+
+    fn rate_limit_refill_per_second_source_for(
+        &self,
+        credentials: &KiroCredentials,
+    ) -> Option<String> {
+        credentials
+            .effective_rate_limit_refill_per_second_source(
+                self.rate_limit_refill_per_second,
+                self.account_type_dispatch_policy_for(credentials),
+            )
+            .map(|source| source.as_str().to_string())
     }
 
     fn bucket_policy_for(&self, credentials: &KiroCredentials) -> Option<TokenBucketPolicy> {
@@ -1449,6 +1503,39 @@ impl MultiTokenManager {
         for entry in entries.iter_mut() {
             Self::sync_rate_limit_bucket_runtime(entry, dispatch, now);
         }
+    }
+
+    fn apply_subscription_title_update(&self, id: u64, subscription_title: &str) {
+        let dispatch = self.dispatch_config();
+        let now = Instant::now();
+        {
+            let _state_write_guard = self.state_write_lock.lock();
+            let mut entries = self.entries.lock();
+            let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) else {
+                return;
+            };
+
+            let old_title = entry.credentials.subscription_title.clone();
+            if old_title.as_deref() == Some(subscription_title) {
+                return;
+            }
+
+            entry.credentials.subscription_title = Some(subscription_title.to_string());
+            Self::sync_rate_limit_bucket_runtime(entry, &dispatch, now);
+
+            tracing::info!(
+                "凭据 #{} 订阅等级已更新: {:?} -> {}",
+                id,
+                old_title,
+                subscription_title
+            );
+            let credentials = Self::persisted_credentials_from_entries(&entries);
+            if let Err(err) = self.persist_credentials_snapshot(&credentials) {
+                tracing::warn!("订阅等级更新后持久化失败（不影响本次请求）: {}", err);
+            }
+        }
+
+        self.availability_notify.notify_waiters();
     }
 
     fn validate_non_negative_finite(name: &str, value: f64) -> anyhow::Result<()> {
@@ -3538,6 +3625,11 @@ impl MultiTokenManager {
                         email: e.credentials.email.clone(),
                         subscription_title: e.credentials.subscription_title.clone(),
                         account_type: e.credentials.account_type.clone(),
+                        resolved_account_type: e.credentials.resolved_account_type(),
+                        account_type_source: e
+                            .credentials
+                            .resolved_account_type_source()
+                            .map(|source| source.as_str().to_string()),
                         allowed_models: e.credentials.allowed_models.clone(),
                         blocked_models: e.credentials.blocked_models.clone(),
                         runtime_model_restrictions: e
@@ -3554,6 +3646,9 @@ impl MultiTokenManager {
                                 dispatch.account_type_dispatch_policy_for(&e.credentials),
                             )
                             .and_then(|limit| u32::try_from(limit).ok()),
+                        max_concurrency_override: e.credentials.max_concurrency_override(),
+                        max_concurrency_source: dispatch
+                            .effective_max_concurrency_source_for(&e.credentials),
                         has_proxy: e.credentials.proxy_url.is_some(),
                         proxy_url: e.credentials.proxy_url.clone(),
                         refresh_failure_count: e.refresh_failure_count,
@@ -3584,6 +3679,8 @@ impl MultiTokenManager {
                         rate_limit_bucket_capacity_override: e
                             .credentials
                             .rate_limit_bucket_capacity_override(),
+                        rate_limit_bucket_capacity_source: dispatch
+                            .rate_limit_bucket_capacity_source_for(&e.credentials),
                         rate_limit_refill_per_second: shared_runtime
                             .as_ref()
                             .and_then(|runtime| runtime.bucket_current_refill_per_second)
@@ -3596,6 +3693,8 @@ impl MultiTokenManager {
                         rate_limit_refill_per_second_override: e
                             .credentials
                             .rate_limit_refill_per_second_override(),
+                        rate_limit_refill_per_second_source: dispatch
+                            .rate_limit_refill_per_second_source_for(&e.credentials),
                         rate_limit_refill_base_per_second: shared_runtime
                             .as_ref()
                             .and_then(|runtime| runtime.bucket_base_refill_per_second)
@@ -3853,26 +3952,7 @@ impl MultiTokenManager {
 
         // 更新订阅等级到凭据（仅在发生变化时持久化）
         if let Some(subscription_title) = usage_limits.subscription_title() {
-            {
-                let _state_write_guard = self.state_write_lock.lock();
-                let mut entries = self.entries.lock();
-                if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                    let old_title = entry.credentials.subscription_title.clone();
-                    if old_title.as_deref() != Some(subscription_title) {
-                        entry.credentials.subscription_title = Some(subscription_title.to_string());
-                        tracing::info!(
-                            "凭据 #{} 订阅等级已更新: {:?} -> {}",
-                            id,
-                            old_title,
-                            subscription_title
-                        );
-                        let credentials = Self::persisted_credentials_from_entries(&entries);
-                        if let Err(e) = self.persist_credentials_snapshot(&credentials) {
-                            tracing::warn!("订阅等级更新后持久化失败（不影响本次请求）: {}", e);
-                        }
-                    }
-                }
-            }
+            self.apply_subscription_title_update(id, subscription_title);
         }
 
         Ok(usage_limits)
@@ -4621,6 +4701,110 @@ mod tests {
         assert_eq!(entry.max_concurrency, Some(32));
         assert_eq!(entry.rate_limit_bucket_capacity, None);
         assert_eq!(entry.rate_limit_refill_per_second, None);
+    }
+
+    #[test]
+    fn test_subscription_title_update_reconfigures_runtime_and_snapshot_sources() {
+        let mut config = Config::default();
+        config.default_max_concurrency = Some(3);
+        config.account_type_dispatch_policies.insert(
+            "power".to_string(),
+            AccountTypeDispatchPolicy {
+                max_concurrency: Some(32),
+                rate_limit_bucket_capacity: Some(0.0),
+                rate_limit_refill_per_second: Some(0.0),
+            },
+        );
+
+        let cred = available_credential(0);
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        let before = manager.snapshot();
+        let before_entry = before.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert_eq!(before_entry.resolved_account_type, None);
+        assert_eq!(before_entry.account_type_source, None);
+        assert_eq!(before_entry.max_concurrency, Some(3));
+        assert_eq!(
+            before_entry.max_concurrency_source.as_deref(),
+            Some("global-default")
+        );
+        assert_eq!(before_entry.rate_limit_bucket_capacity, Some(6.0));
+        assert_eq!(
+            before_entry.rate_limit_bucket_capacity_source.as_deref(),
+            Some("global-default")
+        );
+
+        manager.apply_subscription_title_update(1, "KIRO POWER");
+
+        let after = manager.snapshot();
+        let after_entry = after.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert_eq!(
+            after_entry.subscription_title.as_deref(),
+            Some("KIRO POWER")
+        );
+        assert_eq!(after_entry.resolved_account_type.as_deref(), Some("power"));
+        assert_eq!(
+            after_entry.account_type_source.as_deref(),
+            Some("subscription-title")
+        );
+        assert_eq!(after_entry.max_concurrency, Some(32));
+        assert_eq!(
+            after_entry.max_concurrency_source.as_deref(),
+            Some("account-type")
+        );
+        assert_eq!(after_entry.rate_limit_bucket_capacity, None);
+        assert_eq!(
+            after_entry.rate_limit_bucket_capacity_source.as_deref(),
+            Some("account-type")
+        );
+        assert_eq!(after_entry.rate_limit_refill_per_second, None);
+        assert_eq!(
+            after_entry.rate_limit_refill_per_second_source.as_deref(),
+            Some("account-type")
+        );
+    }
+
+    #[test]
+    fn test_snapshot_prefers_explicit_overrides_for_sources() {
+        let mut config = Config::default();
+        config.default_max_concurrency = Some(3);
+        config.account_type_dispatch_policies.insert(
+            "power".to_string(),
+            AccountTypeDispatchPolicy {
+                max_concurrency: Some(32),
+                rate_limit_bucket_capacity: Some(0.0),
+                rate_limit_refill_per_second: Some(0.0),
+            },
+        );
+
+        let mut cred = available_credential(0);
+        cred.subscription_title = Some("KIRO POWER".to_string());
+        cred.account_type = Some("power-canary".to_string());
+        cred.max_concurrency = Some(7);
+        cred.rate_limit_bucket_capacity = Some(4.0);
+        cred.rate_limit_refill_per_second = Some(1.5);
+
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+
+        assert_eq!(entry.resolved_account_type.as_deref(), Some("power-canary"));
+        assert_eq!(entry.account_type_source.as_deref(), Some("credential"));
+        assert_eq!(entry.max_concurrency, Some(7));
+        assert_eq!(entry.max_concurrency_override, Some(7));
+        assert_eq!(entry.max_concurrency_source.as_deref(), Some("credential"));
+        assert_eq!(entry.rate_limit_bucket_capacity, Some(4.0));
+        assert_eq!(entry.rate_limit_bucket_capacity_override, Some(4.0));
+        assert_eq!(
+            entry.rate_limit_bucket_capacity_source.as_deref(),
+            Some("credential")
+        );
+        assert_eq!(entry.rate_limit_refill_per_second, Some(1.5));
+        assert_eq!(entry.rate_limit_refill_per_second_override, Some(1.5));
+        assert_eq!(
+            entry.rate_limit_refill_per_second_source.as_deref(),
+            Some("credential")
+        );
     }
 
     #[test]

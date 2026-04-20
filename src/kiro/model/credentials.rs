@@ -5,6 +5,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::fs;
 use std::path::Path;
 
@@ -15,6 +16,38 @@ use crate::model::model_policy::{
     AccountTypeDispatchPolicy, ModelSupportPolicy, RuntimeModelRestriction, normalize_account_type,
     normalize_model_entries, normalize_model_selector,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedAccountTypeSource {
+    Explicit,
+    SubscriptionTitle,
+}
+
+impl ResolvedAccountTypeSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Explicit => "credential",
+            Self::SubscriptionTitle => "subscription-title",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchSettingSource {
+    Credential,
+    AccountType,
+    GlobalDefault,
+}
+
+impl DispatchSettingSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Credential => "credential",
+            Self::AccountType => "account-type",
+            Self::GlobalDefault => "global-default",
+        }
+    }
+}
 
 /// Kiro OAuth 凭证
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -305,6 +338,37 @@ impl KiroCredentials {
             .map(|title| title.to_ascii_uppercase())
     }
 
+    pub fn max_concurrency_override(&self) -> Option<u32> {
+        self.max_concurrency.filter(|limit| *limit > 0)
+    }
+
+    pub fn resolved_account_type_source(&self) -> Option<ResolvedAccountTypeSource> {
+        if self.account_type.is_some() {
+            return Some(ResolvedAccountTypeSource::Explicit);
+        }
+
+        self.subscription_title
+            .as_deref()
+            .and_then(infer_standard_account_type_id)
+            .map(|_| ResolvedAccountTypeSource::SubscriptionTitle)
+    }
+
+    pub fn resolved_account_type(&self) -> Option<String> {
+        self.resolved_account_type_key()
+            .map(|value| value.into_owned())
+    }
+
+    fn resolved_account_type_key(&self) -> Option<Cow<'_, str>> {
+        match self.resolved_account_type_source()? {
+            ResolvedAccountTypeSource::Explicit => self.account_type.as_deref().map(Cow::Borrowed),
+            ResolvedAccountTypeSource::SubscriptionTitle => self
+                .subscription_title
+                .as_deref()
+                .and_then(infer_standard_account_type_id)
+                .map(Cow::Borrowed),
+        }
+    }
+
     /// 获取有效的并发上限
     ///
     /// 返回 `None` 表示不限制并发。
@@ -330,7 +394,7 @@ impl KiroCredentials {
         default_limit: Option<u32>,
         account_type_dispatch_policy: Option<&AccountTypeDispatchPolicy>,
     ) -> Option<usize> {
-        self.max_concurrency
+        self.max_concurrency_override()
             .or_else(|| {
                 account_type_dispatch_policy
                     .and_then(AccountTypeDispatchPolicy::effective_max_concurrency)
@@ -338,6 +402,25 @@ impl KiroCredentials {
             .or(default_limit)
             .and_then(|limit| usize::try_from(limit).ok())
             .filter(|limit| *limit > 0)
+    }
+
+    pub fn effective_max_concurrency_source(
+        &self,
+        default_limit: Option<u32>,
+        account_type_dispatch_policy: Option<&AccountTypeDispatchPolicy>,
+    ) -> Option<DispatchSettingSource> {
+        if self.max_concurrency_override().is_some() {
+            return Some(DispatchSettingSource::Credential);
+        }
+        if account_type_dispatch_policy
+            .and_then(AccountTypeDispatchPolicy::effective_max_concurrency)
+            .is_some()
+        {
+            return Some(DispatchSettingSource::AccountType);
+        }
+        default_limit
+            .filter(|limit| *limit > 0)
+            .map(|_| DispatchSettingSource::GlobalDefault)
     }
 
     /// 获取凭据级 token bucket 容量覆盖
@@ -350,6 +433,44 @@ impl KiroCredentials {
     pub fn rate_limit_refill_per_second_override(&self) -> Option<f64> {
         self.rate_limit_refill_per_second
             .and_then(non_negative_finite)
+    }
+
+    pub fn effective_rate_limit_bucket_capacity_source(
+        &self,
+        default_capacity: f64,
+        account_type_dispatch_policy: Option<&AccountTypeDispatchPolicy>,
+    ) -> Option<DispatchSettingSource> {
+        if self.rate_limit_bucket_capacity_override().is_some() {
+            return Some(DispatchSettingSource::Credential);
+        }
+        if account_type_dispatch_policy
+            .and_then(AccountTypeDispatchPolicy::rate_limit_bucket_capacity_override)
+            .is_some()
+        {
+            return Some(DispatchSettingSource::AccountType);
+        }
+        default_capacity
+            .is_finite()
+            .then_some(DispatchSettingSource::GlobalDefault)
+    }
+
+    pub fn effective_rate_limit_refill_per_second_source(
+        &self,
+        default_refill_per_second: f64,
+        account_type_dispatch_policy: Option<&AccountTypeDispatchPolicy>,
+    ) -> Option<DispatchSettingSource> {
+        if self.rate_limit_refill_per_second_override().is_some() {
+            return Some(DispatchSettingSource::Credential);
+        }
+        if account_type_dispatch_policy
+            .and_then(AccountTypeDispatchPolicy::rate_limit_refill_per_second_override)
+            .is_some()
+        {
+            return Some(DispatchSettingSource::AccountType);
+        }
+        default_refill_per_second
+            .is_finite()
+            .then_some(DispatchSettingSource::GlobalDefault)
     }
 
     /// 检查凭据是否支持 Opus 模型
@@ -389,30 +510,16 @@ impl KiroCredentials {
         &'a self,
         policies: &'a std::collections::BTreeMap<String, ModelSupportPolicy>,
     ) -> Option<&'a ModelSupportPolicy> {
-        self.account_type
-            .as_ref()
-            .and_then(|account_type| policies.get(account_type))
-            .or_else(|| {
-                self.subscription_title
-                    .as_deref()
-                    .and_then(infer_standard_account_type_id)
-                    .and_then(|account_type| policies.get(account_type))
-            })
+        let resolved_account_type = self.resolved_account_type_key()?;
+        policies.get(resolved_account_type.as_ref())
     }
 
     pub fn account_type_dispatch_policy<'a>(
         &'a self,
         policies: &'a std::collections::BTreeMap<String, AccountTypeDispatchPolicy>,
     ) -> Option<&'a AccountTypeDispatchPolicy> {
-        self.account_type
-            .as_ref()
-            .and_then(|account_type| policies.get(account_type))
-            .or_else(|| {
-                self.subscription_title
-                    .as_deref()
-                    .and_then(infer_standard_account_type_id)
-                    .and_then(|account_type| policies.get(account_type))
-            })
+        let resolved_account_type = self.resolved_account_type_key()?;
+        policies.get(resolved_account_type.as_ref())
     }
 
     pub fn policy_allows_model(
@@ -660,6 +767,71 @@ mod tests {
         assert_eq!(
             creds.effective_max_concurrency_with_policy(Some(3), Some(&policy)),
             Some(32)
+        );
+        assert_eq!(
+            creds.effective_max_concurrency_source(Some(3), Some(&policy)),
+            Some(DispatchSettingSource::AccountType)
+        );
+    }
+
+    #[test]
+    fn test_resolved_account_type_prefers_explicit_value() {
+        let mut creds = KiroCredentials::default();
+        creds.account_type = Some("power-custom".to_string());
+        creds.subscription_title = Some("KIRO POWER".to_string());
+
+        assert_eq!(
+            creds.resolved_account_type(),
+            Some("power-custom".to_string())
+        );
+        assert_eq!(
+            creds.resolved_account_type_source(),
+            Some(ResolvedAccountTypeSource::Explicit)
+        );
+    }
+
+    #[test]
+    fn test_resolved_account_type_falls_back_to_subscription_title() {
+        let mut creds = KiroCredentials::default();
+        creds.subscription_title = Some("KIRO POWER".to_string());
+
+        assert_eq!(creds.resolved_account_type(), Some("power".to_string()));
+        assert_eq!(
+            creds.resolved_account_type_source(),
+            Some(ResolvedAccountTypeSource::SubscriptionTitle)
+        );
+    }
+
+    #[test]
+    fn test_effective_rate_limit_sources_follow_override_priority() {
+        let mut creds = KiroCredentials::default();
+        creds.subscription_title = Some("KIRO POWER".to_string());
+
+        let policy = AccountTypeDispatchPolicy {
+            max_concurrency: Some(32),
+            rate_limit_bucket_capacity: Some(0.0),
+            rate_limit_refill_per_second: Some(0.0),
+        };
+
+        assert_eq!(
+            creds.effective_rate_limit_bucket_capacity_source(6.0, Some(&policy)),
+            Some(DispatchSettingSource::AccountType)
+        );
+        assert_eq!(
+            creds.effective_rate_limit_refill_per_second_source(2.0, Some(&policy)),
+            Some(DispatchSettingSource::AccountType)
+        );
+
+        creds.rate_limit_bucket_capacity = Some(3.0);
+        creds.rate_limit_refill_per_second = Some(1.5);
+
+        assert_eq!(
+            creds.effective_rate_limit_bucket_capacity_source(6.0, Some(&policy)),
+            Some(DispatchSettingSource::Credential)
+        );
+        assert_eq!(
+            creds.effective_rate_limit_refill_per_second_source(2.0, Some(&policy)),
+            Some(DispatchSettingSource::Credential)
         );
     }
 

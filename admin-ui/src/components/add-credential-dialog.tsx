@@ -58,11 +58,13 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       collectAccountTypeSuggestions(
         credentialsData?.credentials,
         modelCapabilitiesData?.accountTypePolicies,
+        modelCapabilitiesData?.accountTypeDispatchPolicies,
         modelCapabilitiesData?.standardAccountTypePresets
       ),
     [
       credentialsData?.credentials,
       modelCapabilitiesData?.accountTypePolicies,
+      modelCapabilitiesData?.accountTypeDispatchPolicies,
       modelCapabilitiesData?.standardAccountTypePresets,
     ]
   )

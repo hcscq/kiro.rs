@@ -166,6 +166,7 @@ export function Dashboard() {
   const accountTypeSuggestions = collectAccountTypeSuggestions(
     credentials,
     modelCapabilitiesData?.accountTypePolicies,
+    modelCapabilitiesData?.accountTypeDispatchPolicies,
     standardAccountTypePresets
   )
   const modelCatalog = modelCatalogData?.models ?? []

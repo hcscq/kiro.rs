@@ -27,6 +27,10 @@ interface CredentialInput {
   apiRegion?: string
   priority?: number
   machineId?: string
+  accountType?: string
+  maxConcurrency?: number
+  rateLimitBucketCapacity?: number
+  rateLimitRefillPerSecond?: number
 }
 
 interface VerificationResult {
@@ -174,6 +178,26 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             throw new Error('idc 模式需要同时提供 clientId 和 clientSecret')
           }
 
+          if (
+            cred.maxConcurrency !== undefined &&
+            (!Number.isInteger(cred.maxConcurrency) || cred.maxConcurrency <= 0)
+          ) {
+            throw new Error('maxConcurrency 必须是大于 0 的整数')
+          }
+          if (
+            cred.rateLimitBucketCapacity !== undefined &&
+            (!Number.isFinite(cred.rateLimitBucketCapacity) || cred.rateLimitBucketCapacity < 0)
+          ) {
+            throw new Error('rateLimitBucketCapacity 必须是大于等于 0 的数字')
+          }
+          if (
+            cred.rateLimitRefillPerSecond !== undefined &&
+            (!Number.isFinite(cred.rateLimitRefillPerSecond) ||
+              cred.rateLimitRefillPerSecond < 0)
+          ) {
+            throw new Error('rateLimitRefillPerSecond 必须是大于等于 0 的数字')
+          }
+
           const addedCred = await addCredential({
             refreshToken: token,
             authMethod,
@@ -183,6 +207,17 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             clientSecret,
             priority: cred.priority || 0,
             machineId: cred.machineId?.trim() || undefined,
+            accountType: cred.accountType?.trim() || undefined,
+            maxConcurrency:
+              typeof cred.maxConcurrency === 'number' ? cred.maxConcurrency : undefined,
+            rateLimitBucketCapacity:
+              typeof cred.rateLimitBucketCapacity === 'number'
+                ? cred.rateLimitBucketCapacity
+                : undefined,
+            rateLimitRefillPerSecond:
+              typeof cred.rateLimitRefillPerSecond === 'number'
+                ? cred.rateLimitRefillPerSecond
+                : undefined,
           })
 
           addedCredId = addedCred.credentialId
@@ -329,7 +364,8 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               className="flex min-h-[200px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
             />
             <p className="text-xs text-muted-foreground">
-              💡 导入时自动验活，失败的凭据会被排除
+              支持附带 `accountType`、`maxConcurrency`、`rateLimitBucketCapacity`、`rateLimitRefillPerSecond`。
+              导入时会自动验活，失败的凭据会被排除。
             </p>
           </div>
 
