@@ -21,8 +21,10 @@ use crate::kiro::provider::KiroProvider;
 use super::types::ErrorResponse;
 
 const ANTHROPIC_FORWARDED_HEADER: &str = "x-kiro-anthropic-forwarded";
+pub(crate) const ANTHROPIC_RUNTIME_LEADER_REQUIRED_HEADER: &str = "x-kiro-runtime-leader-required";
 const MAX_FORWARDED_ANTHROPIC_BODY_BYTES: usize = 50 * 1024 * 1024;
 
+#[derive(Clone)]
 struct BufferedAnthropicRequest {
     method: Method,
     uri: Uri,
@@ -65,6 +67,21 @@ impl BufferedAnthropicRequest {
             path_and_query
         )
     }
+
+    fn into_axum_request(self) -> Request<Body> {
+        let mut request = Request::builder()
+            .method(self.method)
+            .uri(self.uri)
+            .body(Body::from(self.body))
+            .unwrap_or_else(|err| {
+                panic!("failed to rebuild anthropic request for local handling: {err}");
+            });
+        *request.headers_mut() = self.headers;
+        if let Some(original_uri) = self.original_uri {
+            request.extensions_mut().insert(OriginalUri(original_uri));
+        }
+        request
+    }
 }
 
 /// 应用共享状态
@@ -105,6 +122,13 @@ impl AppState {
         provider.leader_message_forward_target()
     }
 
+    fn runtime_leader_http_base_url(&self) -> anyhow::Result<Option<String>> {
+        let Some(provider) = &self.kiro_provider else {
+            return Ok(None);
+        };
+        provider.runtime_leader_http_base_url()
+    }
+
     async fn forward_messages_to_leader(
         &self,
         leader_http_base_url: &str,
@@ -113,7 +137,7 @@ impl AppState {
         tracing::info!(
             leader_http_base_url = %leader_http_base_url,
             path = request.route_path(),
-            "单共享账号模式命中 follower，转发 messages 请求到 leader"
+            "当前实例需由 runtime leader 处理，转发 messages 请求到 leader"
         );
         let mut upstream_request = self
             .client
@@ -176,6 +200,9 @@ impl AppState {
                 || name == CONTENT_LENGTH
                 || name == CONTENT_ENCODING
                 || name.as_str().eq_ignore_ascii_case("transfer-encoding")
+                || name
+                    .as_str()
+                    .eq_ignore_ascii_case(ANTHROPIC_RUNTIME_LEADER_REQUIRED_HEADER)
             {
                 continue;
             }
@@ -227,6 +254,39 @@ impl AppState {
                     .into_response()
             })
     }
+
+    async fn handle_locally_then_maybe_forward_to_leader(
+        &self,
+        leader_http_base_url: &str,
+        request: Request<Body>,
+        next: Next,
+    ) -> Response {
+        let (parts, body) = request.into_parts();
+        let body = match to_bytes(body, MAX_FORWARDED_ANTHROPIC_BODY_BYTES).await {
+            Ok(body) => body,
+            Err(err) => {
+                return (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    Json(ErrorResponse::new(
+                        "invalid_request_error",
+                        format!("Failed to read request body for leader forwarding: {err}"),
+                    )),
+                )
+                    .into_response();
+            }
+        };
+        let buffered_request = BufferedAnthropicRequest::from_request_parts(parts, body);
+        let mut local_response = next.run(buffered_request.clone().into_axum_request()).await;
+
+        if response_requires_runtime_leader_forwarding(&local_response) {
+            return self
+                .forward_messages_to_leader(leader_http_base_url, buffered_request)
+                .await;
+        }
+
+        strip_internal_routing_headers(&mut local_response);
+        local_response
+    }
 }
 
 /// API Key 认证中间件
@@ -250,7 +310,9 @@ pub async fn message_routing_middleware(
     next: Next,
 ) -> Response {
     if request.headers().contains_key(ANTHROPIC_FORWARDED_HEADER) {
-        return next.run(request).await;
+        let mut response = next.run(request).await;
+        strip_internal_routing_headers(&mut response);
+        return response;
     }
 
     let path = request
@@ -263,11 +325,10 @@ pub async fn message_routing_middleware(
         return next.run(request).await;
     }
 
-    let leader_http_base_url = match state.leader_message_forward_target() {
-        Ok(Some(url)) => url,
-        Ok(None) => return next.run(request).await,
+    let preemptive_leader_http_base_url = match state.leader_message_forward_target() {
+        Ok(url) => url,
         Err(err) => {
-            tracing::warn!("解析 Anthropic leader 转发目标失败: {}", err);
+            tracing::warn!("解析 Anthropic leader 预转发目标失败: {}", err);
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ErrorResponse::new(
@@ -278,28 +339,53 @@ pub async fn message_routing_middleware(
                 .into_response();
         }
     };
-
-    let (parts, body) = request.into_parts();
-    let body = match to_bytes(body, MAX_FORWARDED_ANTHROPIC_BODY_BYTES).await {
-        Ok(body) => body,
+    let fallback_leader_http_base_url = match state.runtime_leader_http_base_url() {
+        Ok(url) => url,
         Err(err) => {
-            return (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                Json(ErrorResponse::new(
-                    "invalid_request_error",
-                    format!("Failed to read request body for leader forwarding: {err}"),
-                )),
-            )
-                .into_response();
+            tracing::warn!(
+                "解析 Anthropic leader 兜底转发目标失败，将继续本地处理: {}",
+                err
+            );
+            None
         }
     };
 
-    state
-        .forward_messages_to_leader(
-            &leader_http_base_url,
-            BufferedAnthropicRequest::from_request_parts(parts, body),
-        )
-        .await
+    if let Some(leader_http_base_url) = preemptive_leader_http_base_url {
+        let (parts, body) = request.into_parts();
+        let body = match to_bytes(body, MAX_FORWARDED_ANTHROPIC_BODY_BYTES).await {
+            Ok(body) => body,
+            Err(err) => {
+                return (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    Json(ErrorResponse::new(
+                        "invalid_request_error",
+                        format!("Failed to read request body for leader forwarding: {err}"),
+                    )),
+                )
+                    .into_response();
+            }
+        };
+
+        return state
+            .forward_messages_to_leader(
+                &leader_http_base_url,
+                BufferedAnthropicRequest::from_request_parts(parts, body),
+            )
+            .await;
+    }
+
+    match fallback_leader_http_base_url {
+        Some(leader_http_base_url) => {
+            state
+                .handle_locally_then_maybe_forward_to_leader(&leader_http_base_url, request, next)
+                .await
+        }
+        None => {
+            let mut response = next.run(request).await;
+            strip_internal_routing_headers(&mut response);
+            response
+        }
+    }
 }
 
 fn requires_leader_message_routing(method: &Method, path: &str) -> bool {
@@ -311,6 +397,18 @@ fn requires_leader_message_routing(method: &Method, path: &str) -> bool {
         path.trim_end_matches('/'),
         "/messages" | "/v1/messages" | "/cc/v1/messages"
     )
+}
+
+fn response_requires_runtime_leader_forwarding(response: &Response) -> bool {
+    response
+        .headers()
+        .contains_key(ANTHROPIC_RUNTIME_LEADER_REQUIRED_HEADER)
+}
+
+fn strip_internal_routing_headers(response: &mut Response) {
+    response
+        .headers_mut()
+        .remove(ANTHROPIC_RUNTIME_LEADER_REQUIRED_HEADER);
 }
 
 /// CORS 中间件层
@@ -333,8 +431,14 @@ pub fn cors_layer() -> tower_http::cors::CorsLayer {
 
 #[cfg(test)]
 mod tests {
-    use super::requires_leader_message_routing;
-    use axum::http::Method;
+    use super::{
+        ANTHROPIC_RUNTIME_LEADER_REQUIRED_HEADER, requires_leader_message_routing,
+        response_requires_runtime_leader_forwarding, strip_internal_routing_headers,
+    };
+    use axum::{
+        body::Body,
+        http::{Method, Response, StatusCode},
+    };
 
     #[test]
     fn requires_leader_message_routing_only_matches_message_posts() {
@@ -355,5 +459,18 @@ mod tests {
             &Method::GET,
             "/v1/messages"
         ));
+    }
+
+    #[test]
+    fn runtime_leader_forwarding_marker_is_internal_only() {
+        let mut response = Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header(ANTHROPIC_RUNTIME_LEADER_REQUIRED_HEADER, "1")
+            .body(Body::empty())
+            .unwrap();
+
+        assert!(response_requires_runtime_leader_forwarding(&response));
+        strip_internal_routing_headers(&mut response);
+        assert!(!response_requires_runtime_leader_forwarding(&response));
     }
 }

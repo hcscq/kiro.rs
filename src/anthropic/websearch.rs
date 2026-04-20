@@ -122,13 +122,11 @@ enum WebSearchOutcome {
 /// 工具调用后的 continuation，而不是“直接发起一次 web search”，应回落到普通
 /// Anthropic -> Kiro 转换链路处理。
 pub fn has_web_search_tool(req: &MessagesRequest) -> bool {
-    req.tools
-        .as_ref()
-        .is_some_and(|tools| {
-            tools.len() == 1
-                && tools.first().is_some_and(is_web_search_tool)
-                && extract_search_query(req).is_some()
-        })
+    req.tools.as_ref().is_some_and(|tools| {
+        tools.len() == 1
+            && tools.first().is_some_and(is_web_search_tool)
+            && extract_search_query(req).is_some()
+    })
 }
 
 fn is_web_search_tool(tool: &Tool) -> bool {

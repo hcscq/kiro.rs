@@ -14,7 +14,7 @@ use axum::{
     Json as JsonExtractor,
     body::Body,
     extract::State,
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
 use bytes::Bytes;
@@ -25,7 +25,7 @@ use tokio::time::interval;
 use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request_with_probe};
-use super::middleware::AppState;
+use super::middleware::{ANTHROPIC_RUNTIME_LEADER_REQUIRED_HEADER, AppState};
 use super::probe::parse_upstream_probe;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::thinking_compat::{build_synthetic_thinking_signature, extract_thinking_and_text};
@@ -71,7 +71,7 @@ fn map_provider_error(err: Error) -> Response {
         .is_some()
     {
         tracing::warn!(error = %err_summary, "共享凭据刷新需由 leader 处理，当前请求快速失败");
-        return (
+        let mut response = (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse::new(
                 "service_unavailable",
@@ -79,6 +79,11 @@ fn map_provider_error(err: Error) -> Response {
             )),
         )
             .into_response();
+        response.headers_mut().insert(
+            ANTHROPIC_RUNTIME_LEADER_REQUIRED_HEADER,
+            HeaderValue::from_static("1"),
+        );
+        return response;
     }
 
     if let Some(public_err) = err.downcast_ref::<PublicProviderError>() {
@@ -1057,8 +1062,8 @@ fn create_buffered_sse_stream(
 #[cfg(test)]
 mod tests {
     use super::{
-        is_opus_4_7_model, map_provider_error, override_thinking_from_model_name,
-        request_thinking_enabled,
+        ANTHROPIC_RUNTIME_LEADER_REQUIRED_HEADER, is_opus_4_7_model, map_provider_error,
+        override_thinking_from_model_name, request_thinking_enabled,
     };
     use crate::anthropic::types::{Message, MessagesRequest, Thinking};
     use crate::kiro::provider::PublicProviderError;
@@ -1175,6 +1180,13 @@ mod tests {
             leader_id: Some("pod-b".to_string()),
         }));
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(ANTHROPIC_RUNTIME_LEADER_REQUIRED_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
 
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();

@@ -1202,6 +1202,10 @@ impl MultiTokenManager {
             return Ok(None);
         }
 
+        self.runtime_leader_http_base_url()
+    }
+
+    pub fn runtime_leader_http_base_url(&self) -> anyhow::Result<Option<String>> {
         let Some(mut status) = self.runtime_refresh_coordination_status()? else {
             return Ok(None);
         };
@@ -1937,7 +1941,11 @@ impl MultiTokenManager {
                         .cooldown_until_epoch_ms
                         .map_or(true, |until| until <= now_epoch_ms)
                         && Self::shared_bucket_is_ready_for(&runtime, request_weight)
-                        && Self::has_capacity(&dispatch, &entry.credentials, runtime.active_requests);
+                        && Self::has_capacity(
+                            &dispatch,
+                            &entry.credentials,
+                            runtime.active_requests,
+                        );
 
                     if !is_dispatchable {
                         if let Some(ready_at) = Self::shared_snapshot_ready_at_for(
@@ -3128,6 +3136,56 @@ impl MultiTokenManager {
         };
         self.save_stats_debounced();
         result
+    }
+
+    pub fn runtime_leader_refresh_required_for_model_candidates(
+        &self,
+        model: &str,
+    ) -> anyhow::Result<Option<RuntimeRefreshLeaderRequiredError>> {
+        let Some(status) = self.runtime_refresh_coordination_status()? else {
+            return Ok(None);
+        };
+        if status.is_leader {
+            return Ok(None);
+        }
+
+        let dispatch = self.dispatch_config();
+        let entries = self.entries.lock();
+        if Self::all_supported_model_candidates_need_local_token_refresh(&dispatch, &entries, model)
+        {
+            return Ok(Some(RuntimeRefreshLeaderRequiredError {
+                instance_id: status.instance_id,
+                leader_id: status.leader_id,
+            }));
+        }
+
+        Ok(None)
+    }
+
+    fn all_supported_model_candidates_need_local_token_refresh(
+        dispatch: &DispatchConfig,
+        entries: &[CredentialEntry],
+        model: &str,
+    ) -> bool {
+        let requirement = Self::model_requirement(Some(model));
+        let mut has_supported = false;
+
+        for entry in entries {
+            if entry.disabled
+                || !Self::is_model_supported(dispatch, &entry.credentials, Some(model), requirement)
+            {
+                continue;
+            }
+
+            has_supported = true;
+
+            if !is_token_expired(&entry.credentials) && !is_token_expiring_soon(&entry.credentials)
+            {
+                return false;
+            }
+        }
+
+        has_supported
     }
 
     /// 报告指定凭据 API 调用失败
@@ -4813,6 +4871,106 @@ mod tests {
             .await
             .expect("其他合法模型不应被前一个 INVALID_MODEL_ID 拖住");
         assert_eq!(ctx.id, 1);
+    }
+
+    #[test]
+    fn test_opus_4_7_remaining_candidates_can_be_detected_as_leader_refresh_only() {
+        let config = Config::default();
+
+        let mut unsupported_primary = available_credential(0);
+        unsupported_primary.id = Some(1);
+        unsupported_primary.subscription_title = Some("KIRO PRO+".to_string());
+
+        let mut unsupported_secondary = available_credential(1);
+        unsupported_secondary.id = Some(2);
+        unsupported_secondary.subscription_title = Some("KIRO POWER".to_string());
+
+        let mut stale_power_a = available_credential(2);
+        stale_power_a.id = Some(3);
+        stale_power_a.subscription_title = Some("KIRO POWER".to_string());
+        stale_power_a.expires_at = Some((Utc::now() + Duration::minutes(1)).to_rfc3339());
+
+        let mut stale_power_b = available_credential(3);
+        stale_power_b.id = Some(4);
+        stale_power_b.subscription_title = Some("KIRO POWER".to_string());
+        stale_power_b.expires_at = Some((Utc::now() + Duration::minutes(2)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                unsupported_primary,
+                unsupported_secondary,
+                stale_power_a,
+                stale_power_b,
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert!(manager.defer_model_unsupported_credential(1, "claude-opus-4.7"));
+        assert!(manager.defer_model_unsupported_credential(2, "claude-opus-4.7"));
+
+        let dispatch = manager.dispatch_config();
+        let entries = manager.entries.lock();
+        assert!(
+            MultiTokenManager::all_supported_model_candidates_need_local_token_refresh(
+                &dispatch,
+                &entries,
+                "claude-opus-4.7"
+            )
+        );
+    }
+
+    #[test]
+    fn test_opus_4_7_remaining_candidates_keep_local_retry_when_fresh_token_exists() {
+        let config = Config::default();
+
+        let mut unsupported_primary = available_credential(0);
+        unsupported_primary.id = Some(1);
+        unsupported_primary.subscription_title = Some("KIRO PRO+".to_string());
+
+        let mut unsupported_secondary = available_credential(1);
+        unsupported_secondary.id = Some(2);
+        unsupported_secondary.subscription_title = Some("KIRO POWER".to_string());
+
+        let mut stale_power = available_credential(2);
+        stale_power.id = Some(3);
+        stale_power.subscription_title = Some("KIRO POWER".to_string());
+        stale_power.expires_at = Some((Utc::now() + Duration::minutes(1)).to_rfc3339());
+
+        let mut fresh_power = available_credential(3);
+        fresh_power.id = Some(4);
+        fresh_power.subscription_title = Some("KIRO POWER".to_string());
+        fresh_power.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                unsupported_primary,
+                unsupported_secondary,
+                stale_power,
+                fresh_power,
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert!(manager.defer_model_unsupported_credential(1, "claude-opus-4.7"));
+        assert!(manager.defer_model_unsupported_credential(2, "claude-opus-4.7"));
+
+        let dispatch = manager.dispatch_config();
+        let entries = manager.entries.lock();
+        assert!(
+            !MultiTokenManager::all_supported_model_candidates_need_local_token_refresh(
+                &dispatch,
+                &entries,
+                "claude-opus-4.7"
+            )
+        );
     }
 
     #[tokio::test]

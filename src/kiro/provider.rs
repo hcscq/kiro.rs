@@ -389,6 +389,10 @@ impl KiroProvider {
             .leader_http_base_url_for_single_shared_credential_mode()
     }
 
+    pub fn runtime_leader_http_base_url(&self) -> anyhow::Result<Option<String>> {
+        self.token_manager.runtime_leader_http_base_url()
+    }
+
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
     fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
         let effective = credentials.effective_proxy(self.global_proxy.as_ref());
@@ -1083,6 +1087,15 @@ impl KiroProvider {
                             model.as_deref().unwrap_or("unknown"),
                             error_summary
                         );
+                    }
+
+                    if let Some(err) = self
+                        .token_manager
+                        .runtime_leader_refresh_required_for_model_candidates(
+                            model.as_deref().unwrap_or("unknown"),
+                        )?
+                    {
+                        return Err(anyhow::Error::new(err));
                     }
 
                     last_error = Some(anyhow::anyhow!(

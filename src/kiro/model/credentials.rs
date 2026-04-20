@@ -8,12 +8,12 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
-use crate::model::account_type_preset::infer_standard_account_type_id;
 use crate::http_client::ProxyConfig;
+use crate::model::account_type_preset::infer_standard_account_type_id;
 use crate::model::config::Config;
 use crate::model::model_policy::{
-    AccountTypeDispatchPolicy, ModelSupportPolicy, RuntimeModelRestriction,
-    normalize_account_type, normalize_model_entries, normalize_model_selector,
+    AccountTypeDispatchPolicy, ModelSupportPolicy, RuntimeModelRestriction, normalize_account_type,
+    normalize_model_entries, normalize_model_selector,
 };
 
 /// Kiro OAuth 凭证
@@ -696,7 +696,8 @@ mod tests {
         );
 
         assert_eq!(
-            creds.account_type_dispatch_policy(&policies)
+            creds
+                .account_type_dispatch_policy(&policies)
                 .and_then(AccountTypeDispatchPolicy::effective_max_concurrency),
             Some(32)
         );
