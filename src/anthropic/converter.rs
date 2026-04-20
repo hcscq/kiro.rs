@@ -1500,6 +1500,7 @@ mod tests {
                 ("properties".to_string(), serde_json::json!({})),
             ]),
             max_uses: None,
+            ..super::super::types::Tool::default()
         }]);
 
         let converted = convert_tools(&tools, &mut HashMap::new());
@@ -1580,6 +1581,7 @@ mod tests {
                 input_schema: schema,
                 tool_type: None,
                 max_uses: None,
+                ..AnthropicTool::default()
             }]),
             thinking: None,
             tool_choice: None,
@@ -1648,6 +1650,7 @@ mod tests {
                 input_schema: schema,
                 tool_type: None,
                 max_uses: None,
+                ..AnthropicTool::default()
             }]),
             thinking: None,
             tool_choice: None,

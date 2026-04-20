@@ -115,7 +115,7 @@ pub struct Metadata {
 }
 
 /// Messages 请求体
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct MessagesRequest {
     pub model: String,
@@ -258,7 +258,14 @@ pub struct SystemMessage {
 /// 支持两种格式：
 /// 1. 普通工具：{ name, description, input_schema }
 /// 2. WebSearch 工具：{ type: "web_search_20250305", name: "web_search", max_uses: 8 }
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// 3. WebFetch 工具：{ type: "web_fetch_20250910", name: "web_fetch", max_uses, ... }
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct ToolCitations {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct Tool {
     /// 工具类型，如 "web_search_20250305"（可选，仅 WebSearch 工具）
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
@@ -275,6 +282,18 @@ pub struct Tool {
     /// 最大使用次数（仅 WebSearch 工具）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_uses: Option<i32>,
+    /// WebFetch 允许抓取的域名/路径模式
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_domains: Option<Vec<String>>,
+    /// WebFetch 禁止抓取的域名/路径模式
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_domains: Option<Vec<String>>,
+    /// WebFetch 是否启用 citations
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub citations: Option<ToolCitations>,
+    /// WebFetch 抓取内容的最大 token 数
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_content_tokens: Option<i32>,
 }
 
 /// 内容块
@@ -378,6 +397,7 @@ mod tests {
             description: "edit files".to_string(),
             input_schema: HashMap::new(),
             max_uses: None,
+            ..Tool::default()
         }]);
         request.thinking = Some(Thinking {
             thinking_type: "enabled".to_string(),
@@ -405,6 +425,7 @@ mod tests {
             description: "edit files".to_string(),
             input_schema: HashMap::new(),
             max_uses: None,
+            ..Tool::default()
         }]);
         request.thinking = Some(Thinking {
             thinking_type: "enabled".to_string(),

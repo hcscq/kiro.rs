@@ -26,17 +26,27 @@ use uuid::Uuid;
 use super::converter::{ConversionError, convert_request_with_probe};
 use super::extractor::AnthropicJson;
 use super::middleware::{ANTHROPIC_RUNTIME_LEADER_REQUIRED_HEADER, AppState};
-use super::probe::parse_upstream_probe;
+use super::probe::{UpstreamProbe, parse_upstream_probe};
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::thinking_compat::{build_synthetic_thinking_signature, extract_thinking_and_text};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
     OutputConfig, Thinking,
 };
+use super::webfetch;
 use super::websearch;
 use crate::kiro::provider::{PublicProviderError, RequestOptions};
 
 const LARGE_ANTHROPIC_REQUEST_WARN_THRESHOLD_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+pub(crate) struct NonStreamMessageResponse {
+    pub body: serde_json::Value,
+    pub content: Vec<serde_json::Value>,
+    pub stop_reason: String,
+    pub input_tokens: i32,
+    pub output_tokens: i32,
+}
 
 fn request_id_from_headers(headers: &HeaderMap) -> String {
     headers
@@ -64,7 +74,7 @@ fn built_in_models() -> Vec<Model> {
 }
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
-fn map_provider_error(err: Error) -> Response {
+pub(crate) fn map_provider_error(err: Error) -> Response {
     let err_str = err.to_string();
     let err_summary = summarize_text_for_log(&err_str, 240);
 
@@ -246,6 +256,27 @@ pub async fn post_messages(
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
+
+    // 检查是否为 WebFetch 请求
+    if webfetch::has_web_fetch_tool(&payload) {
+        tracing::info!(request_id = %request_id, "检测到 WebFetch 工具，路由到 WebFetch 处理");
+
+        let input_tokens = token::count_all_tokens(
+            payload.model.clone(),
+            payload.system.clone(),
+            payload.messages.clone(),
+            payload.tools.clone(),
+        ) as i32;
+
+        return webfetch::handle_webfetch_request(
+            provider,
+            &payload,
+            input_tokens,
+            probe.clone(),
+            &request_id,
+        )
+        .await;
+    }
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
@@ -507,6 +538,80 @@ fn create_sse_stream(
 
 use super::converter::get_context_window_size;
 
+pub(crate) async fn execute_non_stream_round(
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    payload: &MessagesRequest,
+    probe: UpstreamProbe,
+    request_id: Option<String>,
+) -> Result<NonStreamMessageResponse, Response> {
+    let conversion_result = match convert_request_with_probe(payload, probe.clone()) {
+        Ok(result) => result,
+        Err(e) => {
+            let (error_type, message) = match &e {
+                ConversionError::UnsupportedModel(model) => {
+                    ("invalid_request_error", format!("模型不支持: {}", model))
+                }
+                ConversionError::EmptyMessages => {
+                    ("invalid_request_error", "消息列表为空".to_string())
+                }
+            };
+            if let Some(request_id) = request_id.as_deref() {
+                tracing::warn!(request_id = %request_id, error = %e, "请求转换失败");
+            } else {
+                tracing::warn!(error = %e, "请求转换失败");
+            }
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(error_type, message)),
+            )
+                .into_response());
+        }
+    };
+
+    let kiro_request = KiroRequest {
+        conversation_state: conversion_result.conversation_state,
+        profile_arn: None,
+    };
+
+    let request_body = match serde_json::to_string(&kiro_request) {
+        Ok(body) => body,
+        Err(e) => {
+            tracing::error!("序列化请求失败: {}", e);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "internal_error",
+                    format!("序列化请求失败: {}", e),
+                )),
+            )
+                .into_response());
+        }
+    };
+
+    let input_tokens = token::count_all_tokens(
+        payload.model.clone(),
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
+    ) as i32;
+    let request_weighting = provider.request_weighting_config();
+    let request_weight = payload.request_weight_with_config(&request_weighting, Some(input_tokens));
+
+    execute_non_stream_request_body(
+        provider,
+        &request_body,
+        &payload.model,
+        input_tokens,
+        conversion_result.tool_name_map,
+        RequestOptions {
+            omit_agent_mode_header: probe.omit_agent_mode_header,
+            request_id,
+            request_weight,
+        },
+    )
+    .await
+}
+
 /// 处理非流式请求
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
@@ -516,13 +621,36 @@ async fn handle_non_stream_request(
     tool_name_map: std::collections::HashMap<String, String>,
     request_options: RequestOptions,
 ) -> Response {
+    match execute_non_stream_request_body(
+        provider,
+        request_body,
+        model,
+        input_tokens,
+        tool_name_map,
+        request_options,
+    )
+    .await
+    {
+        Ok(result) => (StatusCode::OK, Json(result.body)).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+async fn execute_non_stream_request_body(
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    request_body: &str,
+    model: &str,
+    input_tokens: i32,
+    tool_name_map: std::collections::HashMap<String, String>,
+    request_options: RequestOptions,
+) -> Result<NonStreamMessageResponse, Response> {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider
         .call_api_with_options(request_body, request_options)
         .await
     {
         Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
+        Err(e) => return Err(map_provider_error(e)),
     };
 
     // 读取响应体
@@ -530,17 +658,31 @@ async fn handle_non_stream_request(
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::error!("读取响应体失败: {}", e);
-            return (
+            return Err((
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
                     "api_error",
                     format!("读取响应失败: {}", e),
                 )),
             )
-                .into_response();
+                .into_response());
         }
     };
 
+    Ok(decode_non_stream_message(
+        &body_bytes,
+        model,
+        input_tokens,
+        tool_name_map,
+    ))
+}
+
+fn decode_non_stream_message(
+    body_bytes: &[u8],
+    model: &str,
+    input_tokens: i32,
+    tool_name_map: std::collections::HashMap<String, String>,
+) -> NonStreamMessageResponse {
     // 解析事件流
     let mut decoder = EventStreamDecoder::new();
     if let Err(e) = decoder.feed(&body_bytes) {
@@ -679,9 +821,9 @@ async fn handle_non_stream_request(
         "id": response_id,
         "type": "message",
         "role": "assistant",
-        "content": content,
+        "content": content.clone(),
         "model": model,
-        "stop_reason": stop_reason,
+        "stop_reason": stop_reason.clone(),
         "stop_sequence": null,
         "usage": {
             "input_tokens": final_input_tokens,
@@ -689,7 +831,13 @@ async fn handle_non_stream_request(
         }
     });
 
-    (StatusCode::OK, Json(response_body)).into_response()
+    NonStreamMessageResponse {
+        body: response_body,
+        content,
+        stop_reason,
+        input_tokens: final_input_tokens,
+        output_tokens,
+    }
 }
 
 /// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
@@ -846,6 +994,27 @@ pub async fn post_messages_cc(
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
+
+    // 检查是否为 WebFetch 请求
+    if webfetch::has_web_fetch_tool(&payload) {
+        tracing::info!(request_id = %request_id, "检测到 WebFetch 工具，路由到 WebFetch 处理");
+
+        let input_tokens = token::count_all_tokens(
+            payload.model.clone(),
+            payload.system.clone(),
+            payload.messages.clone(),
+            payload.tools.clone(),
+        ) as i32;
+
+        return webfetch::handle_webfetch_request(
+            provider,
+            &payload,
+            input_tokens,
+            probe.clone(),
+            &request_id,
+        )
+        .await;
+    }
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {

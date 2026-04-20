@@ -106,7 +106,7 @@ pub struct WebSearchResult {
 }
 
 #[derive(Debug)]
-enum WebSearchOutcome {
+pub(crate) enum WebSearchOutcome {
     Results(WebSearchResults),
     Unavailable(String),
     ParseError(String),
@@ -129,7 +129,7 @@ pub fn has_web_search_tool(req: &MessagesRequest) -> bool {
     })
 }
 
-fn is_web_search_tool(tool: &Tool) -> bool {
+pub(crate) fn is_web_search_tool(tool: &Tool) -> bool {
     let name = tool.name.trim();
     let tool_type = tool.tool_type.as_deref().unwrap_or("").trim();
 
@@ -564,7 +564,7 @@ fn create_websearch_json_response(
     })
 }
 
-fn build_search_content(outcome: &WebSearchOutcome) -> Vec<serde_json::Value> {
+pub(crate) fn build_search_content(outcome: &WebSearchOutcome) -> Vec<serde_json::Value> {
     match outcome {
         WebSearchOutcome::Results(results) => results
             .results
@@ -592,7 +592,7 @@ fn estimate_websearch_output_tokens(summary: &str) -> i32 {
 }
 
 /// 生成搜索结果摘要
-fn generate_search_summary(query: &str, outcome: &WebSearchOutcome) -> String {
+pub(crate) fn generate_search_summary(query: &str, outcome: &WebSearchOutcome) -> String {
     let mut summary = format!("Here are the search results for \"{}\":\n\n", query);
 
     match outcome {
@@ -657,29 +657,10 @@ pub async fn handle_websearch_request(
     tracing::info!(query = %query, "处理 WebSearch 请求");
 
     // 2. 创建 MCP 请求
-    let (tool_use_id, mcp_request) = create_mcp_request(&query);
+    let (tool_use_id, _) = create_mcp_request(&query);
 
     // 3. 调用 Kiro MCP API
-    let outcome = match call_mcp_api(&provider, &mcp_request).await {
-        Ok(response) => match parse_search_results_checked(&response) {
-            Ok(results) => {
-                if let Some(error) = results.error.as_deref().filter(|e| !e.trim().is_empty()) {
-                    tracing::warn!(error = %error, "MCP WebSearch 返回错误结果");
-                    WebSearchOutcome::Unavailable(error.to_string())
-                } else {
-                    WebSearchOutcome::Results(results)
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "MCP WebSearch 结果解析失败");
-                WebSearchOutcome::ParseError(e)
-            }
-        },
-        Err(e) => {
-            tracing::warn!("MCP API 调用失败: {}", e);
-            WebSearchOutcome::Unavailable(e.to_string())
-        }
-    };
+    let outcome = perform_web_search(&provider, &query).await;
 
     // 4. 根据 stream 参数生成响应
     let model = payload.model.clone();
@@ -737,6 +718,34 @@ async fn call_mcp_api(
     Ok(mcp_response)
 }
 
+pub(crate) async fn perform_web_search(
+    provider: &crate::kiro::provider::KiroProvider,
+    query: &str,
+) -> WebSearchOutcome {
+    let (_, mcp_request) = create_mcp_request(query);
+
+    match call_mcp_api(provider, &mcp_request).await {
+        Ok(response) => match parse_search_results_checked(&response) {
+            Ok(results) => {
+                if let Some(error) = results.error.as_deref().filter(|e| !e.trim().is_empty()) {
+                    tracing::warn!(query = %query, error = %error, "MCP WebSearch 返回错误结果");
+                    WebSearchOutcome::Unavailable(error.to_string())
+                } else {
+                    WebSearchOutcome::Results(results)
+                }
+            }
+            Err(e) => {
+                tracing::warn!(query = %query, error = %e, "MCP WebSearch 结果解析失败");
+                WebSearchOutcome::ParseError(e)
+            }
+        },
+        Err(e) => {
+            tracing::warn!(query = %query, error = %e, "MCP API 调用失败");
+            WebSearchOutcome::Unavailable(e.to_string())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -760,6 +769,7 @@ mod tests {
                 description: String::new(),
                 input_schema: Default::default(),
                 max_uses: Some(8),
+                ..Tool::default()
             }]),
             tool_choice: None,
             thinking: None,
@@ -789,6 +799,7 @@ mod tests {
                 description: String::new(),
                 input_schema: Default::default(),
                 max_uses: None,
+                ..Tool::default()
             }]),
             tool_choice: None,
             thinking: None,
@@ -818,6 +829,7 @@ mod tests {
                 description: String::new(),
                 input_schema: Default::default(),
                 max_uses: Some(8),
+                ..Tool::default()
             }]),
             tool_choice: None,
             thinking: None,
@@ -848,6 +860,7 @@ mod tests {
                     description: String::new(),
                     input_schema: Default::default(),
                     max_uses: Some(8),
+                    ..Tool::default()
                 },
                 Tool {
                     tool_type: None,
@@ -855,6 +868,7 @@ mod tests {
                     description: "Other tool".to_string(),
                     input_schema: Default::default(),
                     max_uses: None,
+                    ..Tool::default()
                 },
             ]),
             tool_choice: None,
@@ -905,6 +919,7 @@ mod tests {
                 description: String::new(),
                 input_schema: Default::default(),
                 max_uses: Some(8),
+                ..Tool::default()
             }]),
             tool_choice: None,
             thinking: None,

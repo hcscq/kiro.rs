@@ -32,6 +32,7 @@ mod router;
 mod stream;
 mod thinking_compat;
 pub mod types;
+mod webfetch;
 mod websearch;
 
 pub use router::create_router_with_provider;
