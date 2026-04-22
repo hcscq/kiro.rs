@@ -19,7 +19,9 @@ use crate::common::logging::summarize_upstream_error;
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::{CallLease, MultiTokenManager, RuntimeRefreshLeaderRequiredError};
+use crate::kiro::token_manager::{
+    CallLease, MultiTokenManager, RuntimeRefreshLeaderRequiredError, RuntimeRefreshLeaseBusyError,
+};
 use crate::model::config::{RequestWeightingConfig, TlsBackend};
 use parking_lot::Mutex;
 
@@ -664,7 +666,7 @@ impl KiroProvider {
                 Ok(c) => c,
                 Err(err) => {
                     if self
-                        .retry_after_leader_refresh_handoff(attempt, max_retries, &err)
+                        .retry_after_runtime_refresh_coordination(attempt, max_retries, &err)
                         .await
                     {
                         last_error = Some(err);
@@ -784,15 +786,23 @@ impl KiroProvider {
                                         sync_err
                                     );
                                 }
-                                self.token_manager.defer_shared_refresh_credential(
+                                self.token_manager.defer_runtime_refresh_credential(
                                     ctx_id,
-                                    Self::retry_delay(attempt),
+                                    self.token_manager.runtime_refresh_coordination_cooldown(),
                                 );
-                                tracing::warn!(
-                                    "凭据 #{} 需要由 leader 刷新 token，当前请求稍后重试: {}",
-                                    ctx_id,
-                                    err
-                                );
+                                if err.downcast_ref::<RuntimeRefreshLeaseBusyError>().is_some() {
+                                    tracing::info!(
+                                        "凭据 #{} 正等待其他实例刷新 token，当前请求稍后重试: {}",
+                                        ctx_id,
+                                        err
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        "凭据 #{} 需要由 leader 刷新 token，当前请求稍后重试: {}",
+                                        ctx_id,
+                                        err
+                                    );
+                                }
                                 last_error = Some(err);
                                 continue;
                             }
@@ -910,7 +920,7 @@ impl KiroProvider {
                 Ok(c) => c,
                 Err(err) => {
                     if self
-                        .retry_after_leader_refresh_handoff(attempt, max_retries, &err)
+                        .retry_after_runtime_refresh_coordination(attempt, max_retries, &err)
                         .await
                     {
                         last_error = Some(err);
@@ -1239,15 +1249,23 @@ impl KiroProvider {
                                         sync_err
                                     );
                                 }
-                                self.token_manager.defer_shared_refresh_credential(
+                                self.token_manager.defer_runtime_refresh_credential(
                                     ctx_id,
-                                    Self::retry_delay(attempt),
+                                    self.token_manager.runtime_refresh_coordination_cooldown(),
                                 );
-                                tracing::warn!(
-                                    "凭据 #{} 需要由 leader 刷新 token，当前请求稍后重试: {}",
-                                    ctx_id,
-                                    err
-                                );
+                                if err.downcast_ref::<RuntimeRefreshLeaseBusyError>().is_some() {
+                                    tracing::info!(
+                                        "凭据 #{} 正等待其他实例刷新 token，当前请求稍后重试: {}",
+                                        ctx_id,
+                                        err
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        "凭据 #{} 需要由 leader 刷新 token，当前请求稍后重试: {}",
+                                        ctx_id,
+                                        err
+                                    );
+                                }
                                 last_error = Some(err);
                                 continue;
                             }
@@ -1371,7 +1389,7 @@ impl KiroProvider {
         }))
     }
 
-    async fn retry_after_leader_refresh_handoff(
+    async fn retry_after_runtime_refresh_coordination(
         &self,
         attempt: usize,
         max_retries: usize,
@@ -1380,15 +1398,20 @@ impl KiroProvider {
         if err
             .downcast_ref::<RuntimeRefreshLeaderRequiredError>()
             .is_none()
+            && err.downcast_ref::<RuntimeRefreshLeaseBusyError>().is_none()
         {
             return false;
         }
 
         if let Err(sync_err) = self.token_manager.sync_external_state_if_changed() {
-            tracing::warn!("leader 刷新交接重试前同步外部状态失败: {}", sync_err);
+            tracing::warn!("共享凭据刷新协调重试前同步外部状态失败: {}", sync_err);
         }
 
-        if self.token_manager.should_fast_fail_runtime_leader_refresh() {
+        if err
+            .downcast_ref::<RuntimeRefreshLeaderRequiredError>()
+            .is_some()
+            && self.token_manager.should_fast_fail_runtime_leader_refresh()
+        {
             tracing::warn!("单共享账号需由 leader 刷新凭据，停止本地等待重试: {}", err);
             return false;
         }
@@ -1398,11 +1421,19 @@ impl KiroProvider {
         }
 
         let delay = Self::retry_delay(attempt);
-        tracing::warn!(
-            "当前实例需等待运行时 leader 刷新共享凭据，{}ms 后重试: {}",
-            delay.as_millis(),
-            err
-        );
+        if err.downcast_ref::<RuntimeRefreshLeaseBusyError>().is_some() {
+            tracing::info!(
+                "共享凭据正在由其他实例刷新，{}ms 后重试: {}",
+                delay.as_millis(),
+                err
+            );
+        } else {
+            tracing::warn!(
+                "当前实例需等待运行时 leader 刷新共享凭据，{}ms 后重试: {}",
+                delay.as_millis(),
+                err
+            );
+        }
         sleep(delay).await;
         true
     }

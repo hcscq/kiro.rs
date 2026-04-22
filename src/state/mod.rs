@@ -35,6 +35,7 @@ const REDIS_DISPATCH_RUNTIME_LEASES_KEY_SUFFIX: &str = "leases";
 const REDIS_RUNTIME_COORDINATION_NAMESPACE: &str = "kiro:runtime:coordination";
 const REDIS_RUNTIME_INSTANCE_KEY_PREFIX: &str = "instances";
 const REDIS_RUNTIME_LEADER_KEY: &str = "leader";
+const REDIS_RUNTIME_REFRESH_NAMESPACE: &str = "kiro:runtime:refresh";
 const REDIS_STATE_CHANGE_NAMESPACE: &str = "kiro:runtime:state_change";
 const REDIS_STATE_CHANGE_CREDENTIALS_KEY: &str = "credentials_revision";
 const REDIS_STATE_CHANGE_DISPATCH_KEY: &str = "dispatch_revision";
@@ -57,6 +58,29 @@ local current = redis.call('GET', KEYS[1])
 if current == ARGV[1] then
   redis.call('DEL', KEYS[1])
   return {'released', ''}
+end
+if current then
+  return {'held', current}
+end
+return {'empty', ''}
+"#;
+const REDIS_RUNTIME_REFRESH_LEASE_SCRIPT: &str = r#"
+local current = redis.call('GET', KEYS[1])
+if not current then
+  redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2], 'NX')
+  return {'acquired', ARGV[1]}
+end
+if current == ARGV[1] then
+  redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2], 'XX')
+  return {'renewed', ARGV[1]}
+end
+return {'held', current}
+"#;
+const REDIS_RUNTIME_REFRESH_RELEASE_SCRIPT: &str = r#"
+local current = redis.call('GET', KEYS[1])
+if current == ARGV[1] then
+  redis.call('DEL', KEYS[1])
+  return {'released', current}
 end
 if current then
   return {'held', current}
@@ -825,6 +849,31 @@ pub struct RuntimeCoordinationStatus {
     pub is_leader: bool,
 }
 
+#[derive(Debug, Clone)]
+pub enum CredentialCompareAndSwapResult {
+    Applied,
+    Conflict { current: KiroCredentials },
+    Missing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeRefreshLease {
+    credential_id: u64,
+    lease_value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeRefreshLeaseAcquisition {
+    Acquired(RuntimeRefreshLease),
+    HeldByPeer { owner_instance_id: Option<String> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RuntimeRefreshLeaseRecord {
+    lease_id: String,
+    instance_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RuntimeInstanceHeartbeat {
     instance_id: String,
@@ -839,6 +888,7 @@ pub struct StateStore {
     balance_cache_backend: BalanceCacheStore,
     dispatch_runtime_backend: Option<Arc<RedisDispatchRuntimeBackend>>,
     runtime_coordinator: Option<Arc<RedisRuntimeCoordinator>>,
+    runtime_refresh_backend: Option<Arc<RedisRuntimeRefreshBackend>>,
     state_change_backend: Option<Arc<RedisStateChangeBackend>>,
 }
 
@@ -866,6 +916,16 @@ trait StateBackend: Send + Sync {
     fn load_balance_cache(&self) -> anyhow::Result<HashMap<u64, CachedBalanceRecord>>;
     fn save_balance_cache(&self, cache: &HashMap<u64, CachedBalanceRecord>) -> anyhow::Result<()>;
     fn persist_dispatch_config(&self, dispatch: &PersistedDispatchConfig) -> anyhow::Result<()>;
+    fn compare_and_swap_refreshed_credential(
+        &self,
+        id: u64,
+        expected_refresh_token: Option<&str>,
+        credential: &KiroCredentials,
+        is_multiple_format: bool,
+    ) -> anyhow::Result<CredentialCompareAndSwapResult> {
+        let _ = (id, expected_refresh_token, credential, is_multiple_format);
+        anyhow::bail!("当前状态后端不支持凭据级 compare-and-swap 更新")
+    }
 }
 
 impl StateStore {
@@ -898,6 +958,7 @@ impl StateStore {
             balance_cache_backend: BalanceCacheStore::Primary(primary_backend),
             dispatch_runtime_backend: None,
             runtime_coordinator: None,
+            runtime_refresh_backend: None,
             state_change_backend: None,
         }
     }
@@ -931,6 +992,13 @@ impl StateStore {
             )?)),
             None => None,
         };
+        let runtime_refresh_backend = match config.state_redis_url.as_deref() {
+            Some(redis_url) => Some(Arc::new(RedisRuntimeRefreshBackend::connect(
+                redis_url,
+                REDIS_RUNTIME_REFRESH_NAMESPACE,
+            )?)),
+            None => None,
+        };
         let state_change_backend = match config.state_redis_url.as_deref() {
             Some(redis_url) => Some(Arc::new(RedisStateChangeBackend::connect(
                 redis_url,
@@ -944,6 +1012,7 @@ impl StateStore {
             balance_cache_backend,
             dispatch_runtime_backend,
             runtime_coordinator,
+            runtime_refresh_backend,
             state_change_backend,
         })
     }
@@ -1131,6 +1200,10 @@ impl StateStore {
         self.runtime_coordinator.is_some()
     }
 
+    pub fn runtime_refresh_lease_enabled(&self) -> bool {
+        self.runtime_refresh_backend.is_some()
+    }
+
     pub fn runtime_coordination_interval(&self) -> Option<Duration> {
         self.runtime_coordinator
             .as_ref()
@@ -1158,6 +1231,49 @@ impl StateStore {
             .as_ref()
             .map(|coordinator| coordinator.release())
             .transpose()
+    }
+
+    pub fn try_acquire_runtime_refresh_lease(
+        &self,
+        credential_id: u64,
+        instance_id: &str,
+        lease_ttl: Duration,
+    ) -> anyhow::Result<Option<RuntimeRefreshLeaseAcquisition>> {
+        self.runtime_refresh_backend
+            .as_ref()
+            .map(|backend| backend.try_acquire(credential_id, instance_id, lease_ttl))
+            .transpose()
+    }
+
+    pub fn release_runtime_refresh_lease(
+        &self,
+        lease: &RuntimeRefreshLease,
+    ) -> anyhow::Result<Option<bool>> {
+        self.runtime_refresh_backend
+            .as_ref()
+            .map(|backend| backend.release(lease))
+            .transpose()
+    }
+
+    pub fn compare_and_swap_refreshed_credential(
+        &self,
+        id: u64,
+        expected_refresh_token: Option<&str>,
+        credential: &KiroCredentials,
+        is_multiple_format: bool,
+    ) -> anyhow::Result<CredentialCompareAndSwapResult> {
+        let result = self.primary_backend.compare_and_swap_refreshed_credential(
+            id,
+            expected_refresh_token,
+            credential,
+            is_multiple_format,
+        )?;
+        if matches!(result, CredentialCompareAndSwapResult::Applied) {
+            if let Err(err) = self.bump_state_change_revision(StateChangeKind::Credentials) {
+                tracing::warn!("更新共享凭据修订号失败: {}", err);
+            }
+        }
+        Ok(result)
     }
 
     pub fn state_change_revisions(&self) -> anyhow::Result<StateChangeRevisions> {
@@ -1244,6 +1360,26 @@ where
     }
 }
 
+fn apply_refreshed_credential_compare_and_swap(
+    credentials: &mut [KiroCredentials],
+    id: u64,
+    expected_refresh_token: Option<&str>,
+    credential: &KiroCredentials,
+) -> CredentialCompareAndSwapResult {
+    let Some(current) = credentials.iter_mut().find(|item| item.id == Some(id)) else {
+        return CredentialCompareAndSwapResult::Missing;
+    };
+
+    if current.refresh_token.as_deref() != expected_refresh_token {
+        return CredentialCompareAndSwapResult::Conflict {
+            current: current.clone(),
+        };
+    }
+
+    *current = credential.clone();
+    CredentialCompareAndSwapResult::Applied
+}
+
 #[derive(Debug)]
 struct FileStateBackend {
     config_path: Option<PathBuf>,
@@ -1314,6 +1450,40 @@ impl StateBackend for FileStateBackend {
         let json = serde_json::to_vec_pretty(credentials).context("序列化凭据失败")?;
         Self::write_bytes(path, json)?;
         Ok(true)
+    }
+
+    fn compare_and_swap_refreshed_credential(
+        &self,
+        id: u64,
+        expected_refresh_token: Option<&str>,
+        credential: &KiroCredentials,
+        is_multiple_format: bool,
+    ) -> anyhow::Result<CredentialCompareAndSwapResult> {
+        if !is_multiple_format {
+            return Ok(CredentialCompareAndSwapResult::Missing);
+        }
+
+        let path = match &self.credentials_path {
+            Some(path) => path.clone(),
+            None => return Ok(CredentialCompareAndSwapResult::Missing),
+        };
+
+        let mut credentials = CredentialsConfig::load(&path)
+            .with_context(|| format!("加载凭据文件失败: {}", path.display()))?
+            .into_sorted_credentials();
+        let result = apply_refreshed_credential_compare_and_swap(
+            &mut credentials,
+            id,
+            expected_refresh_token,
+            credential,
+        );
+
+        if matches!(result, CredentialCompareAndSwapResult::Applied) {
+            let json = serde_json::to_vec_pretty(&credentials).context("序列化凭据失败")?;
+            Self::write_bytes(&path, json)?;
+        }
+
+        Ok(result)
     }
 
     fn load_stats(&self) -> anyhow::Result<HashMap<String, StatsEntryRecord>> {
@@ -1533,6 +1703,70 @@ impl StateBackend for PostgresStateBackend {
     ) -> anyhow::Result<bool> {
         self.save_json(POSTGRES_CREDENTIALS_KEY, &credentials, "凭据列表")?;
         Ok(true)
+    }
+
+    fn compare_and_swap_refreshed_credential(
+        &self,
+        id: u64,
+        expected_refresh_token: Option<&str>,
+        credential: &KiroCredentials,
+        _is_multiple_format: bool,
+    ) -> anyhow::Result<CredentialCompareAndSwapResult> {
+        let client = Arc::clone(&self.client);
+        let expected_refresh_token = expected_refresh_token.map(str::to_owned);
+        let mut next_credential = credential.clone();
+        next_credential.canonicalize_auth_method();
+        next_credential.normalize_model_capabilities();
+
+        run_blocking_state_op(move || {
+            let mut client = client.lock();
+            let mut transaction = client
+                .transaction()
+                .context("开启 PostgreSQL 凭据 compare-and-swap 事务失败")?;
+            let row = transaction
+                .query_opt(
+                    "SELECT value FROM kiro_state_store WHERE namespace = $1 AND key = $2 FOR UPDATE",
+                    &[&POSTGRES_NAMESPACE, &POSTGRES_CREDENTIALS_KEY],
+                )
+                .context("锁定 PostgreSQL 凭据列表失败")?;
+
+            let Some(row) = row else {
+                transaction
+                    .commit()
+                    .context("提交空 PostgreSQL 凭据 compare-and-swap 事务失败")?;
+                return Ok(CredentialCompareAndSwapResult::Missing);
+            };
+
+            let payload: String = row.get(0);
+            let mut credentials: Vec<KiroCredentials> =
+                serde_json::from_str(&payload).context("解析 PostgreSQL 凭据列表失败")?;
+            let result = apply_refreshed_credential_compare_and_swap(
+                &mut credentials,
+                id,
+                expected_refresh_token.as_deref(),
+                &next_credential,
+            );
+
+            if matches!(result, CredentialCompareAndSwapResult::Applied) {
+                let payload = serde_json::to_string(&credentials)
+                    .context("序列化 PostgreSQL 凭据列表失败")?;
+                transaction
+                    .execute(
+                        r#"
+                        UPDATE kiro_state_store
+                        SET value = $3, updated_at = NOW()
+                        WHERE namespace = $1 AND key = $2
+                        "#,
+                        &[&POSTGRES_NAMESPACE, &POSTGRES_CREDENTIALS_KEY, &payload],
+                    )
+                    .context("更新 PostgreSQL 凭据列表失败")?;
+            }
+
+            transaction
+                .commit()
+                .context("提交 PostgreSQL 凭据 compare-and-swap 事务失败")?;
+            Ok(result)
+        })
     }
 
     fn load_stats(&self) -> anyhow::Result<HashMap<String, StatsEntryRecord>> {
@@ -1960,6 +2194,92 @@ fn current_epoch_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[derive(Debug)]
+struct RedisRuntimeRefreshBackend {
+    client: RedisClient,
+    namespace: String,
+}
+
+impl RedisRuntimeRefreshBackend {
+    fn connect(redis_url: &str, namespace: &str) -> anyhow::Result<Self> {
+        let client = RedisClient::open(redis_url).context("初始化 Redis 凭据刷新协调客户端失败")?;
+        Ok(Self {
+            client,
+            namespace: namespace.to_string(),
+        })
+    }
+
+    fn try_acquire(
+        &self,
+        credential_id: u64,
+        instance_id: &str,
+        lease_ttl: Duration,
+    ) -> anyhow::Result<RuntimeRefreshLeaseAcquisition> {
+        let client = self.client.clone();
+        let lease_key = self.lease_key(credential_id);
+        let lease_record = RuntimeRefreshLeaseRecord {
+            lease_id: uuid::Uuid::new_v4().to_string(),
+            instance_id: instance_id.to_string(),
+        };
+        let lease_value =
+            serde_json::to_string(&lease_record).context("序列化 Redis 凭据刷新租约失败")?;
+        let lease_ttl_ms = lease_ttl.as_millis().clamp(1, u128::from(u64::MAX)) as u64;
+
+        run_blocking_state_op(move || -> anyhow::Result<RuntimeRefreshLeaseAcquisition> {
+            let mut connection = client
+                .get_connection()
+                .context("连接 Redis 凭据刷新协调失败")?;
+            let response: Vec<String> = Script::new(REDIS_RUNTIME_REFRESH_LEASE_SCRIPT)
+                .key(&lease_key)
+                .arg(&lease_value)
+                .arg(lease_ttl_ms)
+                .invoke(&mut connection)
+                .with_context(|| format!("获取 Redis 凭据刷新租约失败: {lease_key}"))?;
+
+            let status = response.first().map(String::as_str).unwrap_or_default();
+            let payload = response.get(1).cloned().unwrap_or_default();
+            if matches!(status, "acquired" | "renewed") {
+                return Ok(RuntimeRefreshLeaseAcquisition::Acquired(
+                    RuntimeRefreshLease {
+                        credential_id,
+                        lease_value,
+                    },
+                ));
+            }
+
+            let owner_instance_id = serde_json::from_str::<RuntimeRefreshLeaseRecord>(&payload)
+                .ok()
+                .map(|record| record.instance_id);
+            Ok(RuntimeRefreshLeaseAcquisition::HeldByPeer { owner_instance_id })
+        })
+    }
+
+    fn release(&self, lease: &RuntimeRefreshLease) -> anyhow::Result<bool> {
+        let client = self.client.clone();
+        let lease_key = self.lease_key(lease.credential_id);
+        let lease_value = lease.lease_value.clone();
+
+        run_blocking_state_op(move || -> anyhow::Result<bool> {
+            let mut connection = client
+                .get_connection()
+                .context("连接 Redis 凭据刷新协调失败")?;
+            let response: Vec<String> = Script::new(REDIS_RUNTIME_REFRESH_RELEASE_SCRIPT)
+                .key(&lease_key)
+                .arg(&lease_value)
+                .invoke(&mut connection)
+                .with_context(|| format!("释放 Redis 凭据刷新租约失败: {lease_key}"))?;
+            Ok(matches!(
+                response.first().map(String::as_str).unwrap_or_default(),
+                "released" | "empty"
+            ))
+        })
+    }
+
+    fn lease_key(&self, credential_id: u64) -> String {
+        format!("{}:credential:{credential_id}:lease", self.namespace)
+    }
 }
 
 pub fn current_epoch_ms() -> u64 {
@@ -2623,6 +2943,68 @@ mod tests {
     }
 
     #[test]
+    fn file_state_store_compare_and_swap_refreshed_credential_updates_only_matching_token() {
+        let dir = temp_test_dir("credential-cas");
+        let credentials_path = dir.join("credentials.json");
+        let store = StateStore::file(None, Some(credentials_path.clone()));
+
+        let original = KiroCredentials {
+            id: Some(7),
+            refresh_token: Some("refresh-old".to_string()),
+            access_token: Some("access-old".to_string()),
+            expires_at: Some("2026-04-15T00:00:00Z".to_string()),
+            ..KiroCredentials::default()
+        };
+        assert!(
+            store
+                .persist_credentials(&[original.clone()], true)
+                .unwrap()
+        );
+
+        let updated = KiroCredentials {
+            id: Some(7),
+            refresh_token: Some("refresh-new".to_string()),
+            access_token: Some("access-new".to_string()),
+            expires_at: Some("2026-04-15T01:00:00Z".to_string()),
+            ..KiroCredentials::default()
+        };
+        let applied = store
+            .compare_and_swap_refreshed_credential(7, Some("refresh-old"), &updated, true)
+            .unwrap();
+        assert!(matches!(applied, CredentialCompareAndSwapResult::Applied));
+
+        let reloaded = store.load_credentials().unwrap();
+        assert_eq!(
+            reloaded.credentials[0].refresh_token.as_deref(),
+            Some("refresh-new")
+        );
+        assert_eq!(
+            reloaded.credentials[0].access_token.as_deref(),
+            Some("access-new")
+        );
+
+        let stale_update = KiroCredentials {
+            id: Some(7),
+            refresh_token: Some("refresh-stale".to_string()),
+            access_token: Some("access-stale".to_string()),
+            expires_at: Some("2026-04-15T02:00:00Z".to_string()),
+            ..KiroCredentials::default()
+        };
+        let conflict = store
+            .compare_and_swap_refreshed_credential(7, Some("refresh-old"), &stale_update, true)
+            .unwrap();
+        match conflict {
+            CredentialCompareAndSwapResult::Conflict { current } => {
+                assert_eq!(current.refresh_token.as_deref(), Some("refresh-new"));
+                assert_eq!(current.access_token.as_deref(), Some("access-new"));
+            }
+            other => panic!("expected CAS conflict, got {:?}", other),
+        }
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn file_state_store_merges_stats_deltas() {
         let dir = temp_test_dir("merge-stats");
         let credentials_path = dir.join("credentials.json");
@@ -2964,6 +3346,57 @@ mod tests {
                 .arg(cleanup_keys)
                 .query(&mut connection)
                 .context("删除 Redis 运行时协调测试键失败")?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn redis_runtime_refresh_backend_allows_single_owner_when_test_url_is_set() {
+        let Ok(redis_url) = std::env::var("TEST_REDIS_URL") else {
+            return;
+        };
+
+        let namespace = format!("kiro:test:runtime-refresh:{}", Uuid::new_v4());
+        let backend = RedisRuntimeRefreshBackend::connect(&redis_url, &namespace).unwrap();
+
+        let lease = match backend
+            .try_acquire(7, "instance-a", Duration::from_secs(30))
+            .unwrap()
+        {
+            RuntimeRefreshLeaseAcquisition::Acquired(lease) => lease,
+            other => panic!("expected lease acquisition, got {:?}", other),
+        };
+
+        let held = backend
+            .try_acquire(7, "instance-b", Duration::from_secs(30))
+            .unwrap();
+        match held {
+            RuntimeRefreshLeaseAcquisition::HeldByPeer { owner_instance_id } => {
+                assert_eq!(owner_instance_id.as_deref(), Some("instance-a"));
+            }
+            other => panic!("expected peer hold, got {:?}", other),
+        }
+
+        assert!(backend.release(&lease).unwrap());
+
+        let reacquired = backend
+            .try_acquire(7, "instance-b", Duration::from_secs(30))
+            .unwrap();
+        let second_lease = match reacquired {
+            RuntimeRefreshLeaseAcquisition::Acquired(lease) => lease,
+            other => panic!("expected reacquired lease, got {:?}", other),
+        };
+        assert!(backend.release(&second_lease).unwrap());
+
+        let cleanup_key = backend.lease_key(7);
+        let client = backend.client.clone();
+        run_blocking_state_op(move || -> anyhow::Result<()> {
+            let mut connection = client.get_connection().context("连接 Redis 测试清理失败")?;
+            let _: usize = redis::cmd("DEL")
+                .arg(&cleanup_key)
+                .query(&mut connection)
+                .context("删除 Redis 凭据刷新租约测试键失败")?;
             Ok(())
         })
         .unwrap();

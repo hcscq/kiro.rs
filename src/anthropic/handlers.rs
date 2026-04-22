@@ -6,7 +6,7 @@ use crate::common::logging::summarize_text_for_log;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
-use crate::kiro::token_manager::RuntimeRefreshLeaderRequiredError;
+use crate::kiro::token_manager::{RuntimeRefreshLeaderRequiredError, RuntimeRefreshLeaseBusyError};
 use crate::model::model_catalog::built_in_model_catalog;
 use crate::token;
 use anyhow::Error;
@@ -96,6 +96,21 @@ pub(crate) fn map_provider_error(err: Error) -> Response {
             HeaderValue::from_static("1"),
         );
         return response;
+    }
+
+    if err.downcast_ref::<RuntimeRefreshLeaseBusyError>().is_some() {
+        tracing::info!(
+            error = %err_summary,
+            "共享凭据正在由其他实例刷新，当前请求快速失败"
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse::new(
+                "service_unavailable",
+                "Shared credential refresh is already in progress on another runtime instance. Retry later.",
+            )),
+        )
+            .into_response();
     }
 
     if let Some(public_err) = err.downcast_ref::<PublicProviderError>() {

@@ -31,8 +31,9 @@ use crate::model::model_policy::{
     normalize_account_type_policies, normalize_model_selector,
 };
 use crate::state::{
-    DispatchLeaseReservationStatus, DispatchRuntimeBucketPolicy, DispatchRuntimeCredential,
-    DispatchRuntimeSnapshot, PersistedDispatchConfig, RuntimeCoordinationStatus, StateChangeKind,
+    CredentialCompareAndSwapResult, DispatchLeaseReservationStatus, DispatchRuntimeBucketPolicy,
+    DispatchRuntimeCredential, DispatchRuntimeSnapshot, PersistedDispatchConfig,
+    RuntimeCoordinationStatus, RuntimeRefreshLeaseAcquisition, StateChangeKind,
     StateChangeRevisions, StateStore, StatsEntryRecord, StatsMergeRecord, current_epoch_ms,
 };
 
@@ -159,6 +160,31 @@ impl fmt::Display for RuntimeRefreshLeaderRequiredError {
 }
 
 impl std::error::Error for RuntimeRefreshLeaderRequiredError {}
+
+#[derive(Debug)]
+pub(crate) struct RuntimeRefreshLeaseBusyError {
+    pub instance_id: String,
+    pub owner_instance_id: Option<String>,
+}
+
+impl fmt::Display for RuntimeRefreshLeaseBusyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.owner_instance_id {
+            Some(owner_instance_id) => write!(
+                f,
+                "共享凭据正在由其他实例刷新（instanceId={}, ownerInstanceId={}）",
+                self.instance_id, owner_instance_id
+            ),
+            None => write!(
+                f,
+                "共享凭据刷新结果尚未同步完成（instanceId={}）",
+                self.instance_id
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RuntimeRefreshLeaseBusyError {}
 
 /// 刷新 Token
 pub(crate) async fn refresh_token(
@@ -994,8 +1020,9 @@ pub struct MultiTokenManager {
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
-/// follower 观察到共享凭据需要由 leader 刷新时，临时避让该凭据的冷却时间
-const SHARED_REFRESH_DEFER_COOLDOWN: StdDuration = StdDuration::from_secs(2);
+/// 共享凭据 refresh 请求的分布式租约 TTL。
+/// refresh_token HTTP 客户端默认超时为 60s，这里保留足够缓冲，避免租约过早失效。
+const RUNTIME_REFRESH_LEASE_TTL: StdDuration = StdDuration::from_secs(90);
 /// 共享调度占位 TTL。请求异常退出时依赖该 TTL 自动回收全局并发占位。
 const SHARED_DISPATCH_LEASE_TTL_MS: u64 = 120_000;
 /// 共享调度占位续租心跳间隔。
@@ -1243,8 +1270,13 @@ impl MultiTokenManager {
         self.entries.lock().iter().filter(|e| !e.disabled).count()
     }
 
+    fn runtime_refresh_lease_enabled(&self) -> bool {
+        self.state_store.is_external() && self.state_store.runtime_refresh_lease_enabled()
+    }
+
     pub fn should_fast_fail_runtime_leader_refresh(&self) -> bool {
-        self.shared_dispatch_runtime_enabled()
+        !self.runtime_refresh_lease_enabled()
+            && self.shared_dispatch_runtime_enabled()
             && self.state_store.runtime_coordination_enabled()
             && self.available_count() <= 1
     }
@@ -2299,14 +2331,18 @@ impl MultiTokenManager {
                 }
                 Err(e) => {
                     drop(lease);
-                    if e.downcast_ref::<RuntimeRefreshLeaderRequiredError>()
-                        .is_some()
-                    {
-                        tracing::warn!("凭据 #{} 需要由 leader 刷新 Token: {}", id, e);
+                    if Self::is_runtime_refresh_coordination_error(&e) {
+                        if e.downcast_ref::<RuntimeRefreshLeaseBusyError>().is_some() {
+                            tracing::info!("凭据 #{} 正等待其他实例刷新 Token: {}", id, e);
+                        } else {
+                            tracing::warn!("凭据 #{} 需要由 leader 刷新 Token: {}", id, e);
+                        }
                         last_runtime_coordination_error = Some(e);
                         attempt_count += 1;
-                        let has_available =
-                            self.defer_shared_refresh_credential(id, SHARED_REFRESH_DEFER_COOLDOWN);
+                        let has_available = self.defer_runtime_refresh_credential(
+                            id,
+                            self.runtime_refresh_coordination_cooldown(),
+                        );
 
                         if !has_available {
                             return Err(last_runtime_coordination_error
@@ -2357,6 +2393,99 @@ impl MultiTokenManager {
         }
     }
 
+    async fn refresh_credentials_via_upstream(
+        &self,
+        id: u64,
+        current_creds: &KiroCredentials,
+    ) -> anyhow::Result<KiroCredentials> {
+        let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
+        let refreshed = match refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
+            .await
+        {
+            Ok(refreshed) => refreshed,
+            Err(err) => {
+                if err.downcast_ref::<RefreshTokenInvalidError>().is_some()
+                    && self.runtime_refresh_lease_enabled()
+                    && !self.refresh_token_still_current_in_shared_state(
+                        id,
+                        current_creds.refresh_token.as_deref(),
+                    )
+                {
+                    tracing::warn!(
+                        "凭据 #{} refresh 返回 invalid_grant，但共享状态中的 refreshToken 已变化，等待最新刷新结果同步",
+                        id
+                    );
+                    return Err(self.runtime_refresh_busy_error(None));
+                }
+                return Err(err);
+            }
+        };
+
+        if is_token_expired(&refreshed) {
+            anyhow::bail!("刷新后的 Token 仍然无效或已过期");
+        }
+
+        let committed = self.commit_refreshed_credential(
+            id,
+            current_creds.refresh_token.as_deref(),
+            refreshed,
+        )?;
+        if committed.access_token.is_none() || is_token_expired(&committed) {
+            return Err(self.runtime_refresh_busy_error(None));
+        }
+        Ok(committed)
+    }
+
+    async fn refresh_credentials_with_runtime_coordination(
+        &self,
+        id: u64,
+        current_creds: &KiroCredentials,
+    ) -> anyhow::Result<KiroCredentials> {
+        if self.runtime_refresh_lease_enabled() {
+            let acquisition = self
+                .state_store
+                .try_acquire_runtime_refresh_lease(
+                    id,
+                    &self.runtime_refresh_instance_id(),
+                    RUNTIME_REFRESH_LEASE_TTL,
+                )?
+                .expect("runtime refresh lease backend should exist when enabled");
+
+            match acquisition {
+                RuntimeRefreshLeaseAcquisition::Acquired(lease) => {
+                    let refresh_result = self
+                        .refresh_credentials_via_upstream(id, current_creds)
+                        .await;
+                    match self.state_store.release_runtime_refresh_lease(&lease) {
+                        Ok(Some(false)) => {
+                            tracing::warn!("凭据 #{} 的 refresh 租约已转移，跳过本地释放", id);
+                        }
+                        Ok(Some(true)) | Ok(None) => {}
+                        Err(err) => {
+                            tracing::warn!("释放凭据 #{} 的 refresh 租约失败: {}", id, err);
+                        }
+                    }
+                    return refresh_result;
+                }
+                RuntimeRefreshLeaseAcquisition::HeldByPeer { owner_instance_id } => {
+                    return Err(self.runtime_refresh_busy_error(owner_instance_id));
+                }
+            }
+        }
+
+        if let Some(status) = self.runtime_refresh_coordination_status()? {
+            if !status.is_leader {
+                return Err(anyhow::Error::new(RuntimeRefreshLeaderRequiredError {
+                    instance_id: status.instance_id,
+                    leader_id: status.leader_id,
+                }));
+            }
+        }
+
+        self.refresh_credentials_via_upstream(id, current_creds)
+            .await
+    }
+
     /// 尝试使用指定凭据获取有效 Token
     ///
     /// 使用双重检查锁定模式，确保同一凭据同一时间只有一个刷新操作
@@ -2389,39 +2518,8 @@ impl MultiTokenManager {
                 }
 
                 if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
-                    if let Some(status) = self.runtime_refresh_coordination_status()? {
-                        if !status.is_leader {
-                            return Err(anyhow::Error::new(RuntimeRefreshLeaderRequiredError {
-                                instance_id: status.instance_id,
-                                leader_id: status.leader_id,
-                            }));
-                        }
-                    }
-
-                    // 确实需要刷新
-                    let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
-                    let new_creds =
-                        refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
-                            .await?;
-
-                    if is_token_expired(&new_creds) {
-                        anyhow::bail!("刷新后的 Token 仍然无效或已过期");
-                    }
-
-                    let _state_write_guard = self.state_write_lock.lock();
-                    {
-                        let mut entries = self.entries.lock();
-                        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                            entry.credentials = new_creds.clone();
-                        }
-                    }
-
-                    let credentials = self.persisted_credentials_snapshot();
-                    if let Err(e) = self.persist_credentials_snapshot(&credentials) {
-                        tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
-                    }
-
-                    new_creds
+                    self.refresh_credentials_with_runtime_coordination(id, &current_creds)
+                        .await?
                 } else {
                     tracing::debug!("Token 已从外部状态更新，跳过本地刷新");
                     current_creds
@@ -2645,6 +2743,101 @@ impl MultiTokenManager {
         }
 
         self.state_store.runtime_coordination_status()
+    }
+
+    fn runtime_refresh_instance_id(&self) -> String {
+        self.config.resolved_instance_id()
+    }
+
+    pub(crate) fn runtime_refresh_coordination_cooldown(&self) -> StdDuration {
+        let baseline = StdDuration::from_secs(5);
+        let coordinated = self
+            .state_store
+            .runtime_coordination_interval()
+            .and_then(|interval| interval.checked_mul(2))
+            .unwrap_or(baseline);
+        coordinated.max(baseline)
+    }
+
+    fn runtime_refresh_busy_error(&self, owner_instance_id: Option<String>) -> anyhow::Error {
+        anyhow::Error::new(RuntimeRefreshLeaseBusyError {
+            instance_id: self.runtime_refresh_instance_id(),
+            owner_instance_id,
+        })
+    }
+
+    fn is_runtime_refresh_coordination_error(err: &anyhow::Error) -> bool {
+        err.downcast_ref::<RuntimeRefreshLeaderRequiredError>()
+            .is_some()
+            || err.downcast_ref::<RuntimeRefreshLeaseBusyError>().is_some()
+    }
+
+    fn refresh_token_still_current_in_shared_state(
+        &self,
+        id: u64,
+        expected_refresh_token: Option<&str>,
+    ) -> bool {
+        if !self.state_store.is_external() {
+            return true;
+        }
+
+        if let Err(err) = self.sync_external_state_if_changed() {
+            tracing::warn!("刷新 invalid_grant 校验前同步共享状态失败: {}", err);
+        }
+
+        self.current_credentials(id)
+            .map(|credentials| credentials.refresh_token.as_deref() == expected_refresh_token)
+            .unwrap_or(false)
+    }
+
+    fn commit_refreshed_credential(
+        &self,
+        id: u64,
+        expected_refresh_token: Option<&str>,
+        refreshed: KiroCredentials,
+    ) -> anyhow::Result<KiroCredentials> {
+        let _state_write_guard = self.state_write_lock.lock();
+
+        if self.state_store.is_external() {
+            match self.state_store.compare_and_swap_refreshed_credential(
+                id,
+                expected_refresh_token,
+                &refreshed,
+                self.is_multiple_format,
+            )? {
+                CredentialCompareAndSwapResult::Applied => {
+                    let mut entries = self.entries.lock();
+                    if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+                        entry.credentials = refreshed.clone();
+                    }
+                    return Ok(refreshed);
+                }
+                CredentialCompareAndSwapResult::Conflict { current } => {
+                    let mut entries = self.entries.lock();
+                    if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+                        entry.credentials = current.clone();
+                    }
+                    return Ok(current);
+                }
+                CredentialCompareAndSwapResult::Missing => {
+                    anyhow::bail!("共享状态中不存在凭据 #{}", id);
+                }
+            }
+        }
+
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+                entry.credentials = refreshed.clone();
+            }
+        }
+
+        let credentials = self.persisted_credentials_snapshot();
+        if let Err(err) = self.persist_credentials_snapshot(&credentials) {
+            tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", err);
+        }
+
+        Ok(refreshed)
     }
 
     fn reload_dispatch_config_from_state(&self) -> anyhow::Result<bool> {
@@ -3048,9 +3241,9 @@ impl MultiTokenManager {
         self.save_stats_debounced();
     }
 
-    /// 当 follower 观察到某个凭据需要由 leader 刷新 token 时，临时冷却该凭据，
+    /// 当共享凭据需要等待其他实例完成 refresh 协调时，临时冷却该凭据，
     /// 让当前请求优先切换到其他可用凭据，避免在同一张共享凭据上反复重试。
-    pub fn defer_shared_refresh_credential(&self, id: u64, cooldown: StdDuration) -> bool {
+    pub fn defer_runtime_refresh_credential(&self, id: u64, cooldown: StdDuration) -> bool {
         let now = Instant::now();
         let deferred_until = now + cooldown;
         let result = {
@@ -3082,21 +3275,21 @@ impl MultiTokenManager {
                 {
                     *current_id = next.id;
                     tracing::info!(
-                        "凭据 #{} 需由 leader 刷新 token，已临时冷却 {}ms 并切换到凭据 #{}",
+                        "凭据 #{} 正等待运行时 refresh 协调，已临时冷却 {}ms 并切换到凭据 #{}",
                         id,
                         cooldown.as_millis(),
                         next.id
                     );
                 } else {
                     tracing::warn!(
-                        "凭据 #{} 需由 leader 刷新 token，已临时冷却 {}ms，当前无其他可切换凭据",
+                        "凭据 #{} 正等待运行时 refresh 协调，已临时冷却 {}ms，当前无其他可切换凭据",
                         id,
                         cooldown.as_millis()
                     );
                 }
             } else {
                 tracing::warn!(
-                    "凭据 #{} 需由 leader 刷新 token，已临时冷却 {}ms",
+                    "凭据 #{} 正等待运行时 refresh 协调，已临时冷却 {}ms",
                     id,
                     cooldown.as_millis()
                 );
@@ -3229,6 +3422,10 @@ impl MultiTokenManager {
         &self,
         model: &str,
     ) -> anyhow::Result<Option<RuntimeRefreshLeaderRequiredError>> {
+        if self.runtime_refresh_lease_enabled() {
+            return Ok(None);
+        }
+
         let Some(status) = self.runtime_refresh_coordination_status()? else {
             return Ok(None);
         };
@@ -4183,39 +4380,33 @@ impl MultiTokenManager {
 
         let credentials = self.current_credentials(id)?;
 
-        if let Some(status) = self.runtime_refresh_coordination_status()? {
-            if !status.is_leader {
-                if credentials.access_token.is_some() && !is_token_expired(&credentials) {
-                    tracing::debug!(
-                        "凭据 #{} 已从外部状态同步到有效 Token，跳过本地强制刷新",
-                        id
-                    );
-                    return Ok(());
-                }
+        if !self.runtime_refresh_lease_enabled() {
+            if let Some(status) = self.runtime_refresh_coordination_status()? {
+                if !status.is_leader {
+                    if credentials.access_token.is_some() && !is_token_expired(&credentials) {
+                        tracing::debug!(
+                            "凭据 #{} 已从外部状态同步到有效 Token，跳过本地强制刷新",
+                            id
+                        );
+                        return Ok(());
+                    }
 
-                return Err(anyhow::Error::new(RuntimeRefreshLeaderRequiredError {
-                    instance_id: status.instance_id,
-                    leader_id: status.leader_id,
-                }));
+                    return Err(anyhow::Error::new(RuntimeRefreshLeaderRequiredError {
+                        instance_id: status.instance_id,
+                        leader_id: status.leader_id,
+                    }));
+                }
             }
         }
 
-        // 无条件调用 refresh_token
-        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let new_creds = refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?;
+        self.refresh_credentials_with_runtime_coordination(id, &credentials)
+            .await?;
 
-        let _state_write_guard = self.state_write_lock.lock();
         {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                entry.credentials = new_creds;
                 entry.refresh_failure_count = 0;
             }
-        }
-
-        let credentials = self.persisted_credentials_snapshot();
-        if let Err(e) = self.persist_credentials_snapshot(&credentials) {
-            tracing::warn!("强制刷新 Token 后持久化失败: {}", e);
         }
 
         tracing::info!("凭据 #{} Token 已强制刷新", id);
