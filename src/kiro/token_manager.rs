@@ -10,7 +10,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as TokioMutex, Notify, oneshot};
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1896,6 +1896,7 @@ impl MultiTokenManager {
         &self,
         model: Option<&str>,
         request_weight: f64,
+        excluded_credential_ids: &HashSet<u64>,
     ) -> Result<(u64, KiroCredentials, CallLease), ReservationFailure> {
         let dispatch = self.dispatch_config();
         let mode = dispatch.mode.clone();
@@ -1924,6 +1925,9 @@ impl MultiTokenManager {
                 continue;
             }
             has_enabled = true;
+            if excluded_credential_ids.contains(&entry.id) {
+                continue;
+            }
 
             if !Self::is_model_supported(&dispatch, &entry.credentials, model, model_requirement) {
                 continue;
@@ -2084,6 +2088,7 @@ impl MultiTokenManager {
         &self,
         model: Option<&str>,
         request_weight: f64,
+        excluded_credential_ids: &HashSet<u64>,
     ) -> Result<(u64, KiroCredentials, CallLease), ReservationFailure> {
         let dispatch = self.dispatch_config();
         let model_requirement = Self::model_requirement(model);
@@ -2126,6 +2131,9 @@ impl MultiTokenManager {
                         continue;
                     }
                     has_enabled = true;
+                    if excluded_credential_ids.contains(&entry.id) {
+                        continue;
+                    }
 
                     if !Self::is_model_supported(
                         &dispatch,
@@ -2330,6 +2338,17 @@ impl MultiTokenManager {
         model: Option<&str>,
         request_weight: f64,
     ) -> anyhow::Result<CallContext> {
+        let excluded_credential_ids = HashSet::new();
+        self.acquire_context_with_weight_excluding(model, request_weight, &excluded_credential_ids)
+            .await
+    }
+
+    pub(crate) async fn acquire_context_with_weight_excluding(
+        &self,
+        model: Option<&str>,
+        request_weight: f64,
+        excluded_credential_ids: &HashSet<u64>,
+    ) -> anyhow::Result<CallContext> {
         let request_weight = if request_weight.is_finite() && request_weight > 0.0 {
             request_weight
         } else {
@@ -2361,9 +2380,9 @@ impl MultiTokenManager {
             }
 
             let (id, credentials, lease) = match if self.shared_dispatch_runtime_enabled() {
-                self.reserve_next_credential_shared(model, request_weight)
+                self.reserve_next_credential_shared(model, request_weight, excluded_credential_ids)
             } else {
-                self.reserve_next_credential(model, request_weight)
+                self.reserve_next_credential(model, request_weight, excluded_credential_ids)
             } {
                 Ok(selection) => {
                     wait_queue_guard = None;
@@ -3411,7 +3430,10 @@ impl MultiTokenManager {
     }
 
     /// 当上游明确返回 `INVALID_MODEL_ID` 时，
-    /// 将当前凭据视为“不支持该模型”，仅记录模型族运行时限制，不对账号施加全局冷却。
+    /// 将当前凭据视为“不支持该模型”。
+    ///
+    /// 当模型冷却开启时会记录模型族运行时限制；关闭时仅调整当前实例内的切卡方向，
+    /// 不会对账号施加全局冷却，也不会写入运行时模型限制。
     pub fn defer_model_unsupported_credential(&self, id: u64, model: &str) -> bool {
         let restriction_expires_at = Utc::now() + Duration::minutes(30);
         let dispatch = self.dispatch_config();
@@ -3495,21 +3517,42 @@ impl MultiTokenManager {
                     })
                 {
                     *current_id = next.id;
-                    tracing::info!(
-                        "凭据 #{} 不支持模型 {}，已记录运行时限制并切换到凭据 #{}",
-                        id,
-                        model_label,
-                        next.id
-                    );
+                    if dispatch.model_cooldown_enabled {
+                        tracing::info!(
+                            "凭据 #{} 不支持模型 {}，已记录运行时限制并切换到凭据 #{}",
+                            id,
+                            model_label,
+                            next.id
+                        );
+                    } else {
+                        tracing::info!(
+                            "凭据 #{} 不支持模型 {}，模型冷却已关闭，切换到凭据 #{}",
+                            id,
+                            model_label,
+                            next.id
+                        );
+                    }
                 } else {
-                    tracing::warn!(
-                        "凭据 #{} 不支持模型 {}，已记录运行时限制，当前无其他可切换凭据",
-                        id,
-                        model_label
-                    );
+                    if dispatch.model_cooldown_enabled {
+                        tracing::warn!(
+                            "凭据 #{} 不支持模型 {}，已记录运行时限制，当前无其他可切换凭据",
+                            id,
+                            model_label
+                        );
+                    } else {
+                        tracing::warn!(
+                            "凭据 #{} 不支持模型 {}，模型冷却已关闭，当前无其他可切换凭据",
+                            id,
+                            model_label
+                        );
+                    }
                 }
             } else {
-                tracing::warn!("凭据 #{} 不支持模型 {}，已记录运行时限制", id, model_label);
+                if dispatch.model_cooldown_enabled {
+                    tracing::warn!("凭据 #{} 不支持模型 {}，已记录运行时限制", id, model_label);
+                } else {
+                    tracing::warn!("凭据 #{} 不支持模型 {}，模型冷却已关闭", id, model_label);
+                }
             }
 
             entries.iter().any(|e| {
@@ -5398,6 +5441,40 @@ mod tests {
         let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
         assert!(entry.runtime_model_restrictions.is_empty());
         assert_eq!(entry.cooldown_remaining_ms, None);
+    }
+
+    #[tokio::test]
+    async fn test_request_scoped_excluded_credentials_are_skipped_in_balanced_mode() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.model_cooldown_enabled = false;
+
+        let mut first = available_credential(0);
+        first.subscription_title = Some("KIRO PRO+".to_string());
+        let mut second = available_credential(0);
+        second.subscription_title = Some("KIRO PRO+".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![first, second], None, None, false)
+            .expect("manager should initialize");
+
+        let initial = manager
+            .acquire_context(Some("claude-opus-4.6"))
+            .await
+            .expect("unexcluded request should pick the first balanced candidate");
+        assert_eq!(initial.id, 1);
+        drop(initial);
+
+        let mut excluded_credential_ids = HashSet::new();
+        excluded_credential_ids.insert(1);
+        let fallback = manager
+            .acquire_context_with_weight_excluding(
+                Some("claude-opus-4.6"),
+                1.0,
+                &excluded_credential_ids,
+            )
+            .await
+            .expect("request-scoped exclusions should force a different candidate");
+        assert_eq!(fallback.id, 2);
     }
 
     #[test]

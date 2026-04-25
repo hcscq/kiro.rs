@@ -883,6 +883,7 @@ impl KiroProvider {
         let total_credentials = self.token_manager.total_count();
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        let mut request_scoped_model_unsupported_credentials: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
         let request_id = options
             .request_id
@@ -914,7 +915,11 @@ impl KiroProvider {
             // 获取调用上下文（绑定 index、credentials、token）
             let ctx = match self
                 .token_manager
-                .acquire_context_with_weight(model.as_deref(), request_weight)
+                .acquire_context_with_weight_excluding(
+                    model.as_deref(),
+                    request_weight,
+                    &request_scoped_model_unsupported_credentials,
+                )
                 .await
             {
                 Ok(c) => c,
@@ -1176,6 +1181,7 @@ impl KiroProvider {
                         ctx_id,
                         model.as_deref().unwrap_or("unknown"),
                     );
+                    request_scoped_model_unsupported_credentials.insert(ctx_id);
                     if !has_available {
                         anyhow::bail!(
                             "{} API 请求失败（所有候选凭据当前均被上游拒绝模型 {}）: {}",
