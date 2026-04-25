@@ -287,6 +287,10 @@ pub struct Config {
     #[serde(default = "default_rate_limit_cooldown_ms")]
     pub rate_limit_cooldown_ms: u64,
 
+    /// 是否启用“模型不支持”后的运行时模型冷却
+    #[serde(default = "default_model_cooldown_enabled")]
+    pub model_cooldown_enabled: bool,
+
     /// 单账号本地 token bucket 的容量（<= 0 表示禁用 token bucket）
     #[serde(default = "default_rate_limit_bucket_capacity")]
     pub rate_limit_bucket_capacity: f64,
@@ -367,6 +371,10 @@ fn default_state_backend() -> StateBackendKind {
 
 fn default_rate_limit_cooldown_ms() -> u64 {
     2_000
+}
+
+fn default_model_cooldown_enabled() -> bool {
+    false
 }
 
 fn default_rate_limit_bucket_capacity() -> f64 {
@@ -486,6 +494,7 @@ impl Default for Config {
             queue_max_size: 0,
             queue_max_wait_ms: 0,
             rate_limit_cooldown_ms: default_rate_limit_cooldown_ms(),
+            model_cooldown_enabled: default_model_cooldown_enabled(),
             rate_limit_bucket_capacity: default_rate_limit_bucket_capacity(),
             rate_limit_refill_per_second: default_rate_limit_refill_per_second(),
             rate_limit_refill_min_per_second: default_rate_limit_refill_min_per_second(),
@@ -675,6 +684,7 @@ mod tests {
     fn request_weighting_defaults_to_enabled_and_tuned_for_weighted_bucket() {
         let config = Config::default();
 
+        assert!(!config.model_cooldown_enabled);
         assert!(config.request_weighting.enabled);
         assert!((config.rate_limit_bucket_capacity - 6.0).abs() < f64::EPSILON);
         assert!((config.rate_limit_refill_per_second - 2.0).abs() < f64::EPSILON);

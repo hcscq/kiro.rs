@@ -185,6 +185,7 @@ export function SettingsPage() {
   const [queueMaxSizeInput, setQueueMaxSizeInput] = useState('0')
   const [queueMaxWaitMsInput, setQueueMaxWaitMsInput] = useState('0')
   const [rateLimitCooldownMsInput, setRateLimitCooldownMsInput] = useState('2000')
+  const [modelCooldownEnabled, setModelCooldownEnabled] = useState(false)
   const [defaultMaxConcurrencyInput, setDefaultMaxConcurrencyInput] = useState('')
   const [rateLimitBucketCapacityInput, setRateLimitBucketCapacityInput] = useState('6')
   const [rateLimitRefillPerSecondInput, setRateLimitRefillPerSecondInput] = useState('2')
@@ -203,6 +204,7 @@ export function SettingsPage() {
     setQueueMaxSizeInput(String(loadBalancingData.queueMaxSize))
     setQueueMaxWaitMsInput(String(loadBalancingData.queueMaxWaitMs))
     setRateLimitCooldownMsInput(String(loadBalancingData.rateLimitCooldownMs))
+    setModelCooldownEnabled(loadBalancingData.modelCooldownEnabled ?? false)
     setDefaultMaxConcurrencyInput(loadBalancingData.defaultMaxConcurrency ? String(loadBalancingData.defaultMaxConcurrency) : '')
     setRateLimitBucketCapacityInput(String(loadBalancingData.rateLimitBucketCapacity))
     setRateLimitRefillPerSecondInput(String(loadBalancingData.rateLimitRefillPerSecond))
@@ -326,6 +328,7 @@ export function SettingsPage() {
         queueMaxSize: parsedQueueMaxSize,
         queueMaxWaitMs: parsedQueueMaxWaitMs,
         rateLimitCooldownMs: parsedRateLimitCooldownMs,
+        modelCooldownEnabled,
         defaultMaxConcurrency: parsedDefaultMaxConcurrency,
         rateLimitBucketCapacity: parsedRateLimitBucketCapacity,
         rateLimitRefillPerSecond: parsedRateLimitRefillPerSecond,
@@ -452,6 +455,30 @@ export function SettingsPage() {
                   onChange={(e) => setDefaultMaxConcurrencyInput(e.target.value)}
                   placeholder="留空或 0 表示全局不限制"
                 />
+              </div>
+
+              <div className="flex flex-col gap-3 rounded-lg border bg-background/70 p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="space-y-1">
+                    <div className="text-sm font-medium">模型冷却</div>
+                    <p className="text-sm text-muted-foreground">
+                      遇到上游 `INVALID_MODEL_ID` 时，是否把该模型族加入账号级运行时临时限制。
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <Badge variant={modelCooldownEnabled ? 'secondary' : 'outline'}>
+                      {modelCooldownEnabled ? '已启用' : '已关闭'}
+                    </Badge>
+                    <Switch
+                      checked={modelCooldownEnabled}
+                      onCheckedChange={setModelCooldownEnabled}
+                      aria-label="切换模型冷却"
+                    />
+                  </div>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  默认关闭。关闭后不再新增模型临时限制，已有运行时模型限制也会被清空。
+                </p>
               </div>
             </div>
           </div>

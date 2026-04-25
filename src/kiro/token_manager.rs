@@ -766,6 +766,7 @@ pub struct LoadBalancingConfigSnapshot {
     pub queue_max_size: usize,
     pub queue_max_wait_ms: u64,
     pub rate_limit_cooldown_ms: u64,
+    pub model_cooldown_enabled: bool,
     pub default_max_concurrency: Option<u32>,
     pub rate_limit_bucket_capacity: f64,
     pub rate_limit_refill_per_second: f64,
@@ -789,6 +790,7 @@ struct DispatchConfig {
     queue_max_size: usize,
     queue_max_wait_ms: u64,
     rate_limit_cooldown_ms: u64,
+    model_cooldown_enabled: bool,
     default_max_concurrency: Option<u32>,
     rate_limit_bucket_capacity: f64,
     rate_limit_refill_per_second: f64,
@@ -826,6 +828,7 @@ impl DispatchConfig {
             queue_max_size: config.queue_max_size,
             queue_max_wait_ms: config.queue_max_wait_ms,
             rate_limit_cooldown_ms: config.rate_limit_cooldown_ms,
+            model_cooldown_enabled: config.model_cooldown_enabled,
             default_max_concurrency: config.default_max_concurrency.filter(|limit| *limit > 0),
             rate_limit_bucket_capacity: normalize_non_negative(
                 config.rate_limit_bucket_capacity,
@@ -1339,7 +1342,11 @@ impl MultiTokenManager {
         let Some(model) = model else {
             return true;
         };
-        credentials.policy_allows_model(dispatch.account_type_policy_for(credentials), model)
+        credentials.policy_allows_model(
+            dispatch.account_type_policy_for(credentials),
+            model,
+            dispatch.model_cooldown_enabled,
+        )
     }
 
     fn is_model_supported(
@@ -1409,6 +1416,22 @@ impl MultiTokenManager {
         for entry in entries.iter_mut() {
             entry.rate_limit_cooldown_until = None;
         }
+    }
+
+    fn clear_all_runtime_model_restrictions(&self) -> anyhow::Result<bool> {
+        let mut entries = self.entries.lock();
+        let mut changed = false;
+        for entry in entries.iter_mut() {
+            changed |= entry.credentials.clear_runtime_model_restrictions();
+        }
+        if !changed {
+            return Ok(false);
+        }
+
+        let credentials = Self::persisted_credentials_from_entries(&entries);
+        drop(entries);
+        self.persist_credentials_snapshot(&credentials)?;
+        Ok(true)
     }
 
     fn is_rate_limited(entry: &CredentialEntry, now: Instant) -> bool {
@@ -2878,11 +2901,12 @@ impl MultiTokenManager {
 
         self.availability_notify.notify_waiters();
         tracing::info!(
-            "已从外部状态热加载调度配置: mode={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, defaultMaxConcurrency={:?}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}",
+            "已从外部状态热加载调度配置: mode={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, modelCooldownEnabled={}, defaultMaxConcurrency={:?}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}",
             next.mode,
             next.queue_max_size,
             next.queue_max_wait_ms,
             next.rate_limit_cooldown_ms,
+            next.model_cooldown_enabled,
             next.default_max_concurrency,
             next.rate_limit_bucket_capacity,
             next.rate_limit_refill_per_second,
@@ -3354,9 +3378,13 @@ impl MultiTokenManager {
             }
 
             entry.last_used_at = Some(Utc::now().to_rfc3339());
-            let restriction_changed = entry
-                .credentials
-                .upsert_runtime_model_restriction(model, restriction_expires_at);
+            let restriction_changed = if dispatch.model_cooldown_enabled {
+                entry
+                    .credentials
+                    .upsert_runtime_model_restriction(model, restriction_expires_at)
+            } else {
+                false
+            };
             if restriction_changed {
                 let credentials = Self::persisted_credentials_from_entries(&entries);
                 if let Err(err) = self.persist_credentials_snapshot(&credentials) {
@@ -3829,9 +3857,11 @@ impl MultiTokenManager {
                             .map(|source| source.as_str().to_string()),
                         allowed_models: e.credentials.allowed_models.clone(),
                         blocked_models: e.credentials.blocked_models.clone(),
-                        runtime_model_restrictions: e
-                            .credentials
-                            .active_runtime_model_restrictions(),
+                        runtime_model_restrictions: if dispatch.model_cooldown_enabled {
+                            e.credentials.active_runtime_model_restrictions()
+                        } else {
+                            Vec::new()
+                        },
                         imported_at: e.credentials.imported_at.clone(),
                         success_count: e.success_count,
                         last_used_at: e.last_used_at.clone(),
@@ -4421,6 +4451,7 @@ impl MultiTokenManager {
             queue_max_size: dispatch.queue_max_size,
             queue_max_wait_ms: dispatch.queue_max_wait_ms,
             rate_limit_cooldown_ms: dispatch.rate_limit_cooldown_ms,
+            model_cooldown_enabled: dispatch.model_cooldown_enabled,
             default_max_concurrency: dispatch.default_max_concurrency,
             rate_limit_bucket_capacity: dispatch.rate_limit_bucket_capacity,
             rate_limit_refill_per_second: dispatch.rate_limit_refill_per_second,
@@ -4469,6 +4500,7 @@ impl MultiTokenManager {
                 queue_max_size: dispatch.queue_max_size,
                 queue_max_wait_ms: dispatch.queue_max_wait_ms,
                 rate_limit_cooldown_ms: dispatch.rate_limit_cooldown_ms,
+                model_cooldown_enabled: dispatch.model_cooldown_enabled,
                 default_max_concurrency: dispatch.default_max_concurrency,
                 rate_limit_bucket_capacity: dispatch.rate_limit_bucket_capacity,
                 rate_limit_refill_per_second: dispatch.rate_limit_refill_per_second,
@@ -4488,6 +4520,7 @@ impl MultiTokenManager {
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
         self.set_load_balancing_config(
             Some(mode),
+            None,
             None,
             None,
             None,
@@ -4560,6 +4593,7 @@ impl MultiTokenManager {
         queue_max_size: Option<usize>,
         queue_max_wait_ms: Option<u64>,
         rate_limit_cooldown_ms: Option<u64>,
+        model_cooldown_enabled: Option<bool>,
         default_max_concurrency: Option<u32>,
         rate_limit_bucket_capacity: Option<f64>,
         rate_limit_refill_per_second: Option<f64>,
@@ -4587,6 +4621,9 @@ impl MultiTokenManager {
         }
         if let Some(rate_limit_cooldown_ms) = rate_limit_cooldown_ms {
             next.rate_limit_cooldown_ms = rate_limit_cooldown_ms;
+        }
+        if let Some(model_cooldown_enabled) = model_cooldown_enabled {
+            next.model_cooldown_enabled = model_cooldown_enabled;
         }
         if let Some(default_max_concurrency) = default_max_concurrency {
             next.default_max_concurrency = Some(default_max_concurrency).filter(|limit| *limit > 0);
@@ -4632,6 +4669,11 @@ impl MultiTokenManager {
         {
             self.clear_all_rate_limit_cooldowns();
         }
+        if previous.model_cooldown_enabled && !next.model_cooldown_enabled {
+            if let Err(err) = self.clear_all_runtime_model_restrictions() {
+                tracing::warn!("关闭模型冷却后清理运行时模型限制失败: {}", err);
+            }
+        }
         if previous.rate_limit_bucket_capacity != next.rate_limit_bucket_capacity
             || previous.rate_limit_refill_per_second != next.rate_limit_refill_per_second
             || previous.rate_limit_refill_min_per_second != next.rate_limit_refill_min_per_second
@@ -4645,11 +4687,12 @@ impl MultiTokenManager {
 
         self.availability_notify.notify_waiters();
         tracing::info!(
-            "调度配置已更新: mode={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, defaultMaxConcurrency={:?}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}, requestWeightingEnabled={}, requestWeightingBaseWeight={}, requestWeightingMaxWeight={}",
+            "调度配置已更新: mode={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, modelCooldownEnabled={}, defaultMaxConcurrency={:?}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}, requestWeightingEnabled={}, requestWeightingBaseWeight={}, requestWeightingMaxWeight={}",
             next.mode,
             next.queue_max_size,
             next.queue_max_wait_ms,
             next.rate_limit_cooldown_ms,
+            next.model_cooldown_enabled,
             next.default_max_concurrency,
             next.rate_limit_bucket_capacity,
             next.rate_limit_refill_per_second,
@@ -5001,6 +5044,7 @@ mod tests {
     #[test]
     fn test_runtime_model_restriction_hides_model_until_cache_cleared() {
         let mut config = Config::default();
+        config.model_cooldown_enabled = true;
         config.account_type_policies.insert(
             "power".to_string(),
             ModelSupportPolicy {
@@ -5216,7 +5260,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_model_unsupported_restriction_does_not_cool_down_account_for_other_models() {
-        let config = Config::default();
+        let mut config = Config::default();
+        config.model_cooldown_enabled = true;
         let mut cred = available_credential(0);
         cred.subscription_title = Some("KIRO PRO+".to_string());
 
@@ -5248,9 +5293,30 @@ mod tests {
         assert_eq!(ctx.id, 1);
     }
 
+    #[tokio::test]
+    async fn test_model_unsupported_restriction_is_skipped_when_model_cooldown_disabled() {
+        let config = Config::default();
+        let mut cred = available_credential(0);
+        cred.subscription_title = Some("KIRO PRO+".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        assert!(!manager.defer_model_unsupported_credential(1, "claude-opus-4.7"));
+        assert!(
+            manager.supports_model("claude-opus-4-7"),
+            "关闭模型冷却后，不应因为单次 INVALID_MODEL_ID 把模型族屏蔽掉"
+        );
+
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert!(entry.runtime_model_restrictions.is_empty());
+        assert_eq!(entry.cooldown_remaining_ms, None);
+    }
+
     #[test]
     fn test_opus_4_7_remaining_candidates_can_be_detected_as_leader_refresh_only() {
-        let config = Config::default();
+        let mut config = Config::default();
+        config.model_cooldown_enabled = true;
 
         let mut unsupported_primary = available_credential(0);
         unsupported_primary.id = Some(1);
@@ -5300,7 +5366,8 @@ mod tests {
 
     #[test]
     fn test_opus_4_7_remaining_candidates_keep_local_retry_when_fresh_token_exists() {
-        let config = Config::default();
+        let mut config = Config::default();
+        config.model_cooldown_enabled = true;
 
         let mut unsupported_primary = available_credential(0);
         unsupported_primary.id = Some(1);
@@ -5904,6 +5971,7 @@ mod tests {
             queue_max_size: 8,
             queue_max_wait_ms: 1500,
             rate_limit_cooldown_ms: 4500,
+            model_cooldown_enabled: true,
             default_max_concurrency: Some(3),
             rate_limit_bucket_capacity: 4.0,
             rate_limit_refill_per_second: 1.2,
@@ -5926,6 +5994,7 @@ mod tests {
         assert_eq!(snapshot.queue_max_size, 8);
         assert_eq!(snapshot.queue_max_wait_ms, 1500);
         assert_eq!(snapshot.rate_limit_cooldown_ms, 4500);
+        assert!(snapshot.model_cooldown_enabled);
         assert_eq!(snapshot.default_max_concurrency, Some(3));
         assert_eq!(snapshot.rate_limit_bucket_capacity, 4.0);
         assert_eq!(snapshot.rate_limit_refill_per_second, 1.2);
@@ -6041,6 +6110,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some(1.0),
                 Some(1.2),
                 None,
@@ -6078,6 +6148,7 @@ mod tests {
                 Some(8),
                 Some(1500),
                 Some(4500),
+                Some(true),
                 Some(3),
                 Some(4.0),
                 Some(1.2),
@@ -6097,6 +6168,7 @@ mod tests {
         assert_eq!(persisted.queue_max_size, 8);
         assert_eq!(persisted.queue_max_wait_ms, 1500);
         assert_eq!(persisted.rate_limit_cooldown_ms, 4500);
+        assert!(persisted.model_cooldown_enabled);
         assert_eq!(persisted.default_max_concurrency, Some(3));
         assert_eq!(persisted.rate_limit_bucket_capacity, 4.0);
         assert_eq!(persisted.rate_limit_refill_per_second, 1.2);

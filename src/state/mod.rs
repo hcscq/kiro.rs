@@ -749,6 +749,8 @@ pub struct PersistedDispatchConfig {
     pub queue_max_size: usize,
     pub queue_max_wait_ms: u64,
     pub rate_limit_cooldown_ms: u64,
+    #[serde(default)]
+    pub model_cooldown_enabled: bool,
     pub default_max_concurrency: Option<u32>,
     pub rate_limit_bucket_capacity: f64,
     pub rate_limit_refill_per_second: f64,
@@ -788,6 +790,7 @@ impl PersistedDispatchConfig {
             queue_max_size: config.queue_max_size,
             queue_max_wait_ms: config.queue_max_wait_ms,
             rate_limit_cooldown_ms: config.rate_limit_cooldown_ms,
+            model_cooldown_enabled: config.model_cooldown_enabled,
             default_max_concurrency: config.default_max_concurrency,
             rate_limit_bucket_capacity: config.rate_limit_bucket_capacity,
             rate_limit_refill_per_second: config.rate_limit_refill_per_second,
@@ -806,6 +809,7 @@ impl PersistedDispatchConfig {
         config.queue_max_size = self.queue_max_size;
         config.queue_max_wait_ms = self.queue_max_wait_ms;
         config.rate_limit_cooldown_ms = self.rate_limit_cooldown_ms;
+        config.model_cooldown_enabled = self.model_cooldown_enabled;
         config.default_max_concurrency = self.default_max_concurrency;
         config.rate_limit_bucket_capacity = self.rate_limit_bucket_capacity;
         config.rate_limit_refill_per_second = self.rate_limit_refill_per_second;
@@ -3065,6 +3069,7 @@ mod tests {
             queue_max_size: 16,
             queue_max_wait_ms: 2000,
             rate_limit_cooldown_ms: 5000,
+            model_cooldown_enabled: true,
             default_max_concurrency: Some(4),
             rate_limit_bucket_capacity: 6.0,
             rate_limit_refill_per_second: 1.5,
@@ -3106,6 +3111,7 @@ mod tests {
         )
         .unwrap();
 
+        assert!(!dispatch.model_cooldown_enabled);
         assert!(dispatch.request_weighting.enabled);
     }
 

@@ -212,6 +212,7 @@ GitHub Actions 镜像构建：
 | `queueMaxSize` | number | `0` | 等待队列最大长度；`0` 表示禁用等待队列 |
 | `queueMaxWaitMs` | number | `0` | 单请求最大排队等待时间（毫秒）；`0` 表示禁用等待队列 |
 | `rateLimitCooldownMs` | number | `2000` | 单账号触发上游 `429` 后的冷却时间（毫秒）；`0` 表示禁用 429 冷却 |
+| `modelCooldownEnabled` | boolean | `false` | 是否启用“模型不支持”后的运行时模型冷却；关闭后不再记录 `INVALID_MODEL_ID` 触发的账号级临时模型限制 |
 | `rateLimitBucketCapacity` | number | `6.0` | 单账号 token bucket 容量；默认允许连续承接两次以上重请求，`<= 0` 表示禁用 token bucket |
 | `rateLimitRefillPerSecond` | number | `2.0` | 单账号 token bucket 基础回填速率（token/s）；默认与轻/重请求加权联动调优，`<= 0` 表示禁用 token bucket |
 | `rateLimitRefillMinPerSecond` | number | `1.0` | 遭遇 `429` 后允许降到的最小回填速率（token/s） |
@@ -259,6 +260,7 @@ GitHub Actions 镜像构建：
    "queueMaxSize": 16,
    "queueMaxWaitMs": 5000,
    "rateLimitCooldownMs": 2000,
+   "modelCooldownEnabled": false,
    "rateLimitBucketCapacity": 6.0,
    "rateLimitRefillPerSecond": 2.0,
    "rateLimitRefillMinPerSecond": 1.0,
@@ -463,6 +465,7 @@ kiro-rs \
 - `maxConcurrency` 可限制单账号最大并发，请求达到上限后会自动切到其他可用账号
 - `queueMaxSize` / `queueMaxWaitMs` 可为瞬时超并发请求提供短暂排队，减少尖峰时直接失败
 - `rateLimitCooldownMs` 可控制单账号触发上游 `429` 后的固定冷却时长；设为 `0` 可关闭该机制
+- `modelCooldownEnabled` 控制“模型不支持”后的运行时模型冷却；默认关闭，关闭时不会把 `INVALID_MODEL_ID` 记成账号级临时模型限制
 - `rateLimitBucketCapacity` / `rateLimitRefillPerSecond` 可限制单账号单位时间内的发放速率，适合给“真实承载能力偏弱”的账号单独降速
 - `requestWeighting` 默认开启，但默认曲线已经压平；重代码/重 thinking 请求会比轻请求多消耗一些 bucket 配额，同时默认 bucket 与 429 退避参数已同步调优
 - 遭遇 `429` 时，本地会清空该账号 bucket，并按 `rateLimitRefillBackoffFactor` 下调当前回填速率；成功请求后再按 `rateLimitRefillRecoveryStepPerSuccess` 逐步恢复

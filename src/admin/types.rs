@@ -320,6 +320,8 @@ pub struct LoadBalancingModeResponse {
     pub queue_max_wait_ms: u64,
     /// 单账号触发 429 后的冷却时间（毫秒，0 表示禁用 429 冷却）
     pub rate_limit_cooldown_ms: u64,
+    /// 是否启用“模型不支持”后的运行时模型冷却
+    pub model_cooldown_enabled: bool,
     /// 全局默认单账号并发上限（null 表示不限制）
     pub default_max_concurrency: Option<u32>,
     /// 单账号 token bucket 容量（<= 0 表示禁用）
@@ -350,6 +352,8 @@ pub struct SetLoadBalancingModeRequest {
     pub queue_max_wait_ms: Option<u64>,
     /// 单账号触发 429 后的冷却时间（毫秒，0 表示禁用 429 冷却）
     pub rate_limit_cooldown_ms: Option<u64>,
+    /// 是否启用“模型不支持”后的运行时模型冷却
+    pub model_cooldown_enabled: Option<bool>,
     /// 全局默认单账号并发上限（0 表示不限制；字段缺失表示不修改）
     pub default_max_concurrency: Option<u32>,
     /// 单账号 token bucket 容量（<= 0 表示禁用）

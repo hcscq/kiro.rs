@@ -526,22 +526,25 @@ impl KiroCredentials {
         &self,
         account_type_policy: Option<&ModelSupportPolicy>,
         model: &str,
+        model_cooldown_enabled: bool,
     ) -> bool {
         let Some(selector) = normalize_model_selector(model) else {
             return true;
         };
 
-        if self
-            .runtime_model_restrictions
-            .iter()
-            .filter(|restriction| restriction.is_active_at(Utc::now()))
-            .any(|restriction| {
-                normalize_model_selector(&restriction.model).is_some_and(|entry| {
-                    entry.family == selector.family || entry.exact == selector.exact
+        if model_cooldown_enabled {
+            if self
+                .runtime_model_restrictions
+                .iter()
+                .filter(|restriction| restriction.is_active_at(Utc::now()))
+                .any(|restriction| {
+                    normalize_model_selector(&restriction.model).is_some_and(|entry| {
+                        entry.family == selector.family || entry.exact == selector.exact
+                    })
                 })
-            })
-        {
-            return false;
+            {
+                return false;
+            }
         }
 
         if account_type_policy.is_some_and(|policy| policy.matches_blocked(&selector)) {

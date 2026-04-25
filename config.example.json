@@ -17,6 +17,7 @@
   "queueMaxSize": 16,
   "queueMaxWaitMs": 5000,
   "rateLimitCooldownMs": 2000,
+  "modelCooldownEnabled": false,
   "rateLimitBucketCapacity": 6.0,
   "rateLimitRefillPerSecond": 2.0,
   "rateLimitRefillMinPerSecond": 1.0,
