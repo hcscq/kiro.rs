@@ -749,7 +749,9 @@ pub struct PersistedDispatchConfig {
     pub queue_max_size: usize,
     pub queue_max_wait_ms: u64,
     pub rate_limit_cooldown_ms: u64,
-    #[serde(default)]
+    #[serde(default = "default_persisted_rate_limit_cooldown_enabled")]
+    pub rate_limit_cooldown_enabled: bool,
+    #[serde(default = "default_persisted_model_cooldown_enabled")]
     pub model_cooldown_enabled: bool,
     pub default_max_concurrency: Option<u32>,
     pub rate_limit_bucket_capacity: f64,
@@ -763,6 +765,14 @@ pub struct PersistedDispatchConfig {
     pub account_type_policies: BTreeMap<String, ModelSupportPolicy>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub account_type_dispatch_policies: BTreeMap<String, AccountTypeDispatchPolicy>,
+}
+
+fn default_persisted_rate_limit_cooldown_enabled() -> bool {
+    false
+}
+
+fn default_persisted_model_cooldown_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -790,6 +800,7 @@ impl PersistedDispatchConfig {
             queue_max_size: config.queue_max_size,
             queue_max_wait_ms: config.queue_max_wait_ms,
             rate_limit_cooldown_ms: config.rate_limit_cooldown_ms,
+            rate_limit_cooldown_enabled: config.rate_limit_cooldown_enabled,
             model_cooldown_enabled: config.model_cooldown_enabled,
             default_max_concurrency: config.default_max_concurrency,
             rate_limit_bucket_capacity: config.rate_limit_bucket_capacity,
@@ -809,6 +820,7 @@ impl PersistedDispatchConfig {
         config.queue_max_size = self.queue_max_size;
         config.queue_max_wait_ms = self.queue_max_wait_ms;
         config.rate_limit_cooldown_ms = self.rate_limit_cooldown_ms;
+        config.rate_limit_cooldown_enabled = self.rate_limit_cooldown_enabled;
         config.model_cooldown_enabled = self.model_cooldown_enabled;
         config.default_max_concurrency = self.default_max_concurrency;
         config.rate_limit_bucket_capacity = self.rate_limit_bucket_capacity;
@@ -1190,6 +1202,18 @@ impl StateStore {
         self.dispatch_runtime_backend
             .as_ref()
             .map(|backend| backend.reset_runtime(id, bucket_policy, now_epoch_ms))
+            .transpose()
+    }
+
+    pub fn clear_dispatch_rate_limit_penalty(
+        &self,
+        id: u64,
+        bucket_policy: Option<DispatchRuntimeBucketPolicy>,
+        now_epoch_ms: u64,
+    ) -> anyhow::Result<Option<DispatchRuntimeSnapshot>> {
+        self.dispatch_runtime_backend
+            .as_ref()
+            .map(|backend| backend.clear_rate_limit_penalty(id, bucket_policy, now_epoch_ms))
             .transpose()
     }
 
@@ -2695,6 +2719,34 @@ impl RedisDispatchRuntimeBackend {
         })
     }
 
+    fn clear_rate_limit_penalty(
+        &self,
+        id: u64,
+        bucket_policy: Option<DispatchRuntimeBucketPolicy>,
+        now_epoch_ms: u64,
+    ) -> anyhow::Result<DispatchRuntimeSnapshot> {
+        let client = self.client.clone();
+        let state_key = self.state_key(id);
+        let (bucket_enabled, capacity, refill_per_second, min_refill_per_second) =
+            Self::bucket_script_args(bucket_policy);
+
+        run_blocking_state_op(move || -> anyhow::Result<DispatchRuntimeSnapshot> {
+            let mut connection = client.get_connection().context("连接 Redis 调度热态失败")?;
+            let response: Vec<String> = Script::new(REDIS_DISPATCH_RUNTIME_SUCCESS_SCRIPT)
+                .key(&state_key)
+                .arg(now_epoch_ms)
+                .arg(if bucket_enabled { 1 } else { 0 })
+                .arg(capacity)
+                .arg(refill_per_second)
+                .arg(min_refill_per_second)
+                .arg(refill_per_second)
+                .invoke(&mut connection)
+                .with_context(|| format!("清理 Redis 调度 429 惩罚失败: {state_key}"))?;
+            let (_, snapshot) = Self::parse_runtime_response(response)?;
+            Ok(snapshot)
+        })
+    }
+
     fn clear_cooldowns(&self, ids: &[u64]) -> anyhow::Result<()> {
         if ids.is_empty() {
             return Ok(());
@@ -3069,6 +3121,7 @@ mod tests {
             queue_max_size: 16,
             queue_max_wait_ms: 2000,
             rate_limit_cooldown_ms: 5000,
+            rate_limit_cooldown_enabled: false,
             model_cooldown_enabled: true,
             default_max_concurrency: Some(4),
             rate_limit_bucket_capacity: 6.0,
@@ -3111,7 +3164,8 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!dispatch.model_cooldown_enabled);
+        assert!(!dispatch.rate_limit_cooldown_enabled);
+        assert!(dispatch.model_cooldown_enabled);
         assert!(dispatch.request_weighting.enabled);
     }
 

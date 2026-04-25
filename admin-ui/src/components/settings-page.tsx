@@ -185,6 +185,7 @@ export function SettingsPage() {
   const [queueMaxSizeInput, setQueueMaxSizeInput] = useState('0')
   const [queueMaxWaitMsInput, setQueueMaxWaitMsInput] = useState('0')
   const [rateLimitCooldownMsInput, setRateLimitCooldownMsInput] = useState('2000')
+  const [rateLimitCooldownEnabled, setRateLimitCooldownEnabled] = useState(false)
   const [modelCooldownEnabled, setModelCooldownEnabled] = useState(false)
   const [defaultMaxConcurrencyInput, setDefaultMaxConcurrencyInput] = useState('')
   const [rateLimitBucketCapacityInput, setRateLimitBucketCapacityInput] = useState('6')
@@ -204,7 +205,8 @@ export function SettingsPage() {
     setQueueMaxSizeInput(String(loadBalancingData.queueMaxSize))
     setQueueMaxWaitMsInput(String(loadBalancingData.queueMaxWaitMs))
     setRateLimitCooldownMsInput(String(loadBalancingData.rateLimitCooldownMs))
-    setModelCooldownEnabled(loadBalancingData.modelCooldownEnabled ?? false)
+    setRateLimitCooldownEnabled(loadBalancingData.rateLimitCooldownEnabled ?? false)
+    setModelCooldownEnabled(loadBalancingData.modelCooldownEnabled ?? true)
     setDefaultMaxConcurrencyInput(loadBalancingData.defaultMaxConcurrency ? String(loadBalancingData.defaultMaxConcurrency) : '')
     setRateLimitBucketCapacityInput(String(loadBalancingData.rateLimitBucketCapacity))
     setRateLimitRefillPerSecondInput(String(loadBalancingData.rateLimitRefillPerSecond))
@@ -328,6 +330,7 @@ export function SettingsPage() {
         queueMaxSize: parsedQueueMaxSize,
         queueMaxWaitMs: parsedQueueMaxWaitMs,
         rateLimitCooldownMs: parsedRateLimitCooldownMs,
+        rateLimitCooldownEnabled,
         modelCooldownEnabled,
         defaultMaxConcurrency: parsedDefaultMaxConcurrency,
         rateLimitBucketCapacity: parsedRateLimitBucketCapacity,
@@ -442,6 +445,30 @@ export function SettingsPage() {
                 />
               </div>
 
+              <div className="flex flex-col gap-3 rounded-lg border bg-background/70 p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="space-y-1">
+                    <div className="text-sm font-medium">429 冷却与退避</div>
+                    <p className="text-sm text-muted-foreground">
+                      控制上游 429 后是否写入账号级冷却，并同步下调 token bucket 的当前回填速率。
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <Badge variant={rateLimitCooldownEnabled ? 'secondary' : 'outline'}>
+                      {rateLimitCooldownEnabled ? '已启用' : '已关闭'}
+                    </Badge>
+                    <Switch
+                      checked={rateLimitCooldownEnabled}
+                      onCheckedChange={setRateLimitCooldownEnabled}
+                      aria-label="切换 429 冷却与退避"
+                    />
+                  </div>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  默认关闭。关闭后遇到 429 只保留请求级重试，不再写入本地冷却，也不会继续压低 bucket 回填速率。
+                </p>
+              </div>
+
               <div className="space-y-2">
                 <label className="text-sm font-medium" htmlFor="defaultMaxConcurrency">
                   默认账号并发上限
@@ -477,7 +504,7 @@ export function SettingsPage() {
                   </div>
                 </div>
                 <p className="text-xs text-muted-foreground">
-                  默认关闭。关闭后不再新增模型临时限制，已有运行时模型限制也会被清空。
+                  默认开启。关闭后不再新增模型临时限制，已有运行时模型限制也会被清空。
                 </p>
               </div>
             </div>

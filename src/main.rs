@@ -913,6 +913,7 @@ mod tests {
             queue_max_size: 16,
             queue_max_wait_ms: 1500,
             rate_limit_cooldown_ms: 5000,
+            rate_limit_cooldown_enabled: false,
             model_cooldown_enabled: true,
             default_max_concurrency: Some(3),
             rate_limit_bucket_capacity: 5.0,

@@ -184,6 +184,7 @@ export interface LoadBalancingConfigResponse {
   queueMaxSize: number
   queueMaxWaitMs: number
   rateLimitCooldownMs: number
+  rateLimitCooldownEnabled: boolean
   modelCooldownEnabled: boolean
   defaultMaxConcurrency: number | null
   rateLimitBucketCapacity: number
@@ -200,6 +201,7 @@ export interface UpdateLoadBalancingConfigRequest {
   queueMaxSize?: number
   queueMaxWaitMs?: number
   rateLimitCooldownMs?: number
+  rateLimitCooldownEnabled?: boolean
   modelCooldownEnabled?: boolean
   defaultMaxConcurrency?: number
   rateLimitBucketCapacity?: number

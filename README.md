@@ -37,7 +37,8 @@
 - **多凭据支持**: 支持配置多个凭据，按优先级自动故障转移
 - **负载均衡**: 支持 `priority`（按优先级）和 `balanced`（按实时并发 + 成功次数均衡）两种模式
 - **等待队列**: 支持在账号瞬时打满时按 `queueMaxSize` / `queueMaxWaitMs` 做有界等待
-- **429 冷却**: 单账号触发上游 `429` 后会按 `rateLimitCooldownMs` 做固定短冷却，避免重试继续打到同一账号
+- **429 冷却开关**: `rateLimitCooldownEnabled` 控制是否在上游 `429` 后施加本地账号冷却与退避，默认关闭
+- **429 冷却**: 当 `rateLimitCooldownEnabled=true` 时，单账号触发上游 `429` 后会按 `rateLimitCooldownMs` 做固定短冷却，避免重试继续打到同一账号
 - **Token Bucket 限速**: 支持为每个账号设置 token bucket；配置 Redis 共享运行态后可在多副本间共享限速状态
 - **429 自适应回填调节**: 遭遇 `429` 时会清空该账号 bucket 并下调回填速率，成功后再逐步恢复
 - **智能重试**: 单凭据最多重试 3 次，单请求最多重试 9 次
@@ -211,8 +212,9 @@ GitHub Actions 镜像构建：
 | `accountTypeDispatchPolicies` | object | - | 账号类型默认调度策略；可按 `power` / `pro-plus` 等类型统一覆盖 `maxConcurrency`、`rateLimitBucketCapacity`、`rateLimitRefillPerSecond` |
 | `queueMaxSize` | number | `0` | 等待队列最大长度；`0` 表示禁用等待队列 |
 | `queueMaxWaitMs` | number | `0` | 单请求最大排队等待时间（毫秒）；`0` 表示禁用等待队列 |
-| `rateLimitCooldownMs` | number | `2000` | 单账号触发上游 `429` 后的冷却时间（毫秒）；`0` 表示禁用 429 冷却 |
-| `modelCooldownEnabled` | boolean | `false` | 是否启用“模型不支持”后的运行时模型冷却；关闭后不再记录 `INVALID_MODEL_ID` 触发的账号级临时模型限制 |
+| `rateLimitCooldownMs` | number | `2000` | 单账号触发上游 `429` 后的冷却时间（毫秒）；仅在 `rateLimitCooldownEnabled=true` 时生效 |
+| `rateLimitCooldownEnabled` | boolean | `false` | 是否启用上游 `429` 后的本地冷却与 bucket 退避；关闭后只保留请求级重试 |
+| `modelCooldownEnabled` | boolean | `true` | 是否启用“模型不支持”后的运行时模型冷却；关闭后不再记录 `INVALID_MODEL_ID` 触发的账号级临时模型限制 |
 | `rateLimitBucketCapacity` | number | `6.0` | 单账号 token bucket 容量；默认允许连续承接两次以上重请求，`<= 0` 表示禁用 token bucket |
 | `rateLimitRefillPerSecond` | number | `2.0` | 单账号 token bucket 基础回填速率（token/s）；默认与轻/重请求加权联动调优，`<= 0` 表示禁用 token bucket |
 | `rateLimitRefillMinPerSecond` | number | `1.0` | 遭遇 `429` 后允许降到的最小回填速率（token/s） |
@@ -260,7 +262,8 @@ GitHub Actions 镜像构建：
    "queueMaxSize": 16,
    "queueMaxWaitMs": 5000,
    "rateLimitCooldownMs": 2000,
-   "modelCooldownEnabled": false,
+   "rateLimitCooldownEnabled": false,
+   "modelCooldownEnabled": true,
    "rateLimitBucketCapacity": 6.0,
    "rateLimitRefillPerSecond": 2.0,
    "rateLimitRefillMinPerSecond": 1.0,
@@ -464,8 +467,9 @@ kiro-rs \
 - `accountTypeDispatchPolicies` 可把同类账号的实测承载能力固化成统一调度策略；当前 `power` 预设建议 `maxConcurrency=32` 且关闭本地 bucket 覆盖
 - `maxConcurrency` 可限制单账号最大并发，请求达到上限后会自动切到其他可用账号
 - `queueMaxSize` / `queueMaxWaitMs` 可为瞬时超并发请求提供短暂排队，减少尖峰时直接失败
-- `rateLimitCooldownMs` 可控制单账号触发上游 `429` 后的固定冷却时长；设为 `0` 可关闭该机制
-- `modelCooldownEnabled` 控制“模型不支持”后的运行时模型冷却；默认关闭，关闭时不会把 `INVALID_MODEL_ID` 记成账号级临时模型限制
+- `rateLimitCooldownEnabled` 控制是否启用上游 `429` 后的本地冷却与 bucket 退避；默认关闭
+- `rateLimitCooldownMs` 可控制单账号触发上游 `429` 后的固定冷却时长；仅在 `rateLimitCooldownEnabled=true` 时生效，设为 `0` 可仅关闭固定冷却
+- `modelCooldownEnabled` 控制“模型不支持”后的运行时模型冷却；默认开启，关闭时不会把 `INVALID_MODEL_ID` 记成账号级临时模型限制
 - `rateLimitBucketCapacity` / `rateLimitRefillPerSecond` 可限制单账号单位时间内的发放速率，适合给“真实承载能力偏弱”的账号单独降速
 - `requestWeighting` 默认开启，但默认曲线已经压平；重代码/重 thinking 请求会比轻请求多消耗一些 bucket 配额，同时默认 bucket 与 429 退避参数已同步调优
 - 遭遇 `429` 时，本地会清空该账号 bucket，并按 `rateLimitRefillBackoffFactor` 下调当前回填速率；成功请求后再按 `rateLimitRefillRecoveryStepPerSuccess` 逐步恢复
