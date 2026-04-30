@@ -593,7 +593,7 @@ impl KiroProvider {
     /// 支持多凭据故障转移：
     /// - 400 Bad Request: 直接返回错误，不计入凭据失败
     /// - 401/403: 视为凭据/权限问题，计入失败次数并允许故障转移
-    /// - 402 MONTHLY_REQUEST_COUNT: 视为额度用尽，禁用凭据并切换
+    /// - 402 quota exhausted: 视为额度用尽，禁用凭据并切换
     /// - 429/5xx/网络等瞬态错误: 重试但不禁用或切换凭据（避免误把所有凭据锁死）
     ///
     /// # Arguments
@@ -619,7 +619,7 @@ impl KiroProvider {
     /// 支持多凭据故障转移：
     /// - 400 Bad Request: 直接返回错误，不计入凭据失败
     /// - 401/403: 视为凭据/权限问题，计入失败次数并允许故障转移
-    /// - 402 MONTHLY_REQUEST_COUNT: 视为额度用尽，禁用凭据并切换
+    /// - 402 quota exhausted: 视为额度用尽，禁用凭据并切换
     /// - 429/5xx/网络等瞬态错误: 重试但不禁用或切换凭据（避免误把所有凭据锁死）
     ///
     /// # Arguments
@@ -748,7 +748,7 @@ impl KiroProvider {
             let error_summary = Self::summarize_error_body(status, &body);
 
             // 402 额度用尽
-            if status.as_u16() == 402 && Self::is_monthly_request_limit(&body) {
+            if status.as_u16() == 402 && Self::is_quota_exhausted(&body) {
                 let has_available = self
                     .token_manager
                     .report_quota_exhausted_with_error(ctx_id, Some(&error_summary));
@@ -1132,7 +1132,7 @@ impl KiroProvider {
             let error_summary = Self::summarize_error_body(status, &body);
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
-            if status.as_u16() == 402 && Self::is_monthly_request_limit(&body) {
+            if status.as_u16() == 402 && Self::is_quota_exhausted(&body) {
                 tracing::warn!(
                     request_id = %request_id,
                     api_type,
@@ -1502,8 +1502,14 @@ impl KiroProvider {
         model.is_some() && Self::is_invalid_model_id(body)
     }
 
-    fn is_monthly_request_limit(body: &str) -> bool {
-        if body.contains("MONTHLY_REQUEST_COUNT") {
+    fn is_quota_exhausted(body: &str) -> bool {
+        const QUOTA_EXHAUSTED_REASONS: &[&str] =
+            &["MONTHLY_REQUEST_COUNT", "OVERAGE_REQUEST_LIMIT_EXCEEDED"];
+
+        if QUOTA_EXHAUSTED_REASONS
+            .iter()
+            .any(|reason| body.contains(reason))
+        {
             return true;
         }
 
@@ -1514,7 +1520,7 @@ impl KiroProvider {
         if value
             .get("reason")
             .and_then(|v| v.as_str())
-            .is_some_and(|v| v == "MONTHLY_REQUEST_COUNT")
+            .is_some_and(|v| QUOTA_EXHAUSTED_REASONS.contains(&v))
         {
             return true;
         }
@@ -1522,7 +1528,7 @@ impl KiroProvider {
         value
             .pointer("/error/reason")
             .and_then(|v| v.as_str())
-            .is_some_and(|v| v == "MONTHLY_REQUEST_COUNT")
+            .is_some_and(|v| QUOTA_EXHAUSTED_REASONS.contains(&v))
     }
 
     /// 检查响应体是否包含 bearer token 失效的特征消息
@@ -1562,21 +1568,33 @@ mod tests {
     }
 
     #[test]
-    fn test_is_monthly_request_limit_detects_reason() {
+    fn test_is_quota_exhausted_detects_monthly_reason() {
         let body = r#"{"message":"You have reached the limit.","reason":"MONTHLY_REQUEST_COUNT"}"#;
-        assert!(KiroProvider::is_monthly_request_limit(body));
+        assert!(KiroProvider::is_quota_exhausted(body));
     }
 
     #[test]
-    fn test_is_monthly_request_limit_nested_reason() {
+    fn test_is_quota_exhausted_detects_nested_monthly_reason() {
         let body = r#"{"error":{"reason":"MONTHLY_REQUEST_COUNT"}}"#;
-        assert!(KiroProvider::is_monthly_request_limit(body));
+        assert!(KiroProvider::is_quota_exhausted(body));
     }
 
     #[test]
-    fn test_is_monthly_request_limit_false() {
+    fn test_is_quota_exhausted_detects_overage_reason() {
+        let body = r#"{"message":"You have reached the limit for overages.","reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}"#;
+        assert!(KiroProvider::is_quota_exhausted(body));
+    }
+
+    #[test]
+    fn test_is_quota_exhausted_detects_nested_overage_reason() {
+        let body = r#"{"error":{"reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}}"#;
+        assert!(KiroProvider::is_quota_exhausted(body));
+    }
+
+    #[test]
+    fn test_is_quota_exhausted_false() {
         let body = r#"{"message":"nope","reason":"DAILY_REQUEST_COUNT"}"#;
-        assert!(!KiroProvider::is_monthly_request_limit(body));
+        assert!(!KiroProvider::is_quota_exhausted(body));
     }
 
     #[test]

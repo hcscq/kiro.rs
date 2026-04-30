@@ -3816,7 +3816,7 @@ impl MultiTokenManager {
 
     /// 报告指定凭据额度已用尽
     ///
-    /// 用于处理 402 Payment Required 且 reason 为 `MONTHLY_REQUEST_COUNT` 的场景：
+    /// 用于处理 402 Payment Required 且 reason 表示额度已用尽的场景：
     /// - 立即禁用该凭据（不等待连续失败阈值）
     /// - 切换到下一个可用凭据继续重试
     /// - 返回是否还有可用凭据
@@ -3855,7 +3855,7 @@ impl MultiTokenManager {
             entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
             persisted_disabled_at = disabled_at;
 
-            tracing::error!("凭据 #{} 额度已用尽（MONTHLY_REQUEST_COUNT），已被禁用", id);
+            tracing::error!("凭据 #{} 额度已用尽，已被禁用", id);
 
             // 切换到优先级最高的可用凭据
             if let Some(next) = entries
