@@ -20,7 +20,8 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::{
-    CallLease, MultiTokenManager, RuntimeRefreshLeaderRequiredError, RuntimeRefreshLeaseBusyError,
+    CallLease, DisabledReason, MultiTokenManager, RuntimeRefreshLeaderRequiredError,
+    RuntimeRefreshLeaseBusyError,
 };
 use crate::model::config::{RequestWeightingConfig, TlsBackend};
 use parking_lot::Mutex;
@@ -748,7 +749,9 @@ impl KiroProvider {
 
             // 402 额度用尽
             if status.as_u16() == 402 && Self::is_monthly_request_limit(&body) {
-                let has_available = self.token_manager.report_quota_exhausted(ctx_id);
+                let has_available = self
+                    .token_manager
+                    .report_quota_exhausted_with_error(ctx_id, Some(&error_summary));
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {}", error_summary);
                 }
@@ -807,7 +810,7 @@ impl KiroProvider {
                                 continue;
                             }
                             tracing::warn!(
-                                "凭据 #{} token 强制刷新失败，计入失败: {}",
+                                "凭据 #{} token 强制刷新失败，将停调该凭据: {}",
                                 ctx_id,
                                 err
                             );
@@ -815,7 +818,13 @@ impl KiroProvider {
                     }
                 }
 
-                let has_available = self.token_manager.report_failure(ctx_id);
+                let disabled_reason = Self::disabled_reason_for_auth_status(status, &body);
+                let has_available = self.token_manager.report_auth_or_permission_failure(
+                    ctx_id,
+                    disabled_reason,
+                    status.as_u16(),
+                    &error_summary,
+                );
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {}", error_summary);
                 }
@@ -1140,7 +1149,9 @@ impl KiroProvider {
                     "API 请求失败（额度已用尽，禁用凭据并切换）"
                 );
 
-                let has_available = self.token_manager.report_quota_exhausted(ctx_id);
+                let has_available = self
+                    .token_manager
+                    .report_quota_exhausted_with_error(ctx_id, Some(&error_summary));
                 if !has_available {
                     anyhow::bail!(
                         "{} API 请求失败（所有凭据已用尽）: {}",
@@ -1214,7 +1225,7 @@ impl KiroProvider {
                 )));
             }
 
-            // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
+            // 401/403 - 更可能是凭据/权限问题：停调该凭据并故障转移
             if matches!(status.as_u16(), 401 | 403) {
                 tracing::warn!(
                     request_id = %request_id,
@@ -1276,7 +1287,7 @@ impl KiroProvider {
                                 continue;
                             }
                             tracing::warn!(
-                                "凭据 #{} token 强制刷新失败，计入失败: {}",
+                                "凭据 #{} token 强制刷新失败，将停调该凭据: {}",
                                 ctx_id,
                                 err
                             );
@@ -1284,7 +1295,13 @@ impl KiroProvider {
                     }
                 }
 
-                let has_available = self.token_manager.report_failure(ctx_id);
+                let disabled_reason = Self::disabled_reason_for_auth_status(status, &body);
+                let has_available = self.token_manager.report_auth_or_permission_failure(
+                    ctx_id,
+                    disabled_reason,
+                    status.as_u16(),
+                    &error_summary,
+                );
                 if !has_available {
                     anyhow::bail!(
                         "{} API 请求失败（所有凭据已用尽）: {}",
@@ -1515,6 +1532,23 @@ impl KiroProvider {
     fn is_bearer_token_invalid(body: &str) -> bool {
         body.contains("The bearer token included in the request is invalid")
     }
+
+    fn is_account_suspended(body: &str) -> bool {
+        let lower = body.to_ascii_lowercase();
+        lower.contains("temporarily is suspended")
+            || lower.contains("locked your account as a security precaution")
+            || lower.contains("account is suspended")
+    }
+
+    fn disabled_reason_for_auth_status(status: reqwest::StatusCode, body: &str) -> DisabledReason {
+        if status.as_u16() == 403 && Self::is_account_suspended(body) {
+            DisabledReason::AccountSuspended
+        } else if Self::is_bearer_token_invalid(body) || status.as_u16() == 401 {
+            DisabledReason::AuthInvalid
+        } else {
+            DisabledReason::PermissionDenied
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1543,6 +1577,24 @@ mod tests {
     fn test_is_monthly_request_limit_false() {
         let body = r#"{"message":"nope","reason":"DAILY_REQUEST_COUNT"}"#;
         assert!(!KiroProvider::is_monthly_request_limit(body));
+    }
+
+    #[test]
+    fn test_disabled_reason_for_suspended_403() {
+        let body = r#"{"message":"Your User ID temporarily is suspended. We've locked your account as a security precaution."}"#;
+        assert_eq!(
+            KiroProvider::disabled_reason_for_auth_status(reqwest::StatusCode::FORBIDDEN, body),
+            DisabledReason::AccountSuspended
+        );
+    }
+
+    #[test]
+    fn test_disabled_reason_for_invalid_bearer_token() {
+        let body = "The bearer token included in the request is invalid";
+        assert_eq!(
+            KiroProvider::disabled_reason_for_auth_status(reqwest::StatusCode::FORBIDDEN, body),
+            DisabledReason::AuthInvalid
+        );
     }
 
     #[test]

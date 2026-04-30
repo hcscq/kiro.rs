@@ -115,6 +115,9 @@ impl AdminService {
                     proxy_url: entry.proxy_url,
                     refresh_failure_count: entry.refresh_failure_count,
                     disabled_reason: entry.disabled_reason,
+                    disabled_at: entry.disabled_at,
+                    last_error_status: entry.last_error_status,
+                    last_error_summary: entry.last_error_summary,
                     cooldown_remaining_ms: entry.cooldown_remaining_ms,
                     rate_limit_bucket_tokens: entry.rate_limit_bucket_tokens,
                     rate_limit_bucket_capacity: entry.rate_limit_bucket_capacity,
@@ -327,6 +330,10 @@ impl AdminService {
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
             disabled: false, // 新添加的凭据默认启用
+            disabled_reason: None,
+            disabled_at: None,
+            last_error_status: None,
+            last_error_summary: None,
         };
 
         // 调用 token_manager 添加凭据

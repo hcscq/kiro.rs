@@ -38,6 +38,9 @@ export interface CredentialStatusItem {
   proxyUrl?: string
   refreshFailureCount: number
   disabledReason?: string
+  disabledAt?: string | null
+  lastErrorStatus?: number | null
+  lastErrorSummary?: string | null
   cooldownRemainingMs?: number | null
   rateLimitBucketTokens?: number | null
   rateLimitBucketCapacity?: number | null

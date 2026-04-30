@@ -408,6 +408,9 @@ export function CredentialCard({
     credential.nextReadyInMs > 0
       ? `${(credential.nextReadyInMs / 1000).toFixed(1)}s`
       : null
+  const disabledAtSummary = credential.disabledAt
+    ? formatRestrictionExpiresAt(credential.disabledAt)
+    : null
   const recognizedStandardAccountType = credential.standardAccountType
     ? findStandardAccountTypePreset(credential.standardAccountType, standardAccountTypePresets)
     : null
@@ -712,6 +715,20 @@ export function CredentialCard({
             <div className="text-xs text-muted-foreground">
               代理地址：
               <span className="ml-1 break-all text-foreground">{credential.proxyUrl}</span>
+            </div>
+          )}
+
+          {credential.disabled && (credential.lastErrorSummary || disabledAtSummary) && (
+            <div className="space-y-1 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs">
+              <div className="flex flex-wrap items-center gap-2 text-muted-foreground">
+                {credential.lastErrorStatus && (
+                  <Badge variant="destructive">HTTP {credential.lastErrorStatus}</Badge>
+                )}
+                {disabledAtSummary && <span>停调时间 {disabledAtSummary}</span>}
+              </div>
+              {credential.lastErrorSummary && (
+                <div className="break-words text-foreground">{credential.lastErrorSummary}</div>
+              )}
             </div>
           )}
 

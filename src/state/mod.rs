@@ -633,6 +633,35 @@ impl PersistedCredentials {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct CredentialHealthPatch {
+    pub disabled: Option<bool>,
+    pub disabled_reason: Option<Option<String>>,
+    pub disabled_at: Option<Option<String>>,
+    pub last_error_status: Option<Option<u16>>,
+    pub last_error_summary: Option<Option<String>>,
+}
+
+impl CredentialHealthPatch {
+    fn apply_to(&self, credential: &mut KiroCredentials) {
+        if let Some(disabled) = self.disabled {
+            credential.disabled = disabled;
+        }
+        if let Some(disabled_reason) = &self.disabled_reason {
+            credential.disabled_reason = disabled_reason.clone();
+        }
+        if let Some(disabled_at) = &self.disabled_at {
+            credential.disabled_at = disabled_at.clone();
+        }
+        if let Some(last_error_status) = self.last_error_status {
+            credential.last_error_status = last_error_status;
+        }
+        if let Some(last_error_summary) = &self.last_error_summary {
+            credential.last_error_summary = last_error_summary.clone();
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatsEntryRecord {
     pub success_count: u64,
@@ -923,6 +952,23 @@ trait StateBackend: Send + Sync {
         credentials: &[KiroCredentials],
         is_multiple_format: bool,
     ) -> anyhow::Result<bool>;
+    fn patch_credential_health(
+        &self,
+        id: u64,
+        patch: &CredentialHealthPatch,
+    ) -> anyhow::Result<bool> {
+        let mut persisted = self.load_credentials()?;
+        let Some(credential) = persisted
+            .credentials
+            .iter_mut()
+            .find(|credential| credential.id == Some(id))
+        else {
+            anyhow::bail!("凭据不存在: {}", id);
+        };
+
+        patch.apply_to(credential);
+        self.persist_credentials(&persisted.credentials, persisted.is_multiple_format)
+    }
     fn load_stats(&self) -> anyhow::Result<HashMap<String, StatsEntryRecord>>;
     fn save_stats(&self, stats: &HashMap<String, StatsEntryRecord>) -> anyhow::Result<()>;
     fn merge_stats(
@@ -1052,6 +1098,14 @@ impl StateStore {
     ) -> anyhow::Result<bool> {
         self.primary_backend
             .persist_credentials(credentials, is_multiple_format)
+    }
+
+    pub fn patch_credential_health(
+        &self,
+        id: u64,
+        patch: &CredentialHealthPatch,
+    ) -> anyhow::Result<bool> {
+        self.primary_backend.patch_credential_health(id, patch)
     }
 
     pub fn load_stats(&self) -> anyhow::Result<HashMap<String, StatsEntryRecord>> {
@@ -1731,6 +1785,67 @@ impl StateBackend for PostgresStateBackend {
     ) -> anyhow::Result<bool> {
         self.save_json(POSTGRES_CREDENTIALS_KEY, &credentials, "凭据列表")?;
         Ok(true)
+    }
+
+    fn patch_credential_health(
+        &self,
+        id: u64,
+        patch: &CredentialHealthPatch,
+    ) -> anyhow::Result<bool> {
+        let client = Arc::clone(&self.client);
+        let patch = patch.clone();
+
+        run_blocking_state_op(move || {
+            let mut client = client.lock();
+            let mut transaction = client
+                .transaction()
+                .context("开启 PostgreSQL 凭据健康状态事务失败")?;
+            let row = transaction
+                .query_opt(
+                    "SELECT value FROM kiro_state_store WHERE namespace = $1 AND key = $2 FOR UPDATE",
+                    &[&POSTGRES_NAMESPACE, &POSTGRES_CREDENTIALS_KEY],
+                )
+                .context("锁定 PostgreSQL 凭据列表失败")?;
+
+            let Some(row) = row else {
+                transaction
+                    .commit()
+                    .context("提交空 PostgreSQL 凭据健康状态事务失败")?;
+                anyhow::bail!("凭据不存在: {}", id);
+            };
+
+            let payload: String = row.get(0);
+            let mut credentials: Vec<KiroCredentials> =
+                serde_json::from_str(&payload).context("解析 PostgreSQL 凭据列表失败")?;
+            let Some(credential) = credentials
+                .iter_mut()
+                .find(|credential| credential.id == Some(id))
+            else {
+                transaction
+                    .commit()
+                    .context("提交未命中 PostgreSQL 凭据健康状态事务失败")?;
+                anyhow::bail!("凭据不存在: {}", id);
+            };
+
+            patch.apply_to(credential);
+            let payload =
+                serde_json::to_string(&credentials).context("序列化 PostgreSQL 凭据列表失败")?;
+            transaction
+                .execute(
+                    r#"
+                    UPDATE kiro_state_store
+                    SET value = $3, updated_at = NOW()
+                    WHERE namespace = $1 AND key = $2
+                    "#,
+                    &[&POSTGRES_NAMESPACE, &POSTGRES_CREDENTIALS_KEY, &payload],
+                )
+                .context("更新 PostgreSQL 凭据健康状态失败")?;
+
+            transaction
+                .commit()
+                .context("提交 PostgreSQL 凭据健康状态事务失败")?;
+            Ok(true)
+        })
     }
 
     fn compare_and_swap_refreshed_credential(

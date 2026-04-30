@@ -109,6 +109,15 @@ pub struct CredentialStatusItem {
     /// 禁用原因
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
+    /// 禁用时间
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_at: Option<String>,
+    /// 最近一次异常状态码
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error_status: Option<u16>,
+    /// 最近一次异常摘要
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error_summary: Option<String>,
     /// 429 冷却剩余时间（毫秒）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cooldown_remaining_ms: Option<u64>,

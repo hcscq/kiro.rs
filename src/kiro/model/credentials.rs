@@ -172,6 +172,26 @@ pub struct KiroCredentials {
     /// 凭据是否被禁用（默认为 false）
     #[serde(default)]
     pub disabled: bool,
+
+    /// 凭据禁用原因（运行时自动标记或管理端手动标记）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub disabled_reason: Option<String>,
+
+    /// 凭据被禁用的时间（RFC3339 格式）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub disabled_at: Option<String>,
+
+    /// 最近一次导致异常标记的上游 HTTP 状态码
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub last_error_status: Option<u16>,
+
+    /// 最近一次导致异常标记的上游错误摘要
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub last_error_summary: Option<String>,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -707,6 +727,10 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
+            disabled_at: None,
+            last_error_status: None,
+            last_error_summary: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -971,6 +995,10 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
+            disabled_at: None,
+            last_error_status: None,
+            last_error_summary: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -1009,6 +1037,10 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
+            disabled_at: None,
+            last_error_status: None,
+            last_error_summary: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -1129,6 +1161,10 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
+            disabled_at: None,
+            last_error_status: None,
+            last_error_summary: None,
         };
 
         let json = original.to_pretty_json().unwrap();

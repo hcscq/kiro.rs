@@ -31,10 +31,11 @@ use crate::model::model_policy::{
     normalize_account_type_policies, normalize_model_selector,
 };
 use crate::state::{
-    CredentialCompareAndSwapResult, DispatchLeaseReservationStatus, DispatchRuntimeBucketPolicy,
-    DispatchRuntimeCredential, DispatchRuntimeSnapshot, PersistedDispatchConfig,
-    RuntimeCoordinationStatus, RuntimeRefreshLeaseAcquisition, StateChangeKind,
-    StateChangeRevisions, StateStore, StatsEntryRecord, StatsMergeRecord, current_epoch_ms,
+    CredentialCompareAndSwapResult, CredentialHealthPatch, DispatchLeaseReservationStatus,
+    DispatchRuntimeBucketPolicy, DispatchRuntimeCredential, DispatchRuntimeSnapshot,
+    PersistedDispatchConfig, RuntimeCoordinationStatus, RuntimeRefreshLeaseAcquisition,
+    StateChangeKind, StateChangeRevisions, StateStore, StatsEntryRecord, StatsMergeRecord,
+    current_epoch_ms,
 };
 
 const DEFAULT_REQUEST_WEIGHT: f64 = 1.0;
@@ -507,7 +508,7 @@ struct CredentialEntry {
 
 /// 禁用原因
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DisabledReason {
+pub(crate) enum DisabledReason {
     /// Admin API 手动禁用
     Manual,
     /// 连续失败达到阈值后自动禁用
@@ -518,6 +519,49 @@ enum DisabledReason {
     QuotaExceeded,
     /// Refresh Token 永久失效（服务端返回 invalid_grant）
     InvalidRefreshToken,
+    /// 上游明确提示账号被暂停或锁定
+    AccountSuspended,
+    /// Token 或授权状态无效，刷新后仍不可用
+    AuthInvalid,
+    /// 上游拒绝访问但未给出更细粒度原因
+    PermissionDenied,
+}
+
+impl DisabledReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "Manual",
+            Self::TooManyFailures => "TooManyFailures",
+            Self::TooManyRefreshFailures => "TooManyRefreshFailures",
+            Self::QuotaExceeded => "QuotaExceeded",
+            Self::InvalidRefreshToken => "InvalidRefreshToken",
+            Self::AccountSuspended => "AccountSuspended",
+            Self::AuthInvalid => "AuthInvalid",
+            Self::PermissionDenied => "PermissionDenied",
+        }
+    }
+
+    fn from_persisted(value: &str) -> Option<Self> {
+        match value {
+            "Manual" => Some(Self::Manual),
+            "TooManyFailures" => Some(Self::TooManyFailures),
+            "TooManyRefreshFailures" => Some(Self::TooManyRefreshFailures),
+            "QuotaExceeded" => Some(Self::QuotaExceeded),
+            "InvalidRefreshToken" => Some(Self::InvalidRefreshToken),
+            "AccountSuspended" => Some(Self::AccountSuspended),
+            "AuthInvalid" => Some(Self::AuthInvalid),
+            "PermissionDenied" => Some(Self::PermissionDenied),
+            _ => None,
+        }
+    }
+}
+
+fn persisted_disabled_reason(credentials: &KiroCredentials) -> DisabledReason {
+    credentials
+        .disabled_reason
+        .as_deref()
+        .and_then(DisabledReason::from_persisted)
+        .unwrap_or(DisabledReason::Manual)
 }
 
 /// 统计数据持久化条目
@@ -710,6 +754,15 @@ pub struct CredentialEntrySnapshot {
     /// 禁用原因
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
+    /// 禁用时间
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_at: Option<String>,
+    /// 最近一次异常状态码
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error_status: Option<u16>,
+    /// 最近一次异常摘要
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error_summary: Option<String>,
     /// 429 限流冷却剩余时间（毫秒）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cooldown_remaining_ms: Option<u64>,
@@ -1191,7 +1244,7 @@ impl MultiTokenManager {
                     refresh_failure_count: 0,
                     disabled: cred.disabled, // 从配置文件读取 disabled 状态
                     disabled_reason: if cred.disabled {
-                        Some(DisabledReason::Manual)
+                        Some(persisted_disabled_reason(&cred))
                     } else {
                         None
                     },
@@ -2679,6 +2732,20 @@ impl MultiTokenManager {
                 credential.canonicalize_auth_method();
                 credential.normalize_model_capabilities();
                 credential.disabled = entry.disabled;
+                if entry.disabled {
+                    credential.disabled_reason = entry
+                        .disabled_reason
+                        .map(|reason| reason.as_str().to_string())
+                        .or_else(|| credential.disabled_reason.clone());
+                    if credential.disabled_at.is_none() {
+                        credential.disabled_at = Some(Utc::now().to_rfc3339());
+                    }
+                } else {
+                    credential.disabled_reason = None;
+                    credential.disabled_at = None;
+                    credential.last_error_status = None;
+                    credential.last_error_summary = None;
+                }
                 credential
             })
             .collect()
@@ -2701,6 +2768,73 @@ impl MultiTokenManager {
             self.try_bump_state_change_revision(StateChangeKind::Credentials);
         }
         Ok(persisted)
+    }
+
+    fn error_summary_for_persistence(error_summary: Option<&str>) -> Option<String> {
+        error_summary.map(|summary| {
+            const MAX_PERSISTED_ERROR_SUMMARY_CHARS: usize = 512;
+            const TRUNCATION_SUFFIX: &str = "...";
+            if summary.chars().count() <= MAX_PERSISTED_ERROR_SUMMARY_CHARS {
+                summary.to_string()
+            } else {
+                let mut truncated: String = summary
+                    .chars()
+                    .take(MAX_PERSISTED_ERROR_SUMMARY_CHARS - TRUNCATION_SUFFIX.len())
+                    .collect();
+                truncated.push_str(TRUNCATION_SUFFIX);
+                truncated
+            }
+        })
+    }
+
+    fn apply_disabled_metadata(
+        credential: &mut KiroCredentials,
+        reason: DisabledReason,
+        disabled_at: &str,
+        status_code: Option<u16>,
+        error_summary: Option<&str>,
+    ) {
+        credential.disabled = true;
+        credential.disabled_reason = Some(reason.as_str().to_string());
+        credential.disabled_at = Some(disabled_at.to_string());
+        credential.last_error_status = status_code;
+        credential.last_error_summary = Self::error_summary_for_persistence(error_summary);
+    }
+
+    fn clear_disabled_metadata(credential: &mut KiroCredentials) {
+        credential.disabled = false;
+        credential.disabled_reason = None;
+        credential.disabled_at = None;
+        credential.last_error_status = None;
+        credential.last_error_summary = None;
+    }
+
+    fn persist_disabled_metadata(
+        &self,
+        id: u64,
+        reason: DisabledReason,
+        disabled_at: &str,
+        status_code: Option<u16>,
+        error_summary: Option<&str>,
+    ) {
+        let patch = CredentialHealthPatch {
+            disabled: Some(true),
+            disabled_reason: Some(Some(reason.as_str().to_string())),
+            disabled_at: Some(Some(disabled_at.to_string())),
+            last_error_status: Some(status_code),
+            last_error_summary: Some(Self::error_summary_for_persistence(error_summary)),
+        };
+
+        match self.state_store.patch_credential_health(id, &patch) {
+            Ok(true) => self.try_bump_state_change_revision(StateChangeKind::Credentials),
+            Ok(false) => {}
+            Err(err) => tracing::warn!(
+                credential_id = id,
+                reason = reason.as_str(),
+                "持久化凭据禁用状态失败: {}",
+                err
+            ),
+        }
     }
 
     fn record_state_change_revisions(&self, revisions: StateChangeRevisions) {
@@ -3055,9 +3189,7 @@ impl MultiTokenManager {
                 entry.disabled = persisted.disabled;
 
                 if persisted.disabled {
-                    if entry.disabled_reason.is_none() {
-                        entry.disabled_reason = Some(DisabledReason::Manual);
-                    }
+                    entry.disabled_reason = Some(persisted_disabled_reason(&persisted));
                 } else {
                     entry.disabled_reason = None;
                     if was_disabled {
@@ -3076,7 +3208,9 @@ impl MultiTokenManager {
                 entries.push(CredentialEntry {
                     id: credential.id.expect("persisted credential id must exist"),
                     disabled: credential.disabled,
-                    disabled_reason: credential.disabled.then_some(DisabledReason::Manual),
+                    disabled_reason: credential
+                        .disabled
+                        .then(|| persisted_disabled_reason(&credential)),
                     credentials: credential.clone(),
                     failure_count: 0,
                     refresh_failure_count: 0,
@@ -3687,6 +3821,11 @@ impl MultiTokenManager {
     /// - 切换到下一个可用凭据继续重试
     /// - 返回是否还有可用凭据
     pub fn report_quota_exhausted(&self, id: u64) -> bool {
+        self.report_quota_exhausted_with_error(id, None)
+    }
+
+    pub fn report_quota_exhausted_with_error(&self, id: u64, error_summary: Option<&str>) -> bool {
+        let persisted_disabled_at: String;
         let result = {
             let _state_write_guard = self.state_write_lock.lock();
             let mut entries = self.entries.lock();
@@ -3701,11 +3840,20 @@ impl MultiTokenManager {
                 return entries.iter().any(|e| !e.disabled);
             }
 
+            let disabled_at = Utc::now().to_rfc3339();
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
+            Self::apply_disabled_metadata(
+                &mut entry.credentials,
+                DisabledReason::QuotaExceeded,
+                &disabled_at,
+                Some(402),
+                error_summary,
+            );
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             // 设为阈值，便于在管理面板中直观看到该凭据已不可用
             entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
+            persisted_disabled_at = disabled_at;
 
             tracing::error!("凭据 #{} 额度已用尽（MONTHLY_REQUEST_COUNT），已被禁用", id);
 
@@ -3727,15 +3875,96 @@ impl MultiTokenManager {
                 false
             }
         };
+        self.persist_disabled_metadata(
+            id,
+            DisabledReason::QuotaExceeded,
+            &persisted_disabled_at,
+            Some(402),
+            error_summary,
+        );
+        self.save_stats_debounced();
+        result
+    }
+
+    /// 报告 401/403 这类明确的认证或账号权限异常。
+    ///
+    /// 这类错误在 token 强制刷新仍不可恢复后继续调度只会消耗重试次数，
+    /// 因此立即停调并把原因持久化到共享凭据状态。
+    pub(crate) fn report_auth_or_permission_failure(
+        &self,
+        id: u64,
+        reason: DisabledReason,
+        status_code: u16,
+        error_summary: &str,
+    ) -> bool {
+        let disabled_at = Utc::now().to_rfc3339();
+        let result = {
+            let _state_write_guard = self.state_write_lock.lock();
+            let mut entries = self.entries.lock();
+            let mut current_id = self.current_id.lock();
+
+            let entry = match entries.iter_mut().find(|e| e.id == id) {
+                Some(e) => e,
+                None => return entries.iter().any(|e| !e.disabled),
+            };
+
+            if entry.disabled {
+                return entries.iter().any(|e| !e.disabled);
+            }
+
+            entry.disabled = true;
+            entry.disabled_reason = Some(reason);
+            entry.last_used_at = Some(Utc::now().to_rfc3339());
+            entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
+            Self::apply_disabled_metadata(
+                &mut entry.credentials,
+                reason,
+                &disabled_at,
+                Some(status_code),
+                Some(error_summary),
+            );
+
+            tracing::error!(
+                "凭据 #{} 因上游 {} 异常已被停调: {}",
+                id,
+                status_code,
+                error_summary
+            );
+
+            if let Some(next) = entries
+                .iter()
+                .filter(|e| !e.disabled)
+                .min_by_key(|e| e.credentials.priority)
+            {
+                *current_id = next.id;
+                tracing::info!(
+                    "已切换到凭据 #{}（优先级 {}）",
+                    next.id,
+                    next.credentials.priority
+                );
+                true
+            } else {
+                tracing::error!("所有凭据均已禁用！");
+                false
+            }
+        };
+
+        self.persist_disabled_metadata(
+            id,
+            reason,
+            &disabled_at,
+            Some(status_code),
+            Some(error_summary),
+        );
         self.save_stats_debounced();
         result
     }
 
     /// 报告指定凭据刷新 Token 失败。
     ///
-    /// 连续刷新失败达到阈值后禁用凭据并切换，阈值内保持当前凭据不切换，
-    /// 与 API 401/403 的累计失败策略保持一致。
+    /// 连续刷新失败达到阈值后禁用凭据并切换，阈值内保持当前凭据不切换。
     pub fn report_refresh_failure(&self, id: u64) -> bool {
+        let persisted_disable: (DisabledReason, String);
         let result = {
             let _state_write_guard = self.state_write_lock.lock();
             let mut entries = self.entries.lock();
@@ -3765,8 +3994,18 @@ impl MultiTokenManager {
                 return entries.iter().any(|e| !e.disabled);
             }
 
+            let disabled_at = Utc::now().to_rfc3339();
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::TooManyRefreshFailures);
+            entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
+            Self::apply_disabled_metadata(
+                &mut entry.credentials,
+                DisabledReason::TooManyRefreshFailures,
+                &disabled_at,
+                None,
+                None,
+            );
+            persisted_disable = (DisabledReason::TooManyRefreshFailures, disabled_at);
 
             tracing::error!(
                 "凭据 #{} Token 已连续刷新失败 {} 次，已被禁用",
@@ -3791,6 +4030,8 @@ impl MultiTokenManager {
                 false
             }
         };
+        let (reason, disabled_at) = persisted_disable;
+        self.persist_disabled_metadata(id, reason, &disabled_at, None, None);
         self.save_stats_debounced();
         result
     }
@@ -3800,6 +4041,7 @@ impl MultiTokenManager {
     /// 立即禁用凭据，不累计、不重试。
     /// 返回是否还有可用凭据。
     pub fn report_refresh_token_invalid(&self, id: u64) -> bool {
+        let persisted_disable: (DisabledReason, String);
         let result = {
             let _state_write_guard = self.state_write_lock.lock();
             let mut entries = self.entries.lock();
@@ -3815,8 +4057,19 @@ impl MultiTokenManager {
             }
 
             entry.last_used_at = Some(Utc::now().to_rfc3339());
+            let disabled_at = Utc::now().to_rfc3339();
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::InvalidRefreshToken);
+            entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
+            entry.refresh_failure_count = MAX_FAILURES_PER_CREDENTIAL;
+            Self::apply_disabled_metadata(
+                &mut entry.credentials,
+                DisabledReason::InvalidRefreshToken,
+                &disabled_at,
+                None,
+                Some("refreshToken invalid_grant"),
+            );
+            persisted_disable = (DisabledReason::InvalidRefreshToken, disabled_at);
 
             tracing::error!(
                 "凭据 #{} refreshToken 已失效 (invalid_grant)，已立即禁用",
@@ -3840,6 +4093,14 @@ impl MultiTokenManager {
                 false
             }
         };
+        let (reason, disabled_at) = persisted_disable;
+        self.persist_disabled_metadata(
+            id,
+            reason,
+            &disabled_at,
+            None,
+            Some("refreshToken invalid_grant"),
+        );
         self.save_stats_debounced();
         result
     }
@@ -3998,16 +4259,10 @@ impl MultiTokenManager {
                         has_proxy: e.credentials.proxy_url.is_some(),
                         proxy_url: e.credentials.proxy_url.clone(),
                         refresh_failure_count: e.refresh_failure_count,
-                        disabled_reason: e.disabled_reason.map(|r| {
-                            match r {
-                                DisabledReason::Manual => "Manual",
-                                DisabledReason::TooManyFailures => "TooManyFailures",
-                                DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
-                                DisabledReason::QuotaExceeded => "QuotaExceeded",
-                                DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
-                            }
-                            .to_string()
-                        }),
+                        disabled_reason: e.disabled_reason.map(|r| r.as_str().to_string()),
+                        disabled_at: e.credentials.disabled_at.clone(),
+                        last_error_status: e.credentials.last_error_status,
+                        last_error_summary: e.credentials.last_error_summary.clone(),
                         cooldown_remaining_ms,
                         rate_limit_bucket_tokens: shared_runtime
                             .as_ref()
@@ -4071,7 +4326,18 @@ impl MultiTokenManager {
         let _state_write_guard = self.state_write_lock.lock();
 
         let mut persisted = self.persisted_credentials_snapshot();
-        Self::persisted_credential_mut(&mut persisted, id)?.disabled = disabled;
+        let persisted_credential = Self::persisted_credential_mut(&mut persisted, id)?;
+        if disabled {
+            Self::apply_disabled_metadata(
+                persisted_credential,
+                DisabledReason::Manual,
+                &Utc::now().to_rfc3339(),
+                None,
+                None,
+            );
+        } else {
+            Self::clear_disabled_metadata(persisted_credential);
+        }
         self.persist_credentials_snapshot(&persisted)?;
 
         {
@@ -4086,9 +4352,17 @@ impl MultiTokenManager {
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
                 entry.disabled_reason = None;
+                Self::clear_disabled_metadata(&mut entry.credentials);
                 Self::reset_rate_limit_runtime(entry, &dispatch, now);
             } else {
                 entry.disabled_reason = Some(DisabledReason::Manual);
+                Self::apply_disabled_metadata(
+                    &mut entry.credentials,
+                    DisabledReason::Manual,
+                    &Utc::now().to_rfc3339(),
+                    None,
+                    None,
+                );
             }
         }
         if !disabled {
@@ -4253,7 +4527,7 @@ impl MultiTokenManager {
         let now = Instant::now();
         let _state_write_guard = self.state_write_lock.lock();
         let mut persisted = self.persisted_credentials_snapshot();
-        Self::persisted_credential_mut(&mut persisted, id)?.disabled = false;
+        Self::clear_disabled_metadata(Self::persisted_credential_mut(&mut persisted, id)?);
         self.persist_credentials_snapshot(&persisted)?;
 
         {
@@ -4266,6 +4540,7 @@ impl MultiTokenManager {
             entry.refresh_failure_count = 0;
             entry.disabled = false;
             entry.disabled_reason = None;
+            Self::clear_disabled_metadata(&mut entry.credentials);
             Self::reset_rate_limit_runtime(entry, &dispatch, now);
         }
         if self.shared_dispatch_runtime_enabled() {
@@ -4400,7 +4675,7 @@ impl MultiTokenManager {
         validated_cred.proxy_url = new_cred.proxy_url;
         validated_cred.proxy_username = new_cred.proxy_username;
         validated_cred.proxy_password = new_cred.proxy_password;
-        validated_cred.disabled = false;
+        Self::clear_disabled_metadata(&mut validated_cred);
         validated_cred.normalize_model_capabilities();
 
         persisted.push(validated_cred.clone());
@@ -4847,6 +5122,7 @@ impl Drop for MultiTokenManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kiro::model::credentials::CredentialsConfig;
     use std::path::{Path, PathBuf};
 
     fn temp_credentials_path(test_name: &str) -> PathBuf {
@@ -6562,6 +6838,80 @@ mod tests {
         // 再禁用第二个后，无可用凭据
         assert!(!manager.report_quota_exhausted(2));
         assert_eq!(manager.available_count(), 0);
+    }
+
+    #[test]
+    fn test_report_quota_exhausted_persists_disabled_metadata() {
+        let credentials_path = temp_credentials_path("quota-disabled-metadata");
+        let mut cred = available_credential(0);
+        cred.id = Some(1);
+        cred.machine_id = Some("machine-1".to_string());
+        write_credentials_file(&credentials_path, &[cred.clone()]);
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred],
+            None,
+            Some(credentials_path.clone()),
+            true,
+        )
+        .unwrap();
+
+        let error_summary =
+            "status=402 reason=MONTHLY_REQUEST_COUNT message=\"You have reached the limit.\"";
+        assert!(!manager.report_quota_exhausted_with_error(1, Some(error_summary)));
+
+        let reloaded = CredentialsConfig::load(&credentials_path)
+            .unwrap()
+            .into_sorted_credentials();
+        let persisted = reloaded.first().unwrap();
+        assert!(persisted.disabled);
+        assert_eq!(
+            persisted.disabled_reason.as_deref(),
+            Some(DisabledReason::QuotaExceeded.as_str())
+        );
+        assert_eq!(persisted.last_error_status, Some(402));
+        assert_eq!(persisted.last_error_summary.as_deref(), Some(error_summary));
+        assert!(persisted.disabled_at.is_some());
+    }
+
+    #[test]
+    fn test_report_auth_failure_persists_disabled_metadata() {
+        let credentials_path = temp_credentials_path("auth-disabled-metadata");
+        let mut cred = available_credential(0);
+        cred.id = Some(1);
+        cred.machine_id = Some("machine-1".to_string());
+        write_credentials_file(&credentials_path, &[cred.clone()]);
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred],
+            None,
+            Some(credentials_path.clone()),
+            true,
+        )
+        .unwrap();
+
+        let error_summary = "status=403 message=\"Your User ID temporarily is suspended.\"";
+        assert!(!manager.report_auth_or_permission_failure(
+            1,
+            DisabledReason::AccountSuspended,
+            403,
+            error_summary
+        ));
+
+        let reloaded = CredentialsConfig::load(&credentials_path)
+            .unwrap()
+            .into_sorted_credentials();
+        let persisted = reloaded.first().unwrap();
+        assert!(persisted.disabled);
+        assert_eq!(
+            persisted.disabled_reason.as_deref(),
+            Some(DisabledReason::AccountSuspended.as_str())
+        );
+        assert_eq!(persisted.last_error_status, Some(403));
+        assert_eq!(persisted.last_error_summary.as_deref(), Some(error_summary));
+        assert!(persisted.disabled_at.is_some());
     }
 
     #[tokio::test]
