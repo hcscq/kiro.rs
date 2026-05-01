@@ -22,6 +22,7 @@ import {
   useModelCatalog,
 } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
+import { getCredentialLabel, getCredentialLabelWithId } from '@/lib/credential-label'
 import { cn, extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse, CredentialStatusItem } from '@/types/api'
 
@@ -162,6 +163,18 @@ export function Dashboard() {
   const { data: modelCapabilitiesData } = useModelCapabilitiesConfig()
   const { data: modelCatalogData } = useModelCatalog()
   const credentials = data?.credentials || []
+  const currentCredential = credentials.find(credential => credential.id === data?.currentId)
+  const selectedCredential = selectedCredentialId === null
+    ? null
+    : credentials.find(credential => credential.id === selectedCredentialId) ?? null
+  const currentCredentialLabel = currentCredential
+    ? getCredentialLabel(currentCredential)
+    : data?.currentId
+      ? `#${data.currentId}`
+      : '-'
+  const selectedCredentialLabel = selectedCredential
+    ? getCredentialLabelWithId(selectedCredential)
+    : null
   const standardAccountTypePresets = modelCapabilitiesData?.standardAccountTypePresets ?? []
   const accountTypeSuggestions = collectAccountTypeSuggestions(
     credentials,
@@ -679,7 +692,12 @@ export function Dashboard() {
     // 初始化结果，所有凭据状态为 pending
     const initialResults = new Map<number, VerifyResult>()
     ids.forEach(id => {
-      initialResults.set(id, { id, status: 'pending' })
+      const credential = credentials.find(item => item.id === id)
+      initialResults.set(id, {
+        id,
+        label: credential ? getCredentialLabelWithId(credential) : `凭据 #${id}`,
+        status: 'pending',
+      })
     })
     setVerifyResults(initialResults)
     setVerifyDialogOpen(true)
@@ -693,11 +711,13 @@ export function Dashboard() {
       }
 
       const id = ids[i]
+      const credential = credentials.find(item => item.id === id)
+      const label = credential ? getCredentialLabelWithId(credential) : `凭据 #${id}`
 
       // 更新当前凭据状态为 verifying
       setVerifyResults(prev => {
         const newResults = new Map(prev)
-        newResults.set(id, { id, status: 'verifying' })
+        newResults.set(id, { id, label, status: 'verifying' })
         return newResults
       })
 
@@ -710,6 +730,7 @@ export function Dashboard() {
           const newResults = new Map(prev)
           newResults.set(id, {
             id,
+            label,
             status: 'success',
             usage: `${balance.currentUsage}/${balance.usageLimit}`
           })
@@ -721,6 +742,7 @@ export function Dashboard() {
           const newResults = new Map(prev)
           newResults.set(id, {
             id,
+            label,
             status: 'failed',
             error: extractErrorMessage(error)
           })
@@ -811,8 +833,15 @@ export function Dashboard() {
               </CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="text-2xl font-bold flex items-center gap-2">
-                #{data?.currentId || '-'}
+              <div className="flex flex-wrap items-center gap-2 text-lg font-bold">
+                <span className="min-w-0 break-all">
+                  {currentCredentialLabel}
+                </span>
+                {currentCredential?.email?.trim() && (
+                  <span className="text-sm font-medium text-muted-foreground">
+                    #{currentCredential.id}
+                  </span>
+                )}
                 <Badge variant="success">活跃</Badge>
               </div>
             </CardContent>
@@ -1027,6 +1056,7 @@ export function Dashboard() {
       {/* 余额对话框 */}
       <BalanceDialog
         credentialId={selectedCredentialId}
+        credentialLabel={selectedCredentialLabel}
         open={balanceDialogOpen}
         onOpenChange={setBalanceDialogOpen}
       />

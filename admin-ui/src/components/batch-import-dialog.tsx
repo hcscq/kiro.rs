@@ -20,6 +20,7 @@ interface BatchImportDialogProps {
 
 interface CredentialInput {
   refreshToken: string
+  email?: string
   clientId?: string
   clientSecret?: string
   region?: string
@@ -106,9 +107,10 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       setProgress({ current: 0, total: credentials.length })
 
       // 2. 初始化结果
-      const initialResults: VerificationResult[] = credentials.map((_, i) => ({
+      const initialResults: VerificationResult[] = credentials.map((credential, i) => ({
         index: i + 1,
-        status: 'pending'
+        status: 'pending',
+        email: credential.email?.trim() || undefined,
       }))
       setResults(initialResults)
 
@@ -129,11 +131,16 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       // 4. 导入并验活
       for (let i = 0; i < credentials.length; i++) {
         const cred = credentials[i]
+        const credentialEmail = cred.email?.trim() || undefined
         const token = cred.refreshToken.trim()
         const tokenHash = await sha256Hex(token)
 
         // 更新状态为检查中
-        setCurrentProcessing(`正在处理凭据 ${i + 1}/${credentials.length}`)
+        setCurrentProcessing(
+          credentialEmail
+            ? `正在处理 ${credentialEmail}`
+            : `正在处理凭据 ${i + 1}/${credentials.length}`
+        )
         setResults(prev => {
           const newResults = [...prev]
           newResults[i] = { ...newResults[i], status: 'checking' }
@@ -150,7 +157,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               ...newResults[i],
               status: 'duplicate',
               error: '该凭据已存在',
-              email: existingCred?.email || undefined
+              email: existingCred?.email || credentialEmail
             }
             return newResults
           })
@@ -200,6 +207,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
           const addedCred = await addCredential({
             refreshToken: token,
+            email: credentialEmail,
             authMethod,
             authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
             apiRegion: cred.apiRegion?.trim() || undefined,
@@ -231,14 +239,16 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           // 验活成功
           successCount++
           existingTokenHashes.add(tokenHash)
-          setCurrentProcessing(addedCred.email ? `验活成功: ${addedCred.email}` : `验活成功: 凭据 ${i + 1}`)
+          setCurrentProcessing(addedCred.email || credentialEmail
+            ? `验活成功: ${addedCred.email || credentialEmail}`
+            : `验活成功: 凭据 ${i + 1}`)
           setResults(prev => {
             const newResults = [...prev]
             newResults[i] = {
               ...newResults[i],
               status: 'verified',
               usage: `${balance.currentUsage}/${balance.usageLimit}`,
-              email: addedCred.email || undefined,
+              email: addedCred.email || credentialEmail,
               credentialId: addedCred.credentialId
             }
             return newResults
@@ -269,7 +279,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               ...newResults[i],
               status: 'failed',
               error: extractErrorMessage(error),
-              email: undefined,
+              email: credentialEmail,
               rollbackStatus,
               rollbackError,
             }
@@ -357,14 +367,14 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               JSON 格式凭据
             </label>
             <textarea
-              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n例如: [{"refreshToken":"...","clientId":"...","clientSecret":"...","authRegion":"us-east-1","apiRegion":"us-west-2"}]\n支持 region 字段自动映射为 authRegion'}
+              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n例如: [{"email":"user@example.com","refreshToken":"...","clientId":"...","clientSecret":"...","authRegion":"us-east-1","apiRegion":"us-west-2"}]\n支持 region 字段自动映射为 authRegion'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}
               className="flex min-h-[200px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
             />
             <p className="text-xs text-muted-foreground">
-              支持附带 `accountType`、`maxConcurrency`、`rateLimitBucketCapacity`、`rateLimitRefillPerSecond`。
+              支持附带 `email`、`accountType`、`maxConcurrency`、`rateLimitBucketCapacity`、`rateLimitRefillPerSecond`。
               导入时会自动验活，失败的凭据会被排除。
             </p>
           </div>

@@ -10,11 +10,12 @@ import { parseError } from '@/lib/utils'
 
 interface BalanceDialogProps {
   credentialId: number | null
+  credentialLabel?: string | null
   open: boolean
   onOpenChange: (open: boolean) => void
 }
 
-export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialogProps) {
+export function BalanceDialog({ credentialId, credentialLabel, open, onOpenChange }: BalanceDialogProps) {
   const { data: balance, isLoading, error } = useCredentialBalance(credentialId)
 
   const formatDate = (timestamp: number | null) => {
@@ -30,8 +31,8 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>
-            凭据 #{credentialId} 余额信息
+          <DialogTitle className="break-all">
+            {credentialLabel || (credentialId ? `凭据 #${credentialId}` : '凭据')} 余额信息
           </DialogTitle>
         </DialogHeader>
 

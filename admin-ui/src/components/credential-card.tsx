@@ -36,6 +36,7 @@ import {
   useDeleteCredential,
   useForceRefreshToken,
 } from '@/hooks/use-credentials'
+import { getCredentialLabel, getCredentialLabelWithId } from '@/lib/credential-label'
 import { cn } from '@/lib/utils'
 
 interface CredentialCardProps {
@@ -414,6 +415,8 @@ export function CredentialCard({
   const recognizedStandardAccountType = credential.standardAccountType
     ? findStandardAccountTypePreset(credential.standardAccountType, standardAccountTypePresets)
     : null
+  const credentialLabel = getCredentialLabel(credential)
+  const credentialLabelWithId = getCredentialLabelWithId(credential)
 
   return (
     <>
@@ -425,8 +428,11 @@ export function CredentialCard({
                 checked={selected}
                 onCheckedChange={onToggleSelect}
               />
-              <CardTitle className="text-lg flex items-center gap-2">
-                {credential.email || `凭据 #${credential.id}`}
+              <CardTitle className="text-lg flex min-w-0 flex-wrap items-center gap-2">
+                <span className="min-w-0 break-all">{credentialLabel}</span>
+                {credential.email?.trim() && (
+                  <Badge variant="outline">#{credential.id}</Badge>
+                )}
                 {credential.isCurrent && (
                   <Badge variant="success">当前</Badge>
                 )}
@@ -916,7 +922,7 @@ export function CredentialCard({
           <DialogHeader>
             <DialogTitle>确认删除凭据</DialogTitle>
             <DialogDescription>
-              您确定要删除凭据 #{credential.id} 吗？此操作无法撤销。
+              您确定要删除 {credentialLabelWithId} 吗？此操作无法撤销。
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
