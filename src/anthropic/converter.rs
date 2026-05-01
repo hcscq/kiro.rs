@@ -3,7 +3,13 @@
 //! 负责将 Anthropic API 请求格式转换为 Kiro API 请求格式
 
 use std::collections::HashMap;
+use std::io::Cursor;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use image::GenericImageView;
+use image::codecs::jpeg::JpegEncoder;
+use image::imageops::FilterType;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -458,7 +464,7 @@ fn process_message_content(
                         "image" => {
                             if let Some(source) = block.source {
                                 if let Some(format) = get_image_format(&source.media_type) {
-                                    images.push(KiroImage::from_base64(format, source.data));
+                                    images.push(build_kiro_image(format, source.data));
                                 }
                             }
                         }
@@ -501,6 +507,70 @@ fn get_image_format(media_type: &str) -> Option<String> {
         "image/webp" => Some("webp".to_string()),
         _ => None,
     }
+}
+
+fn build_kiro_image(format: String, data: String) -> KiroImage {
+    if let Some(resized_data) = resize_oversized_image_base64(&format, &data) {
+        KiroImage::from_base64(format, resized_data)
+    } else {
+        KiroImage::from_base64(format, data)
+    }
+}
+
+fn image_format_for_compat(format: &str) -> Option<image::ImageFormat> {
+    match format {
+        "jpeg" | "jpg" => Some(image::ImageFormat::Jpeg),
+        "png" => Some(image::ImageFormat::Png),
+        _ => None,
+    }
+}
+
+fn resize_oversized_image_base64(format: &str, data: &str) -> Option<String> {
+    let image_format = image_format_for_compat(format)?;
+    let bytes = BASE64_STANDARD.decode(data).ok()?;
+    let image = image::load_from_memory_with_format(&bytes, image_format).ok()?;
+    let (width, height) = image.dimensions();
+    let max_dimension = width.max(height);
+
+    if max_dimension <= KIRO_MAX_IMAGE_DIMENSION_PX {
+        return None;
+    }
+
+    let scale = KIRO_MAX_IMAGE_DIMENSION_PX as f64 / max_dimension as f64;
+    let resized_width = ((width as f64 * scale).round() as u32).max(1);
+    let resized_height = ((height as f64 * scale).round() as u32).max(1);
+    let resized = image.resize(resized_width, resized_height, FilterType::Lanczos3);
+
+    let mut output = Vec::new();
+    match image_format {
+        image::ImageFormat::Jpeg => {
+            let rgb = resized.to_rgb8();
+            let resized = image::DynamicImage::ImageRgb8(rgb);
+            JpegEncoder::new_with_quality(&mut output, 90)
+                .encode_image(&resized)
+                .ok()?;
+        }
+        image::ImageFormat::Png => {
+            let mut cursor = Cursor::new(&mut output);
+            resized
+                .write_to(&mut cursor, image::ImageFormat::Png)
+                .ok()?;
+        }
+        _ => return None,
+    }
+
+    tracing::info!(
+        format,
+        width,
+        height,
+        resized_width,
+        resized_height,
+        original_bytes = bytes.len(),
+        resized_bytes = output.len(),
+        "缩放超出 Kiro 兼容尺寸的图片"
+    );
+
+    Some(BASE64_STANDARD.encode(output))
 }
 
 /// 提取工具结果内容
@@ -864,6 +934,10 @@ impl MergedUserMessageParts {
 /// 实测单 turn 达到 11 张图片时会稳定触发 400 Improperly formed request。
 const KIRO_MAX_IMAGES_PER_USER_TURN: usize = 10;
 
+/// Kiro 上游对图片像素尺寸也较敏感；长边超过约 1200px 的截图会触发
+/// 400 Improperly formed request。等比例缩放保留图片语义，同时兼容上游。
+const KIRO_MAX_IMAGE_DIMENSION_PX: u32 = 1200;
+
 fn merge_user_message_parts(
     messages: &[&super::types::Message],
 ) -> Result<MergedUserMessageParts, ConversionError> {
@@ -1199,6 +1273,62 @@ mod tests {
 
     fn repeated_png_image_blocks(count: usize) -> Vec<serde_json::Value> {
         (0..count).map(|_| png_image_block()).collect()
+    }
+
+    fn oversized_jpeg_block(width: u32, height: u32) -> serde_json::Value {
+        let image = image::RgbImage::from_pixel(width, height, image::Rgb([32, 64, 96]));
+        let image = image::DynamicImage::ImageRgb8(image);
+        let mut encoded = Vec::new();
+        JpegEncoder::new_with_quality(&mut encoded, 90)
+            .encode_image(&image)
+            .expect("test image should encode");
+
+        serde_json::json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/jpeg",
+                "data": BASE64_STANDARD.encode(encoded)
+            }
+        })
+    }
+
+    #[test]
+    fn test_process_message_content_downscales_oversized_current_jpeg() {
+        let content = serde_json::Value::Array(vec![oversized_jpeg_block(952, 1552)]);
+
+        let (_, images, _) =
+            process_message_content(&content).expect("oversized jpeg should convert");
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].format, "jpeg");
+
+        let resized_bytes = BASE64_STANDARD
+            .decode(&images[0].source.bytes)
+            .expect("resized image should be valid base64");
+        let resized = image::load_from_memory_with_format(&resized_bytes, image::ImageFormat::Jpeg)
+            .expect("resized image should decode");
+
+        assert_eq!(resized.height(), KIRO_MAX_IMAGE_DIMENSION_PX);
+        assert!(resized.width() < 952);
+    }
+
+    #[test]
+    fn test_process_message_content_keeps_compatible_jpeg_unchanged() {
+        let block = oversized_jpeg_block(600, KIRO_MAX_IMAGE_DIMENSION_PX);
+        let original_data = block
+            .get("source")
+            .and_then(|source| source.get("data"))
+            .and_then(|data| data.as_str())
+            .expect("test block should contain image data")
+            .to_string();
+        let content = serde_json::Value::Array(vec![block]);
+
+        let (_, images, _) =
+            process_message_content(&content).expect("compatible jpeg should convert");
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].source.bytes, original_data);
     }
 
     #[test]
