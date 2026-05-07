@@ -28,6 +28,7 @@ interface CredentialInput {
   apiRegion?: string
   priority?: number
   machineId?: string
+  startUrl?: string
   accountType?: string
   maxConcurrency?: number
   rateLimitBucketCapacity?: number
@@ -213,6 +214,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             apiRegion: cred.apiRegion?.trim() || undefined,
             clientId,
             clientSecret,
+            startUrl: cred.startUrl?.trim() || undefined,
             priority: cred.priority || 0,
             machineId: cred.machineId?.trim() || undefined,
             accountType: cred.accountType?.trim() || undefined,
@@ -367,14 +369,14 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               JSON 格式凭据
             </label>
             <textarea
-              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n例如: [{"email":"user@example.com","refreshToken":"...","clientId":"...","clientSecret":"...","authRegion":"us-east-1","apiRegion":"us-west-2"}]\n支持 region 字段自动映射为 authRegion'}
+              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n例如: [{"email":"user@example.com","refreshToken":"...","clientId":"...","clientSecret":"...","authRegion":"us-east-1","apiRegion":"us-west-2","startUrl":"https://example.awsapps.com/start"}]\n支持 region 字段自动映射为 authRegion'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}
               className="flex min-h-[200px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
             />
             <p className="text-xs text-muted-foreground">
-              支持附带 `email`、`accountType`、`maxConcurrency`、`rateLimitBucketCapacity`、`rateLimitRefillPerSecond`。
+              支持附带 `email`、`startUrl`、`accountType`、`maxConcurrency`、`rateLimitBucketCapacity`、`rateLimitRefillPerSecond`。
               导入时会自动验活，失败的凭据会被排除。
             </p>
           </div>

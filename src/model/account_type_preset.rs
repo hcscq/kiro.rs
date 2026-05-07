@@ -134,22 +134,27 @@ pub fn infer_standard_account_type(
         return None;
     }
 
-    if normalized.contains("ULTRA") {
+    let compact: String = normalized
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '+')
+        .collect();
+
+    if compact.contains("ULTRA") {
         return find_built_in_account_type_preset("ultra");
     }
-    if normalized.contains("MAX") {
+    if compact.contains("MAX") {
         return find_built_in_account_type_preset("max");
     }
-    if normalized.contains("PRO+") {
+    if compact.contains("PRO+") || compact.contains("PROPLUS") {
         return find_built_in_account_type_preset("pro-plus");
     }
-    if normalized.contains("POWER") {
+    if compact.contains("POWER") {
         return find_built_in_account_type_preset("power");
     }
-    if normalized.contains("FREE") {
+    if compact.contains("FREE") {
         return find_built_in_account_type_preset("free");
     }
-    if normalized.contains("PRO") {
+    if compact.contains("PRO") {
         return find_built_in_account_type_preset("pro");
     }
 
@@ -158,6 +163,15 @@ pub fn infer_standard_account_type(
 
 pub fn infer_standard_account_type_id(subscription_title: &str) -> Option<&'static str> {
     infer_standard_account_type(subscription_title).map(|preset| preset.id)
+}
+
+pub fn infer_standard_account_type_id_from_subscription(
+    subscription_title: Option<&str>,
+    subscription_type: Option<&str>,
+) -> Option<&'static str> {
+    subscription_title
+        .and_then(infer_standard_account_type_id)
+        .or_else(|| subscription_type.and_then(infer_standard_account_type_id))
 }
 
 #[cfg(test)]
@@ -180,6 +194,10 @@ mod tests {
         assert_eq!(infer_standard_account_type_id("KIRO MAX"), Some("max"));
         assert_eq!(infer_standard_account_type_id("KIRO ULTRA"), Some("ultra"));
         assert_eq!(infer_standard_account_type_id("KIRO PRO"), Some("pro"));
+        assert_eq!(
+            infer_standard_account_type_id("Q_DEVELOPER_STANDALONE_PRO_PLUS"),
+            Some("pro-plus")
+        );
         assert_eq!(infer_standard_account_type_id("KIRO FREE"), Some("free"));
     }
 

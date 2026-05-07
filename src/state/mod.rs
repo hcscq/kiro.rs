@@ -3074,6 +3074,7 @@ mod tests {
                 data: BalanceResponse {
                     id: 7,
                     subscription_title: Some("KIRO PRO+".to_string()),
+                    subscription_type: Some("Q_DEVELOPER_STANDALONE_PRO_PLUS".to_string()),
                     current_usage: 1.0,
                     usage_limit: 10.0,
                     remaining: 9.0,
@@ -3338,6 +3339,7 @@ mod tests {
                 data: BalanceResponse {
                     id: 9,
                     subscription_title: Some("KIRO MAX".to_string()),
+                    subscription_type: Some("Q_DEVELOPER_STANDALONE_MAX".to_string()),
                     current_usage: 2.0,
                     usage_limit: 20.0,
                     remaining: 18.0,

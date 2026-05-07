@@ -195,15 +195,8 @@ pub(crate) async fn refresh_token(
 ) -> anyhow::Result<KiroCredentials> {
     validate_refresh_token(credentials)?;
 
-    // 根据 auth_method 选择刷新方式
-    // 如果未指定 auth_method，根据是否有 clientId/clientSecret 自动判断
-    let auth_method = credentials.auth_method.as_deref().unwrap_or_else(|| {
-        if credentials.client_id.is_some() && credentials.client_secret.is_some() {
-            "idc"
-        } else {
-            "social"
-        }
-    });
+    // 根据 auth_method 选择刷新方式；如果未指定，则根据 clientId/clientSecret 自动判断。
+    let auth_method = credentials.effective_auth_method();
 
     if auth_method.eq_ignore_ascii_case("idc")
         || auth_method.eq_ignore_ascii_case("builder-id")
@@ -709,13 +702,19 @@ pub struct CredentialEntrySnapshot {
     /// 订阅等级（KIRO PRO+ / KIRO FREE 等）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subscription_title: Option<String>,
+    /// 订阅内部类型（如 Q_DEVELOPER_STANDALONE_PRO）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription_type: Option<String>,
+    /// 识别出的认证账号类型（social / builder-id / enterprise / idc）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_account_type: Option<String>,
     /// 账号类型
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_type: Option<String>,
-    /// 当前命中的账号类型（显式账号类型或由订阅标题推断）
+    /// 当前命中的账号类型（显式账号类型或由订阅信息推断）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_account_type: Option<String>,
-    /// 当前账号类型来源：credential / subscription-title
+    /// 当前账号类型来源：credential / subscription-title / subscription-type
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_type_source: Option<String>,
     /// 账号级额外允许模型
@@ -1673,7 +1672,16 @@ impl MultiTokenManager {
         }
     }
 
-    fn apply_subscription_title_update(&self, id: u64, subscription_title: &str) {
+    fn apply_subscription_info_update(
+        &self,
+        id: u64,
+        subscription_title: Option<&str>,
+        subscription_type: Option<&str>,
+    ) {
+        if subscription_title.is_none() && subscription_type.is_none() {
+            return;
+        }
+
         let dispatch = self.dispatch_config();
         let now = Instant::now();
         {
@@ -1684,22 +1692,33 @@ impl MultiTokenManager {
             };
 
             let old_title = entry.credentials.subscription_title.clone();
-            if old_title.as_deref() == Some(subscription_title) {
+            let old_type = entry.credentials.subscription_type.clone();
+            let next_title = subscription_title
+                .map(str::to_string)
+                .or_else(|| old_title.clone());
+            let next_type = subscription_type
+                .map(str::to_string)
+                .or_else(|| old_type.clone());
+
+            if old_title == next_title && old_type == next_type {
                 return;
             }
 
-            entry.credentials.subscription_title = Some(subscription_title.to_string());
+            entry.credentials.subscription_title = next_title.clone();
+            entry.credentials.subscription_type = next_type.clone();
             Self::sync_rate_limit_bucket_runtime(entry, &dispatch, now);
 
             tracing::info!(
-                "凭据 #{} 订阅等级已更新: {:?} -> {}",
+                "凭据 #{} 订阅信息已更新: title {:?} -> {:?}, type {:?} -> {:?}",
                 id,
                 old_title,
-                subscription_title
+                next_title,
+                old_type,
+                next_type
             );
             let credentials = Self::persisted_credentials_from_entries(&entries);
             if let Err(err) = self.persist_credentials_snapshot(&credentials) {
-                tracing::warn!("订阅等级更新后持久化失败（不影响本次请求）: {}", err);
+                tracing::warn!("订阅信息更新后持久化失败（不影响本次请求）: {}", err);
             }
         }
 
@@ -4216,19 +4235,14 @@ impl MultiTokenManager {
                         priority: e.credentials.priority,
                         disabled: e.disabled,
                         failure_count: e.failure_count,
-                        auth_method: e.credentials.auth_method.as_deref().map(|m| {
-                            if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam")
-                            {
-                                "idc".to_string()
-                            } else {
-                                m.to_string()
-                            }
-                        }),
+                        auth_method: Some(e.credentials.effective_auth_method().to_string()),
                         has_profile_arn: e.credentials.profile_arn.is_some(),
                         expires_at: e.credentials.expires_at.clone(),
                         refresh_token_hash: e.credentials.refresh_token.as_deref().map(sha256_hex),
                         email: e.credentials.email.clone(),
                         subscription_title: e.credentials.subscription_title.clone(),
+                        subscription_type: e.credentials.subscription_type.clone(),
+                        auth_account_type: e.credentials.detected_auth_account_type(),
                         account_type: e.credentials.account_type.clone(),
                         resolved_account_type: e.credentials.resolved_account_type(),
                         account_type_source: e
@@ -4571,10 +4585,12 @@ impl MultiTokenManager {
         let usage_limits =
             get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
 
-        // 更新订阅等级到凭据（仅在发生变化时持久化）
-        if let Some(subscription_title) = usage_limits.subscription_title() {
-            self.apply_subscription_title_update(id, subscription_title);
-        }
+        // 更新订阅信息到凭据（仅在发生变化时持久化）
+        self.apply_subscription_info_update(
+            id,
+            usage_limits.subscription_title(),
+            usage_limits.subscription_type(),
+        );
 
         Ok(usage_limits)
     }
@@ -4657,11 +4673,13 @@ impl MultiTokenManager {
         });
         validated_cred.client_id = new_cred.client_id;
         validated_cred.client_secret = new_cred.client_secret;
+        validated_cred.start_url = new_cred.start_url;
         validated_cred.region = new_cred.region;
         validated_cred.auth_region = new_cred.auth_region;
         validated_cred.api_region = new_cred.api_region;
         validated_cred.machine_id = new_cred.machine_id;
         validated_cred.email = new_cred.email;
+        validated_cred.subscription_type = new_cred.subscription_type;
         validated_cred.account_type = new_cred.account_type;
         validated_cred.allowed_models = new_cred.allowed_models;
         validated_cred.blocked_models = new_cred.blocked_models;
@@ -5373,7 +5391,7 @@ mod tests {
             Some("global-default")
         );
 
-        manager.apply_subscription_title_update(1, "KIRO POWER");
+        manager.apply_subscription_info_update(1, Some("KIRO POWER"), None);
 
         let after = manager.snapshot();
         let after_entry = after.entries.iter().find(|entry| entry.id == 1).unwrap();

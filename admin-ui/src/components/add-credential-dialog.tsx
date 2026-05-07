@@ -37,6 +37,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [apiRegion, setApiRegion] = useState('')
   const [clientId, setClientId] = useState('')
   const [clientSecret, setClientSecret] = useState('')
+  const [startUrl, setStartUrl] = useState('')
   const [priority, setPriority] = useState('0')
   const [maxConcurrency, setMaxConcurrency] = useState('')
   const [rateLimitBucketCapacity, setRateLimitBucketCapacity] = useState('')
@@ -80,6 +81,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setApiRegion('')
     setClientId('')
     setClientSecret('')
+    setStartUrl('')
     setPriority('0')
     setMaxConcurrency('')
     setRateLimitBucketCapacity('')
@@ -149,6 +151,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         apiRegion: apiRegion.trim() || undefined,
         clientId: clientId.trim() || undefined,
         clientSecret: clientSecret.trim() || undefined,
+        startUrl: startUrl.trim() || undefined,
         priority: parseInt(priority) || 0,
         maxConcurrency: parsedMaxConcurrency,
         rateLimitBucketCapacity: parsedRateLimitBucketCapacity,
@@ -284,6 +287,21 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                     onChange={(e) => setClientSecret(e.target.value)}
                     disabled={isPending}
                   />
+                </div>
+                <div className="space-y-2">
+                  <label htmlFor="startUrl" className="text-sm font-medium">
+                    Start URL
+                  </label>
+                  <Input
+                    id="startUrl"
+                    placeholder="Builder ID 可留空；Enterprise 填企业 AWS Start URL"
+                    value={startUrl}
+                    onChange={(e) => setStartUrl(e.target.value)}
+                    disabled={isPending}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    用于识别 Builder ID / Enterprise 账号类型，不影响 Social 凭据
+                  </p>
                 </div>
               </>
             )}

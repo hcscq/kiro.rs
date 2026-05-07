@@ -10,17 +10,21 @@ use std::fs;
 use std::path::Path;
 
 use crate::http_client::ProxyConfig;
-use crate::model::account_type_preset::infer_standard_account_type_id;
+use crate::model::account_type_preset::{
+    infer_standard_account_type_id, infer_standard_account_type_id_from_subscription,
+};
 use crate::model::config::Config;
 use crate::model::model_policy::{
     AccountTypeDispatchPolicy, ModelSupportPolicy, RuntimeModelRestriction, normalize_account_type,
     normalize_model_entries, normalize_model_selector,
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolvedAccountTypeSource {
     Explicit,
     SubscriptionTitle,
+    SubscriptionType,
 }
 
 impl ResolvedAccountTypeSource {
@@ -28,6 +32,7 @@ impl ResolvedAccountTypeSource {
         match self {
             Self::Explicit => "credential",
             Self::SubscriptionTitle => "subscription-title",
+            Self::SubscriptionType => "subscription-type",
         }
     }
 }
@@ -85,6 +90,11 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_secret: Option<String>,
 
+    /// AWS IAM Identity Center Start URL（企业 IdC 账号用于识别）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub start_url: Option<String>,
+
     /// 凭据优先级（数字越小优先级越高，默认为 0）
     #[serde(default)]
     #[serde(skip_serializing_if = "is_zero")]
@@ -131,6 +141,11 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub subscription_title: Option<String>,
+
+    /// 订阅内部类型（如 Q_DEVELOPER_STANDALONE_PRO）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub subscription_type: Option<String>,
 
     /// 账号类型（用于命中全局账号类型策略）
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -212,6 +227,53 @@ fn canonicalize_auth_method_value(value: &str) -> &str {
     } else {
         value
     }
+}
+
+fn has_client_credentials(credentials: &KiroCredentials) -> bool {
+    credentials
+        .client_id
+        .as_ref()
+        .is_some_and(|value| !value.trim().is_empty())
+        && credentials
+            .client_secret
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn extract_start_url_from_client_secret(client_secret: &str) -> Option<String> {
+    let parts: Vec<&str> = client_secret.split('.').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+
+    let decoded = URL_SAFE_NO_PAD.decode(parts[1]).ok()?;
+    let payload_str = String::from_utf8(decoded).ok()?;
+    let payload_json: serde_json::Value = serde_json::from_str(&payload_str).ok()?;
+    let serialized_str = payload_json.get("serialized")?.as_str()?;
+    let serialized: serde_json::Value = serde_json::from_str(serialized_str).ok()?;
+
+    serialized
+        .get("initiateLoginUri")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn is_builder_id_start_url(start_url: &str) -> bool {
+    let trimmed = start_url.trim().trim_end_matches('/');
+    if trimmed.eq_ignore_ascii_case("https://view.awsapps.com/start") {
+        return true;
+    }
+
+    url::Url::parse(trimmed)
+        .ok()
+        .and_then(|url| {
+            let host = url.host_str()?.to_ascii_lowercase();
+            let path = url.path().trim_end_matches('/').to_ascii_lowercase();
+            Some(host == "view.awsapps.com" && path == "/start")
+        })
+        .unwrap_or(false)
 }
 
 /// 凭据配置（支持单对象或数组格式）
@@ -324,6 +386,47 @@ impl KiroCredentials {
         }
     }
 
+    pub fn effective_auth_method(&self) -> &'static str {
+        match self.auth_method.as_deref() {
+            Some(value)
+                if value.eq_ignore_ascii_case("idc")
+                    || value.eq_ignore_ascii_case("builder-id")
+                    || value.eq_ignore_ascii_case("iam") =>
+            {
+                "idc"
+            }
+            Some(value) if value.eq_ignore_ascii_case("social") => "social",
+            Some(_) => "social",
+            None if has_client_credentials(self) => "idc",
+            None => "social",
+        }
+    }
+
+    pub fn detected_auth_account_type(&self) -> Option<String> {
+        if self.effective_auth_method() == "social" {
+            return Some("social".to_string());
+        }
+
+        let start_url = self.start_url.as_deref().and_then(|value| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then_some(trimmed)
+        });
+        let extracted_start_url = self
+            .client_secret
+            .as_deref()
+            .and_then(extract_start_url_from_client_secret);
+        let detected_start_url = start_url.or(extracted_start_url.as_deref());
+
+        if let Some(start_url) = detected_start_url {
+            if is_builder_id_start_url(start_url) {
+                return Some("builder-id".to_string());
+            }
+            return Some("enterprise".to_string());
+        }
+
+        Some("idc".to_string())
+    }
+
     pub fn canonicalize_auth_method(&mut self) {
         let auth_method = match &self.auth_method {
             Some(m) => m,
@@ -352,10 +455,11 @@ impl KiroCredentials {
             .dedup_by(|left, right| left.model == right.model);
     }
 
-    fn subscription_title_upper(&self) -> Option<String> {
-        self.subscription_title
-            .as_ref()
-            .map(|title| title.to_ascii_uppercase())
+    fn standard_subscription_account_type(&self) -> Option<&'static str> {
+        infer_standard_account_type_id_from_subscription(
+            self.subscription_title.as_deref(),
+            self.subscription_type.as_deref(),
+        )
     }
 
     pub fn max_concurrency_override(&self) -> Option<u32> {
@@ -367,10 +471,19 @@ impl KiroCredentials {
             return Some(ResolvedAccountTypeSource::Explicit);
         }
 
-        self.subscription_title
+        if self
+            .subscription_title
             .as_deref()
             .and_then(infer_standard_account_type_id)
-            .map(|_| ResolvedAccountTypeSource::SubscriptionTitle)
+            .is_some()
+        {
+            return Some(ResolvedAccountTypeSource::SubscriptionTitle);
+        }
+
+        self.subscription_type
+            .as_deref()
+            .and_then(infer_standard_account_type_id)
+            .map(|_| ResolvedAccountTypeSource::SubscriptionType)
     }
 
     pub fn resolved_account_type(&self) -> Option<String> {
@@ -383,6 +496,11 @@ impl KiroCredentials {
             ResolvedAccountTypeSource::Explicit => self.account_type.as_deref().map(Cow::Borrowed),
             ResolvedAccountTypeSource::SubscriptionTitle => self
                 .subscription_title
+                .as_deref()
+                .and_then(infer_standard_account_type_id)
+                .map(Cow::Borrowed),
+            ResolvedAccountTypeSource::SubscriptionType => self
+                .subscription_type
                 .as_deref()
                 .and_then(infer_standard_account_type_id)
                 .map(Cow::Borrowed),
@@ -497,8 +615,8 @@ impl KiroCredentials {
     ///
     /// Free 账号不支持 Opus 模型，需要 PRO 或更高等级订阅
     pub fn supports_opus(&self) -> bool {
-        self.subscription_title_upper()
-            .map(|title| !title.contains("FREE"))
+        self.standard_subscription_account_type()
+            .map(|account_type| account_type != "free")
             // 如果还没有获取订阅信息，暂时允许（首次使用时会获取）
             .unwrap_or(true)
     }
@@ -508,20 +626,16 @@ impl KiroCredentials {
     /// 在上游正式全量开放前，所有非 FREE 档位都保留为候选，
     /// 交由运行时根据 `INVALID_MODEL_ID` 动态探测。
     pub fn supports_real_opus_4_7(&self) -> bool {
-        self.subscription_title_upper()
-            .map(|title| !title.contains("FREE"))
+        self.standard_subscription_account_type()
+            .map(|account_type| account_type != "free")
             .unwrap_or(true)
     }
 
     /// 返回真实 Opus 4.7 的调度偏好，数值越小越优先。
     pub fn opus_4_7_preference_rank(&self) -> u8 {
-        match self.subscription_title_upper() {
-            Some(title)
-                if title.contains("MAX") || title.contains("ULTRA") || title.contains("PRO+") =>
-            {
-                0
-            }
-            Some(title) if title.contains("FREE") => 2,
+        match self.standard_subscription_account_type() {
+            Some("max" | "ultra" | "pro-plus") => 0,
+            Some("free") => 2,
             Some(_) | None => 1,
         }
     }
@@ -708,6 +822,7 @@ mod tests {
             auth_method: Some("social".to_string()),
             client_id: None,
             client_secret: None,
+            start_url: None,
             priority: 0,
             max_concurrency: None,
             rate_limit_bucket_capacity: None,
@@ -718,6 +833,7 @@ mod tests {
             machine_id: None,
             email: None,
             subscription_title: None,
+            subscription_type: None,
             account_type: None,
             allowed_models: vec![],
             blocked_models: vec![],
@@ -826,6 +942,39 @@ mod tests {
         assert_eq!(
             creds.resolved_account_type_source(),
             Some(ResolvedAccountTypeSource::SubscriptionTitle)
+        );
+    }
+
+    #[test]
+    fn test_resolved_account_type_falls_back_to_subscription_type() {
+        let mut creds = KiroCredentials::default();
+        creds.subscription_type = Some("Q_DEVELOPER_STANDALONE_PRO_PLUS".to_string());
+
+        assert_eq!(creds.resolved_account_type(), Some("pro-plus".to_string()));
+        assert_eq!(
+            creds.resolved_account_type_source(),
+            Some(ResolvedAccountTypeSource::SubscriptionType)
+        );
+    }
+
+    #[test]
+    fn test_detected_auth_account_type_uses_start_url_for_idc_accounts() {
+        let mut builder = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            client_id: Some("client".to_string()),
+            client_secret: Some("secret".to_string()),
+            start_url: Some("https://view.awsapps.com/start/".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            builder.detected_auth_account_type().as_deref(),
+            Some("builder-id")
+        );
+
+        builder.start_url = Some("https://example.awsapps.com/start".to_string());
+        assert_eq!(
+            builder.detected_auth_account_type().as_deref(),
+            Some("enterprise")
         );
     }
 
@@ -976,6 +1125,7 @@ mod tests {
             auth_method: None,
             client_id: None,
             client_secret: None,
+            start_url: None,
             priority: 0,
             max_concurrency: None,
             rate_limit_bucket_capacity: None,
@@ -986,6 +1136,7 @@ mod tests {
             machine_id: None,
             email: None,
             subscription_title: None,
+            subscription_type: None,
             account_type: None,
             allowed_models: vec![],
             blocked_models: vec![],
@@ -1018,6 +1169,7 @@ mod tests {
             auth_method: None,
             client_id: None,
             client_secret: None,
+            start_url: None,
             priority: 0,
             max_concurrency: None,
             rate_limit_bucket_capacity: None,
@@ -1028,6 +1180,7 @@ mod tests {
             machine_id: None,
             email: None,
             subscription_title: None,
+            subscription_type: None,
             account_type: None,
             allowed_models: vec![],
             blocked_models: vec![],
@@ -1142,6 +1295,7 @@ mod tests {
             auth_method: Some("social".to_string()),
             client_id: None,
             client_secret: None,
+            start_url: None,
             priority: 3,
             max_concurrency: None,
             rate_limit_bucket_capacity: None,
@@ -1152,6 +1306,7 @@ mod tests {
             machine_id: Some("c".repeat(64)),
             email: None,
             subscription_title: None,
+            subscription_type: None,
             account_type: None,
             allowed_models: vec![],
             blocked_models: vec![],
@@ -1462,5 +1617,24 @@ mod tests {
 
         assert!(!creds.supports_real_opus_4_7());
         assert_eq!(creds.opus_4_7_preference_rank(), 2);
+    }
+
+    #[test]
+    fn test_subscription_type_drives_model_support_when_title_missing() {
+        let free = KiroCredentials {
+            subscription_type: Some("Q_DEVELOPER_STANDALONE_FREE".to_string()),
+            ..Default::default()
+        };
+        assert!(!free.supports_opus());
+        assert!(!free.supports_real_opus_4_7());
+        assert_eq!(free.opus_4_7_preference_rank(), 2);
+
+        let pro_plus = KiroCredentials {
+            subscription_type: Some("Q_DEVELOPER_STANDALONE_PRO_PLUS".to_string()),
+            ..Default::default()
+        };
+        assert!(pro_plus.supports_opus());
+        assert!(pro_plus.supports_real_opus_4_7());
+        assert_eq!(pro_plus.opus_4_7_preference_rank(), 0);
     }
 }

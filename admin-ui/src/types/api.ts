@@ -19,9 +19,11 @@ export interface CredentialStatusItem {
   hasProfileArn: boolean
   email?: string | null
   subscriptionTitle?: string | null
+  subscriptionType?: string | null
+  authAccountType?: 'social' | 'builder-id' | 'enterprise' | 'idc' | string | null
   accountType?: string | null
   resolvedAccountType?: string | null
-  accountTypeSource?: 'credential' | 'subscription-title' | null
+  accountTypeSource?: 'credential' | 'subscription-title' | 'subscription-type' | null
   standardAccountType?: string | null
   allowedModels?: string[]
   blockedModels?: string[]
@@ -58,6 +60,7 @@ export interface CredentialStatusItem {
 export interface BalanceResponse {
   id: number
   subscriptionTitle: string | null
+  subscriptionType?: string | null
   currentUsage: number
   usageLimit: number
   remaining: number
@@ -149,6 +152,7 @@ export interface AddCredentialRequest {
   authRegion?: string
   apiRegion?: string
   machineId?: string
+  startUrl?: string
   email?: string
   accountType?: string
   allowedModels?: string[]
@@ -164,6 +168,10 @@ export interface AddCredentialResponse {
   message: string
   credentialId: number
   email?: string
+  subscriptionTitle?: string | null
+  subscriptionType?: string | null
+  authAccountType?: 'social' | 'builder-id' | 'enterprise' | 'idc' | string | null
+  resolvedAccountType?: string | null
 }
 
 export interface RequestWeightingConfig {

@@ -255,7 +255,10 @@ export function Dashboard() {
           credential.email,
           credential.id.toString(),
           normalizeSubscriptionTitle(credential),
+          credential.subscriptionType,
+          credential.authAccountType,
           credential.accountType,
+          credential.resolvedAccountType,
           credential.standardAccountType,
           credential.proxyUrl,
           credential.disabledReason,
@@ -958,7 +961,7 @@ export function Dashboard() {
                   id="credential-search"
                   value={searchKeyword}
                   onChange={(e) => setSearchKeyword(e.target.value)}
-                  placeholder="搜索邮箱 / ID / 订阅等级 / 代理 / 禁用原因"
+                  placeholder="搜索邮箱 / ID / 订阅 / 账号类型 / 代理 / 禁用原因"
                   className="h-8 text-sm"
                 />
                 <Button

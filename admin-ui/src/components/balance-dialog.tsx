@@ -68,6 +68,11 @@ export function BalanceDialog({ credentialId, credentialLabel, open, onOpenChang
               <span className="text-lg font-semibold">
                 {balance.subscriptionTitle || '未知订阅类型'}
               </span>
+              {balance.subscriptionType && balance.subscriptionType !== balance.subscriptionTitle && (
+                <div className="mt-1 break-all text-xs text-muted-foreground">
+                  {balance.subscriptionType}
+                </div>
+              )}
             </div>
 
             {/* 使用进度 */}

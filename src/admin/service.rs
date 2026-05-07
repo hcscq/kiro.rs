@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::account_type_preset::{
-    built_in_account_type_presets, infer_standard_account_type_id,
+    built_in_account_type_presets, infer_standard_account_type_id_from_subscription,
 };
 use crate::model::model_catalog::built_in_model_catalog;
 use crate::state::{CachedBalanceRecord, RuntimeCoordinationStatus, StateChangeKind};
@@ -79,11 +79,11 @@ impl AdminService {
             .entries
             .into_iter()
             .map(|entry| {
-                let standard_account_type = entry
-                    .subscription_title
-                    .as_deref()
-                    .and_then(infer_standard_account_type_id)
-                    .map(|value| value.to_string());
+                let standard_account_type = infer_standard_account_type_id_from_subscription(
+                    entry.subscription_title.as_deref(),
+                    entry.subscription_type.as_deref(),
+                )
+                .map(|value| value.to_string());
 
                 CredentialStatusItem {
                     id: entry.id,
@@ -97,6 +97,8 @@ impl AdminService {
                     refresh_token_hash: entry.refresh_token_hash,
                     email: entry.email,
                     subscription_title: entry.subscription_title,
+                    subscription_type: entry.subscription_type,
+                    auth_account_type: entry.auth_account_type,
                     account_type: entry.account_type,
                     resolved_account_type: entry.resolved_account_type,
                     account_type_source: entry.account_type_source,
@@ -285,6 +287,7 @@ impl AdminService {
         Ok(BalanceResponse {
             id,
             subscription_title: usage.subscription_title().map(|s| s.to_string()),
+            subscription_type: usage.subscription_type().map(|s| s.to_string()),
             current_usage,
             usage_limit,
             remaining,
@@ -311,6 +314,7 @@ impl AdminService {
             auth_method: Some(req.auth_method),
             client_id: req.client_id,
             client_secret: req.client_secret,
+            start_url: req.start_url,
             priority: req.priority,
             max_concurrency: req.max_concurrency,
             rate_limit_bucket_capacity: req.rate_limit_bucket_capacity,
@@ -321,6 +325,7 @@ impl AdminService {
             machine_id: req.machine_id,
             email: req.email,
             subscription_title: None, // 将在首次获取使用额度时自动更新
+            subscription_type: None,
             account_type: req.account_type,
             allowed_models: req.allowed_models.unwrap_or_default(),
             blocked_models: req.blocked_models.unwrap_or_default(),
@@ -343,16 +348,48 @@ impl AdminService {
             .await
             .map_err(|e| self.classify_add_error(e))?;
 
-        // 主动获取订阅等级，避免首次请求时 Free 账号绕过 Opus 模型过滤
-        if let Err(e) = self.token_manager.get_usage_limits_for(credential_id).await {
-            tracing::warn!("添加凭据后获取订阅等级失败（不影响凭据添加）: {}", e);
-        }
+        // 主动获取订阅信息，避免首次请求时 Free 账号绕过 Opus 模型过滤
+        let usage_info = match self.token_manager.get_usage_limits_for(credential_id).await {
+            Ok(usage) => Some(usage),
+            Err(e) => {
+                tracing::warn!("添加凭据后获取订阅等级失败（不影响凭据添加）: {}", e);
+                None
+            }
+        };
+
+        let credential_snapshot = self
+            .token_manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == credential_id);
 
         Ok(AddCredentialResponse {
             success: true,
             message: format!("凭据添加成功，ID: {}", credential_id),
             credential_id,
             email,
+            subscription_title: usage_info
+                .as_ref()
+                .and_then(|usage| usage.subscription_title().map(str::to_string))
+                .or_else(|| {
+                    credential_snapshot
+                        .as_ref()
+                        .and_then(|entry| entry.subscription_title.clone())
+                }),
+            subscription_type: usage_info
+                .as_ref()
+                .and_then(|usage| usage.subscription_type().map(str::to_string))
+                .or_else(|| {
+                    credential_snapshot
+                        .as_ref()
+                        .and_then(|entry| entry.subscription_type.clone())
+                }),
+            auth_account_type: credential_snapshot
+                .as_ref()
+                .and_then(|entry| entry.auth_account_type.clone()),
+            resolved_account_type: credential_snapshot
+                .and_then(|entry| entry.resolved_account_type),
         })
     }
 
@@ -823,6 +860,7 @@ mod tests {
         let shared_balance = BalanceResponse {
             id: 1,
             subscription_title: Some("KIRO PRO+".to_string()),
+            subscription_type: Some("Q_DEVELOPER_STANDALONE_PRO_PLUS".to_string()),
             current_usage: 12.5,
             usage_limit: 100.0,
             remaining: 87.5,

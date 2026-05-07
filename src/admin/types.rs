@@ -61,6 +61,12 @@ pub struct CredentialStatusItem {
     /// 订阅等级（KIRO PRO+ / KIRO FREE 等）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subscription_title: Option<String>,
+    /// 订阅内部类型（如 Q_DEVELOPER_STANDALONE_PRO）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription_type: Option<String>,
+    /// 识别出的认证账号类型（social / builder-id / enterprise / idc）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_account_type: Option<String>,
     /// 账号类型
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_type: Option<String>,
@@ -254,6 +260,9 @@ pub struct AddCredentialRequest {
     /// 未配置时回退到 config.json 的 machineId
     pub machine_id: Option<String>,
 
+    /// AWS IAM Identity Center Start URL（企业 IdC 账号可选）
+    pub start_url: Option<String>,
+
     /// 用户邮箱（可选，用于前端显示）
     pub email: Option<String>,
 
@@ -291,6 +300,14 @@ pub struct AddCredentialResponse {
     /// 用户邮箱（如果获取成功）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_account_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_account_type: Option<String>,
 }
 
 // ============ 余额查询 ============
@@ -303,6 +320,8 @@ pub struct BalanceResponse {
     pub id: u64,
     /// 订阅类型
     pub subscription_title: Option<String>,
+    /// 订阅内部类型
+    pub subscription_type: Option<String>,
     /// 当前使用量
     pub current_usage: f64,
     /// 使用限额

@@ -135,8 +135,25 @@ function formatAccountTypeSourceLabel(
       return '显式账号类型'
     case 'subscription-title':
       return '按订阅档位推断'
+    case 'subscription-type':
+      return '按订阅类型推断'
     default:
       return null
+  }
+}
+
+function formatAuthAccountTypeLabel(value: CredentialStatusItem['authAccountType']): string {
+  switch (value) {
+    case 'social':
+      return 'Social'
+    case 'builder-id':
+      return 'Builder ID'
+    case 'enterprise':
+      return 'Enterprise'
+    case 'idc':
+      return 'IdC'
+    default:
+      return value || '未知'
   }
 }
 
@@ -386,6 +403,9 @@ export function CredentialCard({
       : '未知'
   const balancePercentRemaining = balance ? `${(100 - balance.usagePercentage).toFixed(1)}% 剩余` : null
   const subscriptionLabel = credential.subscriptionTitle || balance?.subscriptionTitle || '未知'
+  const subscriptionTypeLabel = credential.subscriptionType || balance?.subscriptionType || null
+  const authAccountTypeLabel = formatAuthAccountTypeLabel(credential.authAccountType)
+  const resolvedAccountTypeLabel = credential.resolvedAccountType || '未设置'
   const bucketSummary =
     credential.rateLimitBucketCapacity !== undefined && credential.rateLimitBucketCapacity !== null
       ? `${(credential.rateLimitBucketTokens ?? 0).toFixed(2)} / ${credential.rateLimitBucketCapacity.toFixed(2)}`
@@ -456,7 +476,7 @@ export function CredentialCard({
         </CardHeader>
         <CardContent className="space-y-4">
           {/* 信息摘要 */}
-          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
             <InfoTile label="优先级">
               {editingPriority ? (
                 <div className="flex flex-wrap items-center gap-1">
@@ -559,6 +579,11 @@ export function CredentialCard({
             <InfoTile label="订阅与用量">
               <div className="space-y-1">
                 <div>{loadingBalance && !credential.subscriptionTitle ? <Loader2 className="h-4 w-4 animate-spin" /> : subscriptionLabel}</div>
+                {subscriptionTypeLabel && subscriptionTypeLabel !== subscriptionLabel && (
+                  <div className="break-all text-xs font-normal text-muted-foreground">
+                    {subscriptionTypeLabel}
+                  </div>
+                )}
                 <div className="text-xs font-normal text-muted-foreground">
                   剩余：
                   {loadingBalance ? (
@@ -572,6 +597,16 @@ export function CredentialCard({
                       {balancePercentRemaining && <span className="ml-1">({balancePercentRemaining})</span>}
                     </>
                   )}
+                </div>
+              </div>
+            </InfoTile>
+
+            <InfoTile label="账号类型">
+              <div className="space-y-1">
+                <div>{resolvedAccountTypeLabel}</div>
+                <div className="text-xs font-normal text-muted-foreground">
+                  认证：{authAccountTypeLabel}
+                  {accountTypeSourceLabel && <span className="ml-1">/ {accountTypeSourceLabel}</span>}
                 </div>
               </div>
             </InfoTile>
@@ -689,6 +724,9 @@ export function CredentialCard({
                 标准档位 {recognizedStandardAccountType.preset.displayName}
               </Badge>
             )}
+            <Badge variant="outline" className="max-w-full break-all">
+              认证类型 {authAccountTypeLabel}
+            </Badge>
             <Badge variant="secondary">{policySummary}</Badge>
             {bucketSummary && <Badge variant="outline">Bucket {bucketSummary}</Badge>}
             {refillSummary && <Badge variant="outline">回填 {refillSummary}</Badge>}

@@ -28,6 +28,10 @@ pub struct SubscriptionInfo {
     /// 订阅标题 (KIRO PRO+ / KIRO FREE 等)
     #[serde(default)]
     pub subscription_title: Option<String>,
+
+    /// 订阅内部类型 (如 Q_DEVELOPER_STANDALONE_PRO)
+    #[serde(default, rename = "type")]
+    pub subscription_type: Option<String>,
 }
 
 /// 使用量明细
@@ -139,6 +143,13 @@ impl UsageLimitsResponse {
         self.subscription_info
             .as_ref()
             .and_then(|info| info.subscription_title.as_deref())
+    }
+
+    /// 获取订阅内部类型
+    pub fn subscription_type(&self) -> Option<&str> {
+        self.subscription_info
+            .as_ref()
+            .and_then(|info| info.subscription_type.as_deref())
     }
 
     /// 获取第一个使用量明细
