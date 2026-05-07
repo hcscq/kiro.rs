@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
 use crate::common::logging::summarize_upstream_error;
@@ -33,6 +33,7 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 const MAX_TOTAL_RETRIES: usize = 9;
 const DEFAULT_UPSTREAM_TIMEOUT_SECS: u64 = 720;
 const STREAM_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(240);
+const STREAM_PRE_SSE_RESPONSE_BUDGET: Duration = Duration::from_secs(170);
 const STREAM_TOTAL_WALL_CLOCK_BUDGET: Duration = Duration::from_secs(540);
 const SLOW_UPSTREAM_HEADERS_MS: u128 = 3_000;
 const SLOW_FIRST_CHUNK_MS: u128 = 3_000;
@@ -567,6 +568,65 @@ impl KiroProvider {
         "Upstream stream exceeded the retry time budget before a usable response was produced."
     }
 
+    fn stream_pre_sse_timeout_public_message() -> &'static str {
+        "Upstream stream did not produce a usable response before the retry budget was exhausted."
+    }
+
+    fn stream_pre_sse_timeout_error(
+        overall_started_at: Instant,
+        api_type: &str,
+        request_id: &str,
+    ) -> anyhow::Error {
+        anyhow::Error::new(PublicProviderError::gateway_timeout(
+            format!(
+                "{} API 请求超时: request_id={} total_elapsed_ms={} exceeded pre-SSE stream budget {}ms",
+                api_type,
+                request_id,
+                overall_started_at.elapsed().as_millis(),
+                STREAM_PRE_SSE_RESPONSE_BUDGET.as_millis()
+            ),
+            Self::stream_pre_sse_timeout_public_message(),
+        ))
+    }
+
+    fn remaining_stream_pre_sse_response_budget(
+        overall_started_at: Instant,
+        api_type: &str,
+        request_id: &str,
+    ) -> anyhow::Result<Duration> {
+        STREAM_PRE_SSE_RESPONSE_BUDGET
+            .checked_sub(overall_started_at.elapsed())
+            .ok_or_else(|| {
+                Self::stream_pre_sse_timeout_error(overall_started_at, api_type, request_id)
+            })
+    }
+
+    async fn read_failure_body_before_sse(
+        response: reqwest::Response,
+        is_stream: bool,
+        overall_started_at: Instant,
+        api_type: &str,
+        request_id: &str,
+    ) -> anyhow::Result<String> {
+        if !is_stream {
+            return Ok(response.text().await.unwrap_or_default());
+        }
+
+        let remaining = Self::remaining_stream_pre_sse_response_budget(
+            overall_started_at,
+            api_type,
+            request_id,
+        )?;
+        match timeout(remaining, response.text()).await {
+            Ok(result) => Ok(result.unwrap_or_default()),
+            Err(_) => Err(Self::stream_pre_sse_timeout_error(
+                overall_started_at,
+                api_type,
+                request_id,
+            )),
+        }
+    }
+
     fn remaining_stream_budget(
         overall_started_at: Instant,
         api_type: &str,
@@ -911,26 +971,35 @@ impl KiroProvider {
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(retry_cap);
 
         for attempt in 0..max_retries {
-            let stream_budget_remaining = if is_stream {
-                Some(Self::remaining_stream_budget(
-                    overall_started_at,
-                    api_type,
-                    &request_id,
-                )?)
-            } else {
-                None
-            };
             let attempt_started_at = Instant::now();
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self
-                .token_manager
-                .acquire_context_with_weight_excluding(
+            let acquire_context = || {
+                self.token_manager.acquire_context_with_weight_excluding(
                     model.as_deref(),
                     request_weight,
                     &request_scoped_model_unsupported_credentials,
                 )
-                .await
-            {
+            };
+            let acquire_result = if is_stream {
+                let remaining = Self::remaining_stream_pre_sse_response_budget(
+                    overall_started_at,
+                    api_type,
+                    &request_id,
+                )?;
+                match timeout(remaining, acquire_context()).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        return Err(Self::stream_pre_sse_timeout_error(
+                            overall_started_at,
+                            api_type,
+                            &request_id,
+                        ));
+                    }
+                }
+            } else {
+                acquire_context().await
+            };
+            let ctx = match acquire_result {
                 Ok(c) => c,
                 Err(err) => {
                     if self
@@ -988,8 +1057,29 @@ impl KiroProvider {
             if !options.omit_agent_mode_header {
                 request = request.header("x-amzn-kiro-agent-mode", "vibe");
             }
-            if let Some(remaining_budget) = stream_budget_remaining {
-                let attempt_timeout = remaining_budget.min(STREAM_ATTEMPT_TIMEOUT);
+            let stream_budget_remaining = if is_stream {
+                Some(Self::remaining_stream_budget(
+                    overall_started_at,
+                    api_type,
+                    &request_id,
+                )?)
+            } else {
+                None
+            };
+            let stream_pre_sse_budget_remaining = if is_stream {
+                Some(Self::remaining_stream_pre_sse_response_budget(
+                    overall_started_at,
+                    api_type,
+                    &request_id,
+                )?)
+            } else {
+                None
+            };
+            let stream_attempt_timeout = match stream_budget_remaining {
+                Some(remaining_budget) => Some(remaining_budget.min(STREAM_ATTEMPT_TIMEOUT)),
+                None => None,
+            };
+            if let Some(attempt_timeout) = stream_attempt_timeout {
                 request = request.timeout(attempt_timeout);
             }
 
@@ -1008,8 +1098,11 @@ impl KiroProvider {
                 stream_budget_remaining_ms = stream_budget_remaining
                     .map(|value| value.as_millis())
                     .unwrap_or(0),
-                stream_attempt_timeout_ms = stream_budget_remaining
-                    .map(|value| value.min(STREAM_ATTEMPT_TIMEOUT).as_millis())
+                stream_pre_sse_budget_remaining_ms = stream_pre_sse_budget_remaining
+                    .map(|value| value.as_millis())
+                    .unwrap_or(0),
+                stream_attempt_timeout_ms = stream_attempt_timeout
+                    .map(|value| value.as_millis())
                     .unwrap_or(0),
                 omit_agent_mode_header = options.omit_agent_mode_header,
                 invocation_id = %invocation_id,
@@ -1017,7 +1110,21 @@ impl KiroProvider {
             );
 
             let upstream_request_started_at = Instant::now();
-            let response = match request.send().await {
+            let send_result = if let Some(pre_sse_budget) = stream_pre_sse_budget_remaining {
+                match timeout(pre_sse_budget, request.send()).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        return Err(Self::stream_pre_sse_timeout_error(
+                            overall_started_at,
+                            api_type,
+                            &request_id,
+                        ));
+                    }
+                }
+            } else {
+                request.send().await
+            };
+            let response = match send_result {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::warn!(
@@ -1128,7 +1235,14 @@ impl KiroProvider {
             }
 
             // 失败响应：读取 body 用于日志/错误信息
-            let body = response.text().await.unwrap_or_default();
+            let body = Self::read_failure_body_before_sse(
+                response,
+                is_stream,
+                overall_started_at,
+                api_type,
+                &request_id,
+            )
+            .await?;
             let error_summary = Self::summarize_error_body(status, &body);
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
@@ -1768,6 +1882,26 @@ mod tests {
         assert_eq!(
             public.public_message(),
             "Upstream stream exceeded the retry time budget before a usable response was produced."
+        );
+    }
+
+    #[test]
+    fn test_remaining_stream_pre_sse_response_budget_exhausted_returns_public_timeout_error() {
+        let started_at = Instant::now() - STREAM_PRE_SSE_RESPONSE_BUDGET - Duration::from_millis(1);
+        let err = KiroProvider::remaining_stream_pre_sse_response_budget(
+            started_at,
+            "流式",
+            "kirors-test",
+        )
+        .unwrap_err();
+        let public = err
+            .downcast_ref::<PublicProviderError>()
+            .expect("expected public provider error");
+        assert_eq!(public.status_code(), 504);
+        assert_eq!(public.error_type(), "api_error");
+        assert_eq!(
+            public.public_message(),
+            "Upstream stream did not produce a usable response before the retry budget was exhausted."
         );
     }
 }
