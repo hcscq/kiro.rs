@@ -1,6 +1,20 @@
-import { useState, type ReactNode } from 'react'
+import { useState, type ComponentType, type ReactNode } from 'react'
 import { toast } from 'sonner'
-import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2 } from 'lucide-react'
+import {
+  BadgeCheck,
+  Building2,
+  ChevronDown,
+  ChevronUp,
+  Clock3,
+  KeyRound,
+  Layers,
+  Loader2,
+  RefreshCw,
+  ShieldCheck,
+  Trash2,
+  UserRound,
+  Wallet,
+} from 'lucide-react'
 import {
   AccountTypeInput,
   findStandardAccountTypePreset,
@@ -105,10 +119,37 @@ function InfoTile({
   children: ReactNode
 }) {
   return (
-    <div className={cn('rounded-lg border bg-muted/20 px-3 py-2.5', className)}>
-      <div className="text-xs text-muted-foreground">{label}</div>
-      <div className="mt-1 text-sm font-medium leading-snug">{children}</div>
+    <div className={cn('min-w-0 overflow-hidden rounded-lg border bg-muted/20 px-3 py-2.5', className)}>
+      <div className="truncate text-xs text-muted-foreground">{label}</div>
+      <div className="mt-1 min-w-0 text-sm font-medium leading-snug">{children}</div>
     </div>
+  )
+}
+
+function CompactPill({
+  icon: Icon,
+  label,
+  title,
+  tone = 'muted',
+}: {
+  icon?: ComponentType<{ className?: string }>
+  label: string
+  title?: string
+  tone?: 'muted' | 'accent' | 'success'
+}) {
+  return (
+    <span
+      className={cn(
+        'inline-flex h-5 max-w-full items-center gap-1 rounded-full border px-1.5 text-[11px] font-medium leading-none',
+        tone === 'accent' && 'border-primary/20 bg-primary/10 text-primary',
+        tone === 'success' && 'border-green-500/20 bg-green-500/10 text-green-700',
+        tone === 'muted' && 'border-border bg-background text-muted-foreground'
+      )}
+      title={title ?? label}
+    >
+      {Icon && <Icon className="h-3 w-3 shrink-0" />}
+      <span className="min-w-0 truncate">{label}</span>
+    </span>
   )
 }
 
@@ -142,6 +183,21 @@ function formatAccountTypeSourceLabel(
   }
 }
 
+function formatAccountTypeSourceShortLabel(
+  source: CredentialStatusItem['accountTypeSource']
+): string | null {
+  switch (source) {
+    case 'credential':
+      return '显式'
+    case 'subscription-title':
+      return '档位'
+    case 'subscription-type':
+      return '类型'
+    default:
+      return null
+  }
+}
+
 function formatAuthAccountTypeLabel(value: CredentialStatusItem['authAccountType']): string {
   switch (value) {
     case 'social':
@@ -154,6 +210,50 @@ function formatAuthAccountTypeLabel(value: CredentialStatusItem['authAccountType
       return 'IdC'
     default:
       return value || '未知'
+  }
+}
+
+function formatAccountTypeCompactLabel(value: string | null | undefined): string {
+  switch (value) {
+    case 'pro-plus':
+      return 'PRO+'
+    case 'builder-id':
+      return 'Builder'
+    case 'idc':
+      return 'IdC'
+    default:
+      return value || '未设置'
+  }
+}
+
+function formatSubscriptionTypeCompactLabel(value: string | null | undefined): string | null {
+  if (!value) return null
+
+  const normalized = value.toUpperCase()
+  if (normalized.includes('PRO_PLUS')) return 'PRO+'
+  if (normalized.includes('ULTRA')) return 'ULTRA'
+  if (normalized.includes('MAX')) return 'MAX'
+  if (normalized.includes('POWER')) return 'POWER'
+  if (normalized.includes('FREE')) return 'FREE'
+  if (normalized.includes('PRO')) return 'PRO'
+
+  return value.length > 16 ? `${value.slice(0, 8)}…${value.slice(-5)}` : value
+}
+
+function getAuthAccountTypeIcon(
+  value: CredentialStatusItem['authAccountType']
+): ComponentType<{ className?: string }> {
+  switch (value) {
+    case 'social':
+      return UserRound
+    case 'builder-id':
+      return BadgeCheck
+    case 'enterprise':
+      return Building2
+    case 'idc':
+      return KeyRound
+    default:
+      return KeyRound
   }
 }
 
@@ -380,6 +480,7 @@ export function CredentialCard({
   const blockedModelsSummary = summarizeSelectedModels(blockedModelsValue, modelCatalog)
   const maxConcurrencySourceLabel = formatDispatchSourceLabel(credential.maxConcurrencySource)
   const accountTypeSourceLabel = formatAccountTypeSourceLabel(credential.accountTypeSource)
+  const accountTypeSourceShortLabel = formatAccountTypeSourceShortLabel(credential.accountTypeSource)
   const rateLimitOverrideSummary = [
     credential.rateLimitBucketCapacityOverride === undefined ||
     credential.rateLimitBucketCapacityOverride === null
@@ -404,8 +505,11 @@ export function CredentialCard({
   const balancePercentRemaining = balance ? `${(100 - balance.usagePercentage).toFixed(1)}% 剩余` : null
   const subscriptionLabel = credential.subscriptionTitle || balance?.subscriptionTitle || '未知'
   const subscriptionTypeLabel = credential.subscriptionType || balance?.subscriptionType || null
+  const subscriptionTypeCompactLabel = formatSubscriptionTypeCompactLabel(subscriptionTypeLabel)
   const authAccountTypeLabel = formatAuthAccountTypeLabel(credential.authAccountType)
+  const AuthAccountTypeIcon = getAuthAccountTypeIcon(credential.authAccountType)
   const resolvedAccountTypeLabel = credential.resolvedAccountType || '未设置'
+  const resolvedAccountTypeCompactLabel = formatAccountTypeCompactLabel(credential.resolvedAccountType)
   const bucketSummary =
     credential.rateLimitBucketCapacity !== undefined && credential.rateLimitBucketCapacity !== null
       ? `${(credential.rateLimitBucketTokens ?? 0).toFixed(2)} / ${credential.rateLimitBucketCapacity.toFixed(2)}`
@@ -476,7 +580,7 @@ export function CredentialCard({
         </CardHeader>
         <CardContent className="space-y-4">
           {/* 信息摘要 */}
-          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-5">
             <InfoTile label="优先级">
               {editingPriority ? (
                 <div className="flex flex-wrap items-center gap-1">
@@ -578,24 +682,38 @@ export function CredentialCard({
 
             <InfoTile label="订阅与用量">
               <div className="space-y-1">
-                <div>{loadingBalance && !credential.subscriptionTitle ? <Loader2 className="h-4 w-4 animate-spin" /> : subscriptionLabel}</div>
-                {subscriptionTypeLabel && subscriptionTypeLabel !== subscriptionLabel && (
-                  <div className="break-all text-xs font-normal text-muted-foreground">
-                    {subscriptionTypeLabel}
-                  </div>
-                )}
-                <div className="text-xs font-normal text-muted-foreground">
-                  剩余：
+                <div className="flex min-w-0 items-center gap-1.5">
+                  {loadingBalance && !credential.subscriptionTitle ? (
+                    <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
+                  ) : (
+                    <span className="min-w-0 flex-1 truncate" title={subscriptionLabel}>
+                      {subscriptionLabel}
+                    </span>
+                  )}
+                  {subscriptionTypeCompactLabel && subscriptionTypeLabel !== subscriptionLabel && (
+                    <CompactPill
+                      icon={Layers}
+                      label={subscriptionTypeCompactLabel}
+                      title={`内部订阅类型：${subscriptionTypeLabel}`}
+                      tone="accent"
+                    />
+                  )}
+                </div>
+                <div className="flex min-w-0 items-center gap-1.5 text-xs font-normal text-muted-foreground">
+                  <Wallet className="h-3 w-3 shrink-0" />
                   {loadingBalance ? (
-                    <span className="ml-1 inline-flex items-center gap-1">
+                    <span className="inline-flex min-w-0 items-center gap-1">
                       <Loader2 className="h-3 w-3 animate-spin" />
                       加载中
                     </span>
                   ) : (
-                    <>
-                      <span className="ml-1">{balanceSummary}</span>
+                    <span
+                      className="min-w-0 truncate"
+                      title={balancePercentRemaining ? `${balanceSummary} (${balancePercentRemaining})` : balanceSummary ?? undefined}
+                    >
+                      {balanceSummary}
                       {balancePercentRemaining && <span className="ml-1">({balancePercentRemaining})</span>}
-                    </>
+                    </span>
                   )}
                 </div>
               </div>
@@ -603,16 +721,38 @@ export function CredentialCard({
 
             <InfoTile label="账号类型">
               <div className="space-y-1">
-                <div>{resolvedAccountTypeLabel}</div>
-                <div className="text-xs font-normal text-muted-foreground">
-                  认证：{authAccountTypeLabel}
-                  {accountTypeSourceLabel && <span className="ml-1">/ {accountTypeSourceLabel}</span>}
+                <div className="flex min-w-0 items-center gap-1.5">
+                  <CompactPill
+                    icon={ShieldCheck}
+                    label={resolvedAccountTypeCompactLabel}
+                    title={`生效账号类型：${resolvedAccountTypeLabel}`}
+                    tone={credential.resolvedAccountType ? 'success' : 'muted'}
+                  />
+                </div>
+                <div className="flex min-w-0 flex-wrap gap-1">
+                  <CompactPill
+                    icon={AuthAccountTypeIcon}
+                    label={authAccountTypeLabel}
+                    title={`认证类型：${authAccountTypeLabel}`}
+                  />
+                  {accountTypeSourceShortLabel && (
+                    <CompactPill
+                      icon={Layers}
+                      label={accountTypeSourceShortLabel}
+                      title={accountTypeSourceLabel ?? accountTypeSourceShortLabel}
+                    />
+                  )}
                 </div>
               </div>
             </InfoTile>
 
             <InfoTile label="最后调用">
-              {formatLastUsed(credential.lastUsedAt)}
+              <div className="flex min-w-0 items-center gap-1.5">
+                <Clock3 className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                <span className="min-w-0 truncate" title={formatLastUsed(credential.lastUsedAt)}>
+                  {formatLastUsed(credential.lastUsedAt)}
+                </span>
+              </div>
             </InfoTile>
           </div>
 
