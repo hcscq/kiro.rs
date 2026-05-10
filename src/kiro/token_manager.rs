@@ -1986,7 +1986,7 @@ impl MultiTokenManager {
         let mut has_enabled = false;
         let mut has_supported = false;
         let mut selected_index: Option<usize> = None;
-        let mut priority_key: Option<(u8, u32, usize, u8, u64)> = None;
+        let mut priority_key: Option<(u32, usize, u8, u8, u64)> = None;
         let mut balanced_key: Option<(u8, usize, u64, u32, u64)> = None;
         let mut next_ready_at: Option<Instant> = None;
 
@@ -2035,9 +2035,9 @@ impl MultiTokenManager {
             }
 
             let candidate_key = (
-                Self::model_preference_rank(&entry.credentials, model_requirement),
                 entry.credentials.priority,
                 entry.active_requests,
+                Self::model_preference_rank(&entry.credentials, model_requirement),
                 u8::from(entry.id != current_id_value),
                 entry.id,
             );
@@ -2194,7 +2194,7 @@ impl MultiTokenManager {
                 let mut selected_credentials: Option<KiroCredentials> = None;
                 let mut selected_max_concurrency: Option<usize> = None;
                 let mut selected_bucket_policy: Option<DispatchRuntimeBucketPolicy> = None;
-                let mut priority_key: Option<(u8, u32, usize, u8, u64)> = None;
+                let mut priority_key: Option<(u32, usize, u8, u8, u64)> = None;
                 let mut balanced_key: Option<(u8, usize, u64, u32, u64)> = None;
                 let mut next_ready_at: Option<Instant> = fallback_next_ready_at;
 
@@ -2269,9 +2269,9 @@ impl MultiTokenManager {
                     }
 
                     let candidate_key = (
-                        Self::model_preference_rank(&entry.credentials, model_requirement),
                         entry.credentials.priority,
                         runtime.active_requests,
+                        Self::model_preference_rank(&entry.credentials, model_requirement),
                         u8::from(entry.id != current_id_value),
                         entry.id,
                     );
@@ -2540,6 +2540,74 @@ impl MultiTokenManager {
                 }
             }
         }
+    }
+
+    pub(crate) fn enabled_supported_credential_count(&self, model: Option<&str>) -> usize {
+        let dispatch = self.dispatch_config();
+        let model_requirement = Self::model_requirement(model);
+        let mut entries = self.entries.lock();
+        let now = Instant::now();
+        Self::refresh_runtime_state(&mut entries, now);
+
+        entries
+            .iter()
+            .filter(|entry| {
+                !entry.disabled
+                    && Self::is_model_supported(
+                        &dispatch,
+                        &entry.credentials,
+                        model,
+                        model_requirement,
+                    )
+            })
+            .count()
+    }
+
+    pub(crate) fn enabled_supported_credential_ids_at_priority(
+        &self,
+        model: Option<&str>,
+        priority: u32,
+    ) -> Vec<u64> {
+        let dispatch = self.dispatch_config();
+        let model_requirement = Self::model_requirement(model);
+        let mut entries = self.entries.lock();
+        let now = Instant::now();
+        Self::refresh_runtime_state(&mut entries, now);
+
+        entries
+            .iter()
+            .filter(|entry| {
+                !entry.disabled
+                    && entry.credentials.priority == priority
+                    && Self::is_model_supported(
+                        &dispatch,
+                        &entry.credentials,
+                        model,
+                        model_requirement,
+                    )
+            })
+            .map(|entry| entry.id)
+            .collect()
+    }
+
+    pub(crate) fn has_enabled_supported_credential_below_priority(
+        &self,
+        model: Option<&str>,
+        priority: u32,
+        excluded_credential_ids: &HashSet<u64>,
+    ) -> bool {
+        let dispatch = self.dispatch_config();
+        let model_requirement = Self::model_requirement(model);
+        let mut entries = self.entries.lock();
+        let now = Instant::now();
+        Self::refresh_runtime_state(&mut entries, now);
+
+        entries.iter().any(|entry| {
+            !entry.disabled
+                && entry.credentials.priority > priority
+                && !excluded_credential_ids.contains(&entry.id)
+                && Self::is_model_supported(&dispatch, &entry.credentials, model, model_requirement)
+        })
     }
 
     /// 选择优先级最高的未禁用凭据作为当前凭据（内部方法）
@@ -3663,8 +3731,8 @@ impl MultiTokenManager {
                     })
                     .min_by_key(|e| {
                         (
-                            Self::model_preference_rank(&e.credentials, requirement),
                             e.credentials.priority,
+                            Self::model_preference_rank(&e.credentials, requirement),
                             e.id,
                         )
                     })
@@ -5177,6 +5245,40 @@ mod tests {
     }
 
     #[test]
+    fn test_enabled_supported_priority_helpers_detect_lower_priority_fallback() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                available_credential(0),
+                available_credential(0),
+                available_credential(10),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(manager.enabled_supported_credential_count(None), 3);
+
+        let high_priority_ids = manager.enabled_supported_credential_ids_at_priority(None, 0);
+        assert_eq!(high_priority_ids.len(), 2);
+
+        let fallback_ids = manager.enabled_supported_credential_ids_at_priority(None, 10);
+        assert_eq!(fallback_ids.len(), 1);
+
+        let excluded = HashSet::new();
+        assert!(manager.has_enabled_supported_credential_below_priority(None, 0, &excluded));
+
+        let excluded_fallback: HashSet<u64> = fallback_ids.into_iter().collect();
+        assert!(!manager.has_enabled_supported_credential_below_priority(
+            None,
+            0,
+            &excluded_fallback
+        ));
+    }
+
+    #[test]
     fn test_is_token_expired_with_expired_token() {
         let mut credentials = KiroCredentials::default();
         credentials.expires_at = Some("2020-01-01T00:00:00Z".to_string());
@@ -5649,15 +5751,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_priority_mode_deprioritizes_power_tier_for_real_opus_4_7() {
+    async fn test_priority_mode_keeps_priority_before_real_opus_4_7_preference() {
         let config = Config::default();
-        let mut power = available_credential(0);
-        power.subscription_title = Some("KIRO POWER".to_string());
+        let mut pro = available_credential(0);
+        pro.subscription_title = Some("KIRO PRO".to_string());
         let mut pro_plus = available_credential(9);
         pro_plus.subscription_title = Some("KIRO PRO+".to_string());
 
         let manager =
-            MultiTokenManager::new(config, vec![power, pro_plus], None, None, false).unwrap();
+            MultiTokenManager::new(config, vec![pro, pro_plus], None, None, false).unwrap();
+
+        let ctx = manager
+            .acquire_context(Some("claude-opus-4.7"))
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 1);
+    }
+
+    #[tokio::test]
+    async fn test_priority_mode_spills_to_lower_priority_when_high_priority_at_capacity() {
+        let config = Config::default();
+        let mut primary = available_credential(0);
+        primary.subscription_title = Some("KIRO PRO".to_string());
+        primary.max_concurrency = Some(1);
+        let mut overflow = available_credential(10);
+        overflow.subscription_title = Some("KIRO PRO+".to_string());
+        overflow.max_concurrency = Some(20);
+
+        let manager =
+            MultiTokenManager::new(config, vec![primary, overflow], None, None, false).unwrap();
+
+        let first = manager
+            .acquire_context(Some("claude-opus-4.7"))
+            .await
+            .unwrap();
+        assert_eq!(first.id, 1);
+
+        let second = manager
+            .acquire_context(Some("claude-opus-4.7"))
+            .await
+            .unwrap();
+        assert_eq!(second.id, 2);
+    }
+
+    #[tokio::test]
+    async fn test_priority_mode_model_unsupported_switches_to_next_high_priority_before_pro_plus() {
+        let mut config = Config::default();
+        config.model_cooldown_enabled = true;
+
+        let mut primary = available_credential(0);
+        primary.subscription_title = Some("KIRO PRO".to_string());
+        let mut secondary = available_credential(0);
+        secondary.subscription_title = Some("KIRO PRO".to_string());
+        let mut overflow = available_credential(10);
+        overflow.subscription_title = Some("KIRO PRO+".to_string());
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![primary, secondary, overflow],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert!(manager.defer_model_unsupported_credential(1, "claude-opus-4.7"));
+
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.current_id, 2);
 
         let ctx = manager
             .acquire_context(Some("claude-opus-4.7"))
@@ -5955,6 +6116,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(light.id, 1);
+    }
+
+    #[tokio::test]
+    async fn test_shared_dispatch_priority_prefers_priority_before_opus_rank_when_redis_is_set() {
+        let Some(mut config) = shared_runtime_test_config() else {
+            return;
+        };
+        config.rate_limit_bucket_capacity = 0.0;
+        config.rate_limit_refill_per_second = 0.0;
+
+        let primary_id = unique_credential_id();
+        let overflow_id = unique_credential_id();
+
+        let mut primary = available_credential(0);
+        primary.id = Some(primary_id);
+        primary.subscription_title = Some("KIRO PRO".to_string());
+
+        let mut overflow = available_credential(10);
+        overflow.id = Some(overflow_id);
+        overflow.subscription_title = Some("KIRO PRO+".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![primary, overflow], None, None, false)
+            .expect("manager should initialize with shared runtime");
+
+        let ctx = manager
+            .acquire_context(Some("claude-opus-4.7"))
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, primary_id);
     }
 
     #[tokio::test]
