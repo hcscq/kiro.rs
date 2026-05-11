@@ -3650,6 +3650,126 @@ impl MultiTokenManager {
         result
     }
 
+    /// 当某个凭据在流式请求中长期没有产出可转换的首内容块时，临时冷却该凭据。
+    /// 这不会禁用账号，只是给当前及并发实例一个短窗口去调度其他候选。
+    pub fn defer_slow_first_content_credential(
+        &self,
+        id: u64,
+        model: &str,
+        cooldown: StdDuration,
+    ) -> bool {
+        let now = Instant::now();
+        let deferred_until = now + cooldown;
+        let dispatch = self.dispatch_config();
+        let requirement = Self::model_requirement(Some(model));
+        let result = {
+            let mut entries = self.entries.lock();
+            let mut current_id = self.current_id.lock();
+
+            let entry = match entries.iter_mut().find(|e| e.id == id) {
+                Some(e) => e,
+                None => {
+                    return entries.iter().any(|e| {
+                        !e.disabled
+                            && e.id != id
+                            && Self::is_model_supported(
+                                &dispatch,
+                                &e.credentials,
+                                Some(model),
+                                requirement,
+                            )
+                    });
+                }
+            };
+
+            if entry.disabled {
+                return entries.iter().any(|e| {
+                    !e.disabled
+                        && e.id != id
+                        && Self::is_model_supported(
+                            &dispatch,
+                            &e.credentials,
+                            Some(model),
+                            requirement,
+                        )
+                });
+            }
+
+            entry.rate_limit_cooldown_until = Some(
+                entry
+                    .rate_limit_cooldown_until
+                    .map(|until| until.max(deferred_until))
+                    .unwrap_or(deferred_until),
+            );
+            entry.last_used_at = Some(Utc::now().to_rfc3339());
+
+            if *current_id == id {
+                if let Some(next) = entries
+                    .iter()
+                    .filter(|e| {
+                        !e.disabled
+                            && e.id != id
+                            && Self::is_model_supported(
+                                &dispatch,
+                                &e.credentials,
+                                Some(model),
+                                requirement,
+                            )
+                    })
+                    .min_by_key(|e| {
+                        (
+                            e.credentials.priority,
+                            Self::model_preference_rank(&e.credentials, requirement),
+                            e.id,
+                        )
+                    })
+                {
+                    *current_id = next.id;
+                    tracing::warn!(
+                        "凭据 #{} 流式首内容块过慢，已临时冷却 {}ms 并切换到凭据 #{}",
+                        id,
+                        cooldown.as_millis(),
+                        next.id
+                    );
+                } else {
+                    tracing::warn!(
+                        "凭据 #{} 流式首内容块过慢，已临时冷却 {}ms，当前无其他可切换凭据",
+                        id,
+                        cooldown.as_millis()
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    "凭据 #{} 流式首内容块过慢，已临时冷却 {}ms",
+                    id,
+                    cooldown.as_millis()
+                );
+            }
+
+            entries.iter().any(|e| {
+                !e.disabled
+                    && e.id != id
+                    && Self::is_model_supported(&dispatch, &e.credentials, Some(model), requirement)
+            })
+        };
+
+        if self.shared_dispatch_runtime_enabled() {
+            let cooldown_ms = cooldown.as_millis().min(u128::from(u64::MAX)) as u64;
+            if let Err(err) =
+                self.state_store
+                    .defer_dispatch_credential(id, cooldown_ms, current_epoch_ms())
+            {
+                tracing::warn!(
+                    "更新共享调度首内容块慢启动冷却失败（credentialId={}）: {}",
+                    id,
+                    err
+                );
+            }
+        }
+        self.save_stats_debounced();
+        result
+    }
+
     /// 当上游明确返回 `INVALID_MODEL_ID` 时，
     /// 将当前凭据视为“不支持该模型”。
     ///

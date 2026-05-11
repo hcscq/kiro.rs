@@ -391,6 +391,8 @@ pub async fn post_messages(
                 omit_agent_mode_header: probe.omit_agent_mode_header,
                 request_id: Some(request_id.clone()),
                 request_weight,
+                wait_for_stream_content_start: thinking_enabled,
+                stream_thinking_enabled: thinking_enabled,
             },
         )
         .await
@@ -406,6 +408,8 @@ pub async fn post_messages(
                 omit_agent_mode_header: probe.omit_agent_mode_header,
                 request_id: Some(request_id),
                 request_weight,
+                wait_for_stream_content_start: false,
+                stream_thinking_enabled: false,
             },
         )
         .await
@@ -622,6 +626,8 @@ pub(crate) async fn execute_non_stream_round(
             omit_agent_mode_header: probe.omit_agent_mode_header,
             request_id,
             request_weight,
+            wait_for_stream_content_start: false,
+            stream_thinking_enabled: false,
         },
     )
     .await
@@ -1129,6 +1135,8 @@ pub async fn post_messages_cc(
                 omit_agent_mode_header: probe.omit_agent_mode_header,
                 request_id: Some(request_id.clone()),
                 request_weight,
+                wait_for_stream_content_start: false,
+                stream_thinking_enabled: thinking_enabled,
             },
         )
         .await
@@ -1144,6 +1152,8 @@ pub async fn post_messages_cc(
                 omit_agent_mode_header: probe.omit_agent_mode_header,
                 request_id: Some(request_id),
                 request_weight,
+                wait_for_stream_content_start: false,
+                stream_thinking_enabled: false,
             },
         )
         .await

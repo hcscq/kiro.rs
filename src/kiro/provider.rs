@@ -4,7 +4,7 @@
 //! 支持流式和非流式请求
 //! 支持多凭据故障转移和重试
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::stream::BoxStream;
 use futures::{StreamExt, stream};
 use reqwest::Client;
@@ -19,6 +19,8 @@ use crate::common::logging::summarize_upstream_error;
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::events::Event;
+use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::token_manager::{
     CallLease, DisabledReason, MultiTokenManager, RuntimeRefreshLeaderRequiredError,
     RuntimeRefreshLeaseBusyError,
@@ -37,6 +39,11 @@ const DEFAULT_UPSTREAM_TIMEOUT_SECS: u64 = 720;
 const STREAM_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(240);
 const STREAM_PRE_SSE_RESPONSE_BUDGET: Duration = Duration::from_secs(170);
 const STREAM_TOTAL_WALL_CLOCK_BUDGET: Duration = Duration::from_secs(540);
+const STREAM_FIRST_CONTENT_FAILOVER_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(60);
+const STREAM_FIRST_CONTENT_FAILOVER_TOTAL_BUDGET: Duration = Duration::from_secs(150);
+const STREAM_FIRST_CONTENT_FAILOVER_COOLDOWN: Duration = Duration::from_secs(120);
+const MAX_SLOW_FIRST_CONTENT_FAILOVERS: usize = 1;
+const MIN_STREAM_FIRST_CONTENT_FAILOVER_REMAINING: Duration = Duration::from_secs(15);
 const SLOW_UPSTREAM_HEADERS_MS: u128 = 3_000;
 const SLOW_FIRST_CHUNK_MS: u128 = 3_000;
 const SLOW_HEADERS_TO_FIRST_CHUNK_MS: u128 = 1_000;
@@ -58,9 +65,15 @@ pub struct KiroProvider {
 }
 
 pub struct ManagedResponse {
-    response: reqwest::Response,
+    body: ManagedResponseBody,
     _lease: CallLease,
     trace: Option<ResponseTrace>,
+    stream_first_chunk_already_logged: bool,
+}
+
+enum ManagedResponseBody {
+    Response(reqwest::Response),
+    Stream(BoxStream<'static, Result<Bytes, reqwest::Error>>),
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +81,8 @@ pub struct RequestOptions {
     pub omit_agent_mode_header: bool,
     pub request_id: Option<String>,
     pub request_weight: f64,
+    pub wait_for_stream_content_start: bool,
+    pub stream_thinking_enabled: bool,
 }
 
 impl Default for RequestOptions {
@@ -76,6 +91,8 @@ impl Default for RequestOptions {
             omit_agent_mode_header: false,
             request_id: None,
             request_weight: 1.0,
+            wait_for_stream_content_start: false,
+            stream_thinking_enabled: false,
         }
     }
 }
@@ -187,19 +204,44 @@ struct ResponseTrace {
 impl ManagedResponse {
     fn new(response: reqwest::Response, lease: CallLease, trace: Option<ResponseTrace>) -> Self {
         Self {
-            response,
+            body: ManagedResponseBody::Response(response),
             _lease: lease,
             trace,
+            stream_first_chunk_already_logged: false,
+        }
+    }
+
+    fn new_stream(
+        stream: BoxStream<'static, Result<Bytes, reqwest::Error>>,
+        lease: CallLease,
+        trace: Option<ResponseTrace>,
+        first_chunk_already_logged: bool,
+    ) -> Self {
+        Self {
+            body: ManagedResponseBody::Stream(stream),
+            _lease: lease,
+            trace,
+            stream_first_chunk_already_logged: first_chunk_already_logged,
         }
     }
 
     pub async fn bytes(self) -> reqwest::Result<Bytes> {
         let Self {
-            response,
+            body,
             _lease,
             trace,
+            stream_first_chunk_already_logged: _,
         } = self;
-        let bytes = response.bytes().await?;
+        let bytes = match body {
+            ManagedResponseBody::Response(response) => response.bytes().await?,
+            ManagedResponseBody::Stream(mut body_stream) => {
+                let mut buffer = BytesMut::new();
+                while let Some(chunk) = body_stream.next().await {
+                    buffer.extend_from_slice(&chunk?);
+                }
+                buffer.freeze()
+            }
+        };
         if let Some(trace) = trace {
             trace.log_body_complete(bytes.len());
         }
@@ -208,11 +250,21 @@ impl ManagedResponse {
 
     pub async fn text(self) -> reqwest::Result<String> {
         let Self {
-            response,
+            body,
             _lease,
             trace,
+            stream_first_chunk_already_logged: _,
         } = self;
-        let text = response.text().await?;
+        let text = match body {
+            ManagedResponseBody::Response(response) => response.text().await?,
+            ManagedResponseBody::Stream(mut body_stream) => {
+                let mut buffer = BytesMut::new();
+                while let Some(chunk) = body_stream.next().await {
+                    buffer.extend_from_slice(&chunk?);
+                }
+                String::from_utf8_lossy(&buffer).into_owned()
+            }
+        };
         if let Some(trace) = trace {
             trace.log_body_complete(text.len());
         }
@@ -221,14 +273,25 @@ impl ManagedResponse {
 
     pub fn into_bytes_stream(self) -> BoxStream<'static, Result<Bytes, reqwest::Error>> {
         let Self {
-            response,
+            body,
             _lease,
             trace,
+            stream_first_chunk_already_logged,
         } = self;
-        let body_stream = response.bytes_stream();
+        let body_stream = match body {
+            ManagedResponseBody::Response(response) => response.bytes_stream().boxed(),
+            ManagedResponseBody::Stream(stream) => stream,
+        };
 
         stream::unfold(
-            (body_stream, _lease, trace, false, 0usize, false),
+            (
+                body_stream,
+                _lease,
+                trace,
+                stream_first_chunk_already_logged,
+                0usize,
+                false,
+            ),
             |(mut body_stream, lease, trace, seen_first_chunk, total_bytes, finished)| async move {
                 if finished {
                     return None;
@@ -392,6 +455,62 @@ impl ResponseTrace {
             "上游流读取失败"
         );
     }
+}
+
+struct StreamContentStartProbe {
+    thinking_enabled: bool,
+    buffer: String,
+}
+
+impl StreamContentStartProbe {
+    fn new(thinking_enabled: bool) -> Self {
+        Self {
+            thinking_enabled,
+            buffer: String::new(),
+        }
+    }
+
+    fn observe(&mut self, event: &Event) -> bool {
+        match event {
+            Event::ToolUse(_) => true,
+            Event::AssistantResponse(resp) => self.observe_assistant_content(&resp.content),
+            _ => false,
+        }
+    }
+
+    fn observe_assistant_content(&mut self, content: &str) -> bool {
+        if content.is_empty() {
+            return false;
+        }
+        if !self.thinking_enabled {
+            return true;
+        }
+
+        self.buffer.push_str(content);
+        if self.buffer.contains("<thinking>") {
+            return true;
+        }
+
+        let safe_len = self
+            .buffer
+            .len()
+            .saturating_sub("<thinking>".len())
+            .min(self.buffer.len());
+        safe_len > 0 && !self.buffer[..safe_len].trim().is_empty()
+    }
+}
+
+enum StreamContentStartPrefetch {
+    Ready {
+        stream: BoxStream<'static, Result<Bytes, reqwest::Error>>,
+        first_chunk_logged: bool,
+        prefetched_bytes: usize,
+        elapsed: Duration,
+    },
+    TimedOut {
+        elapsed: Duration,
+        prefetched_bytes: usize,
+    },
 }
 
 impl KiroProvider {
@@ -601,6 +720,90 @@ impl KiroProvider {
             .ok_or_else(|| {
                 Self::stream_pre_sse_timeout_error(overall_started_at, api_type, request_id)
             })
+    }
+
+    fn remaining_stream_first_content_failover_budget(
+        overall_started_at: Instant,
+    ) -> Option<Duration> {
+        STREAM_FIRST_CONTENT_FAILOVER_TOTAL_BUDGET.checked_sub(overall_started_at.elapsed())
+    }
+
+    async fn prefetch_until_stream_content_start(
+        response: reqwest::Response,
+        trace: &ResponseTrace,
+        timeout_budget: Duration,
+        thinking_enabled: bool,
+    ) -> Result<StreamContentStartPrefetch, reqwest::Error> {
+        let mut body_stream = response.bytes_stream().boxed();
+        let mut prefetched = Vec::new();
+        let mut prefetched_bytes = 0usize;
+        let mut first_chunk_logged = false;
+        let mut decoder = EventStreamDecoder::new();
+        let mut probe = StreamContentStartProbe::new(thinking_enabled);
+        let started_at = Instant::now();
+
+        loop {
+            let Some(remaining) = timeout_budget.checked_sub(started_at.elapsed()) else {
+                return Ok(StreamContentStartPrefetch::TimedOut {
+                    elapsed: started_at.elapsed(),
+                    prefetched_bytes,
+                });
+            };
+
+            match timeout(remaining, body_stream.next()).await {
+                Err(_) => {
+                    return Ok(StreamContentStartPrefetch::TimedOut {
+                        elapsed: started_at.elapsed(),
+                        prefetched_bytes,
+                    });
+                }
+                Ok(Some(Ok(chunk))) => {
+                    if !first_chunk_logged {
+                        trace.log_first_chunk(chunk.len());
+                        first_chunk_logged = true;
+                    }
+                    prefetched_bytes += chunk.len();
+                    if let Err(err) = decoder.feed(&chunk) {
+                        tracing::warn!(error = %err, "预读上游流时解码缓冲失败");
+                    }
+                    prefetched.push(chunk);
+
+                    for result in decoder.decode_iter() {
+                        match result {
+                            Ok(frame) => {
+                                if let Ok(event) = Event::from_frame(frame) {
+                                    if probe.observe(&event) {
+                                        let prefetched_stream =
+                                            stream::iter(prefetched.into_iter().map(Ok));
+                                        let stream = prefetched_stream.chain(body_stream).boxed();
+                                        return Ok(StreamContentStartPrefetch::Ready {
+                                            stream,
+                                            first_chunk_logged,
+                                            prefetched_bytes,
+                                            elapsed: started_at.elapsed(),
+                                        });
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                tracing::warn!(error = %err, "预读上游流时解码事件失败");
+                            }
+                        }
+                    }
+                }
+                Ok(Some(Err(err))) => return Err(err),
+                Ok(None) => {
+                    let prefetched_stream = stream::iter(prefetched.into_iter().map(Ok));
+                    let stream = prefetched_stream.chain(body_stream).boxed();
+                    return Ok(StreamContentStartPrefetch::Ready {
+                        stream,
+                        first_chunk_logged,
+                        prefetched_bytes,
+                        elapsed: started_at.elapsed(),
+                    });
+                }
+            }
+        }
     }
 
     async fn read_failure_body_before_sse(
@@ -937,6 +1140,7 @@ impl KiroProvider {
                     self.token_manager.report_rate_limited(ctx_id);
                     request_scoped_rate_limited_credentials.insert(ctx_id);
                     let empty_model_unsupported = HashSet::new();
+                    let empty_slow_first_content = HashSet::new();
                     Self::maybe_spill_rate_limited_priority(
                         &self.token_manager,
                         None,
@@ -944,6 +1148,7 @@ impl KiroProvider {
                         &mut priority_rate_limit_hits,
                         &empty_model_unsupported,
                         &mut request_scoped_rate_limited_credentials,
+                        &empty_slow_first_content,
                     );
                     let supported_candidate_count =
                         self.token_manager.enabled_supported_credential_count(None);
@@ -1010,7 +1215,9 @@ impl KiroProvider {
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let mut request_scoped_model_unsupported_credentials: HashSet<u64> = HashSet::new();
         let mut request_scoped_rate_limited_credentials: HashSet<u64> = HashSet::new();
+        let mut request_scoped_slow_first_content_credentials: HashSet<u64> = HashSet::new();
         let mut priority_rate_limit_hits: HashMap<u32, usize> = HashMap::new();
+        let mut slow_first_content_failovers = 0usize;
         let api_type = if is_stream { "流式" } else { "非流式" };
         let request_id = options
             .request_id
@@ -1048,6 +1255,7 @@ impl KiroProvider {
             let request_scoped_excluded_credentials = Self::combined_request_exclusions(
                 &request_scoped_model_unsupported_credentials,
                 &request_scoped_rate_limited_credentials,
+                &request_scoped_slow_first_content_credentials,
             );
             let acquire_context = || {
                 self.token_manager.acquire_context_with_weight_excluding(
@@ -1306,7 +1514,6 @@ impl KiroProvider {
 
             // 成功响应
             if status.is_success() {
-                self.token_manager.report_success(ctx_id);
                 let trace = ResponseTrace {
                     request_id: request_id.clone(),
                     api_type,
@@ -1315,12 +1522,131 @@ impl KiroProvider {
                     credential_id: ctx_id,
                     attempt: attempt + 1,
                     max_retries,
-                    region,
+                    region: region.clone(),
                     status_code: status.as_u16(),
                     overall_started_at,
                     upstream_request_started_at,
                     response_headers_at,
                 };
+
+                let scoped_candidate_count = supported_candidate_count
+                    .saturating_sub(request_scoped_model_unsupported_credentials.len())
+                    .saturating_sub(request_scoped_rate_limited_credentials.len())
+                    .saturating_sub(request_scoped_slow_first_content_credentials.len());
+                let content_start_probe_budget =
+                    Self::remaining_stream_first_content_failover_budget(overall_started_at);
+                let should_probe_stream_content_start = is_stream
+                    && options.wait_for_stream_content_start
+                    && slow_first_content_failovers < MAX_SLOW_FIRST_CONTENT_FAILOVERS
+                    && scoped_candidate_count > 1
+                    && content_start_probe_budget.is_some_and(|remaining| {
+                        remaining >= MIN_STREAM_FIRST_CONTENT_FAILOVER_REMAINING
+                    });
+
+                if should_probe_stream_content_start {
+                    let prefetch_budget = content_start_probe_budget
+                        .unwrap_or(STREAM_FIRST_CONTENT_FAILOVER_ATTEMPT_TIMEOUT)
+                        .min(STREAM_FIRST_CONTENT_FAILOVER_ATTEMPT_TIMEOUT);
+                    match Self::prefetch_until_stream_content_start(
+                        response,
+                        &trace,
+                        prefetch_budget,
+                        options.stream_thinking_enabled,
+                    )
+                    .await
+                    {
+                        Ok(StreamContentStartPrefetch::Ready {
+                            stream,
+                            first_chunk_logged,
+                            prefetched_bytes,
+                            elapsed,
+                        }) => {
+                            tracing::info!(
+                                request_id = %request_id,
+                                api_type,
+                                model = model.as_deref().unwrap_or("unknown"),
+                                credential_id = ctx_id,
+                                attempt = attempt + 1,
+                                max_retries,
+                                region = %region,
+                                request_body_bytes,
+                                prefetched_bytes,
+                                prefetch_elapsed_ms = elapsed.as_millis(),
+                                "上游流预读已满足首内容块调度条件"
+                            );
+                            self.token_manager.report_success(ctx_id);
+                            return Ok(ManagedResponse::new_stream(
+                                stream,
+                                lease,
+                                Some(trace),
+                                first_chunk_logged,
+                            ));
+                        }
+                        Ok(StreamContentStartPrefetch::TimedOut {
+                            elapsed,
+                            prefetched_bytes,
+                        }) => {
+                            tracing::warn!(
+                                request_id = %request_id,
+                                api_type,
+                                model = model.as_deref().unwrap_or("unknown"),
+                                credential_id = ctx_id,
+                                attempt = attempt + 1,
+                                max_retries,
+                                region = %region,
+                                request_body_bytes,
+                                prefetched_bytes,
+                                prefetch_elapsed_ms = elapsed.as_millis(),
+                                cooldown_ms = STREAM_FIRST_CONTENT_FAILOVER_COOLDOWN.as_millis(),
+                                "上游流在预算内未产生可转换内容块，临时冷却凭据并切换"
+                            );
+                            request_scoped_slow_first_content_credentials.insert(ctx_id);
+                            slow_first_content_failovers =
+                                slow_first_content_failovers.saturating_add(1);
+                            let _ = self.token_manager.defer_slow_first_content_credential(
+                                ctx_id,
+                                model.as_deref().unwrap_or("unknown"),
+                                STREAM_FIRST_CONTENT_FAILOVER_COOLDOWN,
+                            );
+                            last_error = Some(anyhow::Error::new(
+                                PublicProviderError::gateway_timeout(
+                                    format!(
+                                        "{} API 请求首内容块超时: request_id={} credential_id={} attempt={} prefetch_elapsed_ms={} prefetched_bytes={}",
+                                        api_type,
+                                        request_id,
+                                        ctx_id,
+                                        attempt + 1,
+                                        elapsed.as_millis(),
+                                        prefetched_bytes
+                                    ),
+                                    Self::stream_pre_sse_timeout_public_message(),
+                                ),
+                            ));
+                            continue;
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                request_id = %request_id,
+                                api_type,
+                                model = model.as_deref().unwrap_or("unknown"),
+                                credential_id = ctx_id,
+                                attempt = attempt + 1,
+                                max_retries,
+                                region = %region,
+                                request_body_bytes,
+                                error = %err,
+                                "预读上游流首内容块失败"
+                            );
+                            last_error = Some(err.into());
+                            if attempt + 1 < max_retries {
+                                sleep(Self::retry_delay(attempt)).await;
+                            }
+                            continue;
+                        }
+                    }
+                }
+
+                self.token_manager.report_success(ctx_id);
                 return Ok(ManagedResponse::new(response, lease, Some(trace)));
             }
 
@@ -1535,6 +1861,7 @@ impl KiroProvider {
                         &mut priority_rate_limit_hits,
                         &request_scoped_model_unsupported_credentials,
                         &mut request_scoped_rate_limited_credentials,
+                        &request_scoped_slow_first_content_credentials,
                     );
                     let supported_candidate_count = self
                         .token_manager
@@ -1735,9 +2062,11 @@ impl KiroProvider {
     fn combined_request_exclusions(
         model_unsupported_credentials: &HashSet<u64>,
         rate_limited_credentials: &HashSet<u64>,
+        slow_first_content_credentials: &HashSet<u64>,
     ) -> HashSet<u64> {
         let mut excluded = model_unsupported_credentials.clone();
         excluded.extend(rate_limited_credentials.iter().copied());
+        excluded.extend(slow_first_content_credentials.iter().copied());
         excluded
     }
 
@@ -1748,6 +2077,7 @@ impl KiroProvider {
         priority_rate_limit_hits: &mut HashMap<u32, usize>,
         request_scoped_model_unsupported_credentials: &HashSet<u64>,
         request_scoped_rate_limited_credentials: &mut HashSet<u64>,
+        request_scoped_slow_first_content_credentials: &HashSet<u64>,
     ) {
         let hits = priority_rate_limit_hits
             .entry(credential_priority)
@@ -1761,6 +2091,7 @@ impl KiroProvider {
         let excluded = Self::combined_request_exclusions(
             request_scoped_model_unsupported_credentials,
             request_scoped_rate_limited_credentials,
+            request_scoped_slow_first_content_credentials,
         );
         if !token_manager.has_enabled_supported_credential_below_priority(
             model,
@@ -2132,5 +2463,25 @@ mod tests {
             public.public_message(),
             "Upstream stream did not produce a usable response before the retry budget was exhausted."
         );
+    }
+
+    #[test]
+    fn test_stream_content_start_probe_non_thinking_accepts_first_text() {
+        let mut probe = StreamContentStartProbe::new(false);
+        assert!(probe.observe_assistant_content("hello"));
+    }
+
+    #[test]
+    fn test_stream_content_start_probe_thinking_waits_for_real_start() {
+        let mut probe = StreamContentStartProbe::new(true);
+        assert!(!probe.observe_assistant_content("\n\n<th"));
+        assert!(!probe.observe_assistant_content("inking"));
+        assert!(probe.observe_assistant_content(">step 1"));
+    }
+
+    #[test]
+    fn test_stream_content_start_probe_thinking_accepts_plain_text_prefix() {
+        let mut probe = StreamContentStartProbe::new(true);
+        assert!(probe.observe_assistant_content("This is normal text before thinking."));
     }
 }
