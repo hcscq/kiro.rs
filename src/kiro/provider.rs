@@ -496,7 +496,17 @@ impl StreamContentStartProbe {
             .len()
             .saturating_sub("<thinking>".len())
             .min(self.buffer.len());
-        safe_len > 0 && !self.buffer[..safe_len].trim().is_empty()
+        let safe_prefix = match self.buffer.get(..safe_len) {
+            Some(prefix) => prefix,
+            None => {
+                let mut boundary = safe_len;
+                while boundary > 0 && !self.buffer.is_char_boundary(boundary) {
+                    boundary -= 1;
+                }
+                &self.buffer[..boundary]
+            }
+        };
+        !safe_prefix.trim().is_empty()
     }
 }
 
@@ -2483,5 +2493,11 @@ mod tests {
     fn test_stream_content_start_probe_thinking_accepts_plain_text_prefix() {
         let mut probe = StreamContentStartProbe::new(true);
         assert!(probe.observe_assistant_content("This is normal text before thinking."));
+    }
+
+    #[test]
+    fn test_stream_content_start_probe_thinking_accepts_multibyte_plain_text_prefix() {
+        let mut probe = StreamContentStartProbe::new(true);
+        assert!(probe.observe_assistant_content("commit 成功了，"));
     }
 }
