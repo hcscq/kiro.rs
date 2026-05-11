@@ -587,7 +587,8 @@ fn clip_document_text(text: &str, max_chars: usize) -> String {
 
 /// 从 media_type 获取图片格式
 fn get_image_format(media_type: &str) -> Option<String> {
-    match media_type {
+    let media_type = media_type.split(';').next()?.trim().to_lowercase();
+    match media_type.as_str() {
         "image/jpeg" => Some("jpeg".to_string()),
         "image/png" => Some("png".to_string()),
         "image/gif" => Some("gif".to_string()),
@@ -597,11 +598,58 @@ fn get_image_format(media_type: &str) -> Option<String> {
 }
 
 fn build_kiro_image(format: String, data: String) -> KiroImage {
-    if let Some(resized_data) = resize_oversized_image_base64(&format, &data) {
+    if let Some((normalized_format, normalized_data)) = normalize_image_for_kiro(&format, &data) {
+        KiroImage::from_base64(normalized_format, normalized_data)
+    } else if let Some(resized_data) = resize_oversized_image_base64(&format, &data) {
         KiroImage::from_base64(format, resized_data)
     } else {
         KiroImage::from_base64(format, data)
     }
+}
+
+fn normalize_image_for_kiro(format: &str, data: &str) -> Option<(String, String)> {
+    match format {
+        "gif" | "webp" => transcode_image_base64_to_png(format, data),
+        _ => None,
+    }
+}
+
+fn transcode_image_base64_to_png(format: &str, data: &str) -> Option<(String, String)> {
+    let bytes = BASE64_STANDARD.decode(data).ok()?;
+    let image = image::load_from_memory(&bytes).ok()?;
+    let (width, height) = image.dimensions();
+    let max_dimension = width.max(height);
+
+    let converted = if max_dimension > KIRO_MAX_IMAGE_DIMENSION_PX {
+        let scale = KIRO_MAX_IMAGE_DIMENSION_PX as f64 / max_dimension as f64;
+        let resized_width = ((width as f64 * scale).round() as u32).max(1);
+        let resized_height = ((height as f64 * scale).round() as u32).max(1);
+        image.resize(resized_width, resized_height, FilterType::Lanczos3)
+    } else {
+        image
+    };
+
+    let converted_width = converted.width();
+    let converted_height = converted.height();
+    let mut output = Vec::new();
+    let mut cursor = Cursor::new(&mut output);
+    converted
+        .write_to(&mut cursor, image::ImageFormat::Png)
+        .ok()?;
+
+    tracing::info!(
+        source_format = format,
+        target_format = "png",
+        width,
+        height,
+        converted_width,
+        converted_height,
+        original_bytes = bytes.len(),
+        converted_bytes = output.len(),
+        "转码 Kiro 兼容性较差的图片格式"
+    );
+
+    Some(("png".to_string(), BASE64_STANDARD.encode(output)))
 }
 
 fn image_format_for_compat(format: &str) -> Option<image::ImageFormat> {
@@ -667,8 +715,8 @@ fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
         Some(serde_json::Value::Array(arr)) => {
             let mut parts = Vec::new();
             for item in arr {
-                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                    parts.push(text.to_string());
+                if let Some(text) = extract_tool_result_content_item(item) {
+                    parts.push(text);
                 }
             }
             parts.join("\n")
@@ -676,6 +724,42 @@ fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
         Some(v) => v.to_string(),
         None => String::new(),
     }
+}
+
+fn extract_tool_result_content_item(item: &serde_json::Value) -> Option<String> {
+    if let Some(text) = item.as_str() {
+        return Some(text.to_string());
+    }
+
+    if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {
+        match block.block_type.as_str() {
+            "text" => return block.text,
+            "document" => {
+                if let Some(source) = block.source {
+                    return extract_document_text_for_kiro(&source);
+                }
+            }
+            "image" => {
+                if let Some(source) = block.source {
+                    let media_type = source
+                        .media_type
+                        .split(';')
+                        .next()
+                        .unwrap_or("image")
+                        .trim();
+                    return Some(format!(
+                        "[Image content was provided in a tool result: {}]",
+                        media_type
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    item.get("text")
+        .and_then(|v| v.as_str())
+        .map(|text| text.to_string())
 }
 
 /// 验证并过滤 tool_use/tool_result 配对
@@ -1358,6 +1442,17 @@ mod tests {
         })
     }
 
+    fn gif_image_block() -> serde_json::Value {
+        serde_json::json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/gif",
+                "data": "R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=="
+            }
+        })
+    }
+
     fn repeated_png_image_blocks(count: usize) -> Vec<serde_json::Value> {
         (0..count).map(|_| png_image_block()).collect()
     }
@@ -1447,6 +1542,35 @@ mod tests {
         assert!(text.contains("Extracted document text (application/pdf):"));
         assert!(text.contains("6G6S7MSS"));
         assert!(text.contains("What text does this PDF contain?"));
+    }
+
+    #[test]
+    fn test_process_message_content_transcodes_gif_to_png() {
+        let content = serde_json::Value::Array(vec![gif_image_block()]);
+
+        let (_, images, _) = process_message_content(&content).expect("gif should convert");
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].format, "png");
+        let png_bytes = BASE64_STANDARD
+            .decode(&images[0].source.bytes)
+            .expect("converted image should be valid base64");
+        image::load_from_memory_with_format(&png_bytes, image::ImageFormat::Png)
+            .expect("converted image should decode as png");
+    }
+
+    #[test]
+    fn test_extract_tool_result_content_inlines_document_text() {
+        let content = Some(serde_json::Value::Array(vec![
+            serde_json::json!({"type": "text", "text": "Tool output:"}),
+            pdf_document_block(),
+        ]));
+
+        let text = extract_tool_result_content(&content);
+
+        assert!(text.contains("Tool output:"));
+        assert!(text.contains("Extracted document text (application/pdf):"));
+        assert!(text.contains("6G6S7MSS"));
     }
 
     #[test]
