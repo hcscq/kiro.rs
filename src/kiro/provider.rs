@@ -40,10 +40,11 @@ const STREAM_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(240);
 const STREAM_PRE_SSE_RESPONSE_BUDGET: Duration = Duration::from_secs(170);
 const STREAM_TOTAL_WALL_CLOCK_BUDGET: Duration = Duration::from_secs(540);
 const STREAM_FIRST_CONTENT_FAILOVER_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(60);
-const STREAM_FIRST_CONTENT_FAILOVER_TOTAL_BUDGET: Duration = Duration::from_secs(150);
-const STREAM_FIRST_CONTENT_FAILOVER_COOLDOWN: Duration = Duration::from_secs(120);
-const MAX_SLOW_FIRST_CONTENT_FAILOVERS: usize = 1;
+const STREAM_FIRST_CONTENT_FAILOVER_TOTAL_BUDGET: Duration = Duration::from_secs(165);
+const STREAM_FIRST_CONTENT_FAILOVER_COOLDOWN: Duration = Duration::from_secs(90);
+const MAX_SLOW_FIRST_CONTENT_FAILOVERS: usize = 2;
 const MIN_STREAM_FIRST_CONTENT_FAILOVER_REMAINING: Duration = Duration::from_secs(15);
+const SLOW_FIRST_CONTENT_SHARED_COOLDOWN_MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 const SLOW_UPSTREAM_HEADERS_MS: u128 = 3_000;
 const SLOW_FIRST_CHUNK_MS: u128 = 3_000;
 const SLOW_HEADERS_TO_FIRST_CHUNK_MS: u128 = 1_000;
@@ -736,6 +737,10 @@ impl KiroProvider {
         overall_started_at: Instant,
     ) -> Option<Duration> {
         STREAM_FIRST_CONTENT_FAILOVER_TOTAL_BUDGET.checked_sub(overall_started_at.elapsed())
+    }
+
+    fn should_apply_slow_first_content_shared_cooldown(request_body_bytes: usize) -> bool {
+        request_body_bytes <= SLOW_FIRST_CONTENT_SHARED_COOLDOWN_MAX_REQUEST_BODY_BYTES
     }
 
     async fn prefetch_until_stream_content_start(
@@ -1545,13 +1550,19 @@ impl KiroProvider {
                     .saturating_sub(request_scoped_slow_first_content_credentials.len());
                 let content_start_probe_budget =
                     Self::remaining_stream_first_content_failover_budget(overall_started_at);
-                let should_probe_stream_content_start = is_stream
-                    && options.wait_for_stream_content_start
-                    && slow_first_content_failovers < MAX_SLOW_FIRST_CONTENT_FAILOVERS
-                    && scoped_candidate_count > 1
-                    && content_start_probe_budget.is_some_and(|remaining| {
+                let has_content_start_probe_budget =
+                    content_start_probe_budget.is_some_and(|remaining| {
                         remaining >= MIN_STREAM_FIRST_CONTENT_FAILOVER_REMAINING
                     });
+                let can_failover_slow_first_content = slow_first_content_failovers
+                    < MAX_SLOW_FIRST_CONTENT_FAILOVERS
+                    && scoped_candidate_count > 1;
+                let should_guard_final_first_content_attempt = slow_first_content_failovers > 0;
+                let should_probe_stream_content_start = is_stream
+                    && options.wait_for_stream_content_start
+                    && has_content_start_probe_budget
+                    && (can_failover_slow_first_content
+                        || should_guard_final_first_content_attempt);
 
                 if should_probe_stream_content_start {
                     let prefetch_budget = content_start_probe_budget
@@ -1582,6 +1593,8 @@ impl KiroProvider {
                                 request_body_bytes,
                                 prefetched_bytes,
                                 prefetch_elapsed_ms = elapsed.as_millis(),
+                                slow_first_content_failovers,
+                                max_slow_first_content_failovers = MAX_SLOW_FIRST_CONTENT_FAILOVERS,
                                 "上游流预读已满足首内容块调度条件"
                             );
                             self.token_manager.report_success(ctx_id);
@@ -1596,6 +1609,43 @@ impl KiroProvider {
                             elapsed,
                             prefetched_bytes,
                         }) => {
+                            let remaining_after_prefetch =
+                                Self::remaining_stream_first_content_failover_budget(
+                                    overall_started_at,
+                                );
+                            let can_failover_after_timeout = slow_first_content_failovers
+                                < MAX_SLOW_FIRST_CONTENT_FAILOVERS
+                                && scoped_candidate_count > 1
+                                && remaining_after_prefetch.is_some_and(|remaining| {
+                                    remaining >= MIN_STREAM_FIRST_CONTENT_FAILOVER_REMAINING
+                                });
+                            let shared_cooldown_applied = can_failover_after_timeout
+                                && Self::should_apply_slow_first_content_shared_cooldown(
+                                    request_body_bytes,
+                                );
+                            let cooldown_skipped_reason = if shared_cooldown_applied {
+                                "none"
+                            } else if !can_failover_after_timeout {
+                                "no_followup_failover"
+                            } else {
+                                "request_body_too_large"
+                            };
+                            let applied_cooldown_ms = if shared_cooldown_applied {
+                                STREAM_FIRST_CONTENT_FAILOVER_COOLDOWN.as_millis()
+                            } else {
+                                0
+                            };
+                            let first_content_timeout_reason = if can_failover_after_timeout {
+                                "will_retry_with_alternate_credential"
+                            } else if slow_first_content_failovers
+                                >= MAX_SLOW_FIRST_CONTENT_FAILOVERS
+                            {
+                                "max_slow_first_content_failovers_reached"
+                            } else if scoped_candidate_count <= 1 {
+                                "no_alternate_candidate"
+                            } else {
+                                "first_content_failover_budget_exhausted"
+                            };
                             tracing::warn!(
                                 request_id = %request_id,
                                 api_type,
@@ -1607,32 +1657,54 @@ impl KiroProvider {
                                 request_body_bytes,
                                 prefetched_bytes,
                                 prefetch_elapsed_ms = elapsed.as_millis(),
-                                cooldown_ms = STREAM_FIRST_CONTENT_FAILOVER_COOLDOWN.as_millis(),
-                                "上游流在预算内未产生可转换内容块，临时冷却凭据并切换"
+                                slow_first_content_failovers,
+                                max_slow_first_content_failovers = MAX_SLOW_FIRST_CONTENT_FAILOVERS,
+                                scoped_candidate_count,
+                                remaining_first_content_failover_budget_ms = remaining_after_prefetch
+                                    .map(|value| value.as_millis())
+                                    .unwrap_or(0),
+                                will_failover = can_failover_after_timeout,
+                                shared_cooldown_applied,
+                                cooldown_ms = applied_cooldown_ms,
+                                configured_cooldown_ms =
+                                    STREAM_FIRST_CONTENT_FAILOVER_COOLDOWN.as_millis(),
+                                shared_cooldown_max_request_body_bytes =
+                                    SLOW_FIRST_CONTENT_SHARED_COOLDOWN_MAX_REQUEST_BODY_BYTES,
+                                cooldown_skipped_reason,
+                                first_content_timeout_reason,
+                                "上游流在预算内未产生可转换内容块"
                             );
-                            request_scoped_slow_first_content_credentials.insert(ctx_id);
-                            slow_first_content_failovers =
-                                slow_first_content_failovers.saturating_add(1);
-                            let _ = self.token_manager.defer_slow_first_content_credential(
-                                ctx_id,
-                                model.as_deref().unwrap_or("unknown"),
-                                STREAM_FIRST_CONTENT_FAILOVER_COOLDOWN,
-                            );
-                            last_error = Some(anyhow::Error::new(
+                            let timeout_error = anyhow::Error::new(
                                 PublicProviderError::gateway_timeout(
                                     format!(
-                                        "{} API 请求首内容块超时: request_id={} credential_id={} attempt={} prefetch_elapsed_ms={} prefetched_bytes={}",
+                                        "{} API 请求首内容块超时: request_id={} credential_id={} attempt={} prefetch_elapsed_ms={} prefetched_bytes={} slow_first_content_failovers={} first_content_timeout_reason={}",
                                         api_type,
                                         request_id,
                                         ctx_id,
                                         attempt + 1,
                                         elapsed.as_millis(),
-                                        prefetched_bytes
+                                        prefetched_bytes,
+                                        slow_first_content_failovers,
+                                        first_content_timeout_reason
                                     ),
                                     Self::stream_pre_sse_timeout_public_message(),
                                 ),
-                            ));
-                            continue;
+                            );
+                            if can_failover_after_timeout {
+                                request_scoped_slow_first_content_credentials.insert(ctx_id);
+                                slow_first_content_failovers =
+                                    slow_first_content_failovers.saturating_add(1);
+                                if shared_cooldown_applied {
+                                    let _ = self.token_manager.defer_slow_first_content_credential(
+                                        ctx_id,
+                                        model.as_deref().unwrap_or("unknown"),
+                                        STREAM_FIRST_CONTENT_FAILOVER_COOLDOWN,
+                                    );
+                                }
+                                last_error = Some(timeout_error);
+                                continue;
+                            }
+                            return Err(timeout_error);
                         }
                         Err(err) => {
                             tracing::warn!(
@@ -2437,6 +2509,20 @@ mod tests {
         assert!(KiroProvider::should_reset_rate_limited_exclusions_for_next_pass(2, 2, 2, 6));
         assert!(!KiroProvider::should_reset_rate_limited_exclusions_for_next_pass(2, 2, 6, 6));
         assert!(!KiroProvider::should_reset_rate_limited_exclusions_for_next_pass(1, 2, 1, 6));
+    }
+
+    #[test]
+    fn test_slow_first_content_shared_cooldown_skips_large_request_body() {
+        assert!(
+            KiroProvider::should_apply_slow_first_content_shared_cooldown(
+                SLOW_FIRST_CONTENT_SHARED_COOLDOWN_MAX_REQUEST_BODY_BYTES
+            )
+        );
+        assert!(
+            !KiroProvider::should_apply_slow_first_content_shared_cooldown(
+                SLOW_FIRST_CONTENT_SHARED_COOLDOWN_MAX_REQUEST_BODY_BYTES + 1
+            )
+        );
     }
 
     #[test]
