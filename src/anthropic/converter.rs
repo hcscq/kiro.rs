@@ -109,6 +109,10 @@ Complete all chunked operations without commentary.";
 /// 文本可以稳定恢复正常生成，同时尽量不改变原始语义。
 const CURRENT_TOOL_RESULT_FALLBACK_TEXT: &str = "Please continue based on the tool result.";
 
+/// 避免把超大文档直接展开到 Kiro 文本上下文里。
+const MAX_INLINE_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_INLINE_DOCUMENT_TEXT_CHARS: usize = 40_000;
+
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 ///
 /// 按照用户要求：
@@ -468,6 +472,13 @@ fn process_message_content(
                                 }
                             }
                         }
+                        "document" => {
+                            if let Some(source) = block.source {
+                                if let Some(text) = extract_document_text_for_kiro(&source) {
+                                    text_parts.push(text);
+                                }
+                            }
+                        }
                         "tool_result" => {
                             if let Some(tool_use_id) = block.tool_use_id {
                                 let result_content = extract_tool_result_content(&block.content);
@@ -496,6 +507,82 @@ fn process_message_content(
     }
 
     Ok((text_parts.join("\n"), images, tool_results))
+}
+
+fn extract_document_text_for_kiro(source: &super::types::ImageSource) -> Option<String> {
+    let media_type = source.media_type.split(';').next()?.trim().to_lowercase();
+    let source_type = source.source_type.trim().to_lowercase();
+
+    let extracted = match media_type.as_str() {
+        "application/pdf" => {
+            if source_type != "base64" {
+                return None;
+            }
+            let bytes = BASE64_STANDARD.decode(&source.data).ok()?;
+            if bytes.len() > MAX_INLINE_DOCUMENT_BYTES {
+                tracing::warn!(
+                    media_type,
+                    bytes = bytes.len(),
+                    max_bytes = MAX_INLINE_DOCUMENT_BYTES,
+                    "跳过超出内联预算的文档"
+                );
+                return None;
+            }
+            pdf_extract::extract_text_from_mem(&bytes).ok()?
+        }
+        "text/plain" | "text/markdown" | "text/csv" | "application/json" => {
+            if source_type == "base64" {
+                let bytes = BASE64_STANDARD.decode(&source.data).ok()?;
+                if bytes.len() > MAX_INLINE_DOCUMENT_BYTES {
+                    tracing::warn!(
+                        media_type,
+                        bytes = bytes.len(),
+                        max_bytes = MAX_INLINE_DOCUMENT_BYTES,
+                        "跳过超出内联预算的文本文档"
+                    );
+                    return None;
+                }
+                String::from_utf8(bytes).ok()?
+            } else {
+                source.data.clone()
+            }
+        }
+        _ => return None,
+    };
+
+    let normalized = normalize_document_text(&extracted);
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let clipped = clip_document_text(&normalized, MAX_INLINE_DOCUMENT_TEXT_CHARS);
+    Some(format!(
+        "Extracted document text ({}):\n{}",
+        media_type, clipped
+    ))
+}
+
+fn normalize_document_text(text: &str) -> String {
+    let text = text.replace('\u{000c}', "\n");
+    let mut lines = Vec::new();
+    let mut previous_blank = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let blank = trimmed.is_empty();
+        if blank && previous_blank {
+            continue;
+        }
+        lines.push(trimmed.to_string());
+        previous_blank = blank;
+    }
+    lines.join("\n").trim().to_string()
+}
+
+fn clip_document_text(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    text.chars().take(max_chars).collect::<String>()
 }
 
 /// 从 media_type 获取图片格式
@@ -1293,6 +1380,17 @@ mod tests {
         })
     }
 
+    fn pdf_document_block() -> serde_json::Value {
+        serde_json::json!({
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": "JVBERi0xLjAKMSAwIG9iajw8L1R5cGUvQ2F0YWxvZy9QYWdlcyAyIDAgUj4+ZW5kb2JqCjIgMCBvYmo8PC9UeXBlL1BhZ2VzL0tpZHNbMyAwIFJdL0NvdW50IDE+PmVuZG9iagozIDAgb2JqPDwvVHlwZS9QYWdlL01lZGlhQm94WzAgMCAzMDAgNTBdL1BhcmVudCAyIDAgUi9Db250ZW50cyA0IDAgUi9SZXNvdXJjZXM8PC9Gb250PDwvRjEgNSAwIFI+Pj4+Pj5lbmRvYmoKNCAwIG9iajw8L0xlbmd0aCAzOD4+CnN0cmVhbQpCVCAvRjEgMTQgVGYgMTAgMjAgVGQgKDZHNlM3TVNTKSBUaiBFVAplbmRzdHJlYW0KZW5kb2JqCjUgMCBvYmo8PC9UeXBlL0ZvbnQvU3VidHlwZS9UeXBlMS9CYXNlRm9udC9IZWx2ZXRpY2E+PmVuZG9iagp4cmVmCjAgNgowMDAwMDAwMDAwIDY1NTM1IGYgCjAwMDAwMDAwMDkgMDAwMDAgbiAKMDAwMDAwMDA1MiAwMDAwMCBuIAowMDAwMDAwMTAxIDAwMDAwIG4gCjAwMDAwMDAyMTAgMDAwMDAgbiAKMDAwMDAwMDI5NSAwMDAwMCBuIAp0cmFpbGVyPDwvU2l6ZSA2L1Jvb3QgMSAwIFI+PgpzdGFydHhyZWYKMzU2CiUlRU9G"
+            }
+        })
+    }
+
     #[test]
     fn test_process_message_content_downscales_oversized_current_jpeg() {
         let content = serde_json::Value::Array(vec![oversized_jpeg_block(952, 1552)]);
@@ -1329,6 +1427,26 @@ mod tests {
 
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].source.bytes, original_data);
+    }
+
+    #[test]
+    fn test_process_message_content_extracts_pdf_document_text() {
+        let content = serde_json::Value::Array(vec![
+            pdf_document_block(),
+            serde_json::json!({
+                "type": "text",
+                "text": "What text does this PDF contain?"
+            }),
+        ]);
+
+        let (text, images, tool_results) =
+            process_message_content(&content).expect("pdf document should convert");
+
+        assert!(images.is_empty());
+        assert!(tool_results.is_empty());
+        assert!(text.contains("Extracted document text (application/pdf):"));
+        assert!(text.contains("6G6S7MSS"));
+        assert!(text.contains("What text does this PDF contain?"));
     }
 
     #[test]
