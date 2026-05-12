@@ -27,6 +27,7 @@ mod converter;
 mod extractor;
 mod handlers;
 mod middleware;
+mod multimodal;
 mod probe;
 mod router;
 mod stream;

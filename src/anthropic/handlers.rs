@@ -26,6 +26,7 @@ use uuid::Uuid;
 use super::converter::{ConversionError, convert_request_with_probe};
 use super::extractor::AnthropicJson;
 use super::middleware::{ANTHROPIC_RUNTIME_LEADER_REQUIRED_HEADER, AppState};
+use super::multimodal;
 use super::probe::{UpstreamProbe, parse_upstream_probe};
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::thinking_compat::{build_synthetic_thinking_signature, extract_thinking_and_text};
@@ -200,6 +201,42 @@ pub(crate) fn map_provider_error(err: Error) -> Response {
         .into_response()
 }
 
+async fn normalize_multimodal_payload(
+    payload: &mut MessagesRequest,
+    request_id: &str,
+) -> Result<(), Response> {
+    match multimodal::normalize_multimodal_urls(payload).await {
+        Ok(stats) => {
+            if stats.remote_images > 0
+                || stats.data_url_images > 0
+                || stats.openai_image_url_blocks > 0
+                || stats.anthropic_url_blocks > 0
+            {
+                tracing::info!(
+                    request_id = %request_id,
+                    remote_images = stats.remote_images,
+                    data_url_images = stats.data_url_images,
+                    openai_image_url_blocks = stats.openai_image_url_blocks,
+                    anthropic_url_blocks = stats.anthropic_url_blocks,
+                    "normalized multimodal image references"
+                );
+            }
+            Ok(())
+        }
+        Err(err) => {
+            tracing::warn!(request_id = %request_id, error = %err, "多模态图片归一化失败");
+            Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(
+                    "invalid_request_error",
+                    format!("Invalid image URL: {err}"),
+                )),
+            )
+                .into_response())
+        }
+    }
+}
+
 /// GET /v1/models
 ///
 /// 返回可用的模型列表
@@ -271,6 +308,10 @@ pub async fn post_messages(
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
+
+    if let Err(response) = normalize_multimodal_payload(&mut payload, &request_id).await {
+        return response;
+    }
 
     // 检查是否为 WebFetch 请求
     if webfetch::has_web_fetch_tool(&payload) {
@@ -1028,6 +1069,10 @@ pub async fn post_messages_cc(
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
+
+    if let Err(response) = normalize_multimodal_payload(&mut payload, &request_id).await {
+        return response;
+    }
 
     // 检查是否为 WebFetch 请求
     if webfetch::has_web_fetch_tool(&payload) {
