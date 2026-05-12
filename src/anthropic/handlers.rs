@@ -20,7 +20,7 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
 use serde_json::json;
 use std::time::Duration;
-use tokio::time::interval;
+use tokio::time::{Instant, interval_at};
 use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request_with_probe};
@@ -480,8 +480,18 @@ fn create_sse_stream(
     let body_stream = response.into_bytes_stream();
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS))),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
+        (
+            body_stream,
+            ctx,
+            EventStreamDecoder::new(),
+            false,
+            interval_at(
+                Instant::now() + Duration::from_secs(PING_INTERVAL_SECS),
+                Duration::from_secs(PING_INTERVAL_SECS),
+            ),
+            false,
+        ),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, can_ping)| async move {
             if finished {
                 return None;
             }
@@ -512,13 +522,16 @@ fn create_sse_stream(
                                 }
                             }
 
+                            let next_can_ping = can_ping
+                                || events.iter().any(|event| event.event == "content_block_start");
+
                             // 转换为 SSE 字节流
                             let bytes: Vec<Result<Bytes, Infallible>> = events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, next_can_ping)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
@@ -528,7 +541,7 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, can_ping)))
                         }
                         None => {
                             // 流结束，发送最终事件
@@ -537,15 +550,15 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, can_ping)))
                         }
                     }
                 }
                 // 发送 ping 保活
-                _ = ping_interval.tick() => {
+                _ = ping_interval.tick(), if can_ping => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, can_ping)))
                 }
             }
         },
@@ -1222,27 +1235,16 @@ fn create_buffered_sse_stream(
             ctx,
             EventStreamDecoder::new(),
             false,
-            interval(Duration::from_secs(PING_INTERVAL_SECS)),
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished)| async move {
             if finished {
                 return None;
             }
 
             loop {
                 tokio::select! {
-                    // 使用 biased 模式，优先检查 ping 定时器
-                    // 避免在上游 chunk 密集时 ping 被"饿死"
-                    biased;
-
-                    // 优先检查 ping 保活（等待期间唯一发送的数据）
-                    _ = ping_interval.tick() => {
-                        tracing::trace!("发送 ping 保活事件（缓冲模式）");
-                        let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)));
-                    }
-
-                    // 然后处理数据流
+                    // 缓冲模式必须保持首个可见事件为 message_start，且 content_block_start
+                    // 不能被 ping 插入打断；严格结构校验器会拒绝这种序列。
                     chunk_result = body_stream.next() => {
                         match chunk_result {
                             Some(Ok(chunk)) => {
@@ -1274,7 +1276,7 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true)));
                             }
                             None => {
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）
@@ -1283,7 +1285,7 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true)));
                             }
                         }
                     }
