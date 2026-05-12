@@ -875,7 +875,7 @@ impl KiroProvider {
     /// - 401/403: 视为凭据/权限问题，计入失败次数并允许故障转移
     /// - 402 quota exhausted: 视为额度用尽，禁用凭据并切换
     /// - 429: 记录短冷却/退避并在当前请求内切换其他候选凭据
-    /// - 5xx/网络等瞬态错误: 重试但不禁用凭据
+    /// - 5xx/网络等瞬态错误: 重试并在当前请求内切换其他候选凭据，但不禁用账号
     ///
     /// # Arguments
     /// * `request_body` - JSON 格式的请求体字符串
@@ -902,7 +902,7 @@ impl KiroProvider {
     /// - 401/403: 视为凭据/权限问题，计入失败次数并允许故障转移
     /// - 402 quota exhausted: 视为额度用尽，禁用凭据并切换
     /// - 429: 记录短冷却/退避并在当前请求内切换其他候选凭据
-    /// - 5xx/网络等瞬态错误: 重试但不禁用凭据
+    /// - 5xx/网络等瞬态错误: 重试并在当前请求内切换其他候选凭据，但不禁用账号
     ///
     /// # Arguments
     /// * `request_body` - JSON 格式的请求体字符串
@@ -942,31 +942,45 @@ impl KiroProvider {
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let mut request_scoped_rate_limited_credentials: HashSet<u64> = HashSet::new();
+        let mut request_scoped_transient_error_credentials: HashSet<u64> = HashSet::new();
         let mut priority_rate_limit_hits: HashMap<u32, usize> = HashMap::new();
 
         let mut attempt_count = 0;
         while attempt_count < max_retries {
             let supported_candidate_count =
                 self.token_manager.enabled_supported_credential_count(None);
-            if Self::should_reset_rate_limited_exclusions_for_next_pass(
-                request_scoped_rate_limited_credentials.len(),
+            let retryable_exclusion_count = Self::request_scoped_retryable_exclusion_count(
+                &request_scoped_rate_limited_credentials,
+                &request_scoped_transient_error_credentials,
+            );
+            if Self::should_reset_retryable_exclusions_for_next_pass(
+                retryable_exclusion_count,
                 supported_candidate_count,
                 attempt_count,
                 max_retries,
             ) {
                 request_scoped_rate_limited_credentials.clear();
+                request_scoped_transient_error_credentials.clear();
             }
 
             let attempt = attempt_count;
             attempt_count += 1;
             // 获取调用上下文
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
+            let empty_model_unsupported = HashSet::new();
+            let empty_slow_first_content = HashSet::new();
+            let request_scoped_excluded_credentials = Self::combined_request_exclusions(
+                &empty_model_unsupported,
+                &request_scoped_rate_limited_credentials,
+                &empty_slow_first_content,
+                &request_scoped_transient_error_credentials,
+            );
             let ctx = match self
                 .token_manager
                 .acquire_context_with_weight_excluding(
                     None,
                     1.0,
-                    &request_scoped_rate_limited_credentials,
+                    &request_scoped_excluded_credentials,
                 )
                 .await
             {
@@ -979,14 +993,19 @@ impl KiroProvider {
                         last_error = Some(err);
                         continue;
                     }
-                    if !request_scoped_rate_limited_credentials.is_empty() && last_error.is_some() {
+                    if (!request_scoped_rate_limited_credentials.is_empty()
+                        || !request_scoped_transient_error_credentials.is_empty())
+                        && last_error.is_some()
+                    {
                         tracing::warn!(
                             attempt = attempt + 1,
                             max_retries,
                             rate_limited_credentials =
                                 request_scoped_rate_limited_credentials.len(),
+                            transient_error_credentials =
+                                request_scoped_transient_error_credentials.len(),
                             error = %err,
-                            "MCP 请求已无未排除的 429 故障转移候选"
+                            "MCP 请求已无未排除的故障转移候选"
                         );
                         break;
                     }
@@ -1045,6 +1064,7 @@ impl KiroProvider {
                         e
                     );
                     last_error = Some(e.into());
+                    request_scoped_transient_error_credentials.insert(ctx_id);
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
                     }
@@ -1164,6 +1184,7 @@ impl KiroProvider {
                         &empty_model_unsupported,
                         &mut request_scoped_rate_limited_credentials,
                         &empty_slow_first_content,
+                        &request_scoped_transient_error_credentials,
                     );
                     let supported_candidate_count =
                         self.token_manager.enabled_supported_credential_count(None);
@@ -1171,6 +1192,8 @@ impl KiroProvider {
                         total_credentials,
                         supported_candidate_count,
                     ));
+                } else {
+                    request_scoped_transient_error_credentials.insert(ctx_id);
                 }
                 tracing::warn!(
                     credential_id = ctx_id,
@@ -1202,6 +1225,7 @@ impl KiroProvider {
                 "MCP 请求失败（未知错误）"
             );
             last_error = Some(anyhow::anyhow!("MCP 请求失败: {}", error_summary));
+            request_scoped_transient_error_credentials.insert(ctx_id);
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
             }
@@ -1231,6 +1255,7 @@ impl KiroProvider {
         let mut request_scoped_model_unsupported_credentials: HashSet<u64> = HashSet::new();
         let mut request_scoped_rate_limited_credentials: HashSet<u64> = HashSet::new();
         let mut request_scoped_slow_first_content_credentials: HashSet<u64> = HashSet::new();
+        let mut request_scoped_transient_error_credentials: HashSet<u64> = HashSet::new();
         let mut priority_rate_limit_hits: HashMap<u32, usize> = HashMap::new();
         let mut slow_first_content_failovers = 0usize;
         let api_type = if is_stream { "流式" } else { "非流式" };
@@ -1254,13 +1279,18 @@ impl KiroProvider {
                 supported_candidate_count,
                 request_scoped_model_unsupported_credentials.len(),
             );
-            if Self::should_reset_rate_limited_exclusions_for_next_pass(
-                request_scoped_rate_limited_credentials.len(),
+            let retryable_exclusion_count = Self::request_scoped_retryable_exclusion_count(
+                &request_scoped_rate_limited_credentials,
+                &request_scoped_transient_error_credentials,
+            );
+            if Self::should_reset_retryable_exclusions_for_next_pass(
+                retryable_exclusion_count,
                 retryable_candidate_count,
                 attempt_count,
                 max_retries,
             ) {
                 request_scoped_rate_limited_credentials.clear();
+                request_scoped_transient_error_credentials.clear();
             }
 
             let attempt = attempt_count;
@@ -1271,6 +1301,7 @@ impl KiroProvider {
                 &request_scoped_model_unsupported_credentials,
                 &request_scoped_rate_limited_credentials,
                 &request_scoped_slow_first_content_credentials,
+                &request_scoped_transient_error_credentials,
             );
             let acquire_context = || {
                 self.token_manager.acquire_context_with_weight_excluding(
@@ -1308,7 +1339,10 @@ impl KiroProvider {
                         last_error = Some(err);
                         continue;
                     }
-                    if !request_scoped_rate_limited_credentials.is_empty() && last_error.is_some() {
+                    if (!request_scoped_rate_limited_credentials.is_empty()
+                        || !request_scoped_transient_error_credentials.is_empty())
+                        && last_error.is_some()
+                    {
                         tracing::warn!(
                             request_id = %request_id,
                             api_type,
@@ -1317,8 +1351,10 @@ impl KiroProvider {
                             max_retries,
                             rate_limited_credentials =
                                 request_scoped_rate_limited_credentials.len(),
+                            transient_error_credentials =
+                                request_scoped_transient_error_credentials.len(),
                             error = %err,
-                            "当前请求已无未排除的 429 故障转移候选"
+                            "当前请求已无未排除的故障转移候选"
                         );
                         break;
                     }
@@ -1457,8 +1493,8 @@ impl KiroProvider {
                         error = %e,
                         "API 请求发送失败"
                     );
-                    // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
-                    // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
+                    // 网络错误通常是上游/链路瞬态问题，不应禁用凭据；
+                    // 仅在当前请求内跳过该候选，给低优先级账号兜底机会。
                     if e.is_timeout() {
                         last_error = Some(anyhow::Error::new(
                             PublicProviderError::gateway_timeout(
@@ -1477,6 +1513,7 @@ impl KiroProvider {
                     } else {
                         last_error = Some(e.into());
                     }
+                    request_scoped_transient_error_credentials.insert(ctx_id);
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
                     }
@@ -1544,9 +1581,13 @@ impl KiroProvider {
                     response_headers_at,
                 };
 
+                let retryable_excluded_count = Self::request_scoped_retryable_exclusion_count(
+                    &request_scoped_rate_limited_credentials,
+                    &request_scoped_transient_error_credentials,
+                );
                 let scoped_candidate_count = supported_candidate_count
                     .saturating_sub(request_scoped_model_unsupported_credentials.len())
-                    .saturating_sub(request_scoped_rate_limited_credentials.len())
+                    .saturating_sub(retryable_excluded_count)
                     .saturating_sub(request_scoped_slow_first_content_credentials.len());
                 let content_start_probe_budget =
                     Self::remaining_stream_first_content_failover_budget(overall_started_at);
@@ -1720,6 +1761,7 @@ impl KiroProvider {
                                 "预读上游流首内容块失败"
                             );
                             last_error = Some(err.into());
+                            request_scoped_transient_error_credentials.insert(ctx_id);
                             if attempt + 1 < max_retries {
                                 sleep(Self::retry_delay(attempt)).await;
                             }
@@ -1930,8 +1972,8 @@ impl KiroProvider {
                 continue;
             }
 
-            // 429/408/5xx - 瞬态上游错误：重试但不禁用凭据。
-            // 429 会进入短冷却/桶退避，并在当前请求内排除已 429 的候选以便切换。
+            // 429/408/5xx - 瞬态上游错误：重试但不禁用凭据，并在当前请求内切换候选。
+            // 429 会额外进入短冷却/桶退避。
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
                 if status.as_u16() == 429 {
                     self.token_manager.report_rate_limited(ctx_id);
@@ -1944,6 +1986,7 @@ impl KiroProvider {
                         &request_scoped_model_unsupported_credentials,
                         &mut request_scoped_rate_limited_credentials,
                         &request_scoped_slow_first_content_credentials,
+                        &request_scoped_transient_error_credentials,
                     );
                     let supported_candidate_count = self
                         .token_manager
@@ -1952,6 +1995,8 @@ impl KiroProvider {
                         total_credentials,
                         supported_candidate_count,
                     ));
+                } else {
+                    request_scoped_transient_error_credentials.insert(ctx_id);
                 }
                 tracing::warn!(
                     request_id = %request_id,
@@ -2005,7 +2050,7 @@ impl KiroProvider {
                 anyhow::bail!("{} API 请求失败: {}", api_type, error_summary);
             }
 
-            // 兜底：当作可重试的瞬态错误处理（不切换凭据）
+            // 兜底：当作可重试的瞬态错误处理，并在当前请求内切换候选凭据。
             tracing::warn!(
                 request_id = %request_id,
                 api_type,
@@ -2026,6 +2071,7 @@ impl KiroProvider {
                 api_type,
                 error_summary
             ));
+            request_scoped_transient_error_credentials.insert(ctx_id);
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
             }
@@ -2129,15 +2175,15 @@ impl KiroProvider {
         supported_candidate_count.saturating_sub(request_scoped_model_unsupported_count)
     }
 
-    fn should_reset_rate_limited_exclusions_for_next_pass(
-        rate_limited_exclusion_count: usize,
+    fn should_reset_retryable_exclusions_for_next_pass(
+        retryable_exclusion_count: usize,
         retryable_candidate_count: usize,
         attempted_count: usize,
         max_retries: usize,
     ) -> bool {
-        rate_limited_exclusion_count > 0
+        retryable_exclusion_count > 0
             && retryable_candidate_count > 0
-            && rate_limited_exclusion_count >= retryable_candidate_count
+            && retryable_exclusion_count >= retryable_candidate_count
             && attempted_count < max_retries
     }
 
@@ -2145,11 +2191,29 @@ impl KiroProvider {
         model_unsupported_credentials: &HashSet<u64>,
         rate_limited_credentials: &HashSet<u64>,
         slow_first_content_credentials: &HashSet<u64>,
+        transient_error_credentials: &HashSet<u64>,
     ) -> HashSet<u64> {
         let mut excluded = model_unsupported_credentials.clone();
         excluded.extend(rate_limited_credentials.iter().copied());
         excluded.extend(slow_first_content_credentials.iter().copied());
+        excluded.extend(transient_error_credentials.iter().copied());
         excluded
+    }
+
+    fn request_scoped_retryable_exclusion_count(
+        rate_limited_credentials: &HashSet<u64>,
+        transient_error_credentials: &HashSet<u64>,
+    ) -> usize {
+        if rate_limited_credentials.is_empty() {
+            return transient_error_credentials.len();
+        }
+        if transient_error_credentials.is_empty() {
+            return rate_limited_credentials.len();
+        }
+
+        let mut excluded = rate_limited_credentials.clone();
+        excluded.extend(transient_error_credentials.iter().copied());
+        excluded.len()
     }
 
     fn maybe_spill_rate_limited_priority(
@@ -2160,6 +2224,7 @@ impl KiroProvider {
         request_scoped_model_unsupported_credentials: &HashSet<u64>,
         request_scoped_rate_limited_credentials: &mut HashSet<u64>,
         request_scoped_slow_first_content_credentials: &HashSet<u64>,
+        request_scoped_transient_error_credentials: &HashSet<u64>,
     ) {
         let hits = priority_rate_limit_hits
             .entry(credential_priority)
@@ -2174,6 +2239,7 @@ impl KiroProvider {
             request_scoped_model_unsupported_credentials,
             request_scoped_rate_limited_credentials,
             request_scoped_slow_first_content_credentials,
+            request_scoped_transient_error_credentials,
         );
         if !token_manager.has_enabled_supported_credential_below_priority(
             model,
@@ -2505,10 +2571,29 @@ mod tests {
     }
 
     #[test]
-    fn test_rate_limited_exclusions_reset_after_one_pass_when_budget_remains() {
-        assert!(KiroProvider::should_reset_rate_limited_exclusions_for_next_pass(2, 2, 2, 6));
-        assert!(!KiroProvider::should_reset_rate_limited_exclusions_for_next_pass(2, 2, 6, 6));
-        assert!(!KiroProvider::should_reset_rate_limited_exclusions_for_next_pass(1, 2, 1, 6));
+    fn test_retryable_exclusions_reset_after_one_pass_when_budget_remains() {
+        assert!(KiroProvider::should_reset_retryable_exclusions_for_next_pass(2, 2, 2, 6));
+        assert!(!KiroProvider::should_reset_retryable_exclusions_for_next_pass(2, 2, 6, 6));
+        assert!(!KiroProvider::should_reset_retryable_exclusions_for_next_pass(1, 2, 1, 6));
+    }
+
+    #[test]
+    fn test_retryable_exclusion_count_deduplicates_transient_and_rate_limited() {
+        let mut rate_limited = HashSet::new();
+        rate_limited.insert(1);
+        rate_limited.insert(2);
+
+        let mut transient_errors = HashSet::new();
+        transient_errors.insert(2);
+        transient_errors.insert(3);
+
+        assert_eq!(
+            KiroProvider::request_scoped_retryable_exclusion_count(
+                &rate_limited,
+                &transient_errors
+            ),
+            3
+        );
     }
 
     #[test]

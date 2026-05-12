@@ -6052,6 +6052,31 @@ mod tests {
         assert_eq!(fallback.id, 2);
     }
 
+    #[tokio::test]
+    async fn test_request_scoped_excluded_high_priority_spills_to_lower_priority() {
+        let config = Config::default();
+        let primary = available_credential(0);
+        let fallback = available_credential(10);
+
+        let manager = MultiTokenManager::new(config, vec![primary, fallback], None, None, false)
+            .expect("manager should initialize");
+
+        let initial = manager
+            .acquire_context(None)
+            .await
+            .expect("unexcluded request should pick high priority");
+        assert_eq!(initial.id, 1);
+        drop(initial);
+
+        let mut excluded_credential_ids = HashSet::new();
+        excluded_credential_ids.insert(1);
+        let fallback = manager
+            .acquire_context_with_weight_excluding(None, 1.0, &excluded_credential_ids)
+            .await
+            .expect("request-scoped high-priority exclusion should spill to lower priority");
+        assert_eq!(fallback.id, 2);
+    }
+
     #[test]
     fn test_opus_4_7_remaining_candidates_can_be_detected_as_leader_refresh_only() {
         let mut config = Config::default();
