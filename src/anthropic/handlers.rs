@@ -29,7 +29,9 @@ use super::middleware::{ANTHROPIC_RUNTIME_LEADER_REQUIRED_HEADER, AppState};
 use super::multimodal;
 use super::probe::{UpstreamProbe, parse_upstream_probe};
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
-use super::thinking_compat::{build_synthetic_thinking_signature, extract_thinking_and_text};
+use super::thinking_compat::{
+    extract_thinking_and_text, sign_thinking_block, validate_thinking_signatures,
+};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
     OutputConfig, Thinking,
@@ -237,6 +239,37 @@ async fn normalize_multimodal_payload(
     }
 }
 
+fn validate_thinking_signature_payload(
+    payload: &MessagesRequest,
+    request_id: &str,
+) -> Result<(), Response> {
+    match validate_thinking_signatures(payload) {
+        Ok(stats) => {
+            if stats.valid_own_signatures > 0
+                || stats.foreign_signatures > 0
+                || stats.missing_signatures > 0
+            {
+                tracing::info!(
+                    request_id = %request_id,
+                    valid_own_signatures = stats.valid_own_signatures,
+                    foreign_signatures = stats.foreign_signatures,
+                    missing_signatures = stats.missing_signatures,
+                    "validated historical thinking signatures"
+                );
+            }
+            Ok(())
+        }
+        Err(err) => {
+            tracing::warn!(request_id = %request_id, error = %err, "thinking 签名校验失败");
+            Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new("invalid_request_error", err.to_string())),
+            )
+                .into_response())
+        }
+    }
+}
+
 /// GET /v1/models
 ///
 /// 返回可用的模型列表
@@ -308,6 +341,10 @@ pub async fn post_messages(
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
+
+    if let Err(response) = validate_thinking_signature_payload(&payload, &request_id) {
+        return response;
+    }
 
     if let Err(response) = normalize_multimodal_payload(&mut payload, &request_id).await {
         return response;
@@ -863,7 +900,7 @@ fn decode_non_stream_message(
 
     if !text_content.is_empty() {
         if let Some((thinking, remaining_text)) = extract_thinking_and_text(&text_content) {
-            let signature = build_synthetic_thinking_signature(&response_id, 0, &thinking);
+            let signature = sign_thinking_block(0, &thinking);
             content.push(json!({
                 "type": "thinking",
                 "thinking": thinking,
@@ -1069,6 +1106,10 @@ pub async fn post_messages_cc(
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
+
+    if let Err(response) = validate_thinking_signature_payload(&payload, &request_id) {
+        return response;
+    }
 
     if let Err(response) = normalize_multimodal_payload(&mut payload, &request_id).await {
         return response;

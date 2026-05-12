@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::kiro::model::events::Event;
 
-use super::thinking_compat::build_synthetic_thinking_signature;
+use super::thinking_compat::sign_thinking_block;
 
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
@@ -489,7 +489,7 @@ pub struct StreamContext {
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
-    /// 已发送给客户端的 thinking 内容，用于生成 synthetic signature
+    /// 已发送给客户端的 thinking 内容，用于生成不透明 signature
     thinking_signature_source: String,
 }
 
@@ -838,7 +838,7 @@ impl StreamContext {
         )
     }
 
-    /// 创建 thinking_delta 事件并累计内容，供 synthetic signature 使用
+    /// 创建 thinking_delta 事件并累计内容，供 signature 使用
     fn create_tracked_thinking_delta_event(&mut self, index: i32, thinking: &str) -> SseEvent {
         if !thinking.is_empty() {
             self.thinking_signature_source.push_str(thinking);
@@ -846,16 +846,12 @@ impl StreamContext {
         self.create_thinking_delta_event(index, thinking)
     }
 
-    /// 创建 synthetic signature_delta 事件
+    /// 创建 signature_delta 事件
     fn create_signature_delta_event(&self, index: i32) -> Option<SseEvent> {
         if self.thinking_signature_source.is_empty() {
             return None;
         }
-        let signature = build_synthetic_thinking_signature(
-            &self.message_id,
-            index,
-            &self.thinking_signature_source,
-        );
+        let signature = sign_thinking_block(0, &self.thinking_signature_source);
         Some(SseEvent::new(
             "content_block_delta",
             json!({

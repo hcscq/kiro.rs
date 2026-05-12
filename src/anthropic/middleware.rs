@@ -27,6 +27,7 @@ use super::{
         BufferedAnthropicBody, MAX_ANTHROPIC_BODY_SIZE_BYTES, content_length_header_value,
         request_body_too_large_response,
     },
+    thinking_compat::init_thinking_signature_key,
     types::ErrorResponse,
 };
 
@@ -110,8 +111,10 @@ pub struct AppState {
 impl AppState {
     /// 创建新的应用状态
     pub fn new(api_key: impl Into<String>) -> Self {
+        let api_key = api_key.into();
+        init_thinking_signature_key(&api_key);
         Self {
-            api_key: api_key.into(),
+            api_key,
             kiro_provider: None,
             client: Client::builder()
                 .connect_timeout(Duration::from_secs(5))
