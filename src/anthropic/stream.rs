@@ -404,7 +404,7 @@ impl SseStateManager {
     /// 生成最终事件序列
     pub fn generate_final_events(
         &mut self,
-        input_tokens: i32,
+        _input_tokens: i32,
         output_tokens: i32,
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
@@ -435,7 +435,6 @@ impl SseStateManager {
                         "stop_sequence": null
                     },
                     "usage": {
-                        "input_tokens": input_tokens,
                         "output_tokens": output_tokens
                     }
                 }),
@@ -1246,6 +1245,35 @@ mod tests {
         // 重复 stop 应该被跳过
         let event = manager.handle_content_block_stop(0);
         assert!(event.is_none());
+    }
+
+    #[test]
+    fn test_message_delta_usage_only_reports_output_tokens() {
+        let mut manager = SseStateManager::new();
+
+        let events = manager.generate_final_events(123, 7);
+        let message_delta = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta should be emitted");
+
+        assert_eq!(message_delta.data["usage"]["output_tokens"], 7);
+        assert!(
+            message_delta.data["usage"].get("input_tokens").is_none(),
+            "message_delta usage must not include input_tokens"
+        );
+        assert!(
+            message_delta.data["usage"]
+                .get("cache_creation_input_tokens")
+                .is_none(),
+            "message_delta usage must not include cache_creation_input_tokens"
+        );
+        assert!(
+            message_delta.data["usage"]
+                .get("cache_read_input_tokens")
+                .is_none(),
+            "message_delta usage must not include cache_read_input_tokens"
+        );
     }
 
     #[test]
