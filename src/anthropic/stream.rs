@@ -542,10 +542,10 @@ impl StreamContext {
         })
     }
 
-    /// 生成初始事件序列 (message_start + 文本块 start)
+    /// 生成初始事件序列。
     ///
-    /// 当 thinking 启用时，不在初始化时创建文本块，而是等到实际收到内容时再创建。
-    /// 这样可以确保 thinking 块（索引 0）在文本块（索引 1）之前。
+    /// 文本块按实际 text_delta 懒启动，避免纯 tool_use 轮次生成空 text block。
+    /// 如果上游最终没有任何内容，generate_final_events 会补一个最小文本块。
     pub fn generate_initial_events(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
@@ -554,29 +554,6 @@ impl StreamContext {
         if let Some(event) = self.state_manager.handle_message_start(msg_start) {
             events.push(event);
         }
-
-        // 如果启用了 thinking，不在这里创建文本块
-        // thinking 块和文本块会在 process_content_with_thinking 中按正确顺序创建
-        if self.thinking_enabled {
-            return events;
-        }
-
-        // 创建初始文本块（仅在未启用 thinking 时）
-        let text_block_index = self.state_manager.next_block_index();
-        self.text_block_index = Some(text_block_index);
-        let text_block_events = self.state_manager.handle_content_block_start(
-            text_block_index,
-            "text",
-            json!({
-                "type": "content_block_start",
-                "index": text_block_index,
-                "content_block": {
-                    "type": "text",
-                    "text": ""
-                }
-            }),
-        );
-        events.extend(text_block_events);
 
         events
     }
@@ -1077,13 +1054,12 @@ impl StreamContext {
             self.thinking_buffer.clear();
         }
 
-        // thinking 模式下，若最终没有任何非 thinking 内容块，需要补一个最小 text 块，
-        // 避免输出成为仅有 message_* 的 Anthropic SSE，导致兼容性问题。
-        let missing_non_thinking_blocks =
-            self.thinking_enabled && !self.state_manager.has_non_thinking_blocks();
+        // 若最终没有任何非 thinking 内容块，需要补一个最小 text 块，
+        // 避免输出成为仅有 message_* 或 thinking-only 的 Anthropic SSE，导致兼容性问题。
+        let missing_non_thinking_blocks = !self.state_manager.has_non_thinking_blocks();
         if missing_non_thinking_blocks {
             // 只有真的出现过 thinking-only 时，才把 stop_reason 视为 max_tokens。
-            if self.thinking_block_index.is_some() {
+            if self.thinking_enabled && self.thinking_block_index.is_some() {
                 self.state_manager.set_stop_reason("max_tokens");
             }
 
@@ -1314,13 +1290,22 @@ mod tests {
         assert!(
             initial_events
                 .iter()
-                .any(|e| e.event == "content_block_start"
-                    && e.data["content_block"]["type"] == "text")
+                .all(|e| e.event != "content_block_start"),
+            "initial events should not start a text block before content arrives"
         );
 
+        let first_text_events = ctx.process_assistant_response("before");
         let initial_text_index = ctx
             .text_block_index
-            .expect("initial text block index should exist");
+            .expect("text block index should exist after first text");
+        assert!(
+            first_text_events.iter().any(|e| {
+                e.event == "content_block_delta"
+                    && e.data["delta"]["type"] == "text_delta"
+                    && e.data["delta"]["text"] == "before"
+            }),
+            "first text should emit text_delta"
+        );
 
         // tool_use 开始会自动关闭现有 text block
         let tool_events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
@@ -1362,6 +1347,35 @@ mod tests {
                     && e.data["delta"]["text"] == "hello"
             }),
             "should emit text_delta after restarting text block"
+        );
+    }
+
+    #[test]
+    fn test_tool_use_without_prior_text_does_not_emit_empty_text_block() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let mut all_events = ctx.generate_initial_events();
+
+        all_events.extend(
+            ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+                name: "test_tool".to_string(),
+                tool_use_id: "tool_1".to_string(),
+                input: "{}".to_string(),
+                stop: true,
+            }),
+        );
+        all_events.extend(ctx.generate_final_events());
+
+        assert!(
+            all_events.iter().all(|e| {
+                !(e.event == "content_block_start" && e.data["content_block"]["type"] == "text")
+            }),
+            "pure tool_use output should not synthesize an empty text block"
+        );
+        assert!(
+            all_events.iter().any(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
+            }),
+            "tool_use block should still be emitted"
         );
     }
 

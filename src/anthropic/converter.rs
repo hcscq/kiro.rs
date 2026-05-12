@@ -605,7 +605,7 @@ fn build_kiro_image(format: String, data: String) -> KiroImage {
     let data = normalize_base64_payload(&data);
     if let Some((normalized_format, normalized_data)) = normalize_image_for_kiro(&format, &data) {
         KiroImage::from_base64(normalized_format, normalized_data)
-    } else if let Some(resized_data) = resize_oversized_image_base64(&format, &data) {
+    } else if let Some(resized_data) = resize_image_for_kiro_dimensions_base64(&format, &data) {
         KiroImage::from_base64(format, resized_data)
     } else {
         KiroImage::from_base64(format, data)
@@ -639,13 +639,10 @@ fn transcode_image_base64_to_png(format: &str, data: &str) -> Option<(String, St
     let bytes = BASE64_STANDARD.decode(data).ok()?;
     let image = image::load_from_memory(&bytes).ok()?;
     let (width, height) = image.dimensions();
-    let max_dimension = width.max(height);
+    let (target_width, target_height) = target_kiro_image_dimensions(width, height);
 
-    let converted = if max_dimension > KIRO_MAX_IMAGE_DIMENSION_PX {
-        let scale = KIRO_MAX_IMAGE_DIMENSION_PX as f64 / max_dimension as f64;
-        let resized_width = ((width as f64 * scale).round() as u32).max(1);
-        let resized_height = ((height as f64 * scale).round() as u32).max(1);
-        image.resize(resized_width, resized_height, FilterType::Lanczos3)
+    let converted = if target_width != width || target_height != height {
+        image.resize_exact(target_width, target_height, FilterType::Lanczos3)
     } else {
         image
     };
@@ -673,6 +670,25 @@ fn transcode_image_base64_to_png(format: &str, data: &str) -> Option<(String, St
     Some(("png".to_string(), BASE64_STANDARD.encode(output)))
 }
 
+fn target_kiro_image_dimensions(width: u32, height: u32) -> (u32, u32) {
+    let mut target_width = width.max(1);
+    let mut target_height = height.max(1);
+    let max_dimension = target_width.max(target_height);
+
+    if max_dimension > KIRO_MAX_IMAGE_DIMENSION_PX {
+        let scale = KIRO_MAX_IMAGE_DIMENSION_PX as f64 / max_dimension as f64;
+        target_width = ((target_width as f64 * scale).round() as u32).max(1);
+        target_height = ((target_height as f64 * scale).round() as u32).max(1);
+    }
+
+    if target_width < KIRO_MIN_IMAGE_DIMENSION_PX || target_height < KIRO_MIN_IMAGE_DIMENSION_PX {
+        target_width = target_width.max(KIRO_MIN_IMAGE_DIMENSION_PX);
+        target_height = target_height.max(KIRO_MIN_IMAGE_DIMENSION_PX);
+    }
+
+    (target_width, target_height)
+}
+
 fn image_format_for_compat(format: &str) -> Option<image::ImageFormat> {
     match format {
         "jpeg" | "jpg" => Some(image::ImageFormat::Jpeg),
@@ -681,21 +697,92 @@ fn image_format_for_compat(format: &str) -> Option<image::ImageFormat> {
     }
 }
 
-fn resize_oversized_image_base64(format: &str, data: &str) -> Option<String> {
-    let image_format = image_format_for_compat(format)?;
-    let bytes = BASE64_STANDARD.decode(data).ok()?;
-    let image = image::load_from_memory_with_format(&bytes, image_format).ok()?;
-    let (width, height) = image.dimensions();
-    let max_dimension = width.max(height);
+fn load_image_with_optional_png_crc_repair(
+    format: &str,
+    image_format: image::ImageFormat,
+    bytes: &[u8],
+) -> Option<(image::DynamicImage, Option<Vec<u8>>)> {
+    if let Ok(image) = image::load_from_memory_with_format(bytes, image_format) {
+        return Some((image, None));
+    }
 
-    if max_dimension <= KIRO_MAX_IMAGE_DIMENSION_PX {
+    if format != "png" {
         return None;
     }
 
-    let scale = KIRO_MAX_IMAGE_DIMENSION_PX as f64 / max_dimension as f64;
-    let resized_width = ((width as f64 * scale).round() as u32).max(1);
-    let resized_height = ((height as f64 * scale).round() as u32).max(1);
-    let resized = image.resize(resized_width, resized_height, FilterType::Lanczos3);
+    let repaired = repair_png_chunk_crcs(bytes)?;
+    let image = image::load_from_memory_with_format(&repaired, image::ImageFormat::Png).ok()?;
+    Some((image, Some(repaired)))
+}
+
+fn repair_png_chunk_crcs(bytes: &[u8]) -> Option<Vec<u8>> {
+    const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    if bytes.len() < PNG_SIGNATURE.len() || &bytes[..8] != PNG_SIGNATURE {
+        return None;
+    }
+
+    let mut repaired = bytes.to_vec();
+    let mut cursor = PNG_SIGNATURE.len();
+    while cursor + 12 <= repaired.len() {
+        let length = u32::from_be_bytes(repaired[cursor..cursor + 4].try_into().ok()?) as usize;
+        let chunk_type_start = cursor + 4;
+        let data_start = chunk_type_start + 4;
+        let data_end = data_start.checked_add(length)?;
+        let crc_start = data_end;
+        let crc_end = crc_start + 4;
+        if crc_end > repaired.len() {
+            return None;
+        }
+
+        let crc = png_crc32(&repaired[chunk_type_start..data_end]);
+        repaired[crc_start..crc_end].copy_from_slice(&crc.to_be_bytes());
+
+        let chunk_type = &repaired[chunk_type_start..data_start];
+        cursor = crc_end;
+        if chunk_type == b"IEND" {
+            return Some(repaired);
+        }
+    }
+
+    None
+}
+
+fn png_crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for byte in bytes {
+        crc ^= *byte as u32;
+        for _ in 0..8 {
+            let mask = if crc & 1 == 1 { 0xedb8_8320 } else { 0 };
+            crc = (crc >> 1) ^ mask;
+        }
+    }
+    !crc
+}
+
+fn resize_image_for_kiro_dimensions_base64(format: &str, data: &str) -> Option<String> {
+    let image_format = image_format_for_compat(format)?;
+    let bytes = BASE64_STANDARD.decode(data).ok()?;
+    let (image, repaired_bytes) =
+        load_image_with_optional_png_crc_repair(format, image_format, &bytes)?;
+    let (width, height) = image.dimensions();
+    let (resized_width, resized_height) = target_kiro_image_dimensions(width, height);
+
+    if resized_width == width && resized_height == height {
+        if let Some(repaired_bytes) = repaired_bytes {
+            tracing::info!(
+                format,
+                width,
+                height,
+                original_bytes = bytes.len(),
+                repaired_bytes = repaired_bytes.len(),
+                "修复 PNG chunk CRC 以提升 Kiro 图片兼容性"
+            );
+            return Some(BASE64_STANDARD.encode(repaired_bytes));
+        }
+        return None;
+    }
+
+    let resized = image.resize_exact(resized_width, resized_height, FilterType::Lanczos3);
 
     let mut output = Vec::new();
     match image_format {
@@ -723,7 +810,7 @@ fn resize_oversized_image_base64(format: &str, data: &str) -> Option<String> {
         resized_height,
         original_bytes = bytes.len(),
         resized_bytes = output.len(),
-        "缩放超出 Kiro 兼容尺寸的图片"
+        "调整 Kiro 兼容图片尺寸"
     );
 
     Some(BASE64_STANDARD.encode(output))
@@ -1129,6 +1216,8 @@ const KIRO_MAX_IMAGES_PER_USER_TURN: usize = 10;
 /// Kiro 上游对图片像素尺寸也较敏感；长边超过约 1200px 的截图会触发
 /// 400 Improperly formed request。等比例缩放保留图片语义，同时兼容上游。
 const KIRO_MAX_IMAGE_DIMENSION_PX: u32 = 1200;
+/// 极小图片（如 1x1 验证图）也会被上游拒绝，放大到最小兼容尺寸。
+const KIRO_MIN_IMAGE_DIMENSION_PX: u32 = 32;
 
 fn merge_user_message_parts(
     messages: &[&super::types::Message],
@@ -1593,6 +1682,31 @@ mod tests {
 
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].source.bytes, original_data);
+    }
+
+    #[test]
+    fn test_process_message_content_upscales_tiny_png() {
+        let content = serde_json::Value::Array(vec![serde_json::json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADUlEQVR42mP8z8BQDwAFgwJ/lc0p7wAAAABJRU5ErkJggg=="
+            }
+        })]);
+
+        let (_, images, _) = process_message_content(&content).expect("tiny png should convert");
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].format, "png");
+        let resized_bytes = BASE64_STANDARD
+            .decode(&images[0].source.bytes)
+            .expect("resized image should be valid base64");
+        let resized = image::load_from_memory_with_format(&resized_bytes, image::ImageFormat::Png)
+            .expect("resized image should decode");
+
+        assert_eq!(resized.width(), KIRO_MIN_IMAGE_DIMENSION_PX);
+        assert_eq!(resized.height(), KIRO_MIN_IMAGE_DIMENSION_PX);
     }
 
     #[test]
