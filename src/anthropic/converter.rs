@@ -518,7 +518,9 @@ fn extract_document_text_for_kiro(source: &super::types::ImageSource) -> Option<
             if source_type != "base64" {
                 return None;
             }
-            let bytes = BASE64_STANDARD.decode(&source.data).ok()?;
+            let bytes = BASE64_STANDARD
+                .decode(normalize_base64_payload(&source.data))
+                .ok()?;
             if bytes.len() > MAX_INLINE_DOCUMENT_BYTES {
                 tracing::warn!(
                     media_type,
@@ -532,7 +534,9 @@ fn extract_document_text_for_kiro(source: &super::types::ImageSource) -> Option<
         }
         "text/plain" | "text/markdown" | "text/csv" | "application/json" => {
             if source_type == "base64" {
-                let bytes = BASE64_STANDARD.decode(&source.data).ok()?;
+                let bytes = BASE64_STANDARD
+                    .decode(normalize_base64_payload(&source.data))
+                    .ok()?;
                 if bytes.len() > MAX_INLINE_DOCUMENT_BYTES {
                     tracing::warn!(
                         media_type,
@@ -598,6 +602,7 @@ fn get_image_format(media_type: &str) -> Option<String> {
 }
 
 fn build_kiro_image(format: String, data: String) -> KiroImage {
+    let data = normalize_base64_payload(&data);
     if let Some((normalized_format, normalized_data)) = normalize_image_for_kiro(&format, &data) {
         KiroImage::from_base64(normalized_format, normalized_data)
     } else if let Some(resized_data) = resize_oversized_image_base64(&format, &data) {
@@ -605,6 +610,22 @@ fn build_kiro_image(format: String, data: String) -> KiroImage {
     } else {
         KiroImage::from_base64(format, data)
     }
+}
+
+fn normalize_base64_payload(data: &str) -> String {
+    let payload = data
+        .split_once(',')
+        .and_then(|(prefix, payload)| {
+            let prefix = prefix.trim().to_lowercase();
+            if prefix.starts_with("data:") && prefix.contains(";base64") {
+                Some(payload)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(data);
+
+    payload.chars().filter(|ch| !ch.is_whitespace()).collect()
 }
 
 fn normalize_image_for_kiro(format: &str, data: &str) -> Option<(String, String)> {
@@ -1484,6 +1505,56 @@ mod tests {
                 "data": "JVBERi0xLjAKMSAwIG9iajw8L1R5cGUvQ2F0YWxvZy9QYWdlcyAyIDAgUj4+ZW5kb2JqCjIgMCBvYmo8PC9UeXBlL1BhZ2VzL0tpZHNbMyAwIFJdL0NvdW50IDE+PmVuZG9iagozIDAgb2JqPDwvVHlwZS9QYWdlL01lZGlhQm94WzAgMCAzMDAgNTBdL1BhcmVudCAyIDAgUi9Db250ZW50cyA0IDAgUi9SZXNvdXJjZXM8PC9Gb250PDwvRjEgNSAwIFI+Pj4+Pj5lbmRvYmoKNCAwIG9iajw8L0xlbmd0aCAzOD4+CnN0cmVhbQpCVCAvRjEgMTQgVGYgMTAgMjAgVGQgKDZHNlM3TVNTKSBUaiBFVAplbmRzdHJlYW0KZW5kb2JqCjUgMCBvYmo8PC9UeXBlL0ZvbnQvU3VidHlwZS9UeXBlMS9CYXNlRm9udC9IZWx2ZXRpY2E+PmVuZG9iagp4cmVmCjAgNgowMDAwMDAwMDAwIDY1NTM1IGYgCjAwMDAwMDAwMDkgMDAwMDAgbiAKMDAwMDAwMDA1MiAwMDAwMCBuIAowMDAwMDAwMTAxIDAwMDAwIG4gCjAwMDAwMDAyMTAgMDAwMDAgbiAKMDAwMDAwMDI5NSAwMDAwMCBuIAp0cmFpbGVyPDwvU2l6ZSA2L1Jvb3QgMSAwIFI+PgpzdGFydHhyZWYKMzU2CiUlRU9G"
             }
         })
+    }
+
+    fn text_document_data_url_block() -> serde_json::Value {
+        serde_json::json!({
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": "text/plain",
+                "data": "data:text/plain;base64,U0tRRFlHREY="
+            }
+        })
+    }
+
+    #[test]
+    fn test_process_message_content_strips_image_data_url_prefix() {
+        let content = serde_json::Value::Array(vec![serde_json::json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": "data:image/png;base64,aGVsbG8="
+            }
+        })]);
+
+        let (_, images, _) =
+            process_message_content(&content).expect("data url image should convert");
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].format, "png");
+        assert_eq!(images[0].source.bytes, "aGVsbG8=");
+    }
+
+    #[test]
+    fn test_process_message_content_extracts_text_document_data_url() {
+        let content = serde_json::Value::Array(vec![
+            text_document_data_url_block(),
+            serde_json::json!({
+                "type": "text",
+                "text": "What text does this document contain?"
+            }),
+        ]);
+
+        let (text, images, tool_results) =
+            process_message_content(&content).expect("text data url document should convert");
+
+        assert!(images.is_empty());
+        assert!(tool_results.is_empty());
+        assert!(text.contains("Extracted document text (text/plain):"));
+        assert!(text.contains("SKQDYGDF"));
+        assert!(text.contains("What text does this document contain?"));
     }
 
     #[test]
