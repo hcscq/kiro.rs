@@ -49,6 +49,7 @@ const SLOW_UPSTREAM_HEADERS_MS: u128 = 3_000;
 const SLOW_FIRST_CHUNK_MS: u128 = 3_000;
 const SLOW_HEADERS_TO_FIRST_CHUNK_MS: u128 = 1_000;
 const ERROR_BODY_EXCERPT_CHARS: usize = 240;
+const LARGE_PROVIDER_REQUEST_WARN_THRESHOLD_BYTES: usize = 16 * 1024 * 1024;
 
 /// Kiro API Provider
 ///
@@ -81,6 +82,7 @@ enum ManagedResponseBody {
 pub struct RequestOptions {
     pub omit_agent_mode_header: bool,
     pub request_id: Option<String>,
+    pub model_id: Option<String>,
     pub request_weight: f64,
     pub wait_for_stream_content_start: bool,
     pub stream_thinking_enabled: bool,
@@ -91,6 +93,7 @@ impl Default for RequestOptions {
         Self {
             omit_agent_mode_header: false,
             request_id: None,
+            model_id: None,
             request_weight: 1.0,
             wait_for_stream_content_start: false,
             stream_thinking_enabled: false,
@@ -619,14 +622,31 @@ impl KiroProvider {
 
     /// 将凭据的 profile_arn 注入到请求体 JSON 中
     fn inject_profile_arn(request_body: &str, profile_arn: &Option<String>) -> String {
-        if let Some(arn) = profile_arn {
-            if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(request_body) {
-                json["profileArn"] = serde_json::Value::String(arn.clone());
-                if let Ok(body) = serde_json::to_string(&json) {
-                    return body;
-                }
+        let Some(arn) = profile_arn else {
+            return request_body.to_string();
+        };
+
+        if !request_body.contains("\"profileArn\"") {
+            if let Some(insert_at) = request_body.rfind('}') {
+                let arn_json = serde_json::to_string(arn).unwrap_or_else(|_| "\"\"".to_string());
+                let prefix = &request_body[..insert_at];
+                let suffix = &request_body[insert_at..];
+                let separator = if prefix.trim_end().ends_with('{') {
+                    ""
+                } else {
+                    ","
+                };
+                return format!("{prefix}{separator}\"profileArn\":{arn_json}{suffix}");
             }
         }
+
+        if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(request_body) {
+            json["profileArn"] = serde_json::Value::String(arn.clone());
+            if let Ok(body) = serde_json::to_string(&json) {
+                return body;
+            }
+        }
+
         request_body.to_string()
     }
 
@@ -1312,8 +1332,27 @@ impl KiroProvider {
         let request_weight = options.normalized_request_weight();
         let overall_started_at = Instant::now();
 
-        // 尝试从请求体中提取模型信息
-        let model = Self::extract_model_from_request(request_body);
+        // Anthropic handlers already know the mapped Kiro model. Fall back to JSON extraction for
+        // direct provider callers so large requests avoid an extra full-body parse on the hot path.
+        let model_extract_started_at = Instant::now();
+        let model = options
+            .model_id
+            .clone()
+            .or_else(|| Self::extract_model_from_request(request_body));
+        let model_extract_ms = model_extract_started_at.elapsed().as_millis();
+        if request_body.len() >= LARGE_PROVIDER_REQUEST_WARN_THRESHOLD_BYTES
+            || model_extract_ms >= SLOW_HEADERS_TO_FIRST_CHUNK_MS
+        {
+            tracing::warn!(
+                request_id = %request_id,
+                api_type,
+                model = model.as_deref().unwrap_or("unknown"),
+                request_body_bytes = request_body.len(),
+                model_extract_ms,
+                model_id_from_options = options.model_id.is_some(),
+                "Kiro provider request model resolution completed"
+            );
+        }
         let mut max_retries = Self::initial_api_retry_cap(total_credentials, model.as_deref());
         let mut attempt_count = 0;
 
@@ -1432,8 +1471,25 @@ impl KiroProvider {
             let invocation_id = Uuid::new_v4().to_string();
 
             // 注入实际凭据的 profile_arn 到请求体
+            let body_inject_started_at = Instant::now();
             let body = Self::inject_profile_arn(request_body, &credentials.profile_arn);
+            let body_inject_ms = body_inject_started_at.elapsed().as_millis();
             let request_body_bytes = body.len();
+            if request_body_bytes >= LARGE_PROVIDER_REQUEST_WARN_THRESHOLD_BYTES
+                || body_inject_ms >= SLOW_HEADERS_TO_FIRST_CHUNK_MS
+            {
+                tracing::warn!(
+                    request_id = %request_id,
+                    api_type,
+                    model = model.as_deref().unwrap_or("unknown"),
+                    credential_id = ctx_id,
+                    attempt = attempt + 1,
+                    request_body_bytes,
+                    body_inject_ms,
+                    profile_arn_present = credentials.profile_arn.is_some(),
+                    "Kiro provider request body prepared"
+                );
+            }
 
             // 发送请求
             let mut request = self
@@ -1490,6 +1546,8 @@ impl KiroProvider {
                 request_body_bytes,
                 request_weight,
                 acquire_context_ms,
+                model_extract_ms,
+                body_inject_ms,
                 stream_budget_remaining_ms = stream_budget_remaining
                     .map(|value| value.as_millis())
                     .unwrap_or(0),

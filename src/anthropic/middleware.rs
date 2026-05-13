@@ -1,6 +1,9 @@
 //! Anthropic API 中间件
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{
     body::{Body, Bytes, to_bytes},
@@ -284,7 +287,13 @@ impl AppState {
         next: Next,
     ) -> Response {
         let (parts, body) = request.into_parts();
+        let path = parts
+            .extensions
+            .get::<OriginalUri>()
+            .map(|value| value.0.path().to_string())
+            .unwrap_or_else(|| parts.uri.path().to_string());
         let content_length_header = content_length_header_value(&parts.headers);
+        let body_buffer_started_at = Instant::now();
         let body = match to_bytes(body, MAX_ANTHROPIC_BODY_SIZE_BYTES).await {
             Ok(body) => body,
             Err(err) => {
@@ -297,6 +306,16 @@ impl AppState {
                 return request_body_too_large_response();
             }
         };
+        let body_buffer_ms = body_buffer_started_at.elapsed().as_millis();
+        if body.len() >= 16 * 1024 * 1024 || body_buffer_ms >= 1_000 {
+            tracing::warn!(
+                path,
+                body_bytes = body.len(),
+                content_length_header = ?content_length_header,
+                body_buffer_ms,
+                "Buffered Anthropic request body for leader fallback"
+            );
+        }
         let buffered_request = BufferedAnthropicRequest::from_request_parts(parts, body);
         let mut local_response = next.run(buffered_request.clone().into_axum_request()).await;
 
@@ -410,7 +429,13 @@ pub async fn message_routing_middleware(
 
     if let Some(leader_http_base_url) = preemptive_leader_http_base_url {
         let (parts, body) = request.into_parts();
+        let path = parts
+            .extensions
+            .get::<OriginalUri>()
+            .map(|value| value.0.path().to_string())
+            .unwrap_or_else(|| parts.uri.path().to_string());
         let content_length_header = content_length_header_value(&parts.headers);
+        let body_buffer_started_at = Instant::now();
         let body = match to_bytes(body, MAX_ANTHROPIC_BODY_SIZE_BYTES).await {
             Ok(body) => body,
             Err(err) => {
@@ -423,6 +448,17 @@ pub async fn message_routing_middleware(
                 return request_body_too_large_response();
             }
         };
+        let body_buffer_ms = body_buffer_started_at.elapsed().as_millis();
+        if body.len() >= 16 * 1024 * 1024 || body_buffer_ms >= 1_000 {
+            tracing::warn!(
+                path,
+                body_bytes = body.len(),
+                content_length_header = ?content_length_header,
+                body_buffer_ms,
+                leader_http_base_url = %leader_http_base_url,
+                "Buffered Anthropic request body for leader forwarding"
+            );
+        }
 
         return state
             .forward_messages_to_leader(

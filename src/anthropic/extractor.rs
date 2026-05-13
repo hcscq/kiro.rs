@@ -1,6 +1,7 @@
 //! Anthropic API 请求提取与拒绝映射
 
 use std::ops::{Deref, DerefMut};
+use std::time::Instant;
 
 use axum::{
     Json as JsonExtractor,
@@ -37,6 +38,8 @@ pub(crate) struct AnthropicJson<T> {
     inner: T,
     body_len: usize,
     content_length_header: Option<u64>,
+    body_buffer_ms: u128,
+    json_parse_ms: u128,
 }
 
 impl<T> AnthropicJson<T> {
@@ -50,6 +53,14 @@ impl<T> AnthropicJson<T> {
 
     pub(crate) fn content_length_header(&self) -> Option<u64> {
         self.content_length_header
+    }
+
+    pub(crate) fn body_buffer_ms(&self) -> u128 {
+        self.body_buffer_ms
+    }
+
+    pub(crate) fn json_parse_ms(&self) -> u128 {
+        self.json_parse_ms
     }
 }
 
@@ -80,6 +91,7 @@ where
             return Err(missing_json_content_type_response());
         }
 
+        let body_buffer_started_at = Instant::now();
         let bytes =
             if let Some(buffered_body) = req.extensions().get::<BufferedAnthropicBody>().cloned() {
                 buffered_body.into_bytes()
@@ -88,13 +100,17 @@ where
                     .await
                     .map_err(bytes_rejection_response)?
             };
+        let body_buffer_ms = body_buffer_started_at.elapsed().as_millis();
         let body_len = bytes.len();
 
+        let json_parse_started_at = Instant::now();
         match JsonExtractor::<T>::from_bytes(&bytes) {
             Ok(JsonExtractor(payload)) => Ok(Self {
                 inner: payload,
                 body_len,
                 content_length_header,
+                body_buffer_ms,
+                json_parse_ms: json_parse_started_at.elapsed().as_millis(),
             }),
             Err(rejection) => Err(json_rejection_response(rejection)),
         }

@@ -43,6 +43,7 @@ use super::websearch;
 use crate::kiro::provider::{PublicProviderError, RequestOptions};
 
 const LARGE_ANTHROPIC_REQUEST_WARN_THRESHOLD_BYTES: usize = 16 * 1024 * 1024;
+const SLOW_ANTHROPIC_PRE_UPSTREAM_PHASE_MS: u128 = 1_000;
 
 #[derive(Debug, Clone)]
 pub(crate) struct NonStreamMessageResponse {
@@ -297,8 +298,11 @@ pub async fn post_messages(
     headers: HeaderMap,
     payload: AnthropicJson<MessagesRequest>,
 ) -> Response {
+    let handler_started_at = Instant::now();
     let body_bytes = payload.body_len();
     let content_length_header = payload.content_length_header();
+    let body_buffer_ms = payload.body_buffer_ms();
+    let json_parse_ms = payload.json_parse_ms();
     let request_id = request_id_from_headers(&headers);
     tracing::info!(
         request_id = %request_id,
@@ -307,6 +311,8 @@ pub async fn post_messages(
         stream = %payload.stream,
         body_bytes,
         content_length_header = ?content_length_header,
+        body_buffer_ms,
+        json_parse_ms,
         message_count = %payload.messages.len(),
         "Received POST /v1/messages request"
     );
@@ -316,6 +322,8 @@ pub async fn post_messages(
             model = %payload.model,
             body_bytes,
             content_length_header = ?content_length_header,
+            body_buffer_ms,
+            json_parse_ms,
             "Large Anthropic request body observed"
         );
     }
@@ -348,20 +356,43 @@ pub async fn post_messages(
         return response;
     }
 
+    let normalize_started_at = Instant::now();
     if let Err(response) = normalize_multimodal_payload(&mut payload, &request_id).await {
         return response;
     }
+    let normalize_ms = normalize_started_at.elapsed().as_millis();
 
     // 检查是否为 WebFetch 请求
     if webfetch::has_web_fetch_tool(&payload) {
         tracing::info!(request_id = %request_id, "检测到 WebFetch 工具，路由到 WebFetch 处理");
 
-        let input_tokens = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
+        let token_count_started_at = Instant::now();
+        let input_tokens = token::count_all_tokens_borrowed(
+            &payload.model,
+            payload.system.as_deref(),
+            &payload.messages,
+            payload.tools.as_deref(),
         ) as i32;
+        let token_count_ms = token_count_started_at.elapsed().as_millis();
+        let pre_upstream_ms = handler_started_at.elapsed().as_millis();
+        if body_bytes >= LARGE_ANTHROPIC_REQUEST_WARN_THRESHOLD_BYTES
+            || pre_upstream_ms >= SLOW_ANTHROPIC_PRE_UPSTREAM_PHASE_MS
+        {
+            tracing::warn!(
+                request_id = %request_id,
+                route = "webfetch",
+                model = %payload.model,
+                body_bytes,
+                content_length_header = ?content_length_header,
+                body_buffer_ms,
+                json_parse_ms,
+                normalize_ms,
+                token_count_ms,
+                pre_upstream_ms,
+                input_tokens,
+                "Anthropic request pre-upstream phases completed"
+            );
+        }
 
         return webfetch::handle_webfetch_request(
             provider,
@@ -378,17 +409,39 @@ pub async fn post_messages(
         tracing::info!(request_id = %request_id, "检测到 WebSearch 工具，路由到 WebSearch 处理");
 
         // 估算输入 tokens
-        let input_tokens = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
+        let token_count_started_at = Instant::now();
+        let input_tokens = token::count_all_tokens_borrowed(
+            &payload.model,
+            payload.system.as_deref(),
+            &payload.messages,
+            payload.tools.as_deref(),
         ) as i32;
+        let token_count_ms = token_count_started_at.elapsed().as_millis();
+        let pre_upstream_ms = handler_started_at.elapsed().as_millis();
+        if body_bytes >= LARGE_ANTHROPIC_REQUEST_WARN_THRESHOLD_BYTES
+            || pre_upstream_ms >= SLOW_ANTHROPIC_PRE_UPSTREAM_PHASE_MS
+        {
+            tracing::warn!(
+                request_id = %request_id,
+                route = "websearch",
+                model = %payload.model,
+                body_bytes,
+                content_length_header = ?content_length_header,
+                body_buffer_ms,
+                json_parse_ms,
+                normalize_ms,
+                token_count_ms,
+                pre_upstream_ms,
+                input_tokens,
+                "Anthropic request pre-upstream phases completed"
+            );
+        }
 
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
     }
 
     // 转换请求
+    let convert_started_at = Instant::now();
     let conversion_result = match convert_request_with_probe(&payload, probe.clone()) {
         Ok(result) => result,
         Err(e) => {
@@ -408,6 +461,7 @@ pub async fn post_messages(
                 .into_response();
         }
     };
+    let convert_ms = convert_started_at.elapsed().as_millis();
 
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
     let kiro_request = KiroRequest {
@@ -415,6 +469,7 @@ pub async fn post_messages(
         profile_arn: None,
     };
 
+    let serialize_started_at = Instant::now();
     let request_body = match serde_json::to_string(&kiro_request) {
         Ok(body) => body,
         Err(e) => {
@@ -429,6 +484,7 @@ pub async fn post_messages(
                 .into_response();
         }
     };
+    let serialize_ms = serialize_started_at.elapsed().as_millis();
 
     tracing::debug!(
         request_id = %request_id,
@@ -441,13 +497,16 @@ pub async fn post_messages(
     let request_weighting = provider.request_weighting_config();
 
     // 估算输入 tokens
-    let input_tokens = token::count_all_tokens(
-        payload.model.clone(),
-        payload.system.clone(),
-        payload.messages.clone(),
-        payload.tools.clone(),
+    let token_count_started_at = Instant::now();
+    let input_tokens = token::count_all_tokens_borrowed(
+        &payload.model,
+        payload.system.as_deref(),
+        &payload.messages,
+        payload.tools.as_deref(),
     ) as i32;
+    let token_count_ms = token_count_started_at.elapsed().as_millis();
     let request_weight = payload.request_weight_with_config(&request_weighting, Some(input_tokens));
+    let pre_upstream_ms = handler_started_at.elapsed().as_millis();
 
     tracing::debug!(
         request_id = %request_id,
@@ -455,7 +514,34 @@ pub async fn post_messages(
         request_weight,
         "已完成请求轻重分级"
     );
+    if body_bytes >= LARGE_ANTHROPIC_REQUEST_WARN_THRESHOLD_BYTES
+        || pre_upstream_ms >= SLOW_ANTHROPIC_PRE_UPSTREAM_PHASE_MS
+        || convert_ms >= SLOW_ANTHROPIC_PRE_UPSTREAM_PHASE_MS
+        || serialize_ms >= SLOW_ANTHROPIC_PRE_UPSTREAM_PHASE_MS
+        || token_count_ms >= SLOW_ANTHROPIC_PRE_UPSTREAM_PHASE_MS
+    {
+        tracing::warn!(
+            request_id = %request_id,
+            route = "messages",
+            model = %payload.model,
+            stream = payload.stream,
+            body_bytes,
+            content_length_header = ?content_length_header,
+            body_buffer_ms,
+            json_parse_ms,
+            normalize_ms,
+            convert_ms,
+            serialize_ms,
+            token_count_ms,
+            pre_upstream_ms,
+            kiro_request_body_bytes = request_body.len(),
+            input_tokens,
+            request_weight,
+            "Anthropic request pre-upstream phases completed"
+        );
+    }
 
+    let model_id = conversion_result.model_id.clone();
     let tool_name_map = conversion_result.tool_name_map;
 
     if payload.stream {
@@ -470,6 +556,7 @@ pub async fn post_messages(
             RequestOptions {
                 omit_agent_mode_header: probe.omit_agent_mode_header,
                 request_id: Some(request_id.clone()),
+                model_id: Some(model_id.clone()),
                 request_weight,
                 wait_for_stream_content_start: thinking_enabled,
                 stream_thinking_enabled: thinking_enabled,
@@ -487,6 +574,7 @@ pub async fn post_messages(
             RequestOptions {
                 omit_agent_mode_header: probe.omit_agent_mode_header,
                 request_id: Some(request_id),
+                model_id: Some(model_id),
                 request_weight,
                 wait_for_stream_content_start: false,
                 stream_thinking_enabled: false,
@@ -787,11 +875,11 @@ pub(crate) async fn execute_non_stream_round(
         }
     };
 
-    let input_tokens = token::count_all_tokens(
-        payload.model.clone(),
-        payload.system.clone(),
-        payload.messages.clone(),
-        payload.tools.clone(),
+    let input_tokens = token::count_all_tokens_borrowed(
+        &payload.model,
+        payload.system.as_deref(),
+        &payload.messages,
+        payload.tools.as_deref(),
     ) as i32;
     let request_weighting = provider.request_weighting_config();
     let request_weight = payload.request_weight_with_config(&request_weighting, Some(input_tokens));
@@ -805,6 +893,7 @@ pub(crate) async fn execute_non_stream_round(
         RequestOptions {
             omit_agent_mode_header: probe.omit_agent_mode_header,
             request_id,
+            model_id: Some(conversion_result.model_id),
             request_weight,
             wait_for_stream_content_start: false,
             stream_thinking_enabled: false,
@@ -1129,11 +1218,11 @@ pub async fn count_tokens(payload: AnthropicJson<CountTokensRequest>) -> impl In
     }
     let payload = payload.into_inner();
 
-    let total_tokens = token::count_all_tokens(
-        payload.model,
-        payload.system,
-        payload.messages,
-        payload.tools,
+    let total_tokens = token::count_all_tokens_borrowed(
+        &payload.model,
+        payload.system.as_deref(),
+        &payload.messages,
+        payload.tools.as_deref(),
     ) as i32;
 
     Json(CountTokensResponse {
@@ -1151,8 +1240,11 @@ pub async fn post_messages_cc(
     headers: HeaderMap,
     payload: AnthropicJson<MessagesRequest>,
 ) -> Response {
+    let handler_started_at = Instant::now();
     let body_bytes = payload.body_len();
     let content_length_header = payload.content_length_header();
+    let body_buffer_ms = payload.body_buffer_ms();
+    let json_parse_ms = payload.json_parse_ms();
     let request_id = request_id_from_headers(&headers);
     tracing::info!(
         request_id = %request_id,
@@ -1161,6 +1253,8 @@ pub async fn post_messages_cc(
         stream = %payload.stream,
         body_bytes,
         content_length_header = ?content_length_header,
+        body_buffer_ms,
+        json_parse_ms,
         message_count = %payload.messages.len(),
         "Received POST /cc/v1/messages request"
     );
@@ -1170,6 +1264,8 @@ pub async fn post_messages_cc(
             model = %payload.model,
             body_bytes,
             content_length_header = ?content_length_header,
+            body_buffer_ms,
+            json_parse_ms,
             "Large Claude Code compatible request body observed"
         );
     }
@@ -1203,19 +1299,21 @@ pub async fn post_messages_cc(
         return response;
     }
 
+    let normalize_started_at = Instant::now();
     if let Err(response) = normalize_multimodal_payload(&mut payload, &request_id).await {
         return response;
     }
+    let normalize_ms = normalize_started_at.elapsed().as_millis();
 
     // 检查是否为 WebFetch 请求
     if webfetch::has_web_fetch_tool(&payload) {
         tracing::info!(request_id = %request_id, "检测到 WebFetch 工具，路由到 WebFetch 处理");
 
-        let input_tokens = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
+        let input_tokens = token::count_all_tokens_borrowed(
+            &payload.model,
+            payload.system.as_deref(),
+            &payload.messages,
+            payload.tools.as_deref(),
         ) as i32;
 
         return webfetch::handle_webfetch_request(
@@ -1233,17 +1331,18 @@ pub async fn post_messages_cc(
         tracing::info!(request_id = %request_id, "检测到 WebSearch 工具，路由到 WebSearch 处理");
 
         // 估算输入 tokens
-        let input_tokens = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
+        let input_tokens = token::count_all_tokens_borrowed(
+            &payload.model,
+            payload.system.as_deref(),
+            &payload.messages,
+            payload.tools.as_deref(),
         ) as i32;
 
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
     }
 
     // 转换请求
+    let convert_started_at = Instant::now();
     let conversion_result = match convert_request_with_probe(&payload, probe.clone()) {
         Ok(result) => result,
         Err(e) => {
@@ -1263,6 +1362,7 @@ pub async fn post_messages_cc(
                 .into_response();
         }
     };
+    let convert_ms = convert_started_at.elapsed().as_millis();
 
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
     let kiro_request = KiroRequest {
@@ -1270,6 +1370,7 @@ pub async fn post_messages_cc(
         profile_arn: None,
     };
 
+    let serialize_started_at = Instant::now();
     let request_body = match serde_json::to_string(&kiro_request) {
         Ok(body) => body,
         Err(e) => {
@@ -1284,6 +1385,7 @@ pub async fn post_messages_cc(
                 .into_response();
         }
     };
+    let serialize_ms = serialize_started_at.elapsed().as_millis();
 
     tracing::debug!(
         request_id = %request_id,
@@ -1296,13 +1398,16 @@ pub async fn post_messages_cc(
     let request_weighting = provider.request_weighting_config();
 
     // 估算输入 tokens
-    let input_tokens = token::count_all_tokens(
-        payload.model.clone(),
-        payload.system.clone(),
-        payload.messages.clone(),
-        payload.tools.clone(),
+    let token_count_started_at = Instant::now();
+    let input_tokens = token::count_all_tokens_borrowed(
+        &payload.model,
+        payload.system.as_deref(),
+        &payload.messages,
+        payload.tools.as_deref(),
     ) as i32;
+    let token_count_ms = token_count_started_at.elapsed().as_millis();
     let request_weight = payload.request_weight_with_config(&request_weighting, Some(input_tokens));
+    let pre_upstream_ms = handler_started_at.elapsed().as_millis();
 
     tracing::debug!(
         request_id = %request_id,
@@ -1310,7 +1415,34 @@ pub async fn post_messages_cc(
         request_weight,
         "已完成请求轻重分级"
     );
+    if body_bytes >= LARGE_ANTHROPIC_REQUEST_WARN_THRESHOLD_BYTES
+        || pre_upstream_ms >= SLOW_ANTHROPIC_PRE_UPSTREAM_PHASE_MS
+        || convert_ms >= SLOW_ANTHROPIC_PRE_UPSTREAM_PHASE_MS
+        || serialize_ms >= SLOW_ANTHROPIC_PRE_UPSTREAM_PHASE_MS
+        || token_count_ms >= SLOW_ANTHROPIC_PRE_UPSTREAM_PHASE_MS
+    {
+        tracing::warn!(
+            request_id = %request_id,
+            route = "cc_messages",
+            model = %payload.model,
+            stream = payload.stream,
+            body_bytes,
+            content_length_header = ?content_length_header,
+            body_buffer_ms,
+            json_parse_ms,
+            normalize_ms,
+            convert_ms,
+            serialize_ms,
+            token_count_ms,
+            pre_upstream_ms,
+            kiro_request_body_bytes = request_body.len(),
+            input_tokens,
+            request_weight,
+            "Anthropic request pre-upstream phases completed"
+        );
+    }
 
+    let model_id = conversion_result.model_id.clone();
     let tool_name_map = conversion_result.tool_name_map;
 
     if payload.stream {
@@ -1325,6 +1457,7 @@ pub async fn post_messages_cc(
             RequestOptions {
                 omit_agent_mode_header: probe.omit_agent_mode_header,
                 request_id: Some(request_id.clone()),
+                model_id: Some(model_id.clone()),
                 request_weight,
                 wait_for_stream_content_start: false,
                 stream_thinking_enabled: thinking_enabled,
@@ -1342,6 +1475,7 @@ pub async fn post_messages_cc(
             RequestOptions {
                 omit_agent_mode_header: probe.omit_agent_mode_header,
                 request_id: Some(request_id),
+                model_id: Some(model_id),
                 request_weight,
                 wait_for_stream_content_start: false,
                 stream_thinking_enabled: false,

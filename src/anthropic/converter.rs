@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufReader, Cursor};
+use std::time::Instant;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -176,6 +177,8 @@ pub fn get_context_window_size(model: &str) -> i32 {
 /// 转换结果
 #[derive(Debug)]
 pub struct ConversionResult {
+    /// 映射后的 Kiro 模型 ID
+    pub model_id: String,
     /// 转换后的 Kiro 请求
     pub conversation_state: ConversationState,
     /// 工具名称映射（短名称 → 原始名称），仅当存在超长工具名时非空
@@ -421,6 +424,7 @@ pub fn convert_request_with_probe(
     }
 
     Ok(ConversionResult {
+        model_id,
         conversation_state,
         tool_name_map,
     })
@@ -611,14 +615,28 @@ fn get_image_format(media_type: &str) -> Option<String> {
 }
 
 fn build_kiro_images(format: String, data: String) -> Vec<KiroImage> {
+    let started_at = Instant::now();
+    let source_format = format.clone();
+    let input_base64_bytes = data.len();
     let data = normalize_base64_payload(&data);
-    if format == "gif" {
+    let normalized_base64_bytes = data.len();
+    let images = if format == "gif" {
         if let Some(images) = sample_gif_frames_for_kiro(&data) {
-            return images;
+            images
+        } else if let Some((normalized_format, normalized_data)) =
+            normalize_image_for_kiro(&format, &data)
+        {
+            vec![KiroImage::from_base64(normalized_format, normalized_data)]
+        } else if let Some((processed_format, processed_data)) =
+            resize_or_reencode_image_base64(&format, &data)
+        {
+            vec![KiroImage::from_base64(processed_format, processed_data)]
+        } else {
+            vec![KiroImage::from_base64(format, data)]
         }
-    }
-
-    if let Some((normalized_format, normalized_data)) = normalize_image_for_kiro(&format, &data) {
+    } else if let Some((normalized_format, normalized_data)) =
+        normalize_image_for_kiro(&format, &data)
+    {
         vec![KiroImage::from_base64(normalized_format, normalized_data)]
     } else if let Some((processed_format, processed_data)) =
         resize_or_reencode_image_base64(&format, &data)
@@ -626,7 +644,21 @@ fn build_kiro_images(format: String, data: String) -> Vec<KiroImage> {
         vec![KiroImage::from_base64(processed_format, processed_data)]
     } else {
         vec![KiroImage::from_base64(format, data)]
+    };
+    let elapsed_ms = started_at.elapsed().as_millis();
+    if input_base64_bytes >= 4 * 1024 * 1024 || elapsed_ms >= 1_000 {
+        let output_base64_bytes: usize = images.iter().map(|image| image.source.bytes.len()).sum();
+        tracing::warn!(
+            source_format,
+            input_base64_bytes,
+            normalized_base64_bytes,
+            output_base64_bytes,
+            output_image_count = images.len(),
+            elapsed_ms,
+            "Kiro image normalization completed"
+        );
     }
+    images
 }
 
 fn normalize_base64_payload(data: &str) -> String {
