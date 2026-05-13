@@ -9,6 +9,7 @@ use futures::stream::BoxStream;
 use futures::{StreamExt, stream};
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
+use std::error::Error as StdError;
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -40,7 +41,6 @@ const MAX_OPUS_4_7_RETRY_CANDIDATES: usize = 24;
 /// 同一请求内，同一优先级连续触发多少个 429 后开始下探低优先级兜底账号。
 const MAX_RATE_LIMITS_PER_PRIORITY_BEFORE_SPILL: usize = 3;
 const DEFAULT_UPSTREAM_TIMEOUT_SECS: u64 = 720;
-const STREAM_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(240);
 const STREAM_PRE_SSE_RESPONSE_BUDGET: Duration = Duration::from_secs(170);
 const STREAM_TOTAL_WALL_CLOCK_BUDGET: Duration = Duration::from_secs(540);
 const STREAM_FIRST_CONTENT_FAILOVER_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -446,6 +446,7 @@ impl ResponseTrace {
     }
 
     fn log_stream_error(&self, seen_first_chunk: bool, total_bytes: usize, error: &reqwest::Error) {
+        let error_sources = summarize_error_sources(error);
         tracing::warn!(
             request_id = %self.request_id,
             api_type = self.api_type,
@@ -461,9 +462,28 @@ impl ResponseTrace {
             total_elapsed_ms = self.overall_started_at.elapsed().as_millis(),
             stream_elapsed_ms = self.response_headers_at.elapsed().as_millis(),
             error = %error,
+            error_debug = ?error,
+            error_is_timeout = error.is_timeout(),
+            error_is_connect = error.is_connect(),
+            error_is_request = error.is_request(),
+            error_status = error.status().map(|status| status.as_u16()).unwrap_or(0),
+            error_sources = %error_sources,
             "上游流读取失败"
         );
     }
+}
+
+fn summarize_error_sources(error: &reqwest::Error) -> String {
+    let mut sources = Vec::new();
+    let mut current = StdError::source(error);
+    while let Some(source) = current {
+        sources.push(source.to_string());
+        if sources.len() >= 4 {
+            break;
+        }
+        current = source.source();
+    }
+    sources.join(" | ")
 }
 
 struct StreamContentStartProbe {
@@ -1538,14 +1558,6 @@ impl KiroProvider {
             } else {
                 None
             };
-            let stream_attempt_timeout = match stream_budget_remaining {
-                Some(remaining_budget) => Some(remaining_budget.min(STREAM_ATTEMPT_TIMEOUT)),
-                None => None,
-            };
-            if let Some(attempt_timeout) = stream_attempt_timeout {
-                request = request.timeout(attempt_timeout);
-            }
-
             tracing::info!(
                 request_id = %request_id,
                 api_type,
@@ -1566,9 +1578,8 @@ impl KiroProvider {
                 stream_pre_sse_budget_remaining_ms = stream_pre_sse_budget_remaining
                     .map(|value| value.as_millis())
                     .unwrap_or(0),
-                stream_attempt_timeout_ms = stream_attempt_timeout
-                    .map(|value| value.as_millis())
-                    .unwrap_or(0),
+                stream_request_timeout_override_ms = 0u64,
+                upstream_client_timeout_ms = u128::from(DEFAULT_UPSTREAM_TIMEOUT_SECS) * 1000,
                 omit_agent_mode_header = options.omit_agent_mode_header,
                 invocation_id = %invocation_id,
                 "开始调用上游 Kiro API"
