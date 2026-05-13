@@ -33,6 +33,10 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
+/// 429/容量不足时最多探测的候选凭据数量，避免上游容量抖动时把全池扫穿。
+const MAX_RATE_LIMIT_RETRY_CANDIDATES: usize = 24;
+/// 真实 Opus 4.7 模型也只做有限扇出探测，避免大凭据池下单请求长期占用本地资源。
+const MAX_OPUS_4_7_RETRY_CANDIDATES: usize = 24;
 /// 同一请求内，同一优先级连续触发多少个 429 后开始下探低优先级兜底账号。
 const MAX_RATE_LIMITS_PER_PRIORITY_BEFORE_SPILL: usize = 3;
 const DEFAULT_UPSTREAM_TIMEOUT_SECS: u64 = 720;
@@ -42,6 +46,7 @@ const STREAM_TOTAL_WALL_CLOCK_BUDGET: Duration = Duration::from_secs(540);
 const STREAM_FIRST_CONTENT_FAILOVER_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(60);
 const STREAM_FIRST_CONTENT_FAILOVER_TOTAL_BUDGET: Duration = Duration::from_secs(165);
 const STREAM_FIRST_CONTENT_FAILOVER_COOLDOWN: Duration = Duration::from_secs(90);
+const INSUFFICIENT_CAPACITY_COOLDOWN: Duration = Duration::from_secs(60);
 const MAX_SLOW_FIRST_CONTENT_FAILOVERS: usize = 2;
 const MIN_STREAM_FIRST_CONTENT_FAILOVER_REMAINING: Duration = Duration::from_secs(15);
 const SLOW_FIRST_CONTENT_SHARED_COOLDOWN_MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
@@ -687,6 +692,11 @@ impl KiroProvider {
         "Upstream could not process the request payload. Review message ordering, tool payloads, and schema compatibility.".to_string()
     }
 
+    fn is_insufficient_model_capacity(body: &str, error_summary: &str) -> bool {
+        body.contains("INSUFFICIENT_MODEL_CAPACITY")
+            || error_summary.contains("reason=INSUFFICIENT_MODEL_CAPACITY")
+    }
+
     fn public_client_error_for_status(
         status: reqwest::StatusCode,
         api_type: &str,
@@ -1257,6 +1267,7 @@ impl KiroProvider {
                     max_retries = max_retries.max(Self::rate_limit_retry_cap(
                         total_credentials,
                         supported_candidate_count,
+                        None,
                     ));
                 } else {
                     request_scoped_transient_error_credentials.insert(ctx_id);
@@ -1307,8 +1318,8 @@ impl KiroProvider {
     /// 重试策略：
     /// - 每个凭据最多重试 MAX_RETRIES_PER_CREDENTIAL 次
     /// - 默认总重试次数 = min(凭据数量 × 每凭据重试次数, MAX_TOTAL_RETRIES)
-    /// - 真实 Opus 4.7 允许把所有凭据至少探测一遍，避免被前几张不支持的账号截断
-    /// - 429 会扩展到当前支持该模型的候选数，并在请求内排除已 429 的凭据
+    /// - 真实 Opus 4.7 做有限候选探测，避免大池下单请求长期占用本地资源
+    /// - 429 会在有界范围内扩展候选，并在请求内排除已 429 的凭据
     async fn call_api_with_retry(
         &self,
         request_body: &str,
@@ -1324,6 +1335,7 @@ impl KiroProvider {
         let mut request_scoped_transient_error_credentials: HashSet<u64> = HashSet::new();
         let mut priority_rate_limit_hits: HashMap<u32, usize> = HashMap::new();
         let mut slow_first_content_failovers = 0usize;
+        let mut capacity_429_count = 0usize;
         let api_type = if is_stream { "流式" } else { "非流式" };
         let request_id = options
             .request_id
@@ -2080,7 +2092,18 @@ impl KiroProvider {
             // 429 会额外进入短冷却/桶退避。
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
                 if status.as_u16() == 429 {
-                    self.token_manager.report_rate_limited(ctx_id);
+                    let insufficient_capacity =
+                        Self::is_insufficient_model_capacity(&body, &error_summary);
+                    if insufficient_capacity {
+                        capacity_429_count = capacity_429_count.saturating_add(1);
+                        self.token_manager.defer_capacity_limited_credential(
+                            ctx_id,
+                            model.as_deref().unwrap_or("unknown"),
+                            INSUFFICIENT_CAPACITY_COOLDOWN,
+                        );
+                    } else {
+                        self.token_manager.report_rate_limited(ctx_id);
+                    }
                     request_scoped_rate_limited_credentials.insert(ctx_id);
                     Self::maybe_spill_rate_limited_priority(
                         &self.token_manager,
@@ -2098,6 +2121,7 @@ impl KiroProvider {
                     max_retries = max_retries.max(Self::rate_limit_retry_cap(
                         total_credentials,
                         supported_candidate_count,
+                        model.as_deref(),
                     ));
                 } else {
                     request_scoped_transient_error_credentials.insert(ctx_id);
@@ -2114,6 +2138,10 @@ impl KiroProvider {
                     request_body_bytes,
                     status_code = status.as_u16(),
                     error_summary = %error_summary,
+                    insufficient_capacity = status.as_u16() == 429
+                        && Self::is_insufficient_model_capacity(&body, &error_summary),
+                    capacity_429_count,
+                    effective_retry_cap = max_retries,
                     total_elapsed_ms = overall_started_at.elapsed().as_millis(),
                     "API 请求失败（上游瞬态错误）"
                 );
@@ -2260,15 +2288,26 @@ impl KiroProvider {
     fn initial_api_retry_cap(total_credentials: usize, model: Option<&str>) -> usize {
         let base_cap = Self::base_retry_cap(total_credentials);
         if Self::is_real_opus_4_7_model(model) {
-            base_cap.max(total_credentials).max(1)
+            base_cap
+                .max(total_credentials.min(MAX_OPUS_4_7_RETRY_CANDIDATES))
+                .max(1)
         } else {
             base_cap
         }
     }
 
-    fn rate_limit_retry_cap(total_credentials: usize, supported_candidate_count: usize) -> usize {
+    fn rate_limit_retry_cap(
+        total_credentials: usize,
+        supported_candidate_count: usize,
+        model: Option<&str>,
+    ) -> usize {
+        let candidate_cap = if Self::is_real_opus_4_7_model(model) {
+            MAX_OPUS_4_7_RETRY_CANDIDATES
+        } else {
+            MAX_RATE_LIMIT_RETRY_CANDIDATES
+        };
         Self::base_retry_cap(total_credentials)
-            .max(supported_candidate_count)
+            .max(supported_candidate_count.min(candidate_cap))
             .max(1)
     }
 
@@ -2657,21 +2696,45 @@ mod tests {
 
     #[test]
     fn test_rate_limit_retry_cap_scales_to_supported_candidate_count() {
-        assert_eq!(KiroProvider::rate_limit_retry_cap(40, 40), 40);
-        assert_eq!(KiroProvider::rate_limit_retry_cap(40, 12), 12);
-        assert_eq!(KiroProvider::rate_limit_retry_cap(2, 2), 6);
+        assert_eq!(KiroProvider::rate_limit_retry_cap(40, 40, None), 24);
+        assert_eq!(KiroProvider::rate_limit_retry_cap(40, 12, None), 12);
+        assert_eq!(KiroProvider::rate_limit_retry_cap(2, 2, None), 6);
+        assert_eq!(
+            KiroProvider::rate_limit_retry_cap(164, 164, Some("claude-opus-4.7")),
+            24
+        );
     }
 
     #[test]
-    fn test_initial_opus_retry_cap_scales_to_total_credentials() {
+    fn test_initial_opus_retry_cap_is_bounded_for_large_pools() {
         assert_eq!(
             KiroProvider::initial_api_retry_cap(25, Some("claude-opus-4.7")),
-            25
+            24
         );
         assert_eq!(
             KiroProvider::initial_api_retry_cap(25, Some("claude-sonnet-4.5")),
             9
         );
+        assert_eq!(
+            KiroProvider::initial_api_retry_cap(164, Some("claude-opus-4.7")),
+            24
+        );
+    }
+
+    #[test]
+    fn test_insufficient_model_capacity_detection_uses_body_or_summary() {
+        assert!(KiroProvider::is_insufficient_model_capacity(
+            r#"{"reason":"INSUFFICIENT_MODEL_CAPACITY"}"#,
+            "status=429 body_len=44"
+        ));
+        assert!(KiroProvider::is_insufficient_model_capacity(
+            "{}",
+            "status=429 body_len=110 reason=INSUFFICIENT_MODEL_CAPACITY"
+        ));
+        assert!(!KiroProvider::is_insufficient_model_capacity(
+            r#"{"reason":"RATE_LIMIT"}"#,
+            "status=429 body_len=24 reason=RATE_LIMIT"
+        ));
     }
 
     #[test]

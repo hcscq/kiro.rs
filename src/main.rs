@@ -15,7 +15,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -44,6 +44,7 @@ use tokio::{
 const READINESS_DRAIN_FILE: &str = "/tmp/kiro-rs-drain";
 const SHUTDOWN_DRAIN_DELAY: Duration = Duration::from_secs(5);
 const BACKGROUND_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+const READINESS_SNAPSHOT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Serialize)]
 struct FileRollbackExportFiles {
@@ -78,6 +79,15 @@ struct FileRollbackExportManifest {
 #[derive(Default)]
 struct RuntimeHealth {
     draining: AtomicBool,
+    credentials_total: AtomicUsize,
+    credentials_available: AtomicUsize,
+    credentials_dispatchable: AtomicUsize,
+}
+
+struct ReadinessSnapshot {
+    total: usize,
+    available: usize,
+    dispatchable: usize,
 }
 
 impl RuntimeHealth {
@@ -87,6 +97,22 @@ impl RuntimeHealth {
 
     fn is_draining(&self) -> bool {
         self.draining.load(Ordering::SeqCst)
+    }
+
+    fn update_readiness_snapshot(&self, total: usize, available: usize, dispatchable: usize) {
+        self.credentials_total.store(total, Ordering::Relaxed);
+        self.credentials_available
+            .store(available, Ordering::Relaxed);
+        self.credentials_dispatchable
+            .store(dispatchable, Ordering::Relaxed);
+    }
+
+    fn readiness_snapshot(&self) -> ReadinessSnapshot {
+        ReadinessSnapshot {
+            total: self.credentials_total.load(Ordering::Relaxed),
+            available: self.credentials_available.load(Ordering::Relaxed),
+            dispatchable: self.credentials_dispatchable.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -420,11 +446,8 @@ async fn live_handler() -> (StatusCode, Json<serde_json::Value>) {
     (StatusCode::OK, Json(json!({ "status": "ok" })))
 }
 
-async fn ready_handler(
-    health: Arc<RuntimeHealth>,
-    token_manager: Arc<MultiTokenManager>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let snapshot = token_manager.snapshot();
+async fn ready_handler(health: Arc<RuntimeHealth>) -> (StatusCode, Json<serde_json::Value>) {
+    let snapshot = health.readiness_snapshot();
     let draining = health.is_draining() || drain_file_present();
     let ready = !draining && snapshot.total > 0;
     let status = if ready {
@@ -447,6 +470,7 @@ async fn ready_handler(
             "credentials_total": snapshot.total,
             "credentials_available": snapshot.available,
             "credentials_dispatchable": snapshot.dispatchable,
+            "readiness_source": "cached",
         })),
     )
 }
@@ -708,9 +732,39 @@ async fn main() {
     });
     let token_manager = Arc::new(token_manager);
     let kiro_provider = KiroProvider::with_proxy(token_manager.clone(), proxy_config.clone());
+    {
+        let snapshot = token_manager.snapshot();
+        runtime_health.update_readiness_snapshot(
+            snapshot.total,
+            snapshot.available,
+            snapshot.dispatchable,
+        );
+    }
 
     if let Err(err) = clear_drain_signal() {
         tracing::warn!("清理 readiness drain 标记失败: {}", err);
+    }
+
+    {
+        let runtime_health = runtime_health.clone();
+        let token_manager = token_manager.clone();
+        let mut shutdown = background_tasks.subscribe();
+        background_tasks.spawn("readiness_snapshot_refresh", async move {
+            let mut ticker = tokio::time::interval(READINESS_SNAPSHOT_REFRESH_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                if tick_until_shutdown_or_elapsed(&mut ticker, &mut shutdown).await {
+                    break;
+                }
+                let snapshot = token_manager.snapshot();
+                runtime_health.update_readiness_snapshot(
+                    snapshot.total,
+                    snapshot.available,
+                    snapshot.dispatchable,
+                );
+            }
+        });
     }
 
     if state_store.is_external() {
@@ -819,11 +873,9 @@ async fn main() {
             "/readyz",
             get({
                 let runtime_health = runtime_health.clone();
-                let token_manager = token_manager.clone();
                 move || {
                     let runtime_health = runtime_health.clone();
-                    let token_manager = token_manager.clone();
-                    async move { ready_handler(runtime_health, token_manager).await }
+                    async move { ready_handler(runtime_health).await }
                 }
             }),
         );
