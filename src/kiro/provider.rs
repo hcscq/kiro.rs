@@ -25,7 +25,7 @@ use crate::kiro::token_manager::{
     CallLease, DisabledReason, MultiTokenManager, RuntimeRefreshLeaderRequiredError,
     RuntimeRefreshLeaseBusyError,
 };
-use crate::model::config::{RequestWeightingConfig, TlsBackend};
+use crate::model::config::{Config, RequestWeightingConfig, TlsBackend};
 use parking_lot::Mutex;
 
 /// 每个凭据的最大重试次数
@@ -605,17 +605,7 @@ impl KiroProvider {
         let config = self.token_manager.config();
         let api_region = credentials.effective_api_region(config);
         let base = config.effective_runtime_endpoint_base(api_region);
-        url::Url::parse(&base)
-            .ok()
-            .and_then(|parsed| parsed.host_str().map(str::to_string))
-            .unwrap_or_else(|| {
-                base.trim_start_matches("https://")
-                    .trim_start_matches("http://")
-                    .split('/')
-                    .next()
-                    .unwrap_or(&base)
-                    .to_string()
-            })
+        Config::endpoint_host(&base)
     }
 
     /// 从请求体中提取模型信息

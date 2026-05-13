@@ -192,6 +192,11 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_endpoint: Option<String>,
 
+    /// Management API Endpoint（用于配置/生命周期/额度查询），未配置时回退到 q.<region>.amazonaws.com
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub management_endpoint: Option<String>,
+
     #[serde(default = "default_kiro_version")]
     pub kiro_version: String,
 
@@ -483,6 +488,7 @@ impl Default for Config {
             auth_region: None,
             api_region: None,
             runtime_endpoint: None,
+            management_endpoint: None,
             kiro_version: default_kiro_version(),
             machine_id: None,
             api_key: None,
@@ -550,6 +556,32 @@ impl Config {
             .filter(|value| !value.is_empty())
             .map(|value| value.trim_end_matches('/').to_string())
             .unwrap_or_else(|| format!("https://q.{}.amazonaws.com", api_region))
+    }
+
+    /// 获取有效的 Management API base URL（用于管理/额度查询请求）
+    pub fn effective_management_endpoint_base(&self, api_region: &str) -> String {
+        self.management_endpoint
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.trim_end_matches('/').to_string())
+            .unwrap_or_else(|| format!("https://q.{}.amazonaws.com", api_region))
+    }
+
+    /// 从 endpoint base URL 中提取 Host header 使用的域名
+    pub fn endpoint_host(endpoint_base: &str) -> String {
+        url::Url::parse(endpoint_base)
+            .ok()
+            .and_then(|parsed| parsed.host_str().map(str::to_string))
+            .unwrap_or_else(|| {
+                endpoint_base
+                    .trim_start_matches("https://")
+                    .trim_start_matches("http://")
+                    .split('/')
+                    .next()
+                    .unwrap_or(endpoint_base)
+                    .to_string()
+            })
     }
 
     /// 从文件加载配置
@@ -709,6 +741,25 @@ mod tests {
         assert_eq!(
             config.effective_runtime_endpoint_base("eu-central-1"),
             "https://runtime.eu-central-1.kiro.dev"
+        );
+    }
+
+    #[test]
+    fn effective_management_endpoint_base_uses_configured_kiro_endpoint() {
+        let mut config = Config::default();
+        config.management_endpoint = Some("https://management.us-east-1.kiro.dev/".to_string());
+
+        assert_eq!(
+            config.effective_management_endpoint_base("us-east-1"),
+            "https://management.us-east-1.kiro.dev"
+        );
+    }
+
+    #[test]
+    fn endpoint_host_extracts_host_from_endpoint_base() {
+        assert_eq!(
+            Config::endpoint_host("https://runtime.us-east-1.kiro.dev"),
+            "runtime.us-east-1.kiro.dev"
         );
     }
 

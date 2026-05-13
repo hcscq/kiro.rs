@@ -406,7 +406,8 @@ pub(crate) async fn get_usage_limits(
 
     // 优先级：凭据.api_region > config.api_region > config.region
     let region = credentials.effective_api_region(config);
-    let host = format!("q.{}.amazonaws.com", region);
+    let management_endpoint = config.effective_management_endpoint_base(region);
+    let host = Config::endpoint_host(&management_endpoint);
     let machine_id = machine_id::generate_from_credentials(credentials, config)
         .ok_or_else(|| anyhow::anyhow!("无法生成 machineId"))?;
     let kiro_version = &config.kiro_version;
@@ -415,8 +416,8 @@ pub(crate) async fn get_usage_limits(
 
     // 构建 URL
     let mut url = format!(
-        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST",
-        host
+        "{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST",
+        management_endpoint
     );
 
     // profileArn 是可选的
