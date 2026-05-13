@@ -6,6 +6,8 @@ use crate::common::logging::summarize_text_for_log;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
+use crate::kiro::parser::error::ParseError;
+use crate::kiro::parser::frame::Frame;
 use crate::kiro::token_manager::{RuntimeRefreshLeaderRequiredError, RuntimeRefreshLeaseBusyError};
 use crate::model::model_catalog::built_in_model_catalog;
 use crate::token;
@@ -504,6 +506,7 @@ async fn handle_stream_request(
     tool_name_map: std::collections::HashMap<String, String>,
     request_options: RequestOptions,
 ) -> Response {
+    let request_id = request_options.request_id.clone();
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider
         .call_api_stream_with_options(request_body, request_options)
@@ -521,7 +524,7 @@ async fn handle_stream_request(
     let initial_events = ctx.generate_initial_events();
 
     // 创建 SSE 流
-    let stream = create_sse_stream(response, ctx, initial_events);
+    let stream = create_sse_stream(response, ctx, initial_events, request_id);
 
     // 返回 SSE 响应
     Response::builder()
@@ -541,11 +544,62 @@ fn create_ping_sse() -> Bytes {
     Bytes::from("event: ping\ndata: {\"type\": \"ping\"}\n\n")
 }
 
+fn create_stream_error_sse(message: impl AsRef<str>) -> Bytes {
+    let event = SseEvent::new(
+        "error",
+        json!({
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": message.as_ref()
+            }
+        }),
+    );
+    Bytes::from(event.to_sse_string())
+}
+
+fn log_kiro_event_parse_error(
+    context: &'static str,
+    request_id: Option<&str>,
+    frame: &Frame,
+    error: &ParseError,
+) {
+    let payload_text = String::from_utf8_lossy(&frame.payload);
+    tracing::warn!(
+        context,
+        request_id = request_id.unwrap_or("unknown"),
+        message_type = frame.message_type().unwrap_or("unknown"),
+        event_type = frame.event_type().unwrap_or("unknown"),
+        payload_len = frame.payload.len(),
+        payload_excerpt = %summarize_text_for_log(&payload_text, 240),
+        error = %error,
+        "Kiro Event Stream frame payload 解析失败"
+    );
+}
+
+fn decode_error_sse_if_fatal(error: &ParseError, decoder: &EventStreamDecoder) -> Option<Bytes> {
+    if !error.is_fatal_stream_error() {
+        return None;
+    }
+
+    tracing::error!(
+        error = %error,
+        decoder_buffer_len = decoder.buffer_len(),
+        decoder_error_count = decoder.error_count(),
+        decoder_bytes_skipped = decoder.bytes_skipped(),
+        "Kiro Event Stream 解码进入不可恢复状态"
+    );
+    Some(create_stream_error_sse(
+        "Upstream stream could not be decoded reliably.",
+    ))
+}
+
 /// 创建 SSE 事件流
 fn create_sse_stream(
     response: crate::kiro::provider::ManagedResponse,
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
+    request_id: Option<String>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
@@ -568,8 +622,17 @@ fn create_sse_stream(
                 Duration::from_secs(PING_INTERVAL_SECS),
             ),
             false,
+            request_id,
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, can_ping)| async move {
+        |(
+            mut body_stream,
+            mut ctx,
+            mut decoder,
+            finished,
+            mut ping_interval,
+            can_ping,
+            request_id,
+        )| async move {
             if finished {
                 return None;
             }
@@ -582,20 +645,48 @@ fn create_sse_stream(
                         Some(Ok(chunk)) => {
                             // 解码事件
                             if let Err(e) = decoder.feed(&chunk) {
-                                tracing::warn!("缓冲区溢出: {}", e);
+                                tracing::warn!(
+                                    error = %e,
+                                    chunk_len = chunk.len(),
+                                    decoder_buffer_len = decoder.buffer_len(),
+                                    "Kiro Event Stream 缓冲失败"
+                                );
+                                if let Some(error_bytes) = decode_error_sse_if_fatal(&e, &decoder) {
+                                    return Some((stream::iter(vec![Ok(error_bytes)]), (body_stream, ctx, decoder, true, ping_interval, can_ping, request_id)));
+                                }
                             }
 
                             let mut events = Vec::new();
-                            for result in decoder.decode_iter() {
-                                match result {
-                                    Ok(frame) => {
-                                        if let Ok(event) = Event::from_frame(frame) {
-                                            let sse_events = ctx.process_kiro_event(&event);
-                                            events.extend(sse_events);
+                            loop {
+                                match decoder.decode() {
+                                    Ok(Some(frame)) => {
+                                        match Event::from_frame(frame.clone()) {
+                                            Ok(event) => {
+                                                let sse_events = ctx.process_kiro_event(&event);
+                                                events.extend(sse_events);
+                                            }
+                                            Err(e) => {
+                                                log_kiro_event_parse_error(
+                                                    "stream",
+                                                    request_id.as_deref(),
+                                                    &frame,
+                                                    &e,
+                                                );
+                                            }
                                         }
                                     }
+                                    Ok(None) => break,
                                     Err(e) => {
-                                        tracing::warn!("解码事件失败: {}", e);
+                                        tracing::warn!(
+                                            error = %e,
+                                            decoder_buffer_len = decoder.buffer_len(),
+                                            decoder_error_count = decoder.error_count(),
+                                            decoder_bytes_skipped = decoder.bytes_skipped(),
+                                            "Kiro Event Stream frame 解码失败"
+                                        );
+                                        if let Some(error_bytes) = decode_error_sse_if_fatal(&e, &decoder) {
+                                            return Some((stream::iter(vec![Ok(error_bytes)]), (body_stream, ctx, decoder, true, ping_interval, can_ping, request_id)));
+                                        }
                                     }
                                 }
                             }
@@ -609,17 +700,15 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, next_can_ping)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, next_can_ping, request_id)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
-                            // 发送最终事件并结束
-                            let final_events = ctx.generate_final_events();
-                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, can_ping)))
+                            // 流读取失败时不要伪装成正常 message_stop。
+                            let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_stream_error_sse(
+                                "Upstream stream ended with a transport error.",
+                            ))];
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, can_ping, request_id)))
                         }
                         None => {
                             // 流结束，发送最终事件
@@ -628,7 +717,7 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, can_ping)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, can_ping, request_id)))
                         }
                     }
                 }
@@ -636,7 +725,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick(), if can_ping => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, can_ping)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, can_ping, request_id)))
                 }
             }
         },
@@ -815,8 +904,8 @@ fn decode_non_stream_message(
     for result in decoder.decode_iter() {
         match result {
             Ok(frame) => {
-                if let Ok(event) = Event::from_frame(frame) {
-                    match event {
+                match Event::from_frame(frame.clone()) {
+                    Ok(event) => match event {
                         Event::AssistantResponse(resp) => {
                             text_content.push_str(&resp.content);
                         }
@@ -880,6 +969,9 @@ fn decode_non_stream_message(
                             }
                         }
                         _ => {}
+                    },
+                    Err(e) => {
+                        log_kiro_event_parse_error("non_stream", None, &frame, &e);
                     }
                 }
             }
@@ -1336,19 +1428,47 @@ fn create_buffered_sse_stream(
                             Some(Ok(chunk)) => {
                                 // 解码事件
                                 if let Err(e) = decoder.feed(&chunk) {
-                                    tracing::warn!("缓冲区溢出: {}", e);
+                                    tracing::warn!(
+                                        error = %e,
+                                        chunk_len = chunk.len(),
+                                        decoder_buffer_len = decoder.buffer_len(),
+                                        "Kiro Event Stream 缓冲失败（缓冲模式）"
+                                    );
+                                    if let Some(error_bytes) = decode_error_sse_if_fatal(&e, &decoder) {
+                                        return Some((stream::iter(vec![Ok(error_bytes)]), (body_stream, ctx, decoder, true)));
+                                    }
                                 }
 
-                                for result in decoder.decode_iter() {
-                                    match result {
-                                        Ok(frame) => {
-                                            if let Ok(event) = Event::from_frame(frame) {
-                                                // 缓冲事件（复用 StreamContext 的处理逻辑）
-                                                ctx.process_and_buffer(&event);
+                                loop {
+                                    match decoder.decode() {
+                                        Ok(Some(frame)) => {
+                                            match Event::from_frame(frame.clone()) {
+                                                Ok(event) => {
+                                                    // 缓冲事件（复用 StreamContext 的处理逻辑）
+                                                    ctx.process_and_buffer(&event);
+                                                }
+                                                Err(e) => {
+                                                    log_kiro_event_parse_error(
+                                                        "buffered_stream",
+                                                        None,
+                                                        &frame,
+                                                        &e,
+                                                    );
+                                                }
                                             }
                                         }
+                                        Ok(None) => break,
                                         Err(e) => {
-                                            tracing::warn!("解码事件失败: {}", e);
+                                            tracing::warn!(
+                                                error = %e,
+                                                decoder_buffer_len = decoder.buffer_len(),
+                                                decoder_error_count = decoder.error_count(),
+                                                decoder_bytes_skipped = decoder.bytes_skipped(),
+                                                "Kiro Event Stream frame 解码失败（缓冲模式）"
+                                            );
+                                            if let Some(error_bytes) = decode_error_sse_if_fatal(&e, &decoder) {
+                                                return Some((stream::iter(vec![Ok(error_bytes)]), (body_stream, ctx, decoder, true)));
+                                            }
                                         }
                                     }
                                 }
@@ -1356,12 +1476,10 @@ fn create_buffered_sse_stream(
                             }
                             Some(Err(e)) => {
                                 tracing::error!("读取响应流失败: {}", e);
-                                // 发生错误，完成处理并返回所有事件
-                                let all_events = ctx.finish_and_get_all_events();
-                                let bytes: Vec<Result<Bytes, Infallible>> = all_events
-                                    .into_iter()
-                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                    .collect();
+                                // 流读取失败时不要伪装成正常 message_stop。
+                                let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_stream_error_sse(
+                                    "Upstream stream ended with a transport error.",
+                                ))];
                                 return Some((stream::iter(bytes), (body_stream, ctx, decoder, true)));
                             }
                             None => {

@@ -49,7 +49,7 @@ pub struct UsageBreakdown {
 
     /// 奖励额度列表
     #[serde(default)]
-    pub bonuses: Vec<Bonus>,
+    pub bonuses: Option<Vec<Bonus>>,
 
     /// 免费试用信息
     #[serde(default)]
@@ -90,7 +90,7 @@ impl Bonus {
     pub fn is_active(&self) -> bool {
         self.status
             .as_deref()
-            .map(|s| s == "ACTIVE")
+            .map(|s| s.eq_ignore_ascii_case("ACTIVE"))
             .unwrap_or(false)
     }
 }
@@ -132,7 +132,7 @@ impl FreeTrialInfo {
     pub fn is_active(&self) -> bool {
         self.free_trial_status
             .as_deref()
-            .map(|s| s == "ACTIVE")
+            .map(|s| s.eq_ignore_ascii_case("ACTIVE"))
             .unwrap_or(false)
     }
 }
@@ -175,9 +175,11 @@ impl UsageLimitsResponse {
         }
 
         // 累加激活的 bonus 额度
-        for bonus in &breakdown.bonuses {
-            if bonus.is_active() {
-                total += bonus.usage_limit;
+        if let Some(bonuses) = &breakdown.bonuses {
+            for bonus in bonuses {
+                if bonus.is_active() {
+                    total += bonus.usage_limit;
+                }
             }
         }
 
@@ -202,12 +204,62 @@ impl UsageLimitsResponse {
         }
 
         // 累加激活的 bonus 使用量
-        for bonus in &breakdown.bonuses {
-            if bonus.is_active() {
-                total += bonus.current_usage;
+        if let Some(bonuses) = &breakdown.bonuses {
+            for bonus in bonuses {
+                if bonus.is_active() {
+                    total += bonus.current_usage;
+                }
             }
         }
 
         total
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_usage_limits_accepts_null_bonuses() {
+        let payload = r#"{
+            "usageBreakdownList": [{
+                "currentUsageWithPrecision": 10.0,
+                "usageLimitWithPrecision": 100.0,
+                "bonuses": null
+            }]
+        }"#;
+
+        let response: UsageLimitsResponse =
+            serde_json::from_str(payload).expect("null bonuses should deserialize");
+
+        assert_eq!(response.current_usage(), 10.0);
+        assert_eq!(response.usage_limit(), 100.0);
+    }
+
+    #[test]
+    fn test_usage_limits_active_status_is_case_insensitive() {
+        let payload = r#"{
+            "usageBreakdownList": [{
+                "currentUsageWithPrecision": 10.0,
+                "usageLimitWithPrecision": 100.0,
+                "bonuses": [{
+                    "currentUsage": 2.0,
+                    "usageLimit": 20.0,
+                    "status": "active"
+                }],
+                "freeTrialInfo": {
+                    "currentUsageWithPrecision": 3.0,
+                    "usageLimitWithPrecision": 30.0,
+                    "freeTrialStatus": "active"
+                }
+            }]
+        }"#;
+
+        let response: UsageLimitsResponse =
+            serde_json::from_str(payload).expect("lowercase statuses should deserialize");
+
+        assert_eq!(response.current_usage(), 15.0);
+        assert_eq!(response.usage_limit(), 150.0);
     }
 }

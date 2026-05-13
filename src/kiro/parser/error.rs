@@ -31,6 +31,16 @@ pub enum ParseError {
     BufferOverflow { size: usize, max: usize },
 }
 
+impl ParseError {
+    /// 这类错误表示当前流已经无法可靠继续转换，应该终止当前 SSE。
+    pub fn is_fatal_stream_error(&self) -> bool {
+        matches!(
+            self,
+            Self::TooManyErrors { .. } | Self::BufferOverflow { .. }
+        )
+    }
+}
+
 impl std::error::Error for ParseError {}
 
 impl fmt::Display for ParseError {

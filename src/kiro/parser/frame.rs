@@ -26,8 +26,11 @@ pub const PRELUDE_SIZE: usize = 12;
 /// 最小消息大小 (Prelude + Message CRC)
 pub const MIN_MESSAGE_SIZE: usize = PRELUDE_SIZE + 4;
 
-/// 最大消息大小限制 (16 MB)
-pub const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
+/// 最大消息大小限制。
+///
+/// Kiro 上游偶尔会把大工具输入或图片相关事件放进较大的 Event Stream frame。
+/// 这里保留硬上限，但不要误伤 16MB 以上的合法大帧。
+pub const MAX_MESSAGE_SIZE: u32 = 32 * 1024 * 1024;
 
 /// 解析后的消息帧
 #[derive(Debug, Clone)]

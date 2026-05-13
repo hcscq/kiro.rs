@@ -3,13 +3,14 @@
 //! 负责将 Anthropic API 请求格式转换为 Kiro API 请求格式
 
 use std::collections::HashMap;
-use std::io::Cursor;
+use std::io::{BufReader, Cursor};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use image::GenericImageView;
+use image::codecs::gif::GifDecoder;
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
+use image::{AnimationDecoder, GenericImageView};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -112,6 +113,14 @@ const CURRENT_TOOL_RESULT_FALLBACK_TEXT: &str = "Please continue based on the to
 /// 避免把超大文档直接展开到 Kiro 文本上下文里。
 const MAX_INLINE_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_INLINE_DOCUMENT_TEXT_CHARS: usize = 40_000;
+const MAX_TOOL_RESULT_TEXT_CHARS: usize = 120_000;
+const TOOL_RESULT_HEAD_CHARS: usize = 80_000;
+const TOOL_RESULT_TAIL_CHARS: usize = 40_000;
+const KIRO_REENCODE_IMAGE_BYTES: usize = 200_000;
+const KIRO_IMAGE_JPEG_QUALITY: u8 = 85;
+const KIRO_GIF_MAX_OUTPUT_FRAMES: usize = 5;
+const KIRO_GIF_SAMPLE_INTERVAL_MS: u64 = 500;
+const KIRO_GIF_MIN_FRAME_DELAY_MS: u64 = 20;
 
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 ///
@@ -468,7 +477,7 @@ fn process_message_content(
                         "image" => {
                             if let Some(source) = block.source {
                                 if let Some(format) = get_image_format(&source.media_type) {
-                                    images.push(build_kiro_image(format, source.data));
+                                    images.extend(build_kiro_images(format, source.data));
                                 }
                             }
                         }
@@ -601,14 +610,22 @@ fn get_image_format(media_type: &str) -> Option<String> {
     }
 }
 
-fn build_kiro_image(format: String, data: String) -> KiroImage {
+fn build_kiro_images(format: String, data: String) -> Vec<KiroImage> {
     let data = normalize_base64_payload(&data);
+    if format == "gif" {
+        if let Some(images) = sample_gif_frames_for_kiro(&data) {
+            return images;
+        }
+    }
+
     if let Some((normalized_format, normalized_data)) = normalize_image_for_kiro(&format, &data) {
-        KiroImage::from_base64(normalized_format, normalized_data)
-    } else if let Some(resized_data) = resize_image_for_kiro_dimensions_base64(&format, &data) {
-        KiroImage::from_base64(format, resized_data)
+        vec![KiroImage::from_base64(normalized_format, normalized_data)]
+    } else if let Some((processed_format, processed_data)) =
+        resize_or_reencode_image_base64(&format, &data)
+    {
+        vec![KiroImage::from_base64(processed_format, processed_data)]
     } else {
-        KiroImage::from_base64(format, data)
+        vec![KiroImage::from_base64(format, data)]
     }
 }
 
@@ -759,15 +776,41 @@ fn png_crc32(bytes: &[u8]) -> u32 {
     !crc
 }
 
-fn resize_image_for_kiro_dimensions_base64(format: &str, data: &str) -> Option<String> {
+fn encode_kiro_static_image(
+    image: &image::DynamicImage,
+    preferred_format: &str,
+    prefer_lossy: bool,
+) -> Option<(String, Vec<u8>)> {
+    let mut output = Vec::new();
+    let use_jpeg = preferred_format == "jpeg"
+        || preferred_format == "jpg"
+        || (prefer_lossy && !image.has_alpha());
+
+    if use_jpeg {
+        let rgb = image.to_rgb8();
+        let image = image::DynamicImage::ImageRgb8(rgb);
+        JpegEncoder::new_with_quality(&mut output, KIRO_IMAGE_JPEG_QUALITY)
+            .encode_image(&image)
+            .ok()?;
+        Some(("jpeg".to_string(), output))
+    } else {
+        let mut cursor = Cursor::new(&mut output);
+        image.write_to(&mut cursor, image::ImageFormat::Png).ok()?;
+        Some(("png".to_string(), output))
+    }
+}
+
+fn resize_or_reencode_image_base64(format: &str, data: &str) -> Option<(String, String)> {
     let image_format = image_format_for_compat(format)?;
     let bytes = BASE64_STANDARD.decode(data).ok()?;
     let (image, repaired_bytes) =
         load_image_with_optional_png_crc_repair(format, image_format, &bytes)?;
     let (width, height) = image.dimensions();
-    let (resized_width, resized_height) = target_kiro_image_dimensions(width, height);
+    let (target_width, target_height) = target_kiro_image_dimensions(width, height);
+    let needs_resize = target_width != width || target_height != height;
+    let needs_reencode = bytes.len() > KIRO_REENCODE_IMAGE_BYTES;
 
-    if resized_width == width && resized_height == height {
+    if !needs_resize && !needs_reencode {
         if let Some(repaired_bytes) = repaired_bytes {
             tracing::info!(
                 format,
@@ -777,48 +820,106 @@ fn resize_image_for_kiro_dimensions_base64(format: &str, data: &str) -> Option<S
                 repaired_bytes = repaired_bytes.len(),
                 "修复 PNG chunk CRC 以提升 Kiro 图片兼容性"
             );
-            return Some(BASE64_STANDARD.encode(repaired_bytes));
+            return Some((format.to_string(), BASE64_STANDARD.encode(repaired_bytes)));
         }
         return None;
     }
 
-    let resized = image.resize_exact(resized_width, resized_height, FilterType::Lanczos3);
+    let processed = if needs_resize {
+        image.resize_exact(target_width, target_height, FilterType::Lanczos3)
+    } else {
+        image
+    };
+    let processed_width = processed.width();
+    let processed_height = processed.height();
+    let prefer_lossy = needs_reencode && !needs_resize;
+    let (processed_format, output) = encode_kiro_static_image(&processed, format, prefer_lossy)?;
 
-    let mut output = Vec::new();
-    match image_format {
-        image::ImageFormat::Jpeg => {
-            let rgb = resized.to_rgb8();
-            let resized = image::DynamicImage::ImageRgb8(rgb);
-            JpegEncoder::new_with_quality(&mut output, 90)
-                .encode_image(&resized)
-                .ok()?;
+    tracing::info!(
+        source_format = format,
+        target_format = processed_format,
+        width,
+        height,
+        processed_width,
+        processed_height,
+        original_bytes = bytes.len(),
+        processed_bytes = output.len(),
+        needs_resize,
+        needs_reencode,
+        "处理 Kiro 图片尺寸或体积"
+    );
+
+    Some((processed_format, BASE64_STANDARD.encode(output)))
+}
+
+fn sample_gif_frames_for_kiro(data: &str) -> Option<Vec<KiroImage>> {
+    let bytes = BASE64_STANDARD.decode(data).ok()?;
+    let original_bytes = bytes.len();
+    let decoder = GifDecoder::new(BufReader::new(Cursor::new(bytes))).ok()?;
+    let mut frames = Vec::new();
+    let mut source_frames = 0usize;
+    let mut elapsed_ms = 0u64;
+    let mut next_sample_ms = 0u64;
+
+    for frame in decoder.into_frames() {
+        let frame = frame.ok()?;
+        source_frames += 1;
+        let delay_ms = gif_frame_delay_ms(frame.delay());
+
+        if frames.is_empty() || elapsed_ms >= next_sample_ms {
+            let image = image::DynamicImage::ImageRgba8(frame.into_buffer());
+            let (width, height) = image.dimensions();
+            let (target_width, target_height) = target_kiro_image_dimensions(width, height);
+            let processed = if target_width != width || target_height != height {
+                image.resize_exact(target_width, target_height, FilterType::Lanczos3)
+            } else {
+                image
+            };
+            let (_, output) = encode_kiro_static_image(&processed, "jpeg", true)?;
+            frames.push(KiroImage::from_base64(
+                "jpeg",
+                BASE64_STANDARD.encode(output),
+            ));
+            next_sample_ms = elapsed_ms.saturating_add(KIRO_GIF_SAMPLE_INTERVAL_MS);
+
+            if frames.len() >= KIRO_GIF_MAX_OUTPUT_FRAMES {
+                break;
+            }
         }
-        image::ImageFormat::Png => {
-            let mut cursor = Cursor::new(&mut output);
-            resized
-                .write_to(&mut cursor, image::ImageFormat::Png)
-                .ok()?;
-        }
-        _ => return None,
+
+        elapsed_ms = elapsed_ms.saturating_add(delay_ms);
+    }
+
+    if source_frames <= 1 || frames.is_empty() {
+        return None;
     }
 
     tracing::info!(
-        format,
-        width,
-        height,
-        resized_width,
-        resized_height,
-        original_bytes = bytes.len(),
-        resized_bytes = output.len(),
-        "调整 Kiro 兼容图片尺寸"
+        source_frames,
+        sampled_frames = frames.len(),
+        original_bytes,
+        sample_interval_ms = KIRO_GIF_SAMPLE_INTERVAL_MS,
+        "GIF 已抽帧并重编码为静态 JPEG"
     );
 
-    Some(BASE64_STANDARD.encode(output))
+    Some(frames)
+}
+
+fn gif_frame_delay_ms(delay: image::Delay) -> u64 {
+    let (numerator, denominator) = delay.numer_denom_ms();
+    if denominator == 0 {
+        return KIRO_GIF_MIN_FRAME_DELAY_MS;
+    }
+    let numerator = numerator as u64;
+    let denominator = denominator as u64;
+    numerator
+        .div_ceil(denominator)
+        .max(KIRO_GIF_MIN_FRAME_DELAY_MS)
 }
 
 /// 提取工具结果内容
 fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
-    match content {
+    let extracted = match content {
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(serde_json::Value::Array(arr)) => {
             let mut parts = Vec::new();
@@ -831,7 +932,9 @@ fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
         }
         Some(v) => v.to_string(),
         None => String::new(),
-    }
+    };
+
+    compact_tool_result_text(&extracted)
 }
 
 fn extract_tool_result_content_item(item: &serde_json::Value) -> Option<String> {
@@ -868,6 +971,64 @@ fn extract_tool_result_content_item(item: &serde_json::Value) -> Option<String> 
     item.get("text")
         .and_then(|v| v.as_str())
         .map(|text| text.to_string())
+}
+
+fn compact_tool_result_text(text: &str) -> String {
+    let normalized = compact_low_risk_whitespace(text);
+    if normalized.chars().count() <= MAX_TOOL_RESULT_TEXT_CHARS {
+        return normalized;
+    }
+
+    let head: String = normalized.chars().take(TOOL_RESULT_HEAD_CHARS).collect();
+    let tail: String = normalized
+        .chars()
+        .rev()
+        .take(TOOL_RESULT_TAIL_CHARS)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let omitted = normalized
+        .chars()
+        .count()
+        .saturating_sub(TOOL_RESULT_HEAD_CHARS + TOOL_RESULT_TAIL_CHARS);
+
+    tracing::info!(
+        original_chars = normalized.chars().count(),
+        max_chars = MAX_TOOL_RESULT_TEXT_CHARS,
+        omitted_chars = omitted,
+        "截断超大 tool_result 文本，保留头尾内容"
+    );
+
+    format!(
+        "{}\n...[tool_result truncated, {} chars omitted]...\n{}",
+        head, omitted, tail
+    )
+}
+
+fn compact_low_risk_whitespace(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut blank_lines = 0usize;
+
+    for raw_line in text.replace("\r\n", "\n").replace('\r', "\n").lines() {
+        let line = raw_line.trim_end();
+        if line.trim().is_empty() {
+            blank_lines += 1;
+            if blank_lines <= 2 {
+                output.push('\n');
+            }
+            continue;
+        }
+
+        blank_lines = 0;
+        output.push_str(line);
+        output.push('\n');
+    }
+
+    if output.ends_with('\n') {
+        output.pop();
+    }
+    output
 }
 
 /// 验证并过滤 tool_use/tool_result 配对
@@ -1756,6 +1917,23 @@ mod tests {
         assert!(text.contains("Tool output:"));
         assert!(text.contains("Extracted document text (application/pdf):"));
         assert!(text.contains("6G6S7MSS"));
+    }
+
+    #[test]
+    fn test_extract_tool_result_content_compacts_and_truncates_large_text() {
+        let large = format!(
+            "{}\n\n\n\n{}",
+            "head ".repeat(20_000),
+            "tail ".repeat(20_000)
+        );
+        let content = Some(serde_json::Value::String(large));
+
+        let text = extract_tool_result_content(&content);
+
+        assert!(text.contains("[tool_result truncated,"));
+        assert!(text.contains("head head"));
+        assert!(text.contains("tail tail"));
+        assert!(!text.contains("\n\n\n"));
     }
 
     #[test]

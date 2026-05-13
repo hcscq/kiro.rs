@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
-use crate::common::logging::summarize_upstream_error;
+use crate::common::logging::{summarize_text_for_log, summarize_upstream_error};
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
@@ -748,7 +748,7 @@ impl KiroProvider {
         trace: &ResponseTrace,
         timeout_budget: Duration,
         thinking_enabled: bool,
-    ) -> Result<StreamContentStartPrefetch, reqwest::Error> {
+    ) -> anyhow::Result<StreamContentStartPrefetch> {
         let mut body_stream = response.bytes_stream().boxed();
         let mut prefetched = Vec::new();
         let mut prefetched_bytes = 0usize;
@@ -779,34 +779,80 @@ impl KiroProvider {
                     }
                     prefetched_bytes += chunk.len();
                     if let Err(err) = decoder.feed(&chunk) {
-                        tracing::warn!(error = %err, "预读上游流时解码缓冲失败");
+                        tracing::warn!(
+                            error = %err,
+                            chunk_len = chunk.len(),
+                            decoder_buffer_len = decoder.buffer_len(),
+                            "预读上游流时解码缓冲失败"
+                        );
+                        if err.is_fatal_stream_error() {
+                            return Err(anyhow::anyhow!(
+                                "预读上游流时解码进入不可恢复状态: {}",
+                                err
+                            ));
+                        }
                     }
                     prefetched.push(chunk);
 
-                    for result in decoder.decode_iter() {
-                        match result {
-                            Ok(frame) => {
-                                if let Ok(event) = Event::from_frame(frame) {
-                                    if probe.observe(&event) {
-                                        let prefetched_stream =
-                                            stream::iter(prefetched.into_iter().map(Ok));
-                                        let stream = prefetched_stream.chain(body_stream).boxed();
-                                        return Ok(StreamContentStartPrefetch::Ready {
-                                            stream,
-                                            first_chunk_logged,
-                                            prefetched_bytes,
-                                            elapsed: started_at.elapsed(),
-                                        });
+                    loop {
+                        match decoder.decode() {
+                            Ok(Some(frame)) => {
+                                let message_type =
+                                    frame.message_type().unwrap_or("unknown").to_string();
+                                let event_type =
+                                    frame.event_type().unwrap_or("unknown").to_string();
+                                let payload_len = frame.payload.len();
+                                let payload_excerpt = summarize_text_for_log(
+                                    &String::from_utf8_lossy(&frame.payload),
+                                    ERROR_BODY_EXCERPT_CHARS,
+                                );
+                                match Event::from_frame(frame) {
+                                    Ok(event) => {
+                                        if probe.observe(&event) {
+                                            let prefetched_stream =
+                                                stream::iter(prefetched.into_iter().map(Ok));
+                                            let stream =
+                                                prefetched_stream.chain(body_stream).boxed();
+                                            return Ok(StreamContentStartPrefetch::Ready {
+                                                stream,
+                                                first_chunk_logged,
+                                                prefetched_bytes,
+                                                elapsed: started_at.elapsed(),
+                                            });
+                                        }
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            error = %err,
+                                            message_type,
+                                            event_type,
+                                            payload_len,
+                                            payload_excerpt = %payload_excerpt,
+                                            "预读上游流时事件 payload 解析失败"
+                                        );
                                     }
                                 }
                             }
+                            Ok(None) => break,
                             Err(err) => {
-                                tracing::warn!(error = %err, "预读上游流时解码事件失败");
+                                tracing::warn!(
+                                    error = %err,
+                                    decoder_buffer_len = decoder.buffer_len(),
+                                    decoder_error_count = decoder.error_count(),
+                                    decoder_bytes_skipped = decoder.bytes_skipped(),
+                                    "预读上游流时解码事件失败"
+                                );
+                                if err.is_fatal_stream_error() {
+                                    return Err(anyhow::anyhow!(
+                                        "预读上游流时解码进入不可恢复状态: {}",
+                                        err
+                                    ));
+                                }
                             }
                         }
                     }
                 }
-                Ok(Some(Err(err))) => return Err(err),
+                Ok(Some(Err(err))) => return Err(err.into()),
                 Ok(None) => {
                     let prefetched_stream = stream::iter(prefetched.into_iter().map(Ok));
                     let stream = prefetched_stream.chain(body_stream).boxed();
@@ -1760,7 +1806,7 @@ impl KiroProvider {
                                 error = %err,
                                 "预读上游流首内容块失败"
                             );
-                            last_error = Some(err.into());
+                            last_error = Some(err);
                             request_scoped_transient_error_credentials.insert(ctx_id);
                             if attempt + 1 < max_retries {
                                 sleep(Self::retry_delay(attempt)).await;

@@ -31,11 +31,13 @@
 //! ```
 
 use super::error::{ParseError, ParseResult};
-use super::frame::{Frame, PRELUDE_SIZE, parse_frame};
+use super::frame::{Frame, MAX_MESSAGE_SIZE, PRELUDE_SIZE, parse_frame};
 use bytes::{Buf, BytesMut};
 
-/// 默认最大缓冲区大小 (16 MB)
-pub const DEFAULT_MAX_BUFFER_SIZE: usize = 16 * 1024 * 1024;
+/// 默认最大缓冲区大小。
+///
+/// 与 frame parser 的硬上限保持一致，避免合法大 frame 在 feed 阶段被先行拒绝。
+pub const DEFAULT_MAX_BUFFER_SIZE: usize = MAX_MESSAGE_SIZE as usize;
 
 /// 默认最大连续错误数
 pub const DEFAULT_MAX_ERRORS: usize = 5;
@@ -220,6 +222,21 @@ impl EventStreamDecoder {
         DecodeIter { decoder: self }
     }
 
+    /// 获取缓冲区中待处理的字节数，用于诊断线上偶发解码问题。
+    pub fn buffer_len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// 获取当前连续错误计数。
+    pub fn error_count(&self) -> usize {
+        self.error_count
+    }
+
+    /// 获取恢复过程中累计跳过的字节数。
+    pub fn bytes_skipped(&self) -> usize {
+        self.bytes_skipped
+    }
+
     /// 尝试容错恢复
     ///
     /// 根据错误类型采用不同的恢复策略（参考 kiro-kt 的设计）：
@@ -300,10 +317,14 @@ impl<'a> Iterator for DecodeIter<'a> {
     type Item = ParseResult<Frame>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // 如果处于 Stopped 或 Recovering 状态，停止迭代
+        // 如果处于 Stopped 状态，停止迭代。
+        // Recovering 已经在上一次 decode 中跳过了损坏字节，可以在同一 chunk 内继续
+        // drain 后续完整 frame，避免必须等下一次 feed 才恢复。
         match self.decoder.state {
             DecoderState::Stopped => return None,
-            DecoderState::Recovering => return None,
+            DecoderState::Recovering => {
+                self.decoder.state = DecoderState::Ready;
+            }
             _ => {}
         }
 
@@ -318,6 +339,36 @@ impl<'a> Iterator for DecodeIter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kiro::parser::crc::crc32;
+
+    fn string_header(name: &str, value: &str) -> Vec<u8> {
+        let mut header = Vec::new();
+        header.push(name.len() as u8);
+        header.extend_from_slice(name.as_bytes());
+        header.push(7);
+        header.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        header.extend_from_slice(value.as_bytes());
+        header
+    }
+
+    fn event_frame(payload: &[u8]) -> Vec<u8> {
+        let mut headers = Vec::new();
+        headers.extend(string_header(":message-type", "event"));
+        headers.extend(string_header(":event-type", "assistantResponseEvent"));
+
+        let total_length = (PRELUDE_SIZE + headers.len() + payload.len() + 4) as u32;
+        let header_length = headers.len() as u32;
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&total_length.to_be_bytes());
+        frame.extend_from_slice(&header_length.to_be_bytes());
+        let prelude_crc = crc32(&frame);
+        frame.extend_from_slice(&prelude_crc.to_be_bytes());
+        frame.extend_from_slice(&headers);
+        frame.extend_from_slice(payload);
+        let message_crc = crc32(&frame);
+        frame.extend_from_slice(&message_crc.to_be_bytes());
+        frame
+    }
 
     #[test]
     fn test_decoder_feed() {
@@ -332,5 +383,38 @@ mod tests {
 
         let result = decoder.decode();
         assert!(matches!(result, Ok(None)));
+    }
+
+    #[test]
+    fn test_decode_iter_continues_after_recovering_in_same_chunk() {
+        let mut bytes = vec![0xff, 0xfe, 0xfd];
+        bytes.extend(event_frame(br#"{"content":"ok"}"#));
+
+        let mut decoder = EventStreamDecoder::new();
+        decoder.feed(&bytes).unwrap();
+
+        let mut saw_error = false;
+        let mut decoded_frames = 0usize;
+        for result in decoder.decode_iter() {
+            match result {
+                Ok(frame) => {
+                    decoded_frames += 1;
+                    assert_eq!(frame.event_type(), Some("assistantResponseEvent"));
+                }
+                Err(_) => saw_error = true,
+            }
+        }
+
+        assert!(saw_error, "corrupt prefix should be reported");
+        assert_eq!(
+            decoded_frames, 1,
+            "valid frame after recovery should be drained"
+        );
+    }
+
+    #[test]
+    fn test_event_stream_limits_allow_large_frames() {
+        assert!(MAX_MESSAGE_SIZE as usize >= 24 * 1024 * 1024);
+        assert_eq!(DEFAULT_MAX_BUFFER_SIZE, MAX_MESSAGE_SIZE as usize);
     }
 }
