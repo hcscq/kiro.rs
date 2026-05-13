@@ -586,26 +586,36 @@ impl KiroProvider {
 
     /// 获取凭据级 API 基础 URL
     fn base_url_for(&self, credentials: &KiroCredentials) -> String {
-        format!(
-            "https://q.{}.amazonaws.com/generateAssistantResponse",
-            credentials.effective_api_region(self.token_manager.config())
-        )
+        let config = self.token_manager.config();
+        let api_region = credentials.effective_api_region(config);
+        let base = config.effective_runtime_endpoint_base(api_region);
+        format!("{}/generateAssistantResponse", base)
     }
 
     /// 获取凭据级 MCP API URL
     fn mcp_url_for(&self, credentials: &KiroCredentials) -> String {
-        format!(
-            "https://q.{}.amazonaws.com/mcp",
-            credentials.effective_api_region(self.token_manager.config())
-        )
+        let config = self.token_manager.config();
+        let api_region = credentials.effective_api_region(config);
+        let base = config.effective_runtime_endpoint_base(api_region);
+        format!("{}/mcp", base)
     }
 
     /// 获取凭据级 API 基础域名
     fn base_domain_for(&self, credentials: &KiroCredentials) -> String {
-        format!(
-            "q.{}.amazonaws.com",
-            credentials.effective_api_region(self.token_manager.config())
-        )
+        let config = self.token_manager.config();
+        let api_region = credentials.effective_api_region(config);
+        let base = config.effective_runtime_endpoint_base(api_region);
+        url::Url::parse(&base)
+            .ok()
+            .and_then(|parsed| parsed.host_str().map(str::to_string))
+            .unwrap_or_else(|| {
+                base.trim_start_matches("https://")
+                    .trim_start_matches("http://")
+                    .split('/')
+                    .next()
+                    .unwrap_or(&base)
+                    .to_string()
+            })
     }
 
     /// 从请求体中提取模型信息

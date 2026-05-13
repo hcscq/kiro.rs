@@ -187,6 +187,11 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_region: Option<String>,
 
+    /// Runtime API Endpoint（用于推理/流式请求），未配置时回退到 q.<region>.amazonaws.com
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_endpoint: Option<String>,
+
     #[serde(default = "default_kiro_version")]
     pub kiro_version: String,
 
@@ -477,6 +482,7 @@ impl Default for Config {
             region: default_region(),
             auth_region: None,
             api_region: None,
+            runtime_endpoint: None,
             kiro_version: default_kiro_version(),
             machine_id: None,
             api_key: None,
@@ -534,6 +540,16 @@ impl Config {
     /// 优先使用 api_region，未配置时回退到 region
     pub fn effective_api_region(&self) -> &str {
         self.api_region.as_deref().unwrap_or(&self.region)
+    }
+
+    /// 获取有效的 Runtime API base URL（用于推理/MCP 请求）
+    pub fn effective_runtime_endpoint_base(&self, api_region: &str) -> String {
+        self.runtime_endpoint
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.trim_end_matches('/').to_string())
+            .unwrap_or_else(|| format!("https://q.{}.amazonaws.com", api_region))
     }
 
     /// 从文件加载配置
@@ -673,6 +689,27 @@ mod tests {
         config.instance_id = Some("kiro-a".to_string());
 
         assert_eq!(config.resolved_instance_id(), "kiro-a");
+    }
+
+    #[test]
+    fn effective_runtime_endpoint_base_defaults_to_legacy_q_endpoint() {
+        let config = Config::default();
+
+        assert_eq!(
+            config.effective_runtime_endpoint_base("eu-central-1"),
+            "https://q.eu-central-1.amazonaws.com"
+        );
+    }
+
+    #[test]
+    fn effective_runtime_endpoint_base_uses_configured_kiro_endpoint() {
+        let mut config = Config::default();
+        config.runtime_endpoint = Some("https://runtime.eu-central-1.kiro.dev/".to_string());
+
+        assert_eq!(
+            config.effective_runtime_endpoint_base("eu-central-1"),
+            "https://runtime.eu-central-1.kiro.dev"
+        );
     }
 
     #[test]
