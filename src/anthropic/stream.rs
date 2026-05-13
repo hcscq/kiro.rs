@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::kiro::model::events::Event;
 
-use super::thinking_compat::sign_thinking_block;
+use super::thinking_compat::{canonicalize_thinking_for_signature, sign_thinking_block};
 
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
@@ -701,7 +701,9 @@ impl StreamContext {
                 // 在 thinking 块内，查找 </thinking> 结束标签（跳过被反引号包裹的）
                 if let Some(end_pos) = find_real_thinking_end_tag(&self.thinking_buffer) {
                     // 提取 thinking 内容
-                    let thinking_content = self.thinking_buffer[..end_pos].to_string();
+                    let thinking_content = self.thinking_buffer[..end_pos]
+                        .trim_end_matches('\n')
+                        .to_string();
                     if !thinking_content.is_empty() {
                         if let Some(thinking_index) = self.thinking_block_index {
                             events.push(self.create_tracked_thinking_delta_event(
@@ -736,8 +738,10 @@ impl StreamContext {
                         .saturating_sub("</thinking>\n\n".len());
                     let safe_len = find_char_boundary(&self.thinking_buffer, target_len);
                     if safe_len > 0 {
-                        let safe_content = self.thinking_buffer[..safe_len].to_string();
-                        if !safe_content.is_empty() {
+                        let safe_content = &self.thinking_buffer[..safe_len];
+                        let emit_len = safe_content.trim_end_matches('\n').len();
+                        if emit_len > 0 {
+                            let safe_content = self.thinking_buffer[..emit_len].to_string();
                             if let Some(thinking_index) = self.thinking_block_index {
                                 events.push(self.create_tracked_thinking_delta_event(
                                     thinking_index,
@@ -745,7 +749,7 @@ impl StreamContext {
                                 ));
                             }
                         }
-                        self.thinking_buffer = self.thinking_buffer[safe_len..].to_string();
+                        self.thinking_buffer = self.thinking_buffer[emit_len..].to_string();
                     }
                     break;
                 }
@@ -848,10 +852,11 @@ impl StreamContext {
 
     /// 创建 signature_delta 事件
     fn create_signature_delta_event(&self, index: i32) -> Option<SseEvent> {
-        if self.thinking_signature_source.is_empty() {
+        let thinking = canonicalize_thinking_for_signature(&self.thinking_signature_source);
+        if thinking.is_empty() {
             return None;
         }
-        let signature = sign_thinking_block(0, &self.thinking_signature_source);
+        let signature = sign_thinking_block(0, thinking);
         Some(SseEvent::new(
             "content_block_delta",
             json!({
@@ -891,7 +896,9 @@ impl StreamContext {
         // 这里在开始 tool_use block 前做一次“边界场景”的结束标签识别与过滤。
         if self.thinking_enabled && self.in_thinking_block {
             if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(&self.thinking_buffer) {
-                let thinking_content = self.thinking_buffer[..end_pos].to_string();
+                let thinking_content = self.thinking_buffer[..end_pos]
+                    .trim_end_matches('\n')
+                    .to_string();
                 if !thinking_content.is_empty() {
                     if let Some(thinking_index) = self.thinking_block_index {
                         events.push(self.create_tracked_thinking_delta_event(
@@ -1005,7 +1012,9 @@ impl StreamContext {
                 if let Some(end_pos) =
                     find_real_thinking_end_tag_at_buffer_end(&self.thinking_buffer)
                 {
-                    let thinking_content = self.thinking_buffer[..end_pos].to_string();
+                    let thinking_content = self.thinking_buffer[..end_pos]
+                        .trim_end_matches('\n')
+                        .to_string();
                     if !thinking_content.is_empty() {
                         if let Some(thinking_index) = self.thinking_block_index {
                             events.push(self.create_tracked_thinking_delta_event(
@@ -1198,6 +1207,8 @@ fn estimate_tokens(text: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::anthropic::thinking_compat::validate_thinking_signatures;
+    use crate::anthropic::types::{Message, MessagesRequest};
 
     #[test]
     fn test_sse_event_format() {
@@ -1818,6 +1829,72 @@ mod tests {
             .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta")
             .map(|e| e.data["delta"]["text"].as_str().unwrap_or(""))
             .collect()
+    }
+
+    fn collect_first_signature(events: &[SseEvent]) -> Option<String> {
+        events
+            .iter()
+            .find(|e| {
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "signature_delta"
+            })
+            .and_then(|e| e.data["delta"]["signature"].as_str())
+            .map(ToString::to_string)
+    }
+
+    fn request_with_stream_thinking(thinking: String, signature: String) -> MessagesRequest {
+        MessagesRequest {
+            model: "claude-sonnet-4-6-thinking".to_string(),
+            max_tokens: 64,
+            messages: vec![Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {"type":"thinking","thinking": thinking,"signature": signature},
+                    {"type":"text","text":"done"}
+                ]),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn test_thinking_trailing_wrapper_newline_is_not_signed_or_emitted() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response("<thinking>\nabc\n</thinking>\n\n你好"));
+        all.extend(ctx.generate_final_events());
+
+        let thinking = collect_thinking_content(&all);
+        assert_eq!(thinking, "abc");
+
+        let signature = collect_first_signature(&all).expect("signature_delta should be emitted");
+        let req = request_with_stream_thinking(thinking, signature);
+        validate_thinking_signatures(&req).expect("stream signature should validate roundtrip");
+    }
+
+    #[test]
+    fn test_thinking_trailing_wrapper_newline_is_held_across_chunks() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response("<thinking>\nabc\n"));
+        all.extend(ctx.process_assistant_response("</thinking>\n\n你好"));
+        all.extend(ctx.generate_final_events());
+
+        let thinking = collect_thinking_content(&all);
+        assert_eq!(thinking, "abc");
+
+        let signature = collect_first_signature(&all).expect("signature_delta should be emitted");
+        let req = request_with_stream_thinking(thinking, signature);
+        validate_thinking_signatures(&req).expect("stream signature should validate roundtrip");
     }
 
     #[test]

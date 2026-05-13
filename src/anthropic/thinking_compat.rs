@@ -80,6 +80,7 @@ pub(crate) fn init_thinking_signature_key(api_key: &str) {
 pub(crate) fn sign_thinking_block(thinking_ordinal: u32, thinking: &str) -> String {
     let key = signing_key();
     let issuer = issuer_tag(&key);
+    let thinking = canonicalize_thinking_for_signature(thinking);
     let thinking_hash = sha256_bytes(thinking.as_bytes());
 
     let mut body = Vec::with_capacity(1 + ISSUER_TAG_LEN + 4 + HASH_LEN);
@@ -162,7 +163,7 @@ fn classify_signature(signature: &str, thinking_ordinal: u32, thinking: &str) ->
     let issuer_start = 1;
     let issuer_end = issuer_start + ISSUER_TAG_LEN;
     if raw[issuer_start..issuer_end].ct_eq(&issuer).unwrap_u8() != 1 {
-        return SignatureClass::InvalidOwn;
+        return SignatureClass::Foreign;
     }
 
     let ordinal_start = issuer_end;
@@ -179,19 +180,46 @@ fn classify_signature(signature: &str, thinking_ordinal: u32, thinking: &str) ->
 
     let hash_start = ordinal_end;
     let hash_end = hash_start + HASH_LEN;
-    let expected_hash = sha256_bytes(thinking.as_bytes());
-    if raw[hash_start..hash_end].ct_eq(&expected_hash).unwrap_u8() != 1 {
-        return SignatureClass::InvalidOwn;
-    }
-
     let body_end = hash_end;
     let mac_start = body_end;
     let expected_mac = signature_mac(&key, &raw[..body_end]);
-    if raw[mac_start..].ct_eq(&expected_mac).unwrap_u8() == 1 {
+    if raw[mac_start..].ct_eq(&expected_mac).unwrap_u8() != 1 {
+        return SignatureClass::InvalidOwn;
+    }
+
+    if thinking_hash_matches(&raw[hash_start..hash_end], thinking) {
         SignatureClass::ValidOwn
     } else {
         SignatureClass::InvalidOwn
     }
+}
+
+fn thinking_hash_matches(signed_hash: &[u8], thinking: &str) -> bool {
+    let canonical = canonicalize_thinking_for_signature(thinking);
+    let canonical_hash = sha256_bytes(canonical.as_bytes());
+    if signed_hash.ct_eq(&canonical_hash).unwrap_u8() == 1 {
+        return true;
+    }
+
+    // Compatibility for stream signatures emitted before canonicalization:
+    // those signatures could include the wrapper newline immediately before
+    // `</thinking>`, while clients commonly trim it when storing history.
+    let mut legacy = String::with_capacity(canonical.len() + 2);
+    legacy.push_str(canonical);
+    for _ in 0..2 {
+        legacy.push('\n');
+        let legacy_hash = sha256_bytes(legacy.as_bytes());
+        if signed_hash.ct_eq(&legacy_hash).unwrap_u8() == 1 {
+            return true;
+        }
+    }
+
+    if canonical.len() != thinking.len() {
+        let raw_hash = sha256_bytes(thinking.as_bytes());
+        return signed_hash.ct_eq(&raw_hash).unwrap_u8() == 1;
+    }
+
+    false
 }
 
 fn decode_signature(signature: &str) -> Option<Vec<u8>> {
@@ -280,10 +308,7 @@ pub fn extract_thinking_and_text(content: &str) -> Option<(String, String)> {
     let end = thinking_start + end_rel;
 
     let raw_thinking = &content[thinking_start..end];
-    let thinking = raw_thinking
-        .trim_start_matches('\n')
-        .trim_end_matches('\n')
-        .to_string();
+    let thinking = canonicalize_thinking_for_signature(raw_thinking).to_string();
 
     let suffix_start = end + "</thinking>".len();
     let remaining = content[suffix_start..].trim_start().to_string();
@@ -291,11 +316,17 @@ pub fn extract_thinking_and_text(content: &str) -> Option<(String, String)> {
     Some((thinking, remaining))
 }
 
+pub(crate) fn canonicalize_thinking_for_signature(thinking: &str) -> &str {
+    thinking.trim_start_matches('\n').trim_end_matches('\n')
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        STANDARD_NO_PAD, SignatureClass, classify_signature, decode_signature,
-        extract_thinking_and_text, sign_thinking_block, validate_thinking_signatures,
+        HASH_LEN, HMAC_LEN, ISSUER_TAG_LEN, SIGNATURE_VERSION, STANDARD_NO_PAD, SignatureClass,
+        classify_signature, decode_signature, extract_thinking_and_text, hmac_sha256, issuer_tag,
+        sha256_bytes, sign_thinking_block, signature_mac, signing_key,
+        validate_thinking_signatures,
     };
     use crate::anthropic::types::{Message, MessagesRequest};
     use base64::Engine;
@@ -318,6 +349,40 @@ mod tests {
         }
     }
 
+    fn sign_legacy_raw_thinking_block(thinking_ordinal: u32, thinking: &str) -> String {
+        let key = signing_key();
+        let issuer = issuer_tag(&key);
+        let thinking_hash = sha256_bytes(thinking.as_bytes());
+
+        let mut body = Vec::with_capacity(1 + ISSUER_TAG_LEN + 4 + HASH_LEN);
+        body.push(SIGNATURE_VERSION);
+        body.extend_from_slice(&issuer);
+        body.extend_from_slice(&thinking_ordinal.to_be_bytes());
+        body.extend_from_slice(&thinking_hash);
+
+        let mac = signature_mac(&key, &body);
+        let mut raw = body;
+        raw.extend_from_slice(&mac);
+
+        STANDARD_NO_PAD.encode(raw)
+    }
+
+    fn foreign_anthropic_shaped_signature(thinking_ordinal: u32, thinking: &str) -> String {
+        let foreign_key = hmac_sha256(&[0x42; 32], b"foreign");
+        let mut issuer = [0u8; ISSUER_TAG_LEN];
+        issuer.copy_from_slice(&foreign_key[..ISSUER_TAG_LEN]);
+        let thinking_hash = sha256_bytes(thinking.as_bytes());
+
+        let mut raw = Vec::with_capacity(1 + ISSUER_TAG_LEN + 4 + HASH_LEN + HMAC_LEN);
+        raw.push(SIGNATURE_VERSION);
+        raw.extend_from_slice(&issuer);
+        raw.extend_from_slice(&thinking_ordinal.to_be_bytes());
+        raw.extend_from_slice(&thinking_hash);
+        raw.extend_from_slice(&[0x11; HMAC_LEN]);
+
+        STANDARD_NO_PAD.encode(raw)
+    }
+
     #[test]
     fn test_sign_thinking_block_is_opaque_and_verifiable() {
         let signature = sign_thinking_block(0, "hello");
@@ -337,6 +402,47 @@ mod tests {
             classify_signature(&signature, 1, "hello"),
             SignatureClass::InvalidOwn
         );
+    }
+
+    #[test]
+    fn test_sign_thinking_block_canonicalizes_boundary_newlines() {
+        let signature = sign_thinking_block(0, "\nstep 1\n");
+
+        assert_eq!(
+            classify_signature(&signature, 0, "step 1"),
+            SignatureClass::ValidOwn
+        );
+        assert_eq!(
+            classify_signature(&signature, 0, "\nstep 1\n"),
+            SignatureClass::ValidOwn
+        );
+    }
+
+    #[test]
+    fn test_validate_thinking_signatures_accepts_legacy_stream_trailing_newline() {
+        let signature = sign_legacy_raw_thinking_block(0, "step 1\n");
+        let req = request_with_assistant_content(serde_json::json!([
+            {"type":"thinking","thinking":"step 1","signature": signature}
+        ]));
+
+        let stats = validate_thinking_signatures(&req)
+            .expect("legacy stream wrapper newline should validate");
+
+        assert_eq!(stats.valid_own_signatures, 1);
+    }
+
+    #[test]
+    fn test_validate_thinking_signatures_accepts_foreign_anthropic_shaped_signature() {
+        let signature = foreign_anthropic_shaped_signature(0, "external");
+        let req = request_with_assistant_content(serde_json::json!([
+            {"type":"thinking","thinking":"external","signature": signature}
+        ]));
+
+        let stats =
+            validate_thinking_signatures(&req).expect("foreign shaped signatures should pass");
+
+        assert_eq!(stats.valid_own_signatures, 0);
+        assert_eq!(stats.foreign_signatures, 1);
     }
 
     #[test]
