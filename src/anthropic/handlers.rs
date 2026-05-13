@@ -542,6 +542,7 @@ pub async fn post_messages(
     }
 
     let model_id = conversion_result.model_id.clone();
+    let session_affinity_key = conversion_result.session_id.clone();
     let tool_name_map = conversion_result.tool_name_map;
 
     if payload.stream {
@@ -557,6 +558,7 @@ pub async fn post_messages(
                 omit_agent_mode_header: probe.omit_agent_mode_header,
                 request_id: Some(request_id.clone()),
                 model_id: Some(model_id.clone()),
+                session_affinity_key: session_affinity_key.clone(),
                 request_weight,
                 wait_for_stream_content_start: thinking_enabled,
                 stream_thinking_enabled: thinking_enabled,
@@ -575,6 +577,7 @@ pub async fn post_messages(
                 omit_agent_mode_header: probe.omit_agent_mode_header,
                 request_id: Some(request_id),
                 model_id: Some(model_id),
+                session_affinity_key,
                 request_weight,
                 wait_for_stream_content_start: false,
                 stream_thinking_enabled: false,
@@ -894,6 +897,7 @@ pub(crate) async fn execute_non_stream_round(
             omit_agent_mode_header: probe.omit_agent_mode_header,
             request_id,
             model_id: Some(conversion_result.model_id),
+            session_affinity_key: conversion_result.session_id,
             request_weight,
             wait_for_stream_content_start: false,
             stream_thinking_enabled: false,
@@ -1443,6 +1447,7 @@ pub async fn post_messages_cc(
     }
 
     let model_id = conversion_result.model_id.clone();
+    let session_affinity_key = conversion_result.session_id.clone();
     let tool_name_map = conversion_result.tool_name_map;
 
     if payload.stream {
@@ -1458,6 +1463,7 @@ pub async fn post_messages_cc(
                 omit_agent_mode_header: probe.omit_agent_mode_header,
                 request_id: Some(request_id.clone()),
                 model_id: Some(model_id.clone()),
+                session_affinity_key: session_affinity_key.clone(),
                 request_weight,
                 wait_for_stream_content_start: false,
                 stream_thinking_enabled: thinking_enabled,
@@ -1476,6 +1482,7 @@ pub async fn post_messages_cc(
                 omit_agent_mode_header: probe.omit_agent_mode_header,
                 request_id: Some(request_id),
                 model_id: Some(model_id),
+                session_affinity_key,
                 request_weight,
                 wait_for_stream_content_start: false,
                 stream_thinking_enabled: false,

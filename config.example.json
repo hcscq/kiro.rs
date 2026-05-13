@@ -13,6 +13,7 @@
   "stateRedisLeaderLeaseTtlSecs": 9,
   "stateHotPathSyncMinIntervalMs": 25,
   "loadBalancingMode": "balanced",
+  "sessionAffinityEnabled": false,
   "defaultMaxConcurrency": 3,
   "queueMaxSize": 16,
   "queueMaxWaitMs": 5000,

@@ -417,6 +417,7 @@ impl AdminService {
         let snapshot = self.token_manager.load_balancing_config_snapshot();
         Ok(LoadBalancingModeResponse {
             mode: snapshot.mode,
+            session_affinity_enabled: snapshot.session_affinity_enabled,
             queue_max_size: snapshot.queue_max_size,
             queue_max_wait_ms: snapshot.queue_max_wait_ms,
             rate_limit_cooldown_ms: snapshot.rate_limit_cooldown_ms,
@@ -482,6 +483,7 @@ impl AdminService {
         self.ensure_runtime_write_leader()?;
 
         if req.mode.is_none()
+            && req.session_affinity_enabled.is_none()
             && req.queue_max_size.is_none()
             && req.queue_max_wait_ms.is_none()
             && req.rate_limit_cooldown_ms.is_none()
@@ -520,6 +522,7 @@ impl AdminService {
                 req.rate_limit_refill_recovery_step_per_success,
                 req.rate_limit_refill_backoff_factor,
                 req.request_weighting,
+                req.session_affinity_enabled,
             )
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 

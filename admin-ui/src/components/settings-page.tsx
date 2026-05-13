@@ -187,6 +187,7 @@ export function SettingsPage() {
   const [rateLimitCooldownMsInput, setRateLimitCooldownMsInput] = useState('2000')
   const [rateLimitCooldownEnabled, setRateLimitCooldownEnabled] = useState(false)
   const [modelCooldownEnabled, setModelCooldownEnabled] = useState(false)
+  const [sessionAffinityEnabled, setSessionAffinityEnabled] = useState(false)
   const [defaultMaxConcurrencyInput, setDefaultMaxConcurrencyInput] = useState('')
   const [rateLimitBucketCapacityInput, setRateLimitBucketCapacityInput] = useState('6')
   const [rateLimitRefillPerSecondInput, setRateLimitRefillPerSecondInput] = useState('2')
@@ -207,6 +208,7 @@ export function SettingsPage() {
     setRateLimitCooldownMsInput(String(loadBalancingData.rateLimitCooldownMs))
     setRateLimitCooldownEnabled(loadBalancingData.rateLimitCooldownEnabled ?? false)
     setModelCooldownEnabled(loadBalancingData.modelCooldownEnabled ?? true)
+    setSessionAffinityEnabled(loadBalancingData.sessionAffinityEnabled ?? false)
     setDefaultMaxConcurrencyInput(loadBalancingData.defaultMaxConcurrency ? String(loadBalancingData.defaultMaxConcurrency) : '')
     setRateLimitBucketCapacityInput(String(loadBalancingData.rateLimitBucketCapacity))
     setRateLimitRefillPerSecondInput(String(loadBalancingData.rateLimitRefillPerSecond))
@@ -332,6 +334,7 @@ export function SettingsPage() {
         rateLimitCooldownMs: parsedRateLimitCooldownMs,
         rateLimitCooldownEnabled,
         modelCooldownEnabled,
+        sessionAffinityEnabled,
         defaultMaxConcurrency: parsedDefaultMaxConcurrency,
         rateLimitBucketCapacity: parsedRateLimitBucketCapacity,
         rateLimitRefillPerSecond: parsedRateLimitRefillPerSecond,
@@ -505,6 +508,30 @@ export function SettingsPage() {
                 </div>
                 <p className="text-xs text-muted-foreground">
                   默认开启。关闭后不再新增模型临时限制，已有运行时模型限制也会被清空。
+                </p>
+              </div>
+
+              <div className="flex flex-col gap-3 rounded-lg border bg-background/70 p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="space-y-1">
+                    <div className="text-sm font-medium">会话凭据亲和</div>
+                    <p className="text-sm text-muted-foreground">
+                      同一 Claude 会话优先复用上次成功的 Kiro 凭据；凭据不可调度时自动回退现有策略。
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <Badge variant={sessionAffinityEnabled ? 'secondary' : 'outline'}>
+                      {sessionAffinityEnabled ? '已启用' : '已关闭'}
+                    </Badge>
+                    <Switch
+                      checked={sessionAffinityEnabled}
+                      onCheckedChange={setSessionAffinityEnabled}
+                      aria-label="切换会话凭据亲和"
+                    />
+                  </div>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  默认关闭。启用后按模型和会话维度缓存 1 小时，优先使用 Redis 共享缓存，多副本未配置 Redis 时退回本地缓存。
                 </p>
               </div>
             </div>

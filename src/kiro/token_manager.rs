@@ -40,6 +40,9 @@ use crate::state::{
 
 const DEFAULT_REQUEST_WEIGHT: f64 = 1.0;
 const UPSTREAM_ERROR_EXCERPT_CHARS: usize = 240;
+const SESSION_AFFINITY_TTL_MS: u64 = 60 * 60 * 1000;
+const SESSION_AFFINITY_LOCAL_TTL: StdDuration = StdDuration::from_secs(60 * 60);
+const SESSION_AFFINITY_LOCAL_MAX_ENTRIES: usize = 10_000;
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -816,6 +819,7 @@ pub struct ManagerSnapshot {
 #[derive(Debug, Clone)]
 pub struct LoadBalancingConfigSnapshot {
     pub mode: String,
+    pub session_affinity_enabled: bool,
     pub queue_max_size: usize,
     pub queue_max_wait_ms: u64,
     pub rate_limit_cooldown_ms: u64,
@@ -841,6 +845,7 @@ pub struct ExternalStateSyncReport {
 #[derive(Debug, Clone, PartialEq)]
 struct DispatchConfig {
     mode: String,
+    session_affinity_enabled: bool,
     queue_max_size: usize,
     queue_max_wait_ms: u64,
     rate_limit_cooldown_ms: u64,
@@ -880,6 +885,7 @@ impl DispatchConfig {
 
         Self {
             mode: config.load_balancing_mode.clone(),
+            session_affinity_enabled: config.session_affinity_enabled,
             queue_max_size: config.queue_max_size,
             queue_max_wait_ms: config.queue_max_wait_ms,
             rate_limit_cooldown_ms: config.rate_limit_cooldown_ms,
@@ -1063,6 +1069,8 @@ pub struct MultiTokenManager {
     availability_notify: Arc<Notify>,
     /// 当前正在等待可用槽位的请求数
     waiting_requests: Arc<std::sync::atomic::AtomicUsize>,
+    /// 本地会话到凭据的软亲和缓存；未配置 Redis 时使用。
+    session_affinity_cache: Mutex<HashMap<String, SessionAffinityEntry>>,
     /// 串行化本实例内所有会写入共享凭据/调度状态的操作，避免快照覆盖。
     state_write_lock: Mutex<()>,
     /// 最近一次已观察到的共享状态修订号。
@@ -1075,6 +1083,12 @@ pub struct MultiTokenManager {
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+}
+
+#[derive(Debug, Clone)]
+struct SessionAffinityEntry {
+    credential_id: u64,
+    expires_at: Instant,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -1291,6 +1305,7 @@ impl MultiTokenManager {
             dispatch_config: Mutex::new(dispatch_config),
             availability_notify: Arc::new(Notify::new()),
             waiting_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            session_affinity_cache: Mutex::new(HashMap::new()),
             state_write_lock: Mutex::new(()),
             last_state_change_revisions: Mutex::new(initial_state_change_revisions),
             hot_path_state_sync_origin: Instant::now(),
@@ -1380,6 +1395,134 @@ impl MultiTokenManager {
 
     fn dispatch_config(&self) -> DispatchConfig {
         self.dispatch_config.lock().clone()
+    }
+
+    fn session_affinity_cache_key(model: Option<&str>, raw_key: &str) -> Option<String> {
+        let raw_key = raw_key.trim();
+        if raw_key.is_empty() {
+            return None;
+        }
+        let model_label = model
+            .and_then(normalize_model_selector)
+            .map(|selector| selector.family)
+            .or_else(|| model.map(|value| value.trim().to_ascii_lowercase()))
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "unknown".to_string());
+        Some(sha256_hex(&format!("{model_label}\0{raw_key}")))
+    }
+
+    fn session_affinity_cache_key_if_enabled(
+        &self,
+        model: Option<&str>,
+        raw_key: Option<&str>,
+    ) -> Option<String> {
+        let dispatch = self.dispatch_config();
+        if !dispatch.session_affinity_enabled {
+            return None;
+        }
+        raw_key.and_then(|key| Self::session_affinity_cache_key(model, key))
+    }
+
+    fn prune_local_session_affinity_cache(
+        cache: &mut HashMap<String, SessionAffinityEntry>,
+        now: Instant,
+    ) {
+        cache.retain(|_, entry| entry.expires_at > now);
+        if cache.len() <= SESSION_AFFINITY_LOCAL_MAX_ENTRIES {
+            return;
+        }
+
+        let overflow = cache.len() - SESSION_AFFINITY_LOCAL_MAX_ENTRIES;
+        let stale_keys: Vec<String> = cache.keys().take(overflow).cloned().collect();
+        for key in stale_keys {
+            cache.remove(&key);
+        }
+    }
+
+    fn load_session_affinity_credential_id(&self, cache_key: &str) -> Option<u64> {
+        match self.state_store.load_session_affinity(cache_key) {
+            Ok(Some(id)) => return Some(id),
+            Ok(None) => {
+                if self.state_store.session_affinity_store_enabled() {
+                    return None;
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    session_affinity_key = %cache_key,
+                    error = %err,
+                    "读取共享会话凭据亲和缓存失败，将回退本地缓存"
+                );
+            }
+        }
+
+        let now = Instant::now();
+        let mut cache = self.session_affinity_cache.lock();
+        if cache
+            .get(cache_key)
+            .is_some_and(|entry| entry.expires_at <= now)
+        {
+            cache.remove(cache_key);
+            return None;
+        }
+        cache.get(cache_key).map(|entry| entry.credential_id)
+    }
+
+    fn record_session_affinity_cache_key(&self, cache_key: &str, credential_id: u64) {
+        let now = Instant::now();
+        {
+            let mut cache = self.session_affinity_cache.lock();
+            Self::prune_local_session_affinity_cache(&mut cache, now);
+            cache.insert(
+                cache_key.to_string(),
+                SessionAffinityEntry {
+                    credential_id,
+                    expires_at: now + SESSION_AFFINITY_LOCAL_TTL,
+                },
+            );
+        }
+
+        if let Err(err) = self.state_store.record_session_affinity(
+            cache_key,
+            credential_id,
+            SESSION_AFFINITY_TTL_MS,
+        ) {
+            tracing::warn!(
+                session_affinity_key = %cache_key,
+                credential_id,
+                error = %err,
+                "写入共享会话凭据亲和缓存失败"
+            );
+        }
+    }
+
+    fn clear_session_affinity_cache_key(&self, cache_key: &str) {
+        self.session_affinity_cache.lock().remove(cache_key);
+        if let Err(err) = self.state_store.clear_session_affinity(cache_key) {
+            tracing::warn!(
+                session_affinity_key = %cache_key,
+                error = %err,
+                "清理共享会话凭据亲和缓存失败"
+            );
+        }
+    }
+
+    pub(crate) fn record_session_affinity(
+        &self,
+        model: Option<&str>,
+        raw_key: Option<&str>,
+        credential_id: u64,
+    ) {
+        let Some(cache_key) = self.session_affinity_cache_key_if_enabled(model, raw_key) else {
+            return;
+        };
+        self.record_session_affinity_cache_key(&cache_key, credential_id);
+        tracing::debug!(
+            session_affinity_key = %cache_key,
+            credential_id,
+            ttl_ms = SESSION_AFFINITY_TTL_MS,
+            "已记录会话凭据亲和"
+        );
     }
 
     fn queue_depth(&self) -> usize {
@@ -1970,9 +2113,12 @@ impl MultiTokenManager {
         model: Option<&str>,
         request_weight: f64,
         excluded_credential_ids: &HashSet<u64>,
+        session_affinity_cache_key: Option<&str>,
     ) -> Result<(u64, KiroCredentials, CallLease), ReservationFailure> {
         let dispatch = self.dispatch_config();
         let mode = dispatch.mode.clone();
+        let affinity_candidate_id = session_affinity_cache_key
+            .and_then(|key| self.load_session_affinity_credential_id(key));
         let mut entries = self.entries.lock();
         let now = Instant::now();
         let model_requirement = Self::model_requirement(model);
@@ -1987,8 +2133,8 @@ impl MultiTokenManager {
         let mut has_enabled = false;
         let mut has_supported = false;
         let mut selected_index: Option<usize> = None;
-        let mut priority_key: Option<(u32, usize, u8, u8, u64)> = None;
-        let mut balanced_key: Option<(u8, usize, u64, u32, u64)> = None;
+        let mut priority_key: Option<(u32, u8, usize, u8, u8, u64)> = None;
+        let mut balanced_key: Option<(u8, u8, usize, u64, u32, u64)> = None;
         let mut next_ready_at: Option<Instant> = None;
 
         for (index, entry) in entries.iter_mut().enumerate() {
@@ -2019,6 +2165,7 @@ impl MultiTokenManager {
             if is_balanced {
                 let candidate_key = (
                     Self::model_preference_rank(&entry.credentials, model_requirement),
+                    u8::from(affinity_candidate_id != Some(entry.id)),
                     entry.active_requests,
                     entry.success_count,
                     entry.credentials.priority,
@@ -2037,6 +2184,7 @@ impl MultiTokenManager {
 
             let candidate_key = (
                 entry.credentials.priority,
+                u8::from(affinity_candidate_id != Some(entry.id)),
                 entry.active_requests,
                 Self::model_preference_rank(&entry.credentials, model_requirement),
                 u8::from(entry.id != current_id_value),
@@ -2067,6 +2215,22 @@ impl MultiTokenManager {
         };
 
         let selected_id = entries[entry_index].id;
+        if let Some(cache_key) = session_affinity_cache_key {
+            if affinity_candidate_id.is_some()
+                && !entries
+                    .iter()
+                    .any(|entry| Some(entry.id) == affinity_candidate_id)
+            {
+                self.clear_session_affinity_cache_key(cache_key);
+            }
+            tracing::debug!(
+                session_affinity_key = %cache_key,
+                preferred_credential_id = ?affinity_candidate_id,
+                selected_id,
+                session_affinity_hit = affinity_candidate_id == Some(selected_id),
+                "会话凭据亲和调度结果"
+            );
+        }
         let token_consumed = {
             let entry = &mut entries[entry_index];
             entry
@@ -2162,11 +2326,14 @@ impl MultiTokenManager {
         model: Option<&str>,
         request_weight: f64,
         excluded_credential_ids: &HashSet<u64>,
+        session_affinity_cache_key: Option<&str>,
     ) -> Result<(u64, KiroCredentials, CallLease), ReservationFailure> {
         let dispatch = self.dispatch_config();
         let model_requirement = Self::model_requirement(model);
         let mode = dispatch.mode.clone();
         let is_balanced = mode == "balanced";
+        let affinity_candidate_id = session_affinity_cache_key
+            .and_then(|key| self.load_session_affinity_credential_id(key));
         let retry_budget = self.total_count().max(1).saturating_mul(2);
         let mut fallback_next_ready_at: Option<Instant> = None;
 
@@ -2195,8 +2362,8 @@ impl MultiTokenManager {
                 let mut selected_credentials: Option<KiroCredentials> = None;
                 let mut selected_max_concurrency: Option<usize> = None;
                 let mut selected_bucket_policy: Option<DispatchRuntimeBucketPolicy> = None;
-                let mut priority_key: Option<(u32, usize, u8, u8, u64)> = None;
-                let mut balanced_key: Option<(u8, usize, u64, u32, u64)> = None;
+                let mut priority_key: Option<(u32, u8, usize, u8, u8, u64)> = None;
+                let mut balanced_key: Option<(u8, u8, usize, u64, u32, u64)> = None;
                 let mut next_ready_at: Option<Instant> = fallback_next_ready_at;
 
                 for entry in entries.iter() {
@@ -2248,6 +2415,7 @@ impl MultiTokenManager {
                     if is_balanced {
                         let candidate_key = (
                             Self::model_preference_rank(&entry.credentials, model_requirement),
+                            u8::from(affinity_candidate_id != Some(entry.id)),
                             runtime.active_requests,
                             entry.success_count,
                             entry.credentials.priority,
@@ -2271,6 +2439,7 @@ impl MultiTokenManager {
 
                     let candidate_key = (
                         entry.credentials.priority,
+                        u8::from(affinity_candidate_id != Some(entry.id)),
                         runtime.active_requests,
                         Self::model_preference_rank(&entry.credentials, model_requirement),
                         u8::from(entry.id != current_id_value),
@@ -2353,6 +2522,16 @@ impl MultiTokenManager {
                 }
                 *self.current_id.lock() = selected_id;
 
+                if let Some(cache_key) = session_affinity_cache_key {
+                    tracing::debug!(
+                        session_affinity_key = %cache_key,
+                        preferred_credential_id = ?affinity_candidate_id,
+                        selected_id,
+                        session_affinity_hit = affinity_candidate_id == Some(selected_id),
+                        "会话凭据亲和共享调度结果"
+                    );
+                }
+
                 tracing::debug!(
                     "通过共享调度热态分配凭据 #{}，全局运行中请求数: {}{}",
                     selected_id,
@@ -2422,11 +2601,29 @@ impl MultiTokenManager {
         request_weight: f64,
         excluded_credential_ids: &HashSet<u64>,
     ) -> anyhow::Result<CallContext> {
+        self.acquire_context_with_weight_excluding_and_affinity(
+            model,
+            request_weight,
+            excluded_credential_ids,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn acquire_context_with_weight_excluding_and_affinity(
+        &self,
+        model: Option<&str>,
+        request_weight: f64,
+        excluded_credential_ids: &HashSet<u64>,
+        session_affinity_key: Option<&str>,
+    ) -> anyhow::Result<CallContext> {
         let request_weight = if request_weight.is_finite() && request_weight > 0.0 {
             request_weight
         } else {
             DEFAULT_REQUEST_WEIGHT
         };
+        let session_affinity_cache_key =
+            self.session_affinity_cache_key_if_enabled(model, session_affinity_key);
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -2453,9 +2650,19 @@ impl MultiTokenManager {
             }
 
             let (id, credentials, lease) = match if self.shared_dispatch_runtime_enabled() {
-                self.reserve_next_credential_shared(model, request_weight, excluded_credential_ids)
+                self.reserve_next_credential_shared(
+                    model,
+                    request_weight,
+                    excluded_credential_ids,
+                    session_affinity_cache_key.as_deref(),
+                )
             } else {
-                self.reserve_next_credential(model, request_weight, excluded_credential_ids)
+                self.reserve_next_credential(
+                    model,
+                    request_weight,
+                    excluded_credential_ids,
+                    session_affinity_cache_key.as_deref(),
+                )
             } {
                 Ok(selection) => {
                     wait_queue_guard = None;
@@ -3209,8 +3416,9 @@ impl MultiTokenManager {
 
         self.availability_notify.notify_waiters();
         tracing::info!(
-            "已从外部状态热加载调度配置: mode={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, rateLimitCooldownEnabled={}, modelCooldownEnabled={}, defaultMaxConcurrency={:?}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}",
+            "已从外部状态热加载调度配置: mode={}, sessionAffinityEnabled={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, rateLimitCooldownEnabled={}, modelCooldownEnabled={}, defaultMaxConcurrency={:?}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}",
             next.mode,
+            next.session_affinity_enabled,
             next.queue_max_size,
             next.queue_max_wait_ms,
             next.rate_limit_cooldown_ms,
@@ -5176,6 +5384,7 @@ impl MultiTokenManager {
         let dispatch = self.dispatch_config();
         LoadBalancingConfigSnapshot {
             mode: dispatch.mode,
+            session_affinity_enabled: dispatch.session_affinity_enabled,
             queue_max_size: dispatch.queue_max_size,
             queue_max_wait_ms: dispatch.queue_max_wait_ms,
             rate_limit_cooldown_ms: dispatch.rate_limit_cooldown_ms,
@@ -5226,6 +5435,7 @@ impl MultiTokenManager {
         self.state_store
             .persist_dispatch_config(&PersistedDispatchConfig {
                 mode: dispatch.mode.clone(),
+                session_affinity_enabled: dispatch.session_affinity_enabled,
                 queue_max_size: dispatch.queue_max_size,
                 queue_max_wait_ms: dispatch.queue_max_wait_ms,
                 rate_limit_cooldown_ms: dispatch.rate_limit_cooldown_ms,
@@ -5250,6 +5460,7 @@ impl MultiTokenManager {
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
         self.set_load_balancing_config(
             Some(mode),
+            None,
             None,
             None,
             None,
@@ -5333,6 +5544,7 @@ impl MultiTokenManager {
         rate_limit_refill_recovery_step_per_success: Option<f64>,
         rate_limit_refill_backoff_factor: Option<f64>,
         request_weighting: Option<RequestWeightingConfig>,
+        session_affinity_enabled: Option<bool>,
     ) -> anyhow::Result<()> {
         let previous = self.dispatch_config();
         let mut next = previous.clone();
@@ -5384,6 +5596,9 @@ impl MultiTokenManager {
         if let Some(request_weighting) = request_weighting {
             next.request_weighting = request_weighting;
         }
+        if let Some(session_affinity_enabled) = session_affinity_enabled {
+            next.session_affinity_enabled = session_affinity_enabled;
+        }
 
         Self::validate_dispatch_rate_limit_config(&next)?;
 
@@ -5424,8 +5639,9 @@ impl MultiTokenManager {
 
         self.availability_notify.notify_waiters();
         tracing::info!(
-            "调度配置已更新: mode={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, rateLimitCooldownEnabled={}, modelCooldownEnabled={}, defaultMaxConcurrency={:?}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}, requestWeightingEnabled={}, requestWeightingBaseWeight={}, requestWeightingMaxWeight={}",
+            "调度配置已更新: mode={}, sessionAffinityEnabled={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, rateLimitCooldownEnabled={}, modelCooldownEnabled={}, defaultMaxConcurrency={:?}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}, requestWeightingEnabled={}, requestWeightingBaseWeight={}, requestWeightingMaxWeight={}",
             next.mode,
+            next.session_affinity_enabled,
             next.queue_max_size,
             next.queue_max_wait_ms,
             next.rate_limit_cooldown_ms,
@@ -6332,6 +6548,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_session_affinity_reuses_successful_credential_when_enabled() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.session_affinity_enabled = true;
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![available_credential(0), available_credential(1)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let excluded = HashSet::new();
+
+        let first = manager
+            .acquire_context_with_weight_excluding_and_affinity(
+                None,
+                1.0,
+                &excluded,
+                Some("session-a"),
+            )
+            .await
+            .unwrap();
+        let first_id = first.id;
+        drop(first);
+        manager.report_success(first_id);
+        manager.record_session_affinity(None, Some("session-a"), first_id);
+
+        let sticky = manager
+            .acquire_context_with_weight_excluding_and_affinity(
+                None,
+                1.0,
+                &excluded,
+                Some("session-a"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sticky.id, first_id);
+        drop(sticky);
+
+        let unrelated = manager
+            .acquire_context_with_weight_excluding_and_affinity(
+                None,
+                1.0,
+                &excluded,
+                Some("session-b"),
+            )
+            .await
+            .unwrap();
+        assert_ne!(unrelated.id, first_id);
+    }
+
+    #[tokio::test]
+    async fn test_session_affinity_is_disabled_by_default() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![available_credential(0), available_credential(1)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let excluded = HashSet::new();
+
+        let first = manager
+            .acquire_context_with_weight_excluding_and_affinity(
+                None,
+                1.0,
+                &excluded,
+                Some("session-a"),
+            )
+            .await
+            .unwrap();
+        let first_id = first.id;
+        drop(first);
+        manager.report_success(first_id);
+        manager.record_session_affinity(None, Some("session-a"), first_id);
+
+        let next = manager
+            .acquire_context_with_weight_excluding_and_affinity(
+                None,
+                1.0,
+                &excluded,
+                Some("session-a"),
+            )
+            .await
+            .unwrap();
+        assert_ne!(next.id, first_id);
+    }
+
+    #[tokio::test]
+    async fn test_session_affinity_falls_back_when_bound_credential_is_at_capacity() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.session_affinity_enabled = true;
+        config.default_max_concurrency = Some(1);
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![available_credential(0), available_credential(1)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let excluded = HashSet::new();
+
+        manager.record_session_affinity(None, Some("session-a"), 1);
+
+        let first = manager
+            .acquire_context_with_weight_excluding_and_affinity(
+                None,
+                1.0,
+                &excluded,
+                Some("session-a"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.id, 1);
+
+        let fallback = manager
+            .acquire_context_with_weight_excluding_and_affinity(
+                None,
+                1.0,
+                &excluded,
+                Some("session-a"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fallback.id, 2);
+    }
+
+    #[tokio::test]
     async fn test_acquire_context_returns_error_when_all_credentials_at_capacity() {
         let config = Config::default();
         let mut cred = available_credential(0);
@@ -6892,6 +7245,7 @@ mod tests {
 
         let persisted = PersistedDispatchConfig {
             mode: "balanced".to_string(),
+            session_affinity_enabled: true,
             queue_max_size: 8,
             queue_max_wait_ms: 1500,
             rate_limit_cooldown_ms: 4500,
@@ -6916,6 +7270,7 @@ mod tests {
 
         let snapshot = manager.load_balancing_config_snapshot();
         assert_eq!(snapshot.mode, "balanced");
+        assert!(snapshot.session_affinity_enabled);
         assert_eq!(snapshot.queue_max_size, 8);
         assert_eq!(snapshot.queue_max_wait_ms, 1500);
         assert_eq!(snapshot.rate_limit_cooldown_ms, 4500);
@@ -7043,6 +7398,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap_err()
             .to_string();
@@ -7088,11 +7444,13 @@ mod tests {
                     tools_bonus: 1.0,
                     ..RequestWeightingConfig::default()
                 }),
+                Some(true),
             )
             .unwrap();
 
         let persisted = Config::load(&config_path).unwrap();
         assert_eq!(persisted.load_balancing_mode, "balanced");
+        assert!(persisted.session_affinity_enabled);
         assert_eq!(persisted.queue_max_size, 8);
         assert_eq!(persisted.queue_max_wait_ms, 1500);
         assert_eq!(persisted.rate_limit_cooldown_ms, 4500);
@@ -7152,6 +7510,7 @@ mod tests {
                 None,
                 None,
                 Some(false),
+                None,
                 None,
                 None,
                 None,

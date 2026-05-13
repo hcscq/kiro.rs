@@ -179,6 +179,8 @@ pub fn get_context_window_size(model: &str) -> i32 {
 pub struct ConversionResult {
     /// 映射后的 Kiro 模型 ID
     pub model_id: String,
+    /// 从请求元数据提取的稳定会话 ID；不存在时不参与凭据亲和。
+    pub session_id: Option<String>,
     /// 转换后的 Kiro 请求
     pub conversation_state: ConversationState,
     /// 工具名称映射（短名称 → 原始名称），仅当存在超长工具名时非空
@@ -310,11 +312,13 @@ pub fn convert_request_with_probe(
 
     // 3. 生成会话 ID 和代理 ID
     // 优先从 metadata.user_id 中提取 session UUID 作为 conversationId
-    let conversation_id = req
+    let session_id = req
         .metadata
         .as_ref()
         .and_then(|m| m.user_id.as_ref())
-        .and_then(|user_id| extract_session_id(user_id))
+        .and_then(|user_id| extract_session_id(user_id));
+    let conversation_id = session_id
+        .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let agent_continuation_id = Uuid::new_v4().to_string();
 
@@ -425,6 +429,7 @@ pub fn convert_request_with_probe(
 
     Ok(ConversionResult {
         model_id,
+        session_id,
         conversation_state,
         tool_name_map,
     })

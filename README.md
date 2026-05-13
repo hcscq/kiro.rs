@@ -208,6 +208,7 @@ GitHub Actions 镜像构建：
 | `stateRedisLeaderLeaseTtlSecs` | number | `30` | Redis leader 租约 TTL（秒），必须大于心跳间隔 |
 | `stateHotPathSyncMinIntervalMs` | number | `25` | 数据面热路径检查共享状态修订号的最小间隔（毫秒，`0` 表示每次请求都检查） |
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
+| `sessionAffinityEnabled` | boolean | `false` | 是否启用会话到凭据的软亲和调度；启用后同一模型+会话优先复用上次成功凭据，凭据不可调度时回退现有策略 |
 | `defaultMaxConcurrency` | number | - | 全局默认单账号并发上限；仅在凭据未单独配置 `maxConcurrency` 时生效，留空或 <= 0 表示不限制 |
 | `accountTypeDispatchPolicies` | object | - | 账号类型默认调度策略；可按 `power` / `pro-plus` 等类型统一覆盖 `maxConcurrency`、`rateLimitBucketCapacity`、`rateLimitRefillPerSecond` |
 | `queueMaxSize` | number | `0` | 等待队列最大长度；`0` 表示禁用等待队列 |
@@ -251,6 +252,7 @@ GitHub Actions 镜像构建：
    "stateRedisLeaderLeaseTtlSecs": 30,
    "stateHotPathSyncMinIntervalMs": 25,
    "loadBalancingMode": "balanced",
+   "sessionAffinityEnabled": false,
    "defaultMaxConcurrency": 3,
    "accountTypeDispatchPolicies": {
       "power": {

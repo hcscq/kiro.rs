@@ -962,6 +962,7 @@ mod tests {
 
         let dispatch = PersistedDispatchConfig {
             mode: "balanced".into(),
+            session_affinity_enabled: true,
             queue_max_size: 16,
             queue_max_wait_ms: 1500,
             rate_limit_cooldown_ms: 5000,
@@ -988,6 +989,7 @@ mod tests {
         assert!(rollback.state_postgres_url.is_none());
         assert!(rollback.state_redis_url.is_none());
         assert_eq!(rollback.load_balancing_mode, "balanced");
+        assert!(rollback.session_affinity_enabled);
         assert_eq!(rollback.queue_max_size, 16);
         assert_eq!(rollback.queue_max_wait_ms, 1500);
         assert_eq!(rollback.rate_limit_cooldown_ms, 5000);

@@ -279,6 +279,10 @@ pub struct Config {
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
+    /// 是否启用会话到凭据的软亲和调度
+    #[serde(default)]
+    pub session_affinity_enabled: bool,
+
     /// 默认单账号并发上限（可选）
     /// 仅在凭据未单独配置 maxConcurrency 时生效
     #[serde(default)]
@@ -510,6 +514,7 @@ impl Default for Config {
             state_redis_leader_lease_ttl_secs: default_state_redis_leader_lease_ttl_secs(),
             state_hot_path_sync_min_interval_ms: default_state_hot_path_sync_min_interval_ms(),
             load_balancing_mode: default_load_balancing_mode(),
+            session_affinity_enabled: false,
             default_max_concurrency: None,
             queue_max_size: 0,
             queue_max_wait_ms: 0,

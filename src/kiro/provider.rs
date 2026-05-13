@@ -88,6 +88,7 @@ pub struct RequestOptions {
     pub omit_agent_mode_header: bool,
     pub request_id: Option<String>,
     pub model_id: Option<String>,
+    pub session_affinity_key: Option<String>,
     pub request_weight: f64,
     pub wait_for_stream_content_start: bool,
     pub stream_thinking_enabled: bool,
@@ -99,6 +100,7 @@ impl Default for RequestOptions {
             omit_agent_mode_header: false,
             request_id: None,
             model_id: None,
+            session_affinity_key: None,
             request_weight: 1.0,
             wait_for_stream_content_start: false,
             stream_thinking_enabled: false,
@@ -1421,11 +1423,13 @@ impl KiroProvider {
                 &request_scoped_transient_error_credentials,
             );
             let acquire_context = || {
-                self.token_manager.acquire_context_with_weight_excluding(
-                    model.as_deref(),
-                    request_weight,
-                    &request_scoped_excluded_credentials,
-                )
+                self.token_manager
+                    .acquire_context_with_weight_excluding_and_affinity(
+                        model.as_deref(),
+                        request_weight,
+                        &request_scoped_excluded_credentials,
+                        options.session_affinity_key.as_deref(),
+                    )
             };
             let acquire_result = if is_stream {
                 let remaining = Self::remaining_stream_pre_sse_response_budget(
@@ -1765,6 +1769,11 @@ impl KiroProvider {
                                 max_slow_first_content_failovers = MAX_SLOW_FIRST_CONTENT_FAILOVERS,
                                 "上游流预读已满足首内容块调度条件"
                             );
+                            self.token_manager.record_session_affinity(
+                                model.as_deref(),
+                                options.session_affinity_key.as_deref(),
+                                ctx_id,
+                            );
                             self.token_manager.report_success(ctx_id);
                             return Ok(ManagedResponse::new_stream(
                                 stream,
@@ -1897,6 +1906,11 @@ impl KiroProvider {
                     }
                 }
 
+                self.token_manager.record_session_affinity(
+                    model.as_deref(),
+                    options.session_affinity_key.as_deref(),
+                    ctx_id,
+                );
                 self.token_manager.report_success(ctx_id);
                 return Ok(ManagedResponse::new(response, lease, Some(trace)));
             }

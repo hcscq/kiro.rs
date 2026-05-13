@@ -32,6 +32,7 @@ const REDIS_BALANCE_CACHE_TTL_SECS: u64 = 86_400;
 const REDIS_DISPATCH_RUNTIME_NAMESPACE: &str = "kiro:runtime:dispatch";
 const REDIS_DISPATCH_RUNTIME_STATE_KEY_SUFFIX: &str = "state";
 const REDIS_DISPATCH_RUNTIME_LEASES_KEY_SUFFIX: &str = "leases";
+const REDIS_SESSION_AFFINITY_NAMESPACE: &str = "kiro:runtime:session_affinity";
 const REDIS_RUNTIME_COORDINATION_NAMESPACE: &str = "kiro:runtime:coordination";
 const REDIS_RUNTIME_INSTANCE_KEY_PREFIX: &str = "instances";
 const REDIS_RUNTIME_LEADER_KEY: &str = "leader";
@@ -775,6 +776,8 @@ pub struct DispatchLeaseReservation {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PersistedDispatchConfig {
     pub mode: String,
+    #[serde(default)]
+    pub session_affinity_enabled: bool,
     pub queue_max_size: usize,
     pub queue_max_wait_ms: u64,
     pub rate_limit_cooldown_ms: u64,
@@ -826,6 +829,7 @@ impl PersistedDispatchConfig {
         normalize_account_type_dispatch_policies(&mut account_type_dispatch_policies);
         Self {
             mode: config.load_balancing_mode.clone(),
+            session_affinity_enabled: config.session_affinity_enabled,
             queue_max_size: config.queue_max_size,
             queue_max_wait_ms: config.queue_max_wait_ms,
             rate_limit_cooldown_ms: config.rate_limit_cooldown_ms,
@@ -846,6 +850,7 @@ impl PersistedDispatchConfig {
 
     pub fn apply_to_config(&self, config: &mut Config) {
         config.load_balancing_mode = self.mode.clone();
+        config.session_affinity_enabled = self.session_affinity_enabled;
         config.queue_max_size = self.queue_max_size;
         config.queue_max_wait_ms = self.queue_max_wait_ms;
         config.rate_limit_cooldown_ms = self.rate_limit_cooldown_ms;
@@ -932,6 +937,7 @@ pub struct StateStore {
     primary_backend: Arc<dyn StateBackend>,
     balance_cache_backend: BalanceCacheStore,
     dispatch_runtime_backend: Option<Arc<RedisDispatchRuntimeBackend>>,
+    session_affinity_backend: Option<Arc<RedisSessionAffinityBackend>>,
     runtime_coordinator: Option<Arc<RedisRuntimeCoordinator>>,
     runtime_refresh_backend: Option<Arc<RedisRuntimeRefreshBackend>>,
     state_change_backend: Option<Arc<RedisStateChangeBackend>>,
@@ -1019,6 +1025,7 @@ impl StateStore {
             primary_backend: primary_backend.clone(),
             balance_cache_backend: BalanceCacheStore::Primary(primary_backend),
             dispatch_runtime_backend: None,
+            session_affinity_backend: None,
             runtime_coordinator: None,
             runtime_refresh_backend: None,
             state_change_backend: None,
@@ -1054,6 +1061,13 @@ impl StateStore {
             )?)),
             None => None,
         };
+        let session_affinity_backend = match config.state_redis_url.as_deref() {
+            Some(redis_url) => Some(Arc::new(RedisSessionAffinityBackend::connect(
+                redis_url,
+                REDIS_SESSION_AFFINITY_NAMESPACE,
+            )?)),
+            None => None,
+        };
         let runtime_refresh_backend = match config.state_redis_url.as_deref() {
             Some(redis_url) => Some(Arc::new(RedisRuntimeRefreshBackend::connect(
                 redis_url,
@@ -1073,6 +1087,7 @@ impl StateStore {
             primary_backend,
             balance_cache_backend,
             dispatch_runtime_backend,
+            session_affinity_backend,
             runtime_coordinator,
             runtime_refresh_backend,
             state_change_backend,
@@ -1143,6 +1158,37 @@ impl StateStore {
 
     pub fn dispatch_runtime_enabled(&self) -> bool {
         self.dispatch_runtime_backend.is_some()
+    }
+
+    pub fn session_affinity_store_enabled(&self) -> bool {
+        self.session_affinity_backend.is_some()
+    }
+
+    pub fn load_session_affinity(&self, key: &str) -> anyhow::Result<Option<u64>> {
+        self.session_affinity_backend
+            .as_ref()
+            .map(|backend| backend.load(key))
+            .transpose()
+            .map(|value| value.flatten())
+    }
+
+    pub fn record_session_affinity(
+        &self,
+        key: &str,
+        credential_id: u64,
+        ttl_ms: u64,
+    ) -> anyhow::Result<()> {
+        if let Some(backend) = &self.session_affinity_backend {
+            backend.record(key, credential_id, ttl_ms)?;
+        }
+        Ok(())
+    }
+
+    pub fn clear_session_affinity(&self, key: &str) -> anyhow::Result<()> {
+        if let Some(backend) = &self.session_affinity_backend {
+            backend.clear(key)?;
+        }
+        Ok(())
     }
 
     pub fn load_dispatch_runtime_snapshots(
@@ -1646,8 +1692,9 @@ impl StateBackend for FileStateBackend {
             Some(path) => path,
             None => {
                 tracing::warn!(
-                    "配置文件路径未知，调度配置仅在当前进程生效: mode={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, defaultMaxConcurrency={:?}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}",
+                    "配置文件路径未知，调度配置仅在当前进程生效: mode={}, sessionAffinityEnabled={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, defaultMaxConcurrency={:?}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}",
                     dispatch.mode,
+                    dispatch.session_affinity_enabled,
                     dispatch.queue_max_size,
                     dispatch.queue_max_wait_ms,
                     dispatch.rate_limit_cooldown_ms,
@@ -2431,6 +2478,82 @@ pub fn current_epoch_ms() -> u64 {
         .unwrap_or_default()
         .as_millis()
         .min(u128::from(u64::MAX)) as u64
+}
+
+#[derive(Debug)]
+struct RedisSessionAffinityBackend {
+    client: RedisClient,
+    namespace: String,
+}
+
+impl RedisSessionAffinityBackend {
+    fn connect(redis_url: &str, namespace: &str) -> anyhow::Result<Self> {
+        let client = RedisClient::open(redis_url).context("初始化 Redis 会话亲和缓存客户端失败")?;
+        Ok(Self {
+            client,
+            namespace: namespace.to_string(),
+        })
+    }
+
+    fn key(&self, key: &str) -> String {
+        format!("{}:{}", self.namespace, key)
+    }
+
+    fn load(&self, key: &str) -> anyhow::Result<Option<u64>> {
+        let client = self.client.clone();
+        let redis_key = self.key(key);
+
+        run_blocking_state_op(move || -> anyhow::Result<Option<u64>> {
+            let mut connection = client
+                .get_connection()
+                .context("连接 Redis 会话亲和缓存失败")?;
+            let value: Option<String> = connection
+                .get(&redis_key)
+                .with_context(|| format!("读取 Redis 会话亲和缓存失败: {redis_key}"))?;
+            value
+                .map(|raw| {
+                    raw.parse::<u64>()
+                        .with_context(|| format!("解析 Redis 会话亲和凭据 ID 失败: {redis_key}"))
+                })
+                .transpose()
+        })
+    }
+
+    fn record(&self, key: &str, credential_id: u64, ttl_ms: u64) -> anyhow::Result<()> {
+        let client = self.client.clone();
+        let redis_key = self.key(key);
+        let ttl_ms = ttl_ms.max(1);
+
+        run_blocking_state_op(move || -> anyhow::Result<()> {
+            let mut connection = client
+                .get_connection()
+                .context("连接 Redis 会话亲和缓存失败")?;
+            let _: () = redis::cmd("SET")
+                .arg(&redis_key)
+                .arg(credential_id.to_string())
+                .arg("PX")
+                .arg(ttl_ms)
+                .query(&mut connection)
+                .with_context(|| format!("写入 Redis 会话亲和缓存失败: {redis_key}"))?;
+            Ok(())
+        })
+    }
+
+    fn clear(&self, key: &str) -> anyhow::Result<()> {
+        let client = self.client.clone();
+        let redis_key = self.key(key);
+
+        run_blocking_state_op(move || -> anyhow::Result<()> {
+            let mut connection = client
+                .get_connection()
+                .context("连接 Redis 会话亲和缓存失败")?;
+            let _: usize = redis::cmd("DEL")
+                .arg(&redis_key)
+                .query(&mut connection)
+                .with_context(|| format!("清理 Redis 会话亲和缓存失败: {redis_key}"))?;
+            Ok(())
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3234,6 +3357,7 @@ mod tests {
 
         let dispatch = PersistedDispatchConfig {
             mode: "balanced".to_string(),
+            session_affinity_enabled: true,
             queue_max_size: 16,
             queue_max_wait_ms: 2000,
             rate_limit_cooldown_ms: 5000,

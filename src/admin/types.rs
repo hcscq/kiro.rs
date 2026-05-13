@@ -342,6 +342,8 @@ pub struct BalanceResponse {
 pub struct LoadBalancingModeResponse {
     /// 当前模式（"priority" 或 "balanced"）
     pub mode: String,
+    /// 是否启用会话到凭据的软亲和调度
+    pub session_affinity_enabled: bool,
     /// 最大排队数量（0 表示禁用等待队列）
     pub queue_max_size: usize,
     /// 最大等待时间（毫秒，0 表示禁用等待队列）
@@ -376,6 +378,8 @@ pub struct LoadBalancingModeResponse {
 pub struct SetLoadBalancingModeRequest {
     /// 模式（"priority" 或 "balanced"）
     pub mode: Option<String>,
+    /// 是否启用会话到凭据的软亲和调度
+    pub session_affinity_enabled: Option<bool>,
     /// 最大排队数量（0 表示禁用等待队列）
     pub queue_max_size: Option<usize>,
     /// 最大等待时间（毫秒，0 表示禁用等待队列）

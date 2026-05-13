@@ -192,6 +192,7 @@ export interface RequestWeightingConfig {
 
 export interface LoadBalancingConfigResponse {
   mode: 'priority' | 'balanced'
+  sessionAffinityEnabled: boolean
   queueMaxSize: number
   queueMaxWaitMs: number
   rateLimitCooldownMs: number
@@ -209,6 +210,7 @@ export interface LoadBalancingConfigResponse {
 
 export interface UpdateLoadBalancingConfigRequest {
   mode?: 'priority' | 'balanced'
+  sessionAffinityEnabled?: boolean
   queueMaxSize?: number
   queueMaxWaitMs?: number
   rateLimitCooldownMs?: number
