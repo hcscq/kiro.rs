@@ -21,6 +21,7 @@ const HASH_LEN: usize = 32;
 const SIGNATURE_RAW_LEN: usize = 1 + ISSUER_TAG_LEN + 4 + HASH_LEN + HMAC_LEN;
 
 static SIGNING_KEY: OnceLock<[u8; 32]> = OnceLock::new();
+static VALIDATION_KEYS: OnceLock<Vec<[u8; 32]>> = OnceLock::new();
 
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct ThinkingSignatureValidationStats {
@@ -68,8 +69,11 @@ pub(crate) fn init_thinking_signature_key(api_key: &str) {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
     let material = explicit.as_deref().unwrap_or(api_key);
-    let key = derive_key(material.as_bytes());
+    let validation_keys =
+        validation_keys_for_material(material.as_bytes(), explicit.as_ref().map(|_| api_key));
+    let key = validation_keys[0];
     let _ = SIGNING_KEY.set(key);
+    let _ = VALIDATION_KEYS.set(validation_keys);
 }
 
 /// 签发 Anthropic 风格的不透明 thinking signature。
@@ -158,13 +162,16 @@ fn classify_signature(signature: &str, thinking_ordinal: u32, thinking: &str) ->
         return SignatureClass::Foreign;
     }
 
-    let key = signing_key();
-    let issuer = issuer_tag(&key);
     let issuer_start = 1;
     let issuer_end = issuer_start + ISSUER_TAG_LEN;
-    if raw[issuer_start..issuer_end].ct_eq(&issuer).unwrap_u8() != 1 {
+    let Some(key) = validation_keys().iter().find(|key| {
+        raw[issuer_start..issuer_end]
+            .ct_eq(&issuer_tag(key))
+            .unwrap_u8()
+            == 1
+    }) else {
         return SignatureClass::Foreign;
-    }
+    };
 
     let ordinal_start = issuer_end;
     let ordinal_end = ordinal_start + 4;
@@ -240,11 +247,32 @@ fn signing_key() -> [u8; 32] {
     })
 }
 
+fn validation_keys() -> &'static [[u8; 32]] {
+    VALIDATION_KEYS
+        .get_or_init(|| vec![signing_key()])
+        .as_slice()
+}
+
 fn derive_key(material: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"anthropic-thinking-signature-key\n");
     hasher.update(material);
     hasher.finalize().into()
+}
+
+fn validation_keys_for_material(
+    primary_material: &[u8],
+    legacy_material: Option<&str>,
+) -> Vec<[u8; 32]> {
+    let key = derive_key(primary_material);
+    let mut keys = vec![key];
+    if let Some(legacy_material) = legacy_material {
+        let legacy_key = derive_key(legacy_material.as_bytes());
+        if legacy_key != key {
+            keys.push(legacy_key);
+        }
+    }
+    keys
 }
 
 fn issuer_tag(key: &[u8; 32]) -> [u8; ISSUER_TAG_LEN] {
@@ -326,7 +354,7 @@ mod tests {
         HASH_LEN, HMAC_LEN, ISSUER_TAG_LEN, SIGNATURE_VERSION, STANDARD_NO_PAD, SignatureClass,
         classify_signature, decode_signature, extract_thinking_and_text, hmac_sha256, issuer_tag,
         sha256_bytes, sign_thinking_block, signature_mac, signing_key,
-        validate_thinking_signatures,
+        validate_thinking_signatures, validation_keys_for_material,
     };
     use crate::anthropic::types::{Message, MessagesRequest};
     use base64::Engine;
@@ -415,6 +443,18 @@ mod tests {
         assert_eq!(
             classify_signature(&signature, 0, "\nstep 1\n"),
             SignatureClass::ValidOwn
+        );
+    }
+
+    #[test]
+    fn test_validation_keys_include_legacy_api_key_when_explicit_secret_is_set() {
+        let keys = validation_keys_for_material(b"stable-secret", Some("current-api-key"));
+
+        assert_eq!(keys.len(), 2);
+        assert_ne!(keys[0], keys[1]);
+        assert_eq!(
+            validation_keys_for_material(b"same-material", Some("same-material")).len(),
+            1
         );
     }
 
