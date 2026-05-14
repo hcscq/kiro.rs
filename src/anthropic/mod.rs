@@ -31,6 +31,7 @@ mod multimodal;
 mod probe;
 mod router;
 mod stream;
+mod structured_outputs;
 mod thinking_compat;
 pub mod types;
 mod webfetch;

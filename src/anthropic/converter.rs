@@ -25,6 +25,7 @@ use crate::kiro::model::requests::tool::{
 
 use super::{
     probe::UpstreamProbe,
+    structured_outputs,
     types::{ContentBlock, MessagesRequest},
 };
 
@@ -331,6 +332,9 @@ pub fn convert_request_with_probe(
     let current_message_start = trailing_user_message_cluster_start(messages);
     let current_messages: Vec<_> = messages[current_message_start..].iter().collect();
     let mut merged_current = merge_user_message_parts(&current_messages)?;
+    if let Some(output) = structured_outputs::json_schema_output(req) {
+        append_structured_output_instruction(&mut merged_current.content, &output.schema);
+    }
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射）
     let mut tool_name_map = HashMap::new();
@@ -454,6 +458,16 @@ fn trailing_user_message_cluster_start(messages: &[super::types::Message]) -> us
         .iter()
         .rposition(|msg| msg.role != "user")
         .map_or(0, |idx| idx + 1)
+}
+
+fn append_structured_output_instruction(content: &mut String, schema: &serde_json::Value) {
+    let instruction = structured_outputs::instruction_for_schema(schema);
+    if content.trim().is_empty() {
+        *content = instruction;
+    } else {
+        content.push_str("\n\n");
+        content.push_str(&instruction);
+    }
 }
 
 /// 确定聊天触发类型
@@ -3858,5 +3872,47 @@ mod tests {
             current.user_input_message_context.tool_results.is_empty(),
             "current message should no longer carry tool_results after compatibility splitting"
         );
+    }
+
+    #[test]
+    fn test_json_schema_output_instruction_is_appended_to_current_message() {
+        use super::super::types::{Message as AnthropicMessage, OutputConfig, OutputFormat};
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Extract the account status."),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: Some(OutputConfig {
+                effort: "high".to_string(),
+                format: Some(OutputFormat {
+                    format_type: "json_schema".to_string(),
+                    schema: Some(serde_json::json!({
+                        "type": "object",
+                        "properties": {"status": {"type": "string"}},
+                        "required": ["status"],
+                        "additionalProperties": false
+                    })),
+                }),
+            }),
+            metadata: None,
+        };
+
+        let state = convert_request(&req)
+            .expect("json_schema output_config should convert")
+            .conversation_state;
+        let content = &state.current_message.user_input_message.content;
+
+        assert!(content.contains("Extract the account status."));
+        assert!(content.contains("<structured_output_contract>"));
+        assert!(content.contains("\"required\":[\"status\"]"));
+        assert!(content.contains("directly parseable by JSON.parse"));
     }
 }

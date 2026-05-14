@@ -31,6 +31,7 @@ use super::middleware::{ANTHROPIC_RUNTIME_LEADER_REQUIRED_HEADER, AppState};
 use super::multimodal;
 use super::probe::{UpstreamProbe, parse_upstream_probe};
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
+use super::structured_outputs::{self, JsonSchemaOutput, StructuredOutputError};
 use super::thinking_compat::{
     extract_thinking_and_text, sign_thinking_block, validate_thinking_signatures,
 };
@@ -62,6 +63,53 @@ fn request_id_from_headers(headers: &HeaderMap) -> String {
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| format!("kirors-{}", Uuid::new_v4().simple()))
+}
+
+fn json_schema_output_or_response(
+    payload: &MessagesRequest,
+    request_id: &str,
+) -> Result<Option<JsonSchemaOutput>, Response> {
+    if payload
+        .output_config
+        .as_ref()
+        .and_then(|config| config.format.as_ref())
+        .is_some_and(|format| format.format_type == "json_schema" && format.schema.is_none())
+    {
+        let message = "output_config.format.schema is required when format.type is json_schema";
+        tracing::warn!(request_id = %request_id, error = %message, "Structured output schema missing");
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("invalid_request_error", message)),
+        )
+            .into_response());
+    }
+    let Some(output) = structured_outputs::json_schema_output(payload) else {
+        return Ok(None);
+    };
+    if let Err(message) = structured_outputs::validate_json_schema_output(&output) {
+        tracing::warn!(request_id = %request_id, error = %message, "Structured output schema validation failed");
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("invalid_request_error", message)),
+        )
+            .into_response());
+    }
+    Ok(Some(output))
+}
+
+fn structured_outputs_server_tool_response(request_id: &str) -> Response {
+    tracing::warn!(
+        request_id = %request_id,
+        "Structured outputs requested with server-side web tool routing"
+    );
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse::new(
+            "invalid_request_error",
+            "output_config.format.json_schema is not supported together with server-side web_search or web_fetch tools on this Kiro-compatible route",
+        )),
+    )
+        .into_response()
 }
 
 fn built_in_models() -> Vec<Model> {
@@ -361,6 +409,36 @@ pub async fn post_messages(
         return response;
     }
     let normalize_ms = normalize_started_at.elapsed().as_millis();
+
+    let structured_output = match json_schema_output_or_response(&payload, &request_id) {
+        Ok(output) => output,
+        Err(response) => return response,
+    };
+    if structured_output.is_some()
+        && (webfetch::has_web_fetch_tool(&payload) || websearch::has_web_search_tool(&payload))
+    {
+        return structured_outputs_server_tool_response(&request_id);
+    }
+    if let Some(output) = structured_output.clone() {
+        if payload.stream {
+            return handle_structured_stream_request(
+                provider,
+                payload,
+                probe.clone(),
+                request_id.clone(),
+                output,
+            )
+            .await;
+        }
+        return handle_structured_non_stream_request(
+            provider,
+            &payload,
+            probe.clone(),
+            request_id,
+            output,
+        )
+        .await;
+    }
 
     // 检查是否为 WebFetch 请求
     if webfetch::has_web_fetch_tool(&payload) {
@@ -878,12 +956,7 @@ pub(crate) async fn execute_non_stream_round(
         }
     };
 
-    let input_tokens = token::count_all_tokens_borrowed(
-        &payload.model,
-        payload.system.as_deref(),
-        &payload.messages,
-        payload.tools.as_deref(),
-    ) as i32;
+    let input_tokens = count_input_tokens_with_structured_instruction(payload);
     let request_weighting = provider.request_weighting_config();
     let request_weight = payload.request_weight_with_config(&request_weighting, Some(input_tokens));
 
@@ -904,6 +977,230 @@ pub(crate) async fn execute_non_stream_round(
         },
     )
     .await
+}
+
+fn count_input_tokens_with_structured_instruction(payload: &MessagesRequest) -> i32 {
+    let base = token::count_all_tokens_borrowed(
+        &payload.model,
+        payload.system.as_deref(),
+        &payload.messages,
+        payload.tools.as_deref(),
+    ) as i32;
+    let output = structured_outputs::json_schema_output(payload);
+    base + structured_outputs::estimate_instruction_tokens(output.as_ref())
+}
+
+async fn handle_structured_non_stream_request(
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    payload: &MessagesRequest,
+    probe: UpstreamProbe,
+    request_id: String,
+    output: JsonSchemaOutput,
+) -> Response {
+    match execute_structured_non_stream(provider, payload, probe, request_id, output).await {
+        Ok(result) => (StatusCode::OK, Json(result.body)).into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn handle_structured_stream_request(
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    payload: MessagesRequest,
+    probe: UpstreamProbe,
+    request_id: String,
+    output: JsonSchemaOutput,
+) -> Response {
+    match execute_structured_non_stream(provider, &payload, probe, request_id, output).await {
+        Ok(result) => {
+            let events = structured_non_stream_to_sse_events(result);
+            let stream = stream::iter(
+                events
+                    .into_iter()
+                    .map(|event| Ok::<Bytes, Infallible>(Bytes::from(event.to_sse_string()))),
+            );
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .header(header::CACHE_CONTROL, "no-cache")
+                .header(header::CONNECTION, "keep-alive")
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }
+        Err(response) => response,
+    }
+}
+
+async fn execute_structured_non_stream(
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    payload: &MessagesRequest,
+    probe: UpstreamProbe,
+    request_id: String,
+    output: JsonSchemaOutput,
+) -> Result<NonStreamMessageResponse, Response> {
+    let mut attempt_payload = payload.clone();
+    for attempt in 0..=structured_outputs::MAX_JSON_SCHEMA_RETRIES {
+        let result = execute_non_stream_round(
+            provider.clone(),
+            &attempt_payload,
+            probe.clone(),
+            Some(request_id.clone()),
+        )
+        .await?;
+        let previous_text = structured_outputs::collect_text_content(&result.content);
+        match coerce_structured_response(result, &output) {
+            Ok(result) => {
+                if attempt > 0 {
+                    tracing::info!(
+                        request_id = %request_id,
+                        attempt,
+                        "Structured output retry produced a valid JSON Schema response"
+                    );
+                }
+                return Ok(result);
+            }
+            Err(err) if attempt < structured_outputs::MAX_JSON_SCHEMA_RETRIES => {
+                tracing::warn!(
+                    request_id = %request_id,
+                    attempt,
+                    error = %err,
+                    "Structured output response failed validation; retrying"
+                );
+                attempt_payload =
+                    structured_outputs::build_retry_payload(payload, &previous_text, &err);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    request_id = %request_id,
+                    attempt,
+                    error = %err,
+                    "Structured output response failed validation after retries"
+                );
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    Json(ErrorResponse::new(
+                        "api_error",
+                        format!(
+                            "Upstream response did not satisfy output_config.format.json_schema: {err}"
+                        ),
+                    )),
+                )
+                    .into_response());
+            }
+        }
+    }
+
+    unreachable!("structured output retry loop always returns")
+}
+
+fn coerce_structured_response(
+    mut result: NonStreamMessageResponse,
+    output: &JsonSchemaOutput,
+) -> Result<NonStreamMessageResponse, StructuredOutputError> {
+    let text = structured_outputs::collect_text_content(&result.content);
+    let value = structured_outputs::extract_json_value(&text)?;
+    structured_outputs::validate_instance(output, &value)?;
+    let text = serde_json::to_string(&value)
+        .map_err(|err| StructuredOutputError::InvalidJson(err.to_string()))?;
+    let content = vec![json!({
+        "type": "text",
+        "text": text,
+    })];
+    let output_tokens = token::estimate_output_tokens(&content);
+
+    result.content = content.clone();
+    result.stop_reason = "end_turn".to_string();
+    result.output_tokens = output_tokens;
+    result.body["content"] = serde_json::Value::Array(content);
+    result.body["stop_reason"] = json!("end_turn");
+    result.body["usage"]["output_tokens"] = json!(output_tokens);
+    Ok(result)
+}
+
+fn structured_non_stream_to_sse_events(result: NonStreamMessageResponse) -> Vec<SseEvent> {
+    let response_id = result
+        .body
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")));
+    let model = result
+        .body
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let text = result
+        .content
+        .first()
+        .and_then(|block| block.get("text"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    vec![
+        SseEvent::new(
+            "message_start",
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": response_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": model,
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": {
+                        "input_tokens": result.input_tokens,
+                        "output_tokens": 1
+                    }
+                }
+            }),
+        ),
+        SseEvent::new(
+            "content_block_start",
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "text",
+                    "text": ""
+                }
+            }),
+        ),
+        SseEvent::new(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "text_delta",
+                    "text": text
+                }
+            }),
+        ),
+        SseEvent::new(
+            "content_block_stop",
+            json!({
+                "type": "content_block_stop",
+                "index": 0
+            }),
+        ),
+        SseEvent::new(
+            "message_delta",
+            json!({
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": result.stop_reason,
+                    "stop_sequence": null
+                },
+                "usage": {
+                    "output_tokens": result.output_tokens
+                }
+            }),
+        ),
+        SseEvent::new("message_stop", json!({"type": "message_stop"})),
+    ]
 }
 
 /// 处理非流式请求
@@ -1171,6 +1468,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     if is_opus_4_7 {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
+            format: None,
         });
     }
 }
@@ -1308,6 +1606,36 @@ pub async fn post_messages_cc(
         return response;
     }
     let normalize_ms = normalize_started_at.elapsed().as_millis();
+
+    let structured_output = match json_schema_output_or_response(&payload, &request_id) {
+        Ok(output) => output,
+        Err(response) => return response,
+    };
+    if structured_output.is_some()
+        && (webfetch::has_web_fetch_tool(&payload) || websearch::has_web_search_tool(&payload))
+    {
+        return structured_outputs_server_tool_response(&request_id);
+    }
+    if let Some(output) = structured_output.clone() {
+        if payload.stream {
+            return handle_structured_stream_request(
+                provider,
+                payload,
+                probe.clone(),
+                request_id.clone(),
+                output,
+            )
+            .await;
+        }
+        return handle_structured_non_stream_request(
+            provider,
+            &payload,
+            probe.clone(),
+            request_id,
+            output,
+        )
+        .await;
+    }
 
     // 检查是否为 WebFetch 请求
     if webfetch::has_web_fetch_tool(&payload) {
@@ -1644,9 +1972,11 @@ fn create_buffered_sse_stream(
 #[cfg(test)]
 mod tests {
     use super::{
-        ANTHROPIC_RUNTIME_LEADER_REQUIRED_HEADER, is_opus_4_7_model, map_provider_error,
+        ANTHROPIC_RUNTIME_LEADER_REQUIRED_HEADER, NonStreamMessageResponse,
+        coerce_structured_response, is_opus_4_7_model, map_provider_error,
         override_thinking_from_model_name, request_thinking_enabled,
     };
+    use crate::anthropic::structured_outputs::JsonSchemaOutput;
     use crate::anthropic::types::{Message, MessagesRequest, Thinking};
     use crate::kiro::provider::PublicProviderError;
     use crate::kiro::token_manager::RuntimeRefreshLeaderRequiredError;
@@ -1791,6 +2121,53 @@ mod tests {
         assert_eq!(
             json["error"]["message"],
             "Upstream rejected the request as malformed. Review message ordering, tool payloads, and oversized inputs."
+        );
+    }
+
+    #[test]
+    fn test_coerce_structured_response_rewrites_text_to_minified_json() {
+        let output = JsonSchemaOutput {
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "demo_requested": {"type": "boolean"}
+                },
+                "required": ["name", "demo_requested"],
+                "additionalProperties": false
+            }),
+        };
+        let response = NonStreamMessageResponse {
+            body: serde_json::json!({
+                "id": "msg_test",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-6",
+                "content": [{"type": "text", "text": "```json\n{\"name\":\"John Smith\",\"demo_requested\":true}\n```"}],
+                "stop_reason": "end_turn",
+                "stop_sequence": null,
+                "usage": {"input_tokens": 10, "output_tokens": 20}
+            }),
+            content: vec![serde_json::json!({
+                "type": "text",
+                "text": "```json\n{\"name\":\"John Smith\",\"demo_requested\":true}\n```"
+            })],
+            stop_reason: "end_turn".to_string(),
+            input_tokens: 10,
+            output_tokens: 20,
+        };
+
+        let coerced = coerce_structured_response(response, &output).unwrap();
+
+        assert_eq!(
+            coerced.body["content"][0]["text"],
+            "{\"demo_requested\":true,\"name\":\"John Smith\"}"
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(
+                coerced.body["content"][0]["text"].as_str().unwrap()
+            )
+            .is_ok()
         );
     }
 
