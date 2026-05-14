@@ -94,6 +94,16 @@ fn json_schema_output_or_response(
         )
             .into_response());
     }
+    let stats = structured_outputs::schema_stats(&output.schema);
+    tracing::info!(
+        request_id = %request_id,
+        schema_bytes = stats.bytes,
+        schema_depth = stats.max_depth,
+        schema_nodes = stats.nodes,
+        schema_combinator_branches = stats.combinator_branches,
+        schema_properties = stats.properties,
+        "Structured output JSON Schema accepted"
+    );
     Ok(Some(output))
 }
 
@@ -1038,6 +1048,19 @@ async fn execute_structured_non_stream(
     output: JsonSchemaOutput,
 ) -> Result<NonStreamMessageResponse, Response> {
     let mut attempt_payload = payload.clone();
+    let structured_started_at = Instant::now();
+    let schema_stats = structured_outputs::schema_stats(&output.schema);
+    tracing::info!(
+        request_id = %request_id,
+        stream = payload.stream,
+        schema_bytes = schema_stats.bytes,
+        schema_depth = schema_stats.max_depth,
+        schema_nodes = schema_stats.nodes,
+        schema_combinator_branches = schema_stats.combinator_branches,
+        schema_properties = schema_stats.properties,
+        max_retries = structured_outputs::MAX_JSON_SCHEMA_RETRIES,
+        "Structured output request routed through JSON Schema compatibility path"
+    );
     for attempt in 0..=structured_outputs::MAX_JSON_SCHEMA_RETRIES {
         let result = execute_non_stream_round(
             provider.clone(),
@@ -1047,15 +1070,28 @@ async fn execute_structured_non_stream(
         )
         .await?;
         let previous_text = structured_outputs::collect_text_content(&result.content);
+        let previous_text_chars = previous_text.chars().count();
         match coerce_structured_response(result, &output) {
             Ok(result) => {
-                if attempt > 0 {
-                    tracing::info!(
-                        request_id = %request_id,
-                        attempt,
-                        "Structured output retry produced a valid JSON Schema response"
-                    );
-                }
+                let json_text_chars = result
+                    .content
+                    .first()
+                    .and_then(|block| block.get("text"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::len)
+                    .unwrap_or_default();
+                tracing::info!(
+                    request_id = %request_id,
+                    stream = payload.stream,
+                    attempts = attempt + 1,
+                    retried = attempt > 0,
+                    elapsed_ms = structured_started_at.elapsed().as_millis(),
+                    raw_text_chars = previous_text_chars,
+                    json_text_chars,
+                    input_tokens = result.input_tokens,
+                    output_tokens = result.output_tokens,
+                    "Structured output request satisfied JSON Schema"
+                );
                 return Ok(result);
             }
             Err(err) if attempt < structured_outputs::MAX_JSON_SCHEMA_RETRIES => {
@@ -1063,6 +1099,7 @@ async fn execute_structured_non_stream(
                     request_id = %request_id,
                     attempt,
                     error = %err,
+                    previous_text_chars,
                     "Structured output response failed validation; retrying"
                 );
                 attempt_payload =
@@ -1073,6 +1110,8 @@ async fn execute_structured_non_stream(
                     request_id = %request_id,
                     attempt,
                     error = %err,
+                    previous_text_chars,
+                    elapsed_ms = structured_started_at.elapsed().as_millis(),
                     "Structured output response failed validation after retries"
                 );
                 return Err((
