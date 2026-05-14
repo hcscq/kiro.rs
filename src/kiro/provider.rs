@@ -50,6 +50,9 @@ const INSUFFICIENT_CAPACITY_COOLDOWN: Duration = Duration::from_secs(10);
 const MAX_SLOW_FIRST_CONTENT_FAILOVERS: usize = 2;
 const MIN_STREAM_FIRST_CONTENT_FAILOVER_REMAINING: Duration = Duration::from_secs(15);
 const SLOW_FIRST_CONTENT_SHARED_COOLDOWN_MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+const OPUS_4_7_SLOW_MODEL_COOLDOWN: Duration = Duration::from_secs(120);
+const OPUS_4_7_SLOW_MODEL_HEADERS_MS: u128 = 20_000;
+const OPUS_4_7_SLOW_MODEL_FIRST_CHUNK_MS: u128 = 20_000;
 const SLOW_UPSTREAM_HEADERS_MS: u128 = 3_000;
 const SLOW_FIRST_CHUNK_MS: u128 = 3_000;
 const SLOW_HEADERS_TO_FIRST_CHUNK_MS: u128 = 1_000;
@@ -196,7 +199,7 @@ impl fmt::Display for PublicProviderError {
 
 impl std::error::Error for PublicProviderError {}
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ResponseTrace {
     request_id: String,
     api_type: &'static str,
@@ -210,6 +213,12 @@ struct ResponseTrace {
     overall_started_at: Instant,
     upstream_request_started_at: Instant,
     response_headers_at: Instant,
+    slow_model_cooldown: Option<SlowModelCooldownTrace>,
+}
+
+#[derive(Clone)]
+struct SlowModelCooldownTrace {
+    token_manager: Arc<MultiTokenManager>,
 }
 
 impl ManagedResponse {
@@ -356,6 +365,31 @@ impl ResponseTrace {
         self.model.as_deref().unwrap_or("unknown")
     }
 
+    fn defer_slow_model_cooldown_if_needed(
+        &self,
+        observed_ms: u128,
+        threshold_ms: u128,
+        reason: &str,
+    ) -> bool {
+        if observed_ms < threshold_ms {
+            return false;
+        }
+
+        let Some(cooldown) = self.slow_model_cooldown.as_ref() else {
+            return false;
+        };
+        let Some(model) = self.model.as_deref() else {
+            return false;
+        };
+
+        cooldown.token_manager.defer_slow_model_credential(
+            self.credential_id,
+            model,
+            OPUS_4_7_SLOW_MODEL_COOLDOWN,
+            reason,
+        )
+    }
+
     fn log_body_complete(&self, body_len: usize) {
         tracing::info!(
             request_id = %self.request_id,
@@ -390,6 +424,11 @@ impl ResponseTrace {
         let max_retries = self.max_retries;
         let region = &self.region;
         let status_code = self.status_code;
+        let slow_model_cooldown_applied = self.defer_slow_model_cooldown_if_needed(
+            first_chunk_wait_ms,
+            OPUS_4_7_SLOW_MODEL_FIRST_CHUNK_MS,
+            "slow_first_chunk",
+        );
 
         if log_slow {
             tracing::warn!(
@@ -406,6 +445,9 @@ impl ResponseTrace {
                 total_elapsed_ms,
                 first_chunk_wait_ms,
                 headers_to_first_chunk_ms,
+                slow_model_cooldown_applied,
+                slow_model_cooldown_threshold_ms = OPUS_4_7_SLOW_MODEL_FIRST_CHUNK_MS,
+                slow_model_cooldown_ms = OPUS_4_7_SLOW_MODEL_COOLDOWN.as_millis(),
                 "上游流首包偏慢"
             );
         } else {
@@ -1697,6 +1739,33 @@ impl KiroProvider {
 
             // 成功响应
             if status.is_success() {
+                let is_real_opus_4_7 = Self::is_real_opus_4_7_model(model.as_deref());
+                let slow_model_header_cooldown_applied = is_stream
+                    && is_real_opus_4_7
+                    && upstream_headers_ms >= OPUS_4_7_SLOW_MODEL_HEADERS_MS
+                    && self.token_manager.defer_slow_model_credential(
+                        ctx_id,
+                        model.as_deref().unwrap_or("unknown"),
+                        OPUS_4_7_SLOW_MODEL_COOLDOWN,
+                        "slow_upstream_headers",
+                    );
+                if slow_model_header_cooldown_applied {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        api_type,
+                        model = model.as_deref().unwrap_or("unknown"),
+                        credential_id = ctx_id,
+                        attempt = attempt + 1,
+                        max_retries,
+                        region = %region,
+                        request_body_bytes,
+                        status_code = status.as_u16(),
+                        upstream_headers_ms,
+                        slow_model_cooldown_threshold_ms = OPUS_4_7_SLOW_MODEL_HEADERS_MS,
+                        slow_model_cooldown_ms = OPUS_4_7_SLOW_MODEL_COOLDOWN.as_millis(),
+                        "真实 Opus 4.7 响应头过慢，已触发模型级冷却"
+                    );
+                }
                 let trace = ResponseTrace {
                     request_id: request_id.clone(),
                     api_type,
@@ -1710,6 +1779,11 @@ impl KiroProvider {
                     overall_started_at,
                     upstream_request_started_at,
                     response_headers_at,
+                    slow_model_cooldown: (is_stream && is_real_opus_4_7).then(|| {
+                        SlowModelCooldownTrace {
+                            token_manager: Arc::clone(&self.token_manager),
+                        }
+                    }),
                 };
 
                 let retryable_excluded_count = Self::request_scoped_retryable_exclusion_count(
@@ -1796,7 +1870,16 @@ impl KiroProvider {
                                 && remaining_after_prefetch.is_some_and(|remaining| {
                                     remaining >= MIN_STREAM_FIRST_CONTENT_FAILOVER_REMAINING
                                 });
+                            let slow_model_cooldown_applied = can_failover_after_timeout
+                                && is_real_opus_4_7
+                                && self.token_manager.defer_slow_model_credential(
+                                    ctx_id,
+                                    model.as_deref().unwrap_or("unknown"),
+                                    OPUS_4_7_SLOW_MODEL_COOLDOWN,
+                                    "slow_first_content",
+                                );
                             let shared_cooldown_applied = can_failover_after_timeout
+                                && !slow_model_cooldown_applied
                                 && Self::should_apply_slow_first_content_shared_cooldown(
                                     request_body_bytes,
                                 );
@@ -1804,6 +1887,8 @@ impl KiroProvider {
                                 "none"
                             } else if !can_failover_after_timeout {
                                 "no_followup_failover"
+                            } else if slow_model_cooldown_applied {
+                                "model_cooldown_applied"
                             } else {
                                 "request_body_too_large"
                             };
@@ -1842,9 +1927,11 @@ impl KiroProvider {
                                     .unwrap_or(0),
                                 will_failover = can_failover_after_timeout,
                                 shared_cooldown_applied,
+                                slow_model_cooldown_applied,
                                 cooldown_ms = applied_cooldown_ms,
                                 configured_cooldown_ms =
                                     STREAM_FIRST_CONTENT_FAILOVER_COOLDOWN.as_millis(),
+                                slow_model_cooldown_ms = OPUS_4_7_SLOW_MODEL_COOLDOWN.as_millis(),
                                 shared_cooldown_max_request_body_bytes =
                                     SLOW_FIRST_CONTENT_SHARED_COOLDOWN_MAX_REQUEST_BODY_BYTES,
                                 cooldown_skipped_reason,

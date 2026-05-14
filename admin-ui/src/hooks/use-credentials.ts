@@ -5,6 +5,7 @@ import {
   setCredentialMaxConcurrency,
   setCredentialRateLimitConfig,
   setCredentialModelPolicy,
+  clearCredentialRuntimeModelRestrictions,
   setCredentialPriority,
   resetCredentialFailure,
   forceRefreshToken,
@@ -111,6 +112,17 @@ export function useSetCredentialModelPolicy() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
       queryClient.invalidateQueries({ queryKey: ['modelCapabilities'] })
+    },
+  })
+}
+
+// 清除运行时模型限制
+export function useClearCredentialRuntimeModelRestrictions() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => clearCredentialRuntimeModelRestrictions(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
   })
 }

@@ -183,6 +183,16 @@ export async function setCredentialModelPolicy(
   return data
 }
 
+// 清除运行时模型限制
+export async function clearCredentialRuntimeModelRestrictions(
+  id: number
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/${id}/runtime-model-restrictions/clear`
+  )
+  return data
+}
+
 // 重置失败计数
 export async function resetCredentialFailure(
   id: number

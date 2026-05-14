@@ -116,6 +116,25 @@ pub async fn set_credential_model_policy(
     }
 }
 
+/// POST /api/admin/credentials/:id/runtime-model-restrictions/clear
+/// 清除凭据运行时模型限制
+pub async fn clear_credential_runtime_model_restrictions(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.clear_runtime_model_restrictions(id) {
+        Ok(true) => {
+            Json(SuccessResponse::new(format!("凭据 #{} 模型冷却已清除", id))).into_response()
+        }
+        Ok(false) => Json(SuccessResponse::new(format!(
+            "凭据 #{} 当前没有模型冷却",
+            id
+        )))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// POST /api/admin/credentials/:id/reset
 /// 重置失败计数并重新启用
 pub async fn reset_failure_count(

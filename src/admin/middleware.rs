@@ -322,17 +322,21 @@ fn is_retryable_admin_write_route(method: &Method, path: &str) -> bool {
 
 fn retryable_credential_admin_action(path: &str) -> bool {
     let segments: Vec<_> = path.trim_matches('/').split('/').collect();
-    if segments.len() != 3 || segments.first() != Some(&"credentials") {
+    if segments.len() < 3 || segments.first() != Some(&"credentials") {
         return false;
     }
     if segments[1].parse::<u64>().is_err() {
         return false;
     }
 
-    matches!(
-        segments[2],
-        "disabled" | "priority" | "max-concurrency" | "rate-limit-config" | "model-policy"
-    )
+    if segments.len() == 3 {
+        return matches!(
+            segments[2],
+            "disabled" | "priority" | "max-concurrency" | "rate-limit-config" | "model-policy"
+        );
+    }
+
+    segments.len() == 4 && segments[2] == "runtime-model-restrictions" && segments[3] == "clear"
 }
 
 #[cfg(test)]
@@ -368,6 +372,10 @@ mod tests {
         assert!(is_retryable_admin_write_route(
             &Method::POST,
             "/api/admin/credentials/12/model-policy",
+        ));
+        assert!(is_retryable_admin_write_route(
+            &Method::POST,
+            "/api/admin/credentials/12/runtime-model-restrictions/clear",
         ));
 
         assert!(!is_retryable_admin_write_route(

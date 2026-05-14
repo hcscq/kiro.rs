@@ -221,6 +221,14 @@ impl AdminService {
             .map_err(|e| self.classify_error(e, id))
     }
 
+    pub fn clear_runtime_model_restrictions(&self, id: u64) -> Result<bool, AdminServiceError> {
+        self.ensure_runtime_write_leader()?;
+
+        self.token_manager
+            .clear_runtime_model_restrictions_for_credential(id)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
     /// 重置失败计数并重新启用
     pub fn reset_and_enable(&self, id: u64) -> Result<(), AdminServiceError> {
         self.ensure_runtime_write_leader()?;

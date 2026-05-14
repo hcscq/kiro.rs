@@ -42,6 +42,7 @@ import type {
 } from '@/types/api'
 import {
   useSetDisabled,
+  useClearCredentialRuntimeModelRestrictions,
   useSetCredentialModelPolicy,
   useSetCredentialRateLimitConfig,
   useSetMaxConcurrency,
@@ -295,6 +296,7 @@ export function CredentialCard({
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
 
   const setDisabled = useSetDisabled()
+  const clearRuntimeModelCooldown = useClearCredentialRuntimeModelRestrictions()
   const setModelPolicy = useSetCredentialModelPolicy()
   const setMaxConcurrency = useSetMaxConcurrency()
   const setRateLimitConfig = useSetCredentialRateLimitConfig()
@@ -423,6 +425,17 @@ export function CredentialCard({
       },
       onError: (err) => {
         toast.error('刷新失败: ' + (err as Error).message)
+      },
+    })
+  }
+
+  const handleClearRuntimeModelRestrictions = () => {
+    clearRuntimeModelCooldown.mutate(credential.id, {
+      onSuccess: (res) => {
+        toast.success(res.message)
+      },
+      onError: (err) => {
+        toast.error('清除失败: ' + (err as Error).message)
       },
     })
   }
@@ -883,7 +896,24 @@ export function CredentialCard({
             <div className="space-y-2 rounded-lg border border-dashed border-amber-300 bg-amber-50/40 px-3 py-2.5">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="text-xs text-muted-foreground">运行时临时限制</div>
-                <Badge variant="warning">{credential.runtimeModelRestrictions?.length ?? 0} 条</Badge>
+                <div className="flex items-center gap-2">
+                  <Badge variant="warning">{credential.runtimeModelRestrictions?.length ?? 0} 条</Badge>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-7 px-2 text-xs"
+                    onClick={handleClearRuntimeModelRestrictions}
+                    disabled={clearRuntimeModelCooldown.isPending}
+                    title="清除模型冷却"
+                  >
+                    {clearRuntimeModelCooldown.isPending ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <RefreshCw className="h-3.5 w-3.5" />
+                    )}
+                    清除
+                  </Button>
+                </div>
               </div>
               <div className="flex flex-wrap gap-2">
                 {credential.runtimeModelRestrictions?.map((restriction) => (

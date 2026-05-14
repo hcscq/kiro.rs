@@ -7,11 +7,12 @@ use axum::{
 
 use super::{
     handlers::{
-        add_credential, delete_credential, force_refresh_token, get_all_credentials,
-        get_credential_balance, get_load_balancing_mode, get_model_capabilities_config,
-        get_model_catalog, reset_failure_count, set_credential_disabled,
-        set_credential_max_concurrency, set_credential_model_policy, set_credential_priority,
-        set_credential_rate_limit_config, set_load_balancing_mode, set_model_capabilities_config,
+        add_credential, clear_credential_runtime_model_restrictions, delete_credential,
+        force_refresh_token, get_all_credentials, get_credential_balance, get_load_balancing_mode,
+        get_model_capabilities_config, get_model_catalog, reset_failure_count,
+        set_credential_disabled, set_credential_max_concurrency, set_credential_model_policy,
+        set_credential_priority, set_credential_rate_limit_config, set_load_balancing_mode,
+        set_model_capabilities_config,
     },
     middleware::{AdminState, admin_auth_middleware, admin_write_routing_middleware},
 };
@@ -27,6 +28,7 @@ use super::{
 /// - `POST /credentials/:id/max-concurrency` - 设置凭据并发上限
 /// - `POST /credentials/:id/rate-limit-config` - 设置凭据级 token bucket 参数
 /// - `POST /credentials/:id/model-policy` - 设置凭据级模型策略
+/// - `POST /credentials/:id/runtime-model-restrictions/clear` - 清除运行时模型限制
 /// - `POST /credentials/:id/reset` - 重置失败计数
 /// - `POST /credentials/:id/refresh` - 强制刷新 Token
 /// - `GET /credentials/:id/balance` - 获取凭据余额
@@ -60,6 +62,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/credentials/{id}/model-policy",
             post(set_credential_model_policy),
+        )
+        .route(
+            "/credentials/{id}/runtime-model-restrictions/clear",
+            post(clear_credential_runtime_model_restrictions),
         )
         .route("/credentials/{id}/reset", post(reset_failure_count))
         .route("/credentials/{id}/refresh", post(force_refresh_token))

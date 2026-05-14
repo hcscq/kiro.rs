@@ -1690,6 +1690,34 @@ impl MultiTokenManager {
         Ok(true)
     }
 
+    fn enabled_supported_alternate_for_model<'a>(
+        dispatch: &DispatchConfig,
+        entries: &'a [CredentialEntry],
+        excluded_id: u64,
+        model: &str,
+        requirement: ModelRequirement,
+    ) -> Option<&'a CredentialEntry> {
+        entries
+            .iter()
+            .filter(|entry| {
+                !entry.disabled
+                    && entry.id != excluded_id
+                    && Self::is_model_supported(
+                        dispatch,
+                        &entry.credentials,
+                        Some(model),
+                        requirement,
+                    )
+            })
+            .min_by_key(|entry| {
+                (
+                    entry.credentials.priority,
+                    Self::model_preference_rank(&entry.credentials, requirement),
+                    entry.id,
+                )
+            })
+    }
+
     fn is_rate_limited(entry: &CredentialEntry, now: Instant) -> bool {
         entry
             .rate_limit_cooldown_until
@@ -4106,6 +4134,141 @@ impl MultiTokenManager {
         result
     }
 
+    /// 当真实 Opus 4.7 在某个凭据上出现明确慢启动时，仅对该模型族做短暂运行时限制。
+    ///
+    /// 该路径不会设置账号级限流冷却；并且写入前必须确认目标凭据以外仍有至少一个
+    /// 已启用且当前支持该模型的候选，避免特殊情况下把整个 4.7 候选池全部打入冷却。
+    pub fn defer_slow_model_credential(
+        &self,
+        id: u64,
+        model: &str,
+        cooldown: StdDuration,
+        reason: &str,
+    ) -> bool {
+        if cooldown.is_zero() {
+            return false;
+        }
+
+        let dispatch = self.dispatch_config();
+        if !dispatch.model_cooldown_enabled {
+            tracing::debug!(
+                credential_id = id,
+                model,
+                reason,
+                "模型冷却已关闭，跳过慢模型运行时限制"
+            );
+            return false;
+        }
+
+        let requirement = Self::model_requirement(Some(model));
+        let Some(model_label) = normalize_model_selector(model).map(|selector| selector.family)
+        else {
+            tracing::debug!(
+                credential_id = id,
+                model,
+                reason,
+                "模型名称无法规范化，跳过慢模型运行时限制"
+            );
+            return false;
+        };
+        let cooldown_ms = cooldown.as_millis().min(i64::MAX as u128) as i64;
+        let restriction_expires_at = Utc::now() + Duration::milliseconds(cooldown_ms);
+
+        let applied = {
+            let _state_write_guard = self.state_write_lock.lock();
+            let mut entries = self.entries.lock();
+            let mut current_id = self.current_id.lock();
+
+            let Some(entry_index) = entries.iter().position(|entry| entry.id == id) else {
+                tracing::debug!(
+                    credential_id = id,
+                    model = %model_label,
+                    reason,
+                    "凭据不存在，跳过慢模型运行时限制"
+                );
+                return false;
+            };
+
+            if entries[entry_index].disabled {
+                tracing::debug!(
+                    credential_id = id,
+                    model = %model_label,
+                    reason,
+                    "凭据已禁用，跳过慢模型运行时限制"
+                );
+                return false;
+            }
+
+            let alternate_id = Self::enabled_supported_alternate_for_model(
+                &dispatch,
+                &entries,
+                id,
+                model,
+                requirement,
+            )
+            .map(|entry| entry.id);
+            let Some(alternate_id) = alternate_id else {
+                tracing::warn!(
+                    credential_id = id,
+                    model = %model_label,
+                    reason,
+                    cooldown_ms,
+                    "跳过慢模型运行时限制：没有其他可用 4.7 候选，避免全池冷却"
+                );
+                return false;
+            };
+
+            entries[entry_index].last_used_at = Some(Utc::now().to_rfc3339());
+            let restriction_changed = entries[entry_index]
+                .credentials
+                .upsert_runtime_model_restriction(model, restriction_expires_at);
+
+            if restriction_changed {
+                let credentials = Self::persisted_credentials_from_entries(&entries);
+                if let Err(err) = self.persist_credentials_snapshot(&credentials) {
+                    tracing::warn!(
+                        credential_id = id,
+                        model = %model_label,
+                        reason,
+                        error = %err,
+                        "持久化慢模型运行时限制失败"
+                    );
+                }
+            }
+
+            if *current_id == id {
+                *current_id = alternate_id;
+                tracing::warn!(
+                    credential_id = id,
+                    alternate_credential_id = alternate_id,
+                    model = %model_label,
+                    reason,
+                    cooldown_ms,
+                    restriction_changed,
+                    "凭据触发慢模型运行时限制，已切换到其他 4.7 候选"
+                );
+            } else {
+                tracing::warn!(
+                    credential_id = id,
+                    alternate_credential_id = alternate_id,
+                    model = %model_label,
+                    reason,
+                    cooldown_ms,
+                    restriction_changed,
+                    "凭据触发慢模型运行时限制"
+                );
+            }
+
+            true
+        };
+
+        if applied {
+            self.availability_notify.notify_waiters();
+            self.save_stats_debounced();
+        }
+        applied
+    }
+
     /// 当上游明确返回 `INVALID_MODEL_ID` 时，
     /// 将当前凭据视为“不支持该模型”。
     ///
@@ -5057,6 +5220,33 @@ impl MultiTokenManager {
 
         self.availability_notify.notify_waiters();
         Ok(())
+    }
+
+    /// 清除单个凭据的运行时模型限制（Admin API）
+    pub fn clear_runtime_model_restrictions_for_credential(&self, id: u64) -> anyhow::Result<bool> {
+        let _state_write_guard = self.state_write_lock.lock();
+        let mut persisted = self.persisted_credentials_snapshot();
+        let credential = Self::persisted_credential_mut(&mut persisted, id)?;
+        let changed = credential.clear_runtime_model_restrictions();
+        let updated_credential = credential.clone();
+
+        if changed {
+            self.persist_credentials_snapshot(&persisted)?;
+        }
+
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials = updated_credential;
+        }
+
+        if changed {
+            self.availability_notify.notify_waiters();
+        }
+        Ok(changed)
     }
 
     /// 重置凭据失败计数并重新启用（Admin API）
@@ -6360,6 +6550,104 @@ mod tests {
         let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
         assert!(entry.runtime_model_restrictions.is_empty());
         assert_eq!(entry.cooldown_remaining_ms, None);
+    }
+
+    #[tokio::test]
+    async fn test_slow_model_cooldown_restricts_only_target_model_and_switches_candidates() {
+        let mut config = Config::default();
+        config.model_cooldown_enabled = true;
+
+        let mut primary = available_credential(0);
+        primary.subscription_title = Some("KIRO PRO+".to_string());
+        let mut alternate = available_credential(0);
+        alternate.subscription_title = Some("KIRO PRO+".to_string());
+
+        let manager =
+            MultiTokenManager::new(config, vec![primary, alternate], None, None, false).unwrap();
+
+        assert!(manager.defer_slow_model_credential(
+            1,
+            "claude-opus-4.7",
+            StdDuration::from_secs(120),
+            "test"
+        ));
+
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.current_id, 2);
+        let primary = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert_eq!(primary.cooldown_remaining_ms, None);
+        assert_eq!(primary.runtime_model_restrictions.len(), 1);
+        assert_eq!(
+            primary.runtime_model_restrictions[0].model,
+            "claude-opus-4.7"
+        );
+
+        let ctx = manager
+            .acquire_context(Some("claude-opus-4.7"))
+            .await
+            .expect("4.7 应切换到未冷却的候选");
+        assert_eq!(ctx.id, 2);
+        drop(ctx);
+
+        assert!(
+            manager.supports_model("claude-opus-4.6"),
+            "慢 4.7 模型冷却不应影响其他模型族"
+        );
+    }
+
+    #[test]
+    fn test_slow_model_cooldown_skips_last_supported_candidate() {
+        let mut config = Config::default();
+        config.model_cooldown_enabled = true;
+        let mut cred = available_credential(0);
+        cred.subscription_title = Some("KIRO PRO+".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        assert!(!manager.defer_slow_model_credential(
+            1,
+            "claude-opus-4.7",
+            StdDuration::from_secs(120),
+            "test"
+        ));
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert!(entry.runtime_model_restrictions.is_empty());
+    }
+
+    #[test]
+    fn test_clear_runtime_model_restrictions_for_credential() {
+        let mut config = Config::default();
+        config.model_cooldown_enabled = true;
+
+        let mut primary = available_credential(0);
+        primary.subscription_title = Some("KIRO PRO+".to_string());
+        let mut alternate = available_credential(0);
+        alternate.subscription_title = Some("KIRO PRO+".to_string());
+
+        let manager =
+            MultiTokenManager::new(config, vec![primary, alternate], None, None, false).unwrap();
+
+        assert!(manager.defer_slow_model_credential(
+            1,
+            "claude-opus-4.7",
+            StdDuration::from_secs(120),
+            "test"
+        ));
+        assert!(
+            manager
+                .clear_runtime_model_restrictions_for_credential(1)
+                .unwrap()
+        );
+        assert!(
+            !manager
+                .clear_runtime_model_restrictions_for_credential(1)
+                .unwrap()
+        );
+
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert!(entry.runtime_model_restrictions.is_empty());
     }
 
     #[tokio::test]
