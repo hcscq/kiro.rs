@@ -32,7 +32,10 @@ use super::stream::SseEvent;
 use super::types::{ErrorResponse, Message, MessagesRequest, Tool};
 use super::websearch;
 
-const WEB_FETCH_TOOL_TYPE: &str = "web_fetch_20250910";
+const WEB_FETCH_TOOL_TYPE_20250910: &str = "web_fetch_20250910";
+const WEB_FETCH_TOOL_TYPE_20260209: &str = "web_fetch_20260209";
+const SUPPORTED_WEB_FETCH_TOOL_TYPES: &[&str] =
+    &[WEB_FETCH_TOOL_TYPE_20250910, WEB_FETCH_TOOL_TYPE_20260209];
 const INTERNAL_WEB_FETCH_TOOL_NAME: &str = "__anthropic_server_web_fetch";
 const INTERNAL_WEB_SEARCH_TOOL_NAME: &str = "__anthropic_server_web_search";
 const EXTERNAL_WEB_FETCH_TOOL_NAME: &str = "web_fetch";
@@ -139,8 +142,8 @@ pub async fn handle_webfetch_request(
             Json(ErrorResponse::new(
                 "invalid_request_error",
                 format!(
-                    "kiro.rs currently supports Anthropic web_fetch server tool version {} only; received {}",
-                    WEB_FETCH_TOOL_TYPE, version
+                    "kiro.rs currently supports Anthropic web_fetch server tool versions {} only; received {}",
+                    SUPPORTED_WEB_FETCH_TOOL_TYPES.join(", "), version
                 ),
             )),
         )
@@ -264,7 +267,7 @@ fn is_any_web_fetch_tool(tool: &Tool) -> bool {
 fn is_supported_web_fetch_tool(tool: &Tool) -> bool {
     tool.tool_type
         .as_deref()
-        .is_some_and(|tool_type| tool_type.trim() == WEB_FETCH_TOOL_TYPE)
+        .is_some_and(|tool_type| SUPPORTED_WEB_FETCH_TOOL_TYPES.contains(&tool_type.trim()))
 }
 
 fn build_web_fetch_config(tool: &Tool) -> Result<WebFetchConfig, String> {
@@ -1444,7 +1447,7 @@ mod tests {
 
     fn sample_tool() -> Tool {
         Tool {
-            tool_type: Some(WEB_FETCH_TOOL_TYPE.to_string()),
+            tool_type: Some(WEB_FETCH_TOOL_TYPE_20250910.to_string()),
             name: EXTERNAL_WEB_FETCH_TOOL_NAME.to_string(),
             description: String::new(),
             input_schema: HashMap::new(),
@@ -1480,6 +1483,21 @@ mod tests {
         ]);
 
         assert!(has_web_fetch_tool(&req));
+    }
+
+    #[test]
+    fn test_supported_web_fetch_tool_versions() {
+        let mut old_tool = sample_tool();
+        old_tool.tool_type = Some(WEB_FETCH_TOOL_TYPE_20250910.to_string());
+        assert!(is_supported_web_fetch_tool(&old_tool));
+
+        let mut new_tool = sample_tool();
+        new_tool.tool_type = Some(WEB_FETCH_TOOL_TYPE_20260209.to_string());
+        assert!(is_supported_web_fetch_tool(&new_tool));
+
+        let mut unsupported_tool = sample_tool();
+        unsupported_tool.tool_type = Some("web_fetch_20990101".to_string());
+        assert!(!is_supported_web_fetch_tool(&unsupported_tool));
     }
 
     #[test]

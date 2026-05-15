@@ -266,10 +266,10 @@ pub struct SystemMessage {
 
 /// 工具定义
 ///
-/// 支持两种格式：
+/// 支持三种格式：
 /// 1. 普通工具：{ name, description, input_schema }
 /// 2. WebSearch 工具：{ type: "web_search_20250305", name: "web_search", max_uses: 8 }
-/// 3. WebFetch 工具：{ type: "web_fetch_20250910", name: "web_fetch", max_uses, ... }
+/// 3. WebFetch 工具：{ type: "web_fetch_20250910" 或 "web_fetch_20260209", name: "web_fetch", max_uses, ... }
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ToolCitations {
     #[serde(default)]
