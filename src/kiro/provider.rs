@@ -689,10 +689,12 @@ impl KiroProvider {
             .map(|s| s.to_string())
     }
 
-    /// 将凭据的 profile_arn 注入到请求体 JSON 中
-    fn inject_profile_arn(request_body: &str, profile_arn: &Option<String>) -> String {
+    /// 将凭据的 profile_arn 注入到请求体 JSON 中。
+    ///
+    /// 返回 `None` 表示请求体保持原样，调用方可复用已缓存的 Bytes，避免重试时反复复制大请求体。
+    fn inject_profile_arn(request_body: &str, profile_arn: &Option<String>) -> Option<String> {
         let Some(arn) = profile_arn else {
-            return request_body.to_string();
+            return None;
         };
 
         if !request_body.contains("\"profileArn\"") {
@@ -705,18 +707,34 @@ impl KiroProvider {
                 } else {
                     ","
                 };
-                return format!("{prefix}{separator}\"profileArn\":{arn_json}{suffix}");
+                return Some(format!(
+                    "{prefix}{separator}\"profileArn\":{arn_json}{suffix}"
+                ));
             }
         }
 
         if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(request_body) {
             json["profileArn"] = serde_json::Value::String(arn.clone());
             if let Ok(body) = serde_json::to_string(&json) {
-                return body;
+                return Some(body);
             }
         }
 
-        request_body.to_string()
+        None
+    }
+
+    fn request_body_for_profile_arn(
+        request_body: &str,
+        original_body: &mut Option<Bytes>,
+        profile_arn: &Option<String>,
+    ) -> Bytes {
+        if let Some(body) = Self::inject_profile_arn(request_body, profile_arn) {
+            return Bytes::from(body);
+        }
+
+        original_body
+            .get_or_insert_with(|| Bytes::copy_from_slice(request_body.as_bytes()))
+            .clone()
     }
 
     fn summarize_error_body(status: reqwest::StatusCode, body: &str) -> String {
@@ -1407,6 +1425,7 @@ impl KiroProvider {
             .unwrap_or_else(|| format!("kirors-{}", Uuid::new_v4().simple()));
         let request_weight = options.normalized_request_weight();
         let overall_started_at = Instant::now();
+        let mut original_request_body: Option<Bytes> = None;
 
         // Anthropic handlers already know the mapped Kiro model. Fall back to JSON extraction for
         // direct provider callers so large requests avoid an extra full-body parse on the hot path.
@@ -1550,7 +1569,11 @@ impl KiroProvider {
 
             // 注入实际凭据的 profile_arn 到请求体
             let body_inject_started_at = Instant::now();
-            let body = Self::inject_profile_arn(request_body, &credentials.profile_arn);
+            let body = Self::request_body_for_profile_arn(
+                request_body,
+                &mut original_request_body,
+                &credentials.profile_arn,
+            );
             let body_inject_ms = body_inject_started_at.elapsed().as_millis();
             let request_body_bytes = body.len();
             if request_body_bytes >= LARGE_PROVIDER_REQUEST_WARN_THRESHOLD_BYTES
@@ -2686,7 +2709,7 @@ mod tests {
     fn test_inject_profile_arn_with_some() {
         let body = r#"{"conversationState":{"conversationId":"c1"}}"#;
         let arn = Some("arn:aws:codewhisperer:us-east-1:123:profile/ABC".to_string());
-        let result = KiroProvider::inject_profile_arn(body, &arn);
+        let result = KiroProvider::inject_profile_arn(body, &arn).unwrap();
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(
             json["profileArn"],
@@ -2699,9 +2722,10 @@ mod tests {
     #[test]
     fn test_inject_profile_arn_with_none() {
         let body = r#"{"conversationState":{"conversationId":"c1"}}"#;
-        let result = KiroProvider::inject_profile_arn(body, &None);
+        let mut original_body = None;
+        let result = KiroProvider::request_body_for_profile_arn(body, &mut original_body, &None);
         // 不注入 profileArn，原样返回
-        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&result).unwrap();
         assert!(json.get("profileArn").is_none());
         assert_eq!(json["conversationState"]["conversationId"], "c1");
     }
@@ -2710,7 +2734,7 @@ mod tests {
     fn test_inject_profile_arn_overwrites_existing() {
         let body = r#"{"conversationState":{},"profileArn":"old-arn"}"#;
         let arn = Some("new-arn".to_string());
-        let result = KiroProvider::inject_profile_arn(body, &arn);
+        let result = KiroProvider::inject_profile_arn(body, &arn).unwrap();
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(json["profileArn"], "new-arn");
     }
@@ -2719,9 +2743,10 @@ mod tests {
     fn test_inject_profile_arn_invalid_json() {
         let body = "not-valid-json";
         let arn = Some("arn:test".to_string());
-        let result = KiroProvider::inject_profile_arn(body, &arn);
+        let mut original_body = None;
+        let result = KiroProvider::request_body_for_profile_arn(body, &mut original_body, &arn);
         // 解析失败时原样返回
-        assert_eq!(result, "not-valid-json");
+        assert_eq!(&result[..], body.as_bytes());
     }
 
     #[test]

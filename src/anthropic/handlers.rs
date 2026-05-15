@@ -455,12 +455,7 @@ pub async fn post_messages(
         tracing::info!(request_id = %request_id, "检测到 WebFetch 工具，路由到 WebFetch 处理");
 
         let token_count_started_at = Instant::now();
-        let input_tokens = token::count_all_tokens_borrowed(
-            &payload.model,
-            payload.system.as_deref(),
-            &payload.messages,
-            payload.tools.as_deref(),
-        ) as i32;
+        let input_tokens = count_billing_input_tokens(&payload).await;
         let token_count_ms = token_count_started_at.elapsed().as_millis();
         let pre_upstream_ms = handler_started_at.elapsed().as_millis();
         if body_bytes >= LARGE_ANTHROPIC_REQUEST_WARN_THRESHOLD_BYTES
@@ -496,14 +491,9 @@ pub async fn post_messages(
     if websearch::has_web_search_tool(&payload) {
         tracing::info!(request_id = %request_id, "检测到 WebSearch 工具，路由到 WebSearch 处理");
 
-        // 估算输入 tokens
+        // 下游 usage 计费使用远端计数优先。
         let token_count_started_at = Instant::now();
-        let input_tokens = token::count_all_tokens_borrowed(
-            &payload.model,
-            payload.system.as_deref(),
-            &payload.messages,
-            payload.tools.as_deref(),
-        ) as i32;
+        let input_tokens = count_billing_input_tokens(&payload).await;
         let token_count_ms = token_count_started_at.elapsed().as_millis();
         let pre_upstream_ms = handler_started_at.elapsed().as_millis();
         if body_bytes >= LARGE_ANTHROPIC_REQUEST_WARN_THRESHOLD_BYTES
@@ -584,21 +574,21 @@ pub async fn post_messages(
     let thinking_enabled = request_thinking_enabled(&payload);
     let request_weighting = provider.request_weighting_config();
 
-    // 估算输入 tokens
+    // 调度使用本地估算，返回给下游的 usage 使用远端计数优先。
     let token_count_started_at = Instant::now();
-    let input_tokens = token::count_all_tokens_borrowed(
-        &payload.model,
-        payload.system.as_deref(),
-        &payload.messages,
-        payload.tools.as_deref(),
-    ) as i32;
+    let estimated_input_tokens = estimate_input_tokens(&payload);
     let token_count_ms = token_count_started_at.elapsed().as_millis();
-    let request_weight = payload.request_weight_with_config(&request_weighting, Some(input_tokens));
+    let billing_token_count_started_at = Instant::now();
+    let billing_input_tokens = count_billing_input_tokens(&payload).await;
+    let billing_token_count_ms = billing_token_count_started_at.elapsed().as_millis();
+    let request_weight =
+        payload.request_weight_with_config(&request_weighting, Some(estimated_input_tokens));
     let pre_upstream_ms = handler_started_at.elapsed().as_millis();
 
     tracing::debug!(
         request_id = %request_id,
-        input_tokens,
+        estimated_input_tokens,
+        billing_input_tokens,
         request_weight,
         "已完成请求轻重分级"
     );
@@ -607,6 +597,7 @@ pub async fn post_messages(
         || convert_ms >= SLOW_ANTHROPIC_PRE_UPSTREAM_PHASE_MS
         || serialize_ms >= SLOW_ANTHROPIC_PRE_UPSTREAM_PHASE_MS
         || token_count_ms >= SLOW_ANTHROPIC_PRE_UPSTREAM_PHASE_MS
+        || billing_token_count_ms >= SLOW_ANTHROPIC_PRE_UPSTREAM_PHASE_MS
     {
         tracing::warn!(
             request_id = %request_id,
@@ -621,9 +612,11 @@ pub async fn post_messages(
             convert_ms,
             serialize_ms,
             token_count_ms,
+            billing_token_count_ms,
             pre_upstream_ms,
             kiro_request_body_bytes = request_body.len(),
-            input_tokens,
+            estimated_input_tokens,
+            billing_input_tokens,
             request_weight,
             "Anthropic request pre-upstream phases completed"
         );
@@ -639,7 +632,7 @@ pub async fn post_messages(
             provider,
             &request_body,
             &payload.model,
-            input_tokens,
+            billing_input_tokens,
             thinking_enabled,
             tool_name_map,
             RequestOptions {
@@ -659,8 +652,9 @@ pub async fn post_messages(
             provider,
             &request_body,
             &payload.model,
-            input_tokens,
+            billing_input_tokens,
             tool_name_map,
+            false,
             RequestOptions {
                 omit_agent_mode_header: probe.omit_agent_mode_header,
                 request_id: Some(request_id),
@@ -966,16 +960,20 @@ pub(crate) async fn execute_non_stream_round(
         }
     };
 
-    let input_tokens = count_input_tokens_with_structured_instruction(payload);
+    let estimated_input_tokens = estimate_input_tokens_with_structured_instruction(payload);
+    let billing_input_tokens =
+        count_billing_input_tokens_with_structured_instruction(payload).await;
     let request_weighting = provider.request_weighting_config();
-    let request_weight = payload.request_weight_with_config(&request_weighting, Some(input_tokens));
+    let request_weight =
+        payload.request_weight_with_config(&request_weighting, Some(estimated_input_tokens));
 
     execute_non_stream_request_body(
         provider,
         &request_body,
         &payload.model,
-        input_tokens,
+        billing_input_tokens,
         conversion_result.tool_name_map,
+        false,
         RequestOptions {
             omit_agent_mode_header: probe.omit_agent_mode_header,
             request_id,
@@ -989,15 +987,45 @@ pub(crate) async fn execute_non_stream_round(
     .await
 }
 
-fn count_input_tokens_with_structured_instruction(payload: &MessagesRequest) -> i32 {
-    let base = token::count_all_tokens_borrowed(
+fn tokens_to_i32(tokens: u64) -> i32 {
+    tokens.min(i32::MAX as u64) as i32
+}
+
+fn estimate_input_tokens(payload: &MessagesRequest) -> i32 {
+    tokens_to_i32(token::count_all_tokens_borrowed(
         &payload.model,
         payload.system.as_deref(),
         &payload.messages,
         payload.tools.as_deref(),
-    ) as i32;
+    ))
+}
+
+async fn count_billing_input_tokens(payload: &MessagesRequest) -> i32 {
+    tokens_to_i32(
+        token::count_all_tokens_remote_or_local(
+            &payload.model,
+            payload.system.as_deref(),
+            &payload.messages,
+            payload.tools.as_deref(),
+        )
+        .await,
+    )
+}
+
+fn estimate_input_tokens_with_structured_instruction(payload: &MessagesRequest) -> i32 {
+    let base = estimate_input_tokens(payload);
     let output = structured_outputs::json_schema_output(payload);
-    base + structured_outputs::estimate_instruction_tokens(output.as_ref())
+    base.saturating_add(structured_outputs::estimate_instruction_tokens(
+        output.as_ref(),
+    ))
+}
+
+async fn count_billing_input_tokens_with_structured_instruction(payload: &MessagesRequest) -> i32 {
+    let base = count_billing_input_tokens(payload).await;
+    let output = structured_outputs::json_schema_output(payload);
+    base.saturating_add(structured_outputs::estimate_instruction_tokens(
+        output.as_ref(),
+    ))
 }
 
 async fn handle_structured_non_stream_request(
@@ -1249,6 +1277,7 @@ async fn handle_non_stream_request(
     model: &str,
     input_tokens: i32,
     tool_name_map: std::collections::HashMap<String, String>,
+    prefer_context_input_tokens: bool,
     request_options: RequestOptions,
 ) -> Response {
     match execute_non_stream_request_body(
@@ -1257,6 +1286,7 @@ async fn handle_non_stream_request(
         model,
         input_tokens,
         tool_name_map,
+        prefer_context_input_tokens,
         request_options,
     )
     .await
@@ -1272,6 +1302,7 @@ async fn execute_non_stream_request_body(
     model: &str,
     input_tokens: i32,
     tool_name_map: std::collections::HashMap<String, String>,
+    prefer_context_input_tokens: bool,
     request_options: RequestOptions,
 ) -> Result<NonStreamMessageResponse, Response> {
     // 调用 Kiro API（支持多凭据故障转移）
@@ -1304,6 +1335,7 @@ async fn execute_non_stream_request_body(
         model,
         input_tokens,
         tool_name_map,
+        prefer_context_input_tokens,
     ))
 }
 
@@ -1312,6 +1344,7 @@ fn decode_non_stream_message(
     model: &str,
     input_tokens: i32,
     tool_name_map: std::collections::HashMap<String, String>,
+    prefer_context_input_tokens: bool,
 ) -> NonStreamMessageResponse {
     // 解析事件流
     let mut decoder = EventStreamDecoder::new();
@@ -1446,8 +1479,13 @@ fn decode_non_stream_message(
     // 估算输出 tokens
     let output_tokens = token::estimate_output_tokens(&content);
 
-    // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
-    let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
+    // 普通 Anthropic 路由保留远端 count_tokens 结果作为 usage；CC 兼容路由仍可选择
+    // 用 contextUsageEvent 修正首包/非流式 usage。
+    let final_input_tokens = if prefer_context_input_tokens {
+        context_input_tokens.unwrap_or(input_tokens)
+    } else {
+        input_tokens
+    };
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -1559,12 +1597,13 @@ pub async fn count_tokens(payload: AnthropicJson<CountTokensRequest>) -> impl In
     }
     let payload = payload.into_inner();
 
-    let total_tokens = token::count_all_tokens_borrowed(
+    let total_tokens = token::count_all_tokens_remote_or_local(
         &payload.model,
         payload.system.as_deref(),
         &payload.messages,
         payload.tools.as_deref(),
-    ) as i32;
+    )
+    .await as i32;
 
     Json(CountTokensResponse {
         input_tokens: total_tokens.max(1) as i32,
@@ -1680,12 +1719,7 @@ pub async fn post_messages_cc(
     if webfetch::has_web_fetch_tool(&payload) {
         tracing::info!(request_id = %request_id, "检测到 WebFetch 工具，路由到 WebFetch 处理");
 
-        let input_tokens = token::count_all_tokens_borrowed(
-            &payload.model,
-            payload.system.as_deref(),
-            &payload.messages,
-            payload.tools.as_deref(),
-        ) as i32;
+        let input_tokens = count_billing_input_tokens(&payload).await;
 
         return webfetch::handle_webfetch_request(
             provider,
@@ -1701,13 +1735,8 @@ pub async fn post_messages_cc(
     if websearch::has_web_search_tool(&payload) {
         tracing::info!(request_id = %request_id, "检测到 WebSearch 工具，路由到 WebSearch 处理");
 
-        // 估算输入 tokens
-        let input_tokens = token::count_all_tokens_borrowed(
-            &payload.model,
-            payload.system.as_deref(),
-            &payload.messages,
-            payload.tools.as_deref(),
-        ) as i32;
+        // 下游 usage 计费使用远端计数优先。
+        let input_tokens = count_billing_input_tokens(&payload).await;
 
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
     }
@@ -1768,21 +1797,21 @@ pub async fn post_messages_cc(
     let thinking_enabled = request_thinking_enabled(&payload);
     let request_weighting = provider.request_weighting_config();
 
-    // 估算输入 tokens
+    // 调度使用本地估算，返回给下游的 usage 使用远端计数优先。
     let token_count_started_at = Instant::now();
-    let input_tokens = token::count_all_tokens_borrowed(
-        &payload.model,
-        payload.system.as_deref(),
-        &payload.messages,
-        payload.tools.as_deref(),
-    ) as i32;
+    let estimated_input_tokens = estimate_input_tokens(&payload);
     let token_count_ms = token_count_started_at.elapsed().as_millis();
-    let request_weight = payload.request_weight_with_config(&request_weighting, Some(input_tokens));
+    let billing_token_count_started_at = Instant::now();
+    let billing_input_tokens = count_billing_input_tokens(&payload).await;
+    let billing_token_count_ms = billing_token_count_started_at.elapsed().as_millis();
+    let request_weight =
+        payload.request_weight_with_config(&request_weighting, Some(estimated_input_tokens));
     let pre_upstream_ms = handler_started_at.elapsed().as_millis();
 
     tracing::debug!(
         request_id = %request_id,
-        input_tokens,
+        estimated_input_tokens,
+        billing_input_tokens,
         request_weight,
         "已完成请求轻重分级"
     );
@@ -1791,6 +1820,7 @@ pub async fn post_messages_cc(
         || convert_ms >= SLOW_ANTHROPIC_PRE_UPSTREAM_PHASE_MS
         || serialize_ms >= SLOW_ANTHROPIC_PRE_UPSTREAM_PHASE_MS
         || token_count_ms >= SLOW_ANTHROPIC_PRE_UPSTREAM_PHASE_MS
+        || billing_token_count_ms >= SLOW_ANTHROPIC_PRE_UPSTREAM_PHASE_MS
     {
         tracing::warn!(
             request_id = %request_id,
@@ -1805,9 +1835,11 @@ pub async fn post_messages_cc(
             convert_ms,
             serialize_ms,
             token_count_ms,
+            billing_token_count_ms,
             pre_upstream_ms,
             kiro_request_body_bytes = request_body.len(),
-            input_tokens,
+            estimated_input_tokens,
+            billing_input_tokens,
             request_weight,
             "Anthropic request pre-upstream phases completed"
         );
@@ -1823,7 +1855,7 @@ pub async fn post_messages_cc(
             provider,
             &request_body,
             &payload.model,
-            input_tokens,
+            billing_input_tokens,
             thinking_enabled,
             tool_name_map,
             RequestOptions {
@@ -1843,8 +1875,9 @@ pub async fn post_messages_cc(
             provider,
             &request_body,
             &payload.model,
-            input_tokens,
+            billing_input_tokens,
             tool_name_map,
+            true,
             RequestOptions {
                 omit_agent_mode_header: probe.omit_agent_mode_header,
                 request_id: Some(request_id),
@@ -2012,14 +2045,17 @@ fn create_buffered_sse_stream(
 mod tests {
     use super::{
         ANTHROPIC_RUNTIME_LEADER_REQUIRED_HEADER, NonStreamMessageResponse,
-        coerce_structured_response, is_opus_4_7_model, map_provider_error,
-        override_thinking_from_model_name, request_thinking_enabled,
+        coerce_structured_response, decode_non_stream_message, is_opus_4_7_model,
+        map_provider_error, override_thinking_from_model_name, request_thinking_enabled,
     };
     use crate::anthropic::structured_outputs::JsonSchemaOutput;
     use crate::anthropic::types::{Message, MessagesRequest, Thinking};
+    use crate::kiro::parser::crc::crc32;
+    use crate::kiro::parser::frame::PRELUDE_SIZE;
     use crate::kiro::provider::PublicProviderError;
     use crate::kiro::token_manager::RuntimeRefreshLeaderRequiredError;
     use axum::{body::to_bytes, http::StatusCode};
+    use std::collections::HashMap;
 
     fn base_request(model: &str) -> MessagesRequest {
         MessagesRequest {
@@ -2037,6 +2073,58 @@ mod tests {
             output_config: None,
             metadata: None,
         }
+    }
+
+    fn string_header(name: &str, value: &str) -> Vec<u8> {
+        let mut header = Vec::new();
+        header.push(name.len() as u8);
+        header.extend_from_slice(name.as_bytes());
+        header.push(7);
+        header.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        header.extend_from_slice(value.as_bytes());
+        header
+    }
+
+    fn event_frame(event_type: &str, payload: &[u8]) -> Vec<u8> {
+        let mut headers = Vec::new();
+        headers.extend(string_header(":message-type", "event"));
+        headers.extend(string_header(":event-type", event_type));
+
+        let total_length = (PRELUDE_SIZE + headers.len() + payload.len() + 4) as u32;
+        let header_length = headers.len() as u32;
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&total_length.to_be_bytes());
+        frame.extend_from_slice(&header_length.to_be_bytes());
+        let prelude_crc = crc32(&frame);
+        frame.extend_from_slice(&prelude_crc.to_be_bytes());
+        frame.extend_from_slice(&headers);
+        frame.extend_from_slice(payload);
+        let message_crc = crc32(&frame);
+        frame.extend_from_slice(&message_crc.to_be_bytes());
+        frame
+    }
+
+    #[test]
+    fn test_decode_non_stream_preserves_billing_input_tokens_by_default() {
+        let body = event_frame("contextUsageEvent", br#"{"contextUsagePercentage":50.0}"#);
+        let response =
+            decode_non_stream_message(&body, "claude-sonnet-4-6", 123, HashMap::new(), false);
+
+        assert_eq!(response.input_tokens, 123);
+        assert_eq!(response.body["usage"]["input_tokens"], 123);
+    }
+
+    #[test]
+    fn test_decode_non_stream_can_prefer_context_usage_for_cc() {
+        let body = event_frame("contextUsageEvent", br#"{"contextUsagePercentage":50.0}"#);
+        let response =
+            decode_non_stream_message(&body, "claude-sonnet-4-6", 123, HashMap::new(), true);
+
+        assert!(response.input_tokens > 123);
+        assert_eq!(
+            response.body["usage"]["input_tokens"],
+            response.input_tokens
+        );
     }
 
     #[test]

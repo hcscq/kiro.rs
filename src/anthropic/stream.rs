@@ -1185,12 +1185,11 @@ impl BufferedStreamContext {
 
 /// 简单的 token 估算
 fn estimate_tokens(text: &str) -> i32 {
-    let chars: Vec<char> = text.chars().collect();
     let mut chinese_count = 0;
     let mut other_count = 0;
 
-    for c in &chars {
-        if *c >= '\u{4E00}' && *c <= '\u{9FFF}' {
+    for c in text.chars() {
+        if ('\u{4E00}'..='\u{9FFF}').contains(&c) {
             chinese_count += 1;
         } else {
             other_count += 1;

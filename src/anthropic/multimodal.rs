@@ -1,4 +1,5 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use base64::Engine;
@@ -15,6 +16,7 @@ use super::types::MessagesRequest;
 const MAX_REMOTE_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_IMAGE_REDIRECTS: usize = 3;
 const IMAGE_FETCH_TIMEOUT_SECS: u64 = 10;
+static IMAGE_FETCH_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct MultimodalNormalizeStats {
@@ -56,7 +58,7 @@ pub(crate) async fn normalize_multimodal_urls(
             continue;
         };
         for block in blocks {
-            normalize_content_block(block, &client, &mut stats).await?;
+            normalize_content_block(block, client, &mut stats).await?;
         }
     }
 
@@ -182,14 +184,23 @@ fn parse_image_data_url(
     Ok(Some((media_type.to_string(), data.trim().to_string())))
 }
 
-fn image_fetch_client() -> Result<reqwest::Client, MultimodalNormalizeError> {
-    reqwest::Client::builder()
+fn image_fetch_client() -> Result<&'static reqwest::Client, MultimodalNormalizeError> {
+    if let Some(client) = IMAGE_FETCH_CLIENT.get() {
+        return Ok(client);
+    }
+
+    let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(IMAGE_FETCH_TIMEOUT_SECS))
         .redirect(Policy::none())
         .build()
         .map_err(|err| {
             MultimodalNormalizeError::new(format!("failed to create image fetch client: {err}"))
-        })
+        })?;
+
+    let _ = IMAGE_FETCH_CLIENT.set(client);
+    IMAGE_FETCH_CLIENT
+        .get()
+        .ok_or_else(|| MultimodalNormalizeError::new("failed to cache image fetch client"))
 }
 
 async fn fetch_remote_image(

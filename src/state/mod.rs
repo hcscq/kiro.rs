@@ -2718,9 +2718,9 @@ impl RedisDispatchRuntimeBackend {
         run_blocking_state_op(
             move || -> anyhow::Result<HashMap<u64, DispatchRuntimeSnapshot>> {
                 let mut connection = client.get_connection().context("连接 Redis 调度热态失败")?;
-                let mut snapshots = HashMap::with_capacity(credentials.len());
+                let mut pipe = redis::pipe();
 
-                for credential in credentials {
+                for credential in &credentials {
                     let state_key = format!(
                         "{}:credential:{}:{}",
                         namespace, credential.id, REDIS_DISPATCH_RUNTIME_STATE_KEY_SUFFIX
@@ -2729,8 +2729,48 @@ impl RedisDispatchRuntimeBackend {
                         "{}:credential:{}:{}",
                         namespace, credential.id, REDIS_DISPATCH_RUNTIME_LEASES_KEY_SUFFIX
                     );
-                    let record =
-                        Self::load_record(&mut connection, &state_key, &leases_key, now_epoch_ms)?;
+                    pipe.cmd("ZREMRANGEBYSCORE")
+                        .arg(&leases_key)
+                        .arg("-inf")
+                        .arg(now_epoch_ms)
+                        .ignore();
+                    pipe.cmd("ZCARD").arg(&leases_key);
+                    pipe.cmd("HMGET")
+                        .arg(&state_key)
+                        .arg("cooldown_until_ms")
+                        .arg("rate_limit_hit_streak")
+                        .arg("bucket_tokens")
+                        .arg("bucket_current_refill_per_second")
+                        .arg("bucket_last_refill_at_ms")
+                        .arg("bucket_capacity")
+                        .arg("bucket_base_refill_per_second");
+                }
+
+                let values: Vec<redis::Value> = pipe
+                    .query(&mut connection)
+                    .context("批量读取 Redis 调度热态失败")?;
+                let expected_values = credentials.len() * 2;
+                if values.len() != expected_values {
+                    anyhow::bail!(
+                        "批量读取 Redis 调度热态返回数量异常: expected {}, got {}",
+                        expected_values,
+                        values.len()
+                    );
+                }
+
+                let mut values = values.into_iter();
+                let mut snapshots = HashMap::with_capacity(credentials.len());
+
+                for credential in credentials {
+                    let active_value = values.next().context("Redis 调度热态响应缺少 ZCARD")?;
+                    let active_requests: usize = redis::from_redis_value(&active_value)
+                        .with_context(|| {
+                            format!("读取 Redis 调度占位计数失败: {}", credential.id)
+                        })?;
+                    let fields_value = values.next().context("Redis 调度热态响应缺少 HMGET")?;
+                    let field_values: Vec<Option<String>> = redis::from_redis_value(&fields_value)
+                        .with_context(|| format!("读取 Redis 调度热态失败: {}", credential.id))?;
+                    let record = Self::record_from_values(active_requests, field_values);
                     snapshots.insert(
                         credential.id,
                         record.normalize(credential.bucket_policy, now_epoch_ms),
@@ -3005,35 +3045,11 @@ impl RedisDispatchRuntimeBackend {
         })
     }
 
-    fn load_record(
-        connection: &mut redis::Connection,
-        state_key: &str,
-        leases_key: &str,
-        now_epoch_ms: u64,
-    ) -> anyhow::Result<DispatchRuntimeRecord> {
-        let _: usize = redis::cmd("ZREMRANGEBYSCORE")
-            .arg(leases_key)
-            .arg("-inf")
-            .arg(now_epoch_ms)
-            .query(connection)
-            .with_context(|| format!("清理过期 Redis 调度占位失败: {leases_key}"))?;
-        let active_requests: usize = redis::cmd("ZCARD")
-            .arg(leases_key)
-            .query(connection)
-            .with_context(|| format!("读取 Redis 调度占位计数失败: {leases_key}"))?;
-        let values: Vec<Option<String>> = redis::cmd("HMGET")
-            .arg(state_key)
-            .arg("cooldown_until_ms")
-            .arg("rate_limit_hit_streak")
-            .arg("bucket_tokens")
-            .arg("bucket_current_refill_per_second")
-            .arg("bucket_last_refill_at_ms")
-            .arg("bucket_capacity")
-            .arg("bucket_base_refill_per_second")
-            .query(connection)
-            .with_context(|| format!("读取 Redis 调度热态失败: {state_key}"))?;
-
-        Ok(DispatchRuntimeRecord {
+    fn record_from_values(
+        active_requests: usize,
+        values: Vec<Option<String>>,
+    ) -> DispatchRuntimeRecord {
+        DispatchRuntimeRecord {
             active_requests,
             cooldown_until_epoch_ms: Self::parse_optional_u64(values.first()),
             rate_limit_hit_streak: Self::parse_optional_u32(values.get(1)).unwrap_or_default(),
@@ -3042,7 +3058,7 @@ impl RedisDispatchRuntimeBackend {
             bucket_last_refill_at_epoch_ms: Self::parse_optional_u64(values.get(4)),
             bucket_capacity: Self::parse_optional_f64(values.get(5)),
             bucket_base_refill_per_second: Self::parse_optional_f64(values.get(6)),
-        })
+        }
     }
 
     fn bucket_script_args(

@@ -31,6 +31,7 @@ pub struct CountTokensConfig {
 
 /// 全局配置存储
 static COUNT_TOKENS_CONFIG: OnceLock<CountTokensConfig> = OnceLock::new();
+static COUNT_TOKENS_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 /// 初始化 count_tokens 配置
 ///
@@ -103,8 +104,6 @@ pub fn count_tokens(text: &str) -> u64 {
 }
 
 /// 估算请求的输入 tokens
-///
-/// 优先调用远程 API，失败时回退到本地计算
 #[allow(dead_code)]
 pub(crate) fn count_all_tokens(
     model: String,
@@ -116,30 +115,27 @@ pub(crate) fn count_all_tokens(
 }
 
 pub(crate) fn count_all_tokens_borrowed(
+    _model: &str,
+    system: Option<&[SystemMessage]>,
+    messages: &[Message],
+    tools: Option<&[Tool]>,
+) -> u64 {
+    // 热路径保持纯本地计算，避免普通消息请求在高并发下阻塞等待远端 count_tokens。
+    count_all_tokens_local_borrowed(system, messages, tools)
+}
+
+/// 为需要返回给下游的 usage 计算输入 tokens。
+///
+/// 远端 API 配置存在时优先异步调用远端计数，失败时回退到本地估算。
+pub(crate) async fn count_all_tokens_remote_or_local(
     model: &str,
     system: Option<&[SystemMessage]>,
     messages: &[Message],
     tools: Option<&[Tool]>,
 ) -> u64 {
-    // 检查是否配置了远程 API
     if let Some(config) = get_config() {
-        if let Some(api_url) = &config.api_url {
-            // 尝试调用远程 API
-            let owned_system = system.map(|items| items.to_vec());
-            let owned_messages = messages.to_vec();
-            let owned_tools = tools.map(|items| items.to_vec());
-            let result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(call_remote_count_tokens(
-                    api_url,
-                    config,
-                    model.to_string(),
-                    &owned_system,
-                    &owned_messages,
-                    &owned_tools,
-                ))
-            });
-
-            match result {
+        if let Some(api_url) = config.api_url.as_deref() {
+            match call_remote_count_tokens(api_url, config, model, system, messages, tools).await {
                 Ok(tokens) => {
                     tracing::debug!("远程 count_tokens API 返回: {}", tokens);
                     return tokens;
@@ -155,23 +151,38 @@ pub(crate) fn count_all_tokens_borrowed(
     count_all_tokens_local_borrowed(system, messages, tools)
 }
 
+fn count_tokens_client(
+    config: &CountTokensConfig,
+) -> Result<&'static reqwest::Client, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(client) = COUNT_TOKENS_CLIENT.get() {
+        return Ok(client);
+    }
+
+    let client = build_client(config.proxy.as_ref(), 300, config.tls_backend)
+        .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { err.into() })?;
+    let _ = COUNT_TOKENS_CLIENT.set(client);
+    COUNT_TOKENS_CLIENT
+        .get()
+        .ok_or_else(|| "count_tokens client initialization failed".into())
+}
+
 /// 调用远程 count_tokens API
 async fn call_remote_count_tokens(
     api_url: &str,
     config: &CountTokensConfig,
-    model: String,
-    system: &Option<Vec<SystemMessage>>,
-    messages: &Vec<Message>,
-    tools: &Option<Vec<Tool>>,
+    model: &str,
+    system: Option<&[SystemMessage]>,
+    messages: &[Message],
+    tools: Option<&[Tool]>,
 ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-    let client = build_client(config.proxy.as_ref(), 300, config.tls_backend)?;
+    let client = count_tokens_client(config)?;
 
     // 构建请求体
     let request = CountTokensRequest {
-        model: model, // 模型名称用于 token 计算
-        messages: messages.clone(),
-        system: system.clone(),
-        tools: tools.clone(),
+        model: model.to_string(), // 模型名称用于 token 计算
+        messages: messages.to_vec(),
+        system: system.map(|items| items.to_vec()),
+        tools: tools.map(|items| items.to_vec()),
     };
 
     // 构建请求
