@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::convert::Infallible;
 use std::io::Cursor;
 use std::sync::OnceLock;
+use std::time::Instant;
 
 use axum::{
     body::Body,
@@ -20,7 +21,7 @@ use bytes::Bytes;
 use futures::{Stream, stream};
 use regex::Regex;
 use reqwest::redirect::Policy;
-use serde_json::json;
+use serde_json::{Value, json};
 use url::Url;
 use uuid::Uuid;
 
@@ -29,6 +30,7 @@ use crate::token;
 use super::handlers::execute_non_stream_round;
 use super::probe::UpstreamProbe;
 use super::stream::SseEvent;
+use super::structured_outputs::{self, JsonSchemaOutput, StructuredOutputError};
 use super::types::{ErrorResponse, Message, MessagesRequest, Tool};
 use super::websearch;
 
@@ -85,83 +87,91 @@ struct ServerToolExecution {
     web_search_requests: i32,
 }
 
+#[derive(Debug, Clone)]
+struct WebSearchConfig {
+    max_uses: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct ServerWebToolConfig {
+    web_fetch: Option<WebFetchConfig>,
+    web_search: Option<WebSearchConfig>,
+}
+
+#[derive(Debug)]
+struct ServerWebToolRun {
+    content: Vec<serde_json::Value>,
+    stop_reason: String,
+    fallback_input_tokens: i32,
+    total_input_tokens: i32,
+    total_output_tokens: i32,
+    web_fetch_requests: i32,
+    web_search_requests: i32,
+}
+
 pub fn has_web_fetch_tool(req: &MessagesRequest) -> bool {
     req.tools
         .as_ref()
         .is_some_and(|tools| tools.iter().any(is_any_web_fetch_tool))
 }
 
-pub async fn handle_webfetch_request(
+pub fn has_server_web_tool(req: &MessagesRequest) -> bool {
+    has_web_fetch_tool(req)
+        || req.tools.as_ref().is_some_and(|tools| {
+            tools.iter().any(websearch::is_web_search_tool)
+                && websearch::extract_search_query(req).is_some()
+        })
+}
+
+pub async fn handle_server_web_tool_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     payload: &MessagesRequest,
     input_tokens: i32,
     probe: UpstreamProbe,
     request_id: &str,
+    structured_output: Option<JsonSchemaOutput>,
 ) -> Response {
-    let Some(tools) = payload.tools.as_ref() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "web_fetch tool declaration is missing",
-            )),
-        )
-            .into_response();
+    let run = match execute_server_web_tool_loop(
+        provider.clone(),
+        payload,
+        input_tokens,
+        probe.clone(),
+        request_id,
+    )
+    .await
+    {
+        Ok(run) => run,
+        Err(response) => return response,
     };
 
-    let web_fetch_tools: Vec<&Tool> = tools
-        .iter()
-        .filter(|tool| is_any_web_fetch_tool(tool))
-        .collect();
-    if web_fetch_tools.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "web_fetch tool declaration is missing",
-            )),
+    if let Some(output) = structured_output {
+        return finalize_structured_server_web_tool_response(
+            provider, payload, run, probe, request_id, output,
         )
-            .into_response();
-    }
-    if web_fetch_tools.len() > 1 {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "only one web_fetch tool declaration is supported per request",
-            )),
-        )
-            .into_response();
+        .await;
     }
 
-    let tool = web_fetch_tools[0];
-    if !is_supported_web_fetch_tool(tool) {
-        let version = tool.tool_type.as_deref().unwrap_or("unknown");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                format!(
-                    "kiro.rs currently supports Anthropic web_fetch server tool versions {} only; received {}",
-                    SUPPORTED_WEB_FETCH_TOOL_TYPES.join(", "), version
-                ),
-            )),
-        )
-            .into_response();
-    }
+    finalize_web_fetch_response(
+        payload,
+        run.content,
+        run.stop_reason,
+        run.fallback_input_tokens,
+        run.total_input_tokens,
+        run.total_output_tokens,
+        run.web_fetch_requests,
+        run.web_search_requests,
+    )
+}
 
-    let config = match build_web_fetch_config(tool) {
-        Ok(config) => config,
-        Err(message) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new("invalid_request_error", message)),
-            )
-                .into_response();
-        }
-    };
-
-    let mut internal_payload = build_internal_webfetch_payload(payload, tool);
+async fn execute_server_web_tool_loop(
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    payload: &MessagesRequest,
+    input_tokens: i32,
+    probe: UpstreamProbe,
+    request_id: &str,
+) -> Result<ServerWebToolRun, Response> {
+    let config = validate_server_web_tools(payload)?;
+    let mut internal_payload = build_internal_server_web_tool_payload(payload);
     let mut outward_content: Vec<serde_json::Value> = Vec::new();
     let mut total_input_tokens = 0;
     let mut total_output_tokens = 0;
@@ -169,18 +179,14 @@ pub async fn handle_webfetch_request(
     let mut web_search_requests = 0;
 
     for round_idx in 0..WEB_FETCH_HARD_MAX_USES {
-        let round_request_id = format!("{request_id}-webfetch-{round_idx}");
-        let round = match execute_non_stream_round(
+        let round_request_id = format!("{request_id}-webtool-{round_idx}");
+        let round = execute_non_stream_round(
             provider.clone(),
             &internal_payload,
             probe.clone(),
             Some(round_request_id),
         )
-        .await
-        {
-            Ok(round) => round,
-            Err(resp) => return resp,
-        };
+        .await?;
 
         total_input_tokens += round.input_tokens.max(0);
         total_output_tokens += round.output_tokens.max(0);
@@ -190,13 +196,20 @@ pub async fn handle_webfetch_request(
 
         for block in &round.content {
             if is_internal_web_fetch_tool_use(block) {
-                let execution = execute_web_fetch_tool(
-                    &internal_payload,
-                    &config,
-                    block,
-                    web_fetch_requests as usize,
-                )
-                .await;
+                let execution = if let Some(fetch_config) = &config.web_fetch {
+                    execute_web_fetch_tool(
+                        &internal_payload,
+                        fetch_config,
+                        block,
+                        web_fetch_requests as usize,
+                    )
+                    .await
+                } else {
+                    build_unavailable_web_fetch_execution(
+                        block,
+                        "web_fetch tool declaration is missing",
+                    )
+                };
                 web_fetch_requests += execution.web_fetch_requests;
                 web_search_requests += execution.web_search_requests;
                 outward_content.push(execution.server_tool_use_block);
@@ -206,7 +219,13 @@ pub async fn handle_webfetch_request(
             }
 
             if is_internal_web_search_tool_use(block) {
-                let execution = execute_web_search_tool(provider.as_ref(), block).await;
+                let execution = execute_web_search_tool(
+                    provider.as_ref(),
+                    block,
+                    config.web_search.as_ref(),
+                    web_search_requests as usize,
+                )
+                .await;
                 web_fetch_requests += execution.web_fetch_requests;
                 web_search_requests += execution.web_search_requests;
                 outward_content.push(execution.server_tool_use_block);
@@ -222,20 +241,19 @@ pub async fn handle_webfetch_request(
         }
 
         if tool_result_blocks.is_empty() || saw_client_tool_use {
-            return finalize_web_fetch_response(
-                payload,
-                outward_content,
-                if saw_client_tool_use {
+            return Ok(ServerWebToolRun {
+                content: outward_content,
+                stop_reason: if saw_client_tool_use {
                     "tool_use".to_string()
                 } else {
                     round.stop_reason
                 },
-                input_tokens,
+                fallback_input_tokens: input_tokens,
                 total_input_tokens,
                 total_output_tokens,
                 web_fetch_requests,
                 web_search_requests,
-            );
+            });
         }
 
         internal_payload.messages.push(Message {
@@ -248,14 +266,107 @@ pub async fn handle_webfetch_request(
         });
     }
 
-    (
+    Err((
         StatusCode::BAD_GATEWAY,
         Json(ErrorResponse::new(
             "api_error",
-            "web_fetch tool loop exceeded the internal safety limit",
+            "server-side web tool loop exceeded the internal safety limit",
         )),
     )
-        .into_response()
+        .into_response())
+}
+
+fn validate_server_web_tools(payload: &MessagesRequest) -> Result<ServerWebToolConfig, Response> {
+    let Some(tools) = payload.tools.as_ref() else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                "server-side web tool declaration is missing",
+            )),
+        )
+            .into_response());
+    };
+
+    let web_fetch_tools: Vec<&Tool> = tools
+        .iter()
+        .filter(|tool| is_any_web_fetch_tool(tool))
+        .collect();
+    let web_search_tools: Vec<&Tool> = tools
+        .iter()
+        .filter(|tool| websearch::is_web_search_tool(tool))
+        .collect();
+
+    if web_fetch_tools.is_empty() && web_search_tools.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                "server-side web tool declaration is missing",
+            )),
+        )
+            .into_response());
+    }
+    if web_fetch_tools.len() > 1 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                "only one web_fetch tool declaration is supported per request",
+            )),
+        )
+            .into_response());
+    }
+    if web_search_tools.len() > 1 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                "only one web_search tool declaration is supported per request",
+            )),
+        )
+            .into_response());
+    }
+
+    let web_fetch = if let Some(tool) = web_fetch_tools.first().copied() {
+        if !is_supported_web_fetch_tool(tool) {
+            let version = tool.tool_type.as_deref().unwrap_or("unknown");
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(
+                    "invalid_request_error",
+                    format!(
+                        "kiro.rs currently supports Anthropic web_fetch server tool versions {} only; received {}",
+                        SUPPORTED_WEB_FETCH_TOOL_TYPES.join(", "), version
+                    ),
+                )),
+            )
+                .into_response());
+        }
+        match build_web_fetch_config(tool) {
+            Ok(config) => Some(config),
+            Err(message) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse::new("invalid_request_error", message)),
+                )
+                    .into_response());
+            }
+        }
+    } else {
+        None
+    };
+
+    let web_search = web_search_tools.first().map(|tool| WebSearchConfig {
+        max_uses: tool
+            .max_uses
+            .and_then(|value| usize::try_from(value.max(0)).ok()),
+    });
+
+    Ok(ServerWebToolConfig {
+        web_fetch,
+        web_search,
+    })
 }
 
 fn is_any_web_fetch_tool(tool: &Tool) -> bool {
@@ -312,15 +423,20 @@ fn build_web_fetch_config(tool: &Tool) -> Result<WebFetchConfig, String> {
     })
 }
 
-fn build_internal_webfetch_payload(payload: &MessagesRequest, tool: &Tool) -> MessagesRequest {
+#[cfg(test)]
+fn build_internal_webfetch_payload(payload: &MessagesRequest, _tool: &Tool) -> MessagesRequest {
+    build_internal_server_web_tool_payload(payload)
+}
+
+fn build_internal_server_web_tool_payload(payload: &MessagesRequest) -> MessagesRequest {
     let mut cloned = payload.clone();
     cloned.stream = false;
     cloned.tools = payload.tools.as_ref().map(|tools| {
         tools
             .iter()
             .map(|declared_tool| {
-                if std::ptr::eq(declared_tool, tool) || is_supported_web_fetch_tool(declared_tool) {
-                    build_internal_webfetch_tool(tool)
+                if is_any_web_fetch_tool(declared_tool) {
+                    build_internal_webfetch_tool(declared_tool)
                 } else if websearch::is_web_search_tool(declared_tool) {
                     build_internal_websearch_tool(declared_tool)
                 } else {
@@ -526,6 +642,8 @@ async fn execute_web_fetch_tool(
 async fn execute_web_search_tool(
     provider: &crate::kiro::provider::KiroProvider,
     tool_use: &serde_json::Value,
+    config: Option<&WebSearchConfig>,
+    completed_uses: usize,
 ) -> ServerToolExecution {
     let internal_tool_use_id = tool_use
         .get("id")
@@ -539,8 +657,13 @@ async fn execute_web_search_tool(
         .map(str::trim)
         .unwrap_or("");
 
-    let performed_request = !query.is_empty();
-    let outcome = if performed_request {
+    let max_uses_exceeded = config
+        .and_then(|config| config.max_uses)
+        .is_some_and(|max_uses| completed_uses >= max_uses);
+    let performed_request = !query.is_empty() && !max_uses_exceeded;
+    let outcome = if max_uses_exceeded {
+        websearch::WebSearchOutcome::Unavailable("web_search max_uses exceeded".to_string())
+    } else if performed_request {
         websearch::perform_web_search(provider, query).await
     } else {
         websearch::WebSearchOutcome::Unavailable("Missing `query` in web_search input".to_string())
@@ -568,6 +691,50 @@ async fn execute_web_search_tool(
         }),
         web_fetch_requests: 0,
         web_search_requests: if performed_request { 1 } else { 0 },
+    }
+}
+
+fn build_unavailable_web_fetch_execution(
+    tool_use: &serde_json::Value,
+    message: &str,
+) -> ServerToolExecution {
+    let internal_tool_use_id = tool_use
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("tooluse_web_fetch_invalid");
+    let external_tool_use_id = generate_server_tool_use_id();
+    let url = tool_use
+        .get("input")
+        .and_then(|value| value.get("url"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+
+    ServerToolExecution {
+        server_tool_use_block: json!({
+            "type": "server_tool_use",
+            "id": external_tool_use_id,
+            "name": EXTERNAL_WEB_FETCH_TOOL_NAME,
+            "input": {
+                "url": url
+            }
+        }),
+        result_block: json!({
+            "type": "web_fetch_tool_result",
+            "tool_use_id": external_tool_use_id,
+            "content": {
+                "type": "web_fetch_tool_error",
+                "error_code": "tool_unavailable"
+            }
+        }),
+        internal_tool_result: json!({
+            "type": "tool_result",
+            "tool_use_id": internal_tool_use_id,
+            "content": format!("web_fetch error (tool_unavailable): {}", message),
+            "is_error": true
+        }),
+        web_fetch_requests: 0,
+        web_search_requests: 0,
     }
 }
 
@@ -797,6 +964,344 @@ fn build_internal_tool_result_text(url: &str, title: Option<&str>, text: &str) -
     result.push_str("Content:\n");
     result.push_str(text);
     result
+}
+
+async fn finalize_structured_server_web_tool_response(
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    payload: &MessagesRequest,
+    mut run: ServerWebToolRun,
+    probe: UpstreamProbe,
+    request_id: &str,
+    output: JsonSchemaOutput,
+) -> Response {
+    let structured_started_at = Instant::now();
+    let stats = structured_outputs::schema_stats(&output.schema);
+    tracing::info!(
+        request_id = %request_id,
+        stream = payload.stream,
+        schema_bytes = stats.bytes,
+        schema_depth = stats.max_depth,
+        schema_nodes = stats.nodes,
+        schema_combinator_branches = stats.combinator_branches,
+        schema_properties = stats.properties,
+        max_retries = structured_outputs::MAX_JSON_SCHEMA_RETRIES,
+        web_fetch_requests = run.web_fetch_requests,
+        web_search_requests = run.web_search_requests,
+        "Server-side web tool structured output routed through JSON Schema compatibility path"
+    );
+
+    let previous_text = structured_outputs::collect_text_content(&run.content);
+    match coerce_server_web_tool_structured_content(&run.content, &output) {
+        Ok((content, json_text_chars)) => {
+            run.content = content;
+            tracing::info!(
+                request_id = %request_id,
+                stream = payload.stream,
+                attempts = 1,
+                retried = false,
+                elapsed_ms = structured_started_at.elapsed().as_millis(),
+                raw_text_chars = previous_text.chars().count(),
+                json_text_chars,
+                input_tokens = run.total_input_tokens.max(run.fallback_input_tokens).max(1),
+                output_tokens = estimate_webfetch_output_tokens(&run.content),
+                web_fetch_requests = run.web_fetch_requests,
+                web_search_requests = run.web_search_requests,
+                "Server-side web tool structured output satisfied JSON Schema"
+            );
+            return finalize_web_fetch_response(
+                payload,
+                run.content,
+                "end_turn".to_string(),
+                run.fallback_input_tokens,
+                run.total_input_tokens,
+                run.total_output_tokens,
+                run.web_fetch_requests,
+                run.web_search_requests,
+            );
+        }
+        Err(mut last_error) => {
+            for attempt in 0..structured_outputs::MAX_JSON_SCHEMA_RETRIES {
+                tracing::warn!(
+                    request_id = %request_id,
+                    attempt,
+                    error = %last_error,
+                    previous_text_chars = previous_text.chars().count(),
+                    web_fetch_requests = run.web_fetch_requests,
+                    web_search_requests = run.web_search_requests,
+                    "Server-side web tool structured output failed validation; repairing without re-running web tools"
+                );
+                let repair_payload = build_server_web_tool_repair_payload(
+                    payload,
+                    &run.content,
+                    &last_error,
+                    &output,
+                );
+                let repair_request_id = format!("{request_id}-webtool-structured-repair-{attempt}");
+                let repair_result = match execute_non_stream_round(
+                    provider.clone(),
+                    &repair_payload,
+                    probe.clone(),
+                    Some(repair_request_id),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(response) => return response,
+                };
+
+                run.total_input_tokens += repair_result.input_tokens.max(0);
+                run.total_output_tokens += repair_result.output_tokens.max(0);
+                match extract_valid_structured_json_text(&repair_result.content, &output) {
+                    Ok(json_text) => {
+                        let json_text_chars = json_text.chars().count();
+                        run.content = content_with_structured_json(&run.content, json_text);
+                        tracing::info!(
+                            request_id = %request_id,
+                            stream = payload.stream,
+                            attempts = attempt + 2,
+                            retried = true,
+                            elapsed_ms = structured_started_at.elapsed().as_millis(),
+                            raw_text_chars = previous_text.chars().count(),
+                            json_text_chars,
+                            input_tokens = run.total_input_tokens.max(run.fallback_input_tokens).max(1),
+                            output_tokens = estimate_webfetch_output_tokens(&run.content),
+                            web_fetch_requests = run.web_fetch_requests,
+                            web_search_requests = run.web_search_requests,
+                            "Server-side web tool structured output satisfied JSON Schema"
+                        );
+                        return finalize_web_fetch_response(
+                            payload,
+                            run.content,
+                            "end_turn".to_string(),
+                            run.fallback_input_tokens,
+                            run.total_input_tokens,
+                            run.total_output_tokens,
+                            run.web_fetch_requests,
+                            run.web_search_requests,
+                        );
+                    }
+                    Err(err) => last_error = err,
+                }
+            }
+
+            tracing::warn!(
+                request_id = %request_id,
+                error = %last_error,
+                elapsed_ms = structured_started_at.elapsed().as_millis(),
+                web_fetch_requests = run.web_fetch_requests,
+                web_search_requests = run.web_search_requests,
+                "Server-side web tool structured output failed validation after retries"
+            );
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse::new(
+                    "api_error",
+                    format!(
+                        "Upstream response did not satisfy output_config.format.json_schema after server-side web tool execution: {last_error}"
+                    ),
+                )),
+            )
+                .into_response()
+        }
+    }
+}
+
+fn coerce_server_web_tool_structured_content(
+    content: &[Value],
+    output: &JsonSchemaOutput,
+) -> Result<(Vec<Value>, usize), StructuredOutputError> {
+    let json_text = extract_valid_structured_json_text(content, output)?;
+    let json_text_chars = json_text.chars().count();
+    Ok((
+        content_with_structured_json(content, json_text),
+        json_text_chars,
+    ))
+}
+
+fn extract_valid_structured_json_text(
+    content: &[Value],
+    output: &JsonSchemaOutput,
+) -> Result<String, StructuredOutputError> {
+    let text = structured_outputs::collect_text_content(content);
+    let value = structured_outputs::extract_json_value(&text)?;
+    structured_outputs::validate_instance(output, &value)?;
+    serde_json::to_string(&value).map_err(|err| StructuredOutputError::InvalidJson(err.to_string()))
+}
+
+fn content_with_structured_json(content: &[Value], json_text: String) -> Vec<Value> {
+    let mut coerced: Vec<Value> = content
+        .iter()
+        .filter(|block| is_server_web_trace_block(block))
+        .cloned()
+        .collect();
+    coerced.push(json!({
+        "type": "text",
+        "text": json_text,
+    }));
+    coerced
+}
+
+fn is_server_web_trace_block(block: &Value) -> bool {
+    matches!(
+        block.get("type").and_then(Value::as_str),
+        Some("server_tool_use") | Some("web_fetch_tool_result") | Some("web_search_tool_result")
+    )
+}
+
+fn build_server_web_tool_repair_payload(
+    payload: &MessagesRequest,
+    content: &[Value],
+    error: &StructuredOutputError,
+    output: &JsonSchemaOutput,
+) -> MessagesRequest {
+    let mut repair = payload.clone();
+    repair.stream = false;
+    repair.tools = None;
+    repair.tool_choice = None;
+    let previous_text = truncate_chars(&structured_outputs::collect_text_content(content), 8_000);
+    let trace = server_web_tool_trace_for_repair(content);
+    let schema_contract = structured_outputs::instruction_for_schema(&output.schema);
+    repair.messages.push(Message {
+        role: "user".to_string(),
+        content: Value::String(format!(
+            "Server-side web tools have already been executed for this request. \
+             Do not ask to call tools and do not repeat any web search or fetch. \
+             Use only the original conversation, the web tool trace, and the previous answer below.\n\
+             <server_side_web_tool_trace>\n{trace}\n</server_side_web_tool_trace>\n\
+             <previous_answer>\n{previous_text}\n</previous_answer>\n\
+             The previous response failed output_config.format.json_schema validation: {error}.\n\
+             {schema_contract}\n\
+             Return only the corrected JSON value."
+        )),
+    });
+    repair
+}
+
+fn server_web_tool_trace_for_repair(content: &[Value]) -> String {
+    const TRACE_LIMIT: usize = 24_000;
+    let mut trace = String::new();
+    for block in content {
+        match block.get("type").and_then(Value::as_str) {
+            Some("server_tool_use") => {
+                let name = block
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
+                push_repair_line(
+                    &mut trace,
+                    &format!(
+                        "Tool use: {name} input={}",
+                        serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string())
+                    ),
+                    TRACE_LIMIT,
+                );
+            }
+            Some("web_search_tool_result") => {
+                push_repair_line(&mut trace, "web_search results:", TRACE_LIMIT);
+                if let Some(results) = block.get("content").and_then(Value::as_array) {
+                    for result in results.iter().take(8) {
+                        let title = result.get("title").and_then(Value::as_str).unwrap_or("");
+                        let url = result.get("url").and_then(Value::as_str).unwrap_or("");
+                        let snippet = result
+                            .get("encrypted_content")
+                            .or_else(|| result.get("snippet"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        push_repair_line(
+                            &mut trace,
+                            &format!("- {title} ({url}): {}", truncate_chars(snippet, 800)),
+                            TRACE_LIMIT,
+                        );
+                    }
+                }
+            }
+            Some("web_fetch_tool_result") => {
+                let Some(result) = block.get("content") else {
+                    continue;
+                };
+                match result.get("type").and_then(Value::as_str) {
+                    Some("web_fetch_result") => {
+                        let url = result.get("url").and_then(Value::as_str).unwrap_or("");
+                        push_repair_line(
+                            &mut trace,
+                            &format!("web_fetch result: {url}"),
+                            TRACE_LIMIT,
+                        );
+                        if let Some(document) = result.get("content") {
+                            push_repair_line(
+                                &mut trace,
+                                &document_text_for_repair(document),
+                                TRACE_LIMIT,
+                            );
+                        }
+                    }
+                    Some("web_fetch_tool_error") => {
+                        let code = result
+                            .get("error_code")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown");
+                        push_repair_line(
+                            &mut trace,
+                            &format!("web_fetch error: {code}"),
+                            TRACE_LIMIT,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    if trace.trim().is_empty() {
+        "No server-side web tool trace blocks were available.".to_string()
+    } else {
+        trace
+    }
+}
+
+fn document_text_for_repair(document: &Value) -> String {
+    if let Some(title) = document.get("title").and_then(Value::as_str) {
+        let mut text = format!("Title: {title}\n");
+        if let Some(data) = document
+            .get("source")
+            .and_then(|source| source.get("data"))
+            .and_then(Value::as_str)
+        {
+            text.push_str(&truncate_chars(data, 4_000));
+        }
+        return text;
+    }
+    if document
+        .get("source")
+        .and_then(|source| source.get("media_type"))
+        .and_then(Value::as_str)
+        == Some("application/pdf")
+    {
+        return "Fetched PDF document was available to the previous model round; binary content omitted from repair prompt.".to_string();
+    }
+    truncate_chars(&serde_json::to_string(document).unwrap_or_default(), 4_000)
+}
+
+fn push_repair_line(trace: &mut String, line: &str, limit: usize) {
+    if trace.len() >= limit {
+        return;
+    }
+    let remaining = limit.saturating_sub(trace.len());
+    trace.push_str(&truncate_chars(line, remaining.saturating_sub(1)));
+    trace.push('\n');
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut truncated = text
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    truncated.push('…');
+    truncated
 }
 
 fn finalize_web_fetch_response(
@@ -1459,6 +1964,33 @@ mod tests {
         }
     }
 
+    fn sample_web_search_tool() -> Tool {
+        Tool {
+            tool_type: Some("web_search_20250305".to_string()),
+            name: EXTERNAL_WEB_SEARCH_TOOL_NAME.to_string(),
+            description: String::new(),
+            input_schema: HashMap::new(),
+            max_uses: Some(1),
+            allowed_domains: None,
+            blocked_domains: None,
+            citations: None,
+            max_content_tokens: None,
+        }
+    }
+
+    fn sample_schema_output() -> JsonSchemaOutput {
+        JsonSchemaOutput {
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "answer": {"type": "string"}
+                },
+                "required": ["answer"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
     #[test]
     fn test_has_web_fetch_tool_only_single_tool() {
         let req = sample_request(sample_tool());
@@ -1467,22 +1999,46 @@ mod tests {
 
     #[test]
     fn test_has_web_fetch_tool_detects_multi_tool_request() {
-        let req = sample_request_with_tools(vec![
-            Tool {
-                tool_type: Some("web_search_20250305".to_string()),
-                name: EXTERNAL_WEB_SEARCH_TOOL_NAME.to_string(),
-                description: String::new(),
-                input_schema: HashMap::new(),
-                max_uses: Some(1),
-                allowed_domains: None,
-                blocked_domains: None,
-                citations: None,
-                max_content_tokens: None,
-            },
-            sample_tool(),
-        ]);
+        let req = sample_request_with_tools(vec![sample_web_search_tool(), sample_tool()]);
 
         assert!(has_web_fetch_tool(&req));
+    }
+
+    #[test]
+    fn test_has_server_web_tool_detects_web_search_with_text_query() {
+        let req = sample_request_with_tools(vec![sample_web_search_tool()]);
+
+        assert!(has_server_web_tool(&req));
+    }
+
+    #[test]
+    fn test_has_server_web_tool_ignores_web_search_tool_result_continuation() {
+        let mut req = sample_request_with_tools(vec![sample_web_search_tool()]);
+        req.messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: json!("search for rust"),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: json!([{
+                    "type": "tool_use",
+                    "id": "toolu_web_01",
+                    "name": "web_search",
+                    "input": {"query": "rust"}
+                }]),
+            },
+            Message {
+                role: "user".to_string(),
+                content: json!([{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_web_01",
+                    "content": "Rust release notes"
+                }]),
+            },
+        ];
+
+        assert!(!has_server_web_tool(&req));
     }
 
     #[test]
@@ -1543,17 +2099,7 @@ mod tests {
     fn test_build_internal_payload_rewrites_server_tools_and_preserves_client_tools() {
         let req = sample_request_with_tools(vec![
             sample_tool(),
-            Tool {
-                tool_type: Some("web_search_20250305".to_string()),
-                name: EXTERNAL_WEB_SEARCH_TOOL_NAME.to_string(),
-                description: String::new(),
-                input_schema: HashMap::new(),
-                max_uses: Some(1),
-                allowed_domains: None,
-                blocked_domains: None,
-                citations: None,
-                max_content_tokens: None,
-            },
+            sample_web_search_tool(),
             Tool {
                 tool_type: None,
                 name: "custom_tool".to_string(),
@@ -1574,6 +2120,14 @@ mod tests {
         assert_eq!(tools[0].name, INTERNAL_WEB_FETCH_TOOL_NAME);
         assert_eq!(tools[1].name, INTERNAL_WEB_SEARCH_TOOL_NAME);
         assert_eq!(tools[2].name, "custom_tool");
+    }
+
+    #[test]
+    fn test_validate_server_web_tools_rejects_duplicate_web_search() {
+        let req =
+            sample_request_with_tools(vec![sample_web_search_tool(), sample_web_search_tool()]);
+
+        assert!(validate_server_web_tools(&req).is_err());
     }
 
     #[test]
@@ -1602,6 +2156,88 @@ mod tests {
             1
         );
         assert_eq!(response["content"][0]["type"], "text");
+    }
+
+    #[test]
+    fn test_structured_server_web_content_preserves_trace_and_replaces_text() {
+        let content = vec![
+            json!({"type":"text","text":"I'll search first."}),
+            json!({
+                "type":"server_tool_use",
+                "id":"srvtoolu_test",
+                "name":"web_search",
+                "input":{"query":"rust"}
+            }),
+            json!({
+                "type":"web_search_tool_result",
+                "content":[{
+                    "type":"web_search_result",
+                    "title":"Rust",
+                    "url":"https://example.com/rust",
+                    "encrypted_content":"Rust result"
+                }]
+            }),
+            json!({"type":"thinking","thinking":"internal"}),
+            json!({"type":"text","text":"{\"answer\":\"Rust result\"}"}),
+        ];
+
+        let (coerced, _) =
+            coerce_server_web_tool_structured_content(&content, &sample_schema_output()).unwrap();
+
+        assert_eq!(coerced.len(), 3);
+        assert_eq!(coerced[0]["type"], "server_tool_use");
+        assert_eq!(coerced[1]["type"], "web_search_tool_result");
+        assert_eq!(coerced[2]["type"], "text");
+        assert_eq!(coerced[2]["text"], "{\"answer\":\"Rust result\"}");
+    }
+
+    #[test]
+    fn test_structured_server_web_content_rejects_schema_mismatch() {
+        let content = vec![json!({"type":"text","text":"{\"other\":\"value\"}"})];
+
+        let err = coerce_server_web_tool_structured_content(&content, &sample_schema_output())
+            .unwrap_err();
+
+        assert!(matches!(err, StructuredOutputError::SchemaValidation(_)));
+    }
+
+    #[test]
+    fn test_repair_payload_removes_tools_and_embeds_web_trace() {
+        let mut req = sample_request_with_tools(vec![sample_tool(), sample_web_search_tool()]);
+        req.stream = true;
+        let content = vec![
+            json!({
+                "type":"server_tool_use",
+                "id":"srvtoolu_test",
+                "name":"web_fetch",
+                "input":{"url":"https://example.com"}
+            }),
+            json!({
+                "type":"web_fetch_tool_result",
+                "tool_use_id":"srvtoolu_test",
+                "content":{
+                    "type":"web_fetch_result",
+                    "url":"https://example.com",
+                    "content": build_text_document("Fetched page text", Some("Example"), false),
+                    "retrieved_at":"2026-05-15T00:00:00Z"
+                }
+            }),
+            json!({"type":"text","text":"not json"}),
+        ];
+        let repair = build_server_web_tool_repair_payload(
+            &req,
+            &content,
+            &StructuredOutputError::MissingJsonText,
+            &sample_schema_output(),
+        );
+
+        assert!(!repair.stream);
+        assert!(repair.tools.is_none());
+        assert!(repair.tool_choice.is_none());
+        let last = repair.messages.last().unwrap().content.as_str().unwrap();
+        assert!(last.contains("Do not ask to call tools"));
+        assert!(last.contains("Fetched page text"));
+        assert!(last.contains("JSON Schema"));
     }
 
     #[test]

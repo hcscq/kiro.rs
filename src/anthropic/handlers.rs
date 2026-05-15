@@ -40,7 +40,6 @@ use super::types::{
     OutputConfig, Thinking,
 };
 use super::webfetch;
-use super::websearch;
 use crate::kiro::provider::{PublicProviderError, RequestOptions};
 
 const LARGE_ANTHROPIC_REQUEST_WARN_THRESHOLD_BYTES: usize = 16 * 1024 * 1024;
@@ -105,21 +104,6 @@ fn json_schema_output_or_response(
         "Structured output JSON Schema accepted"
     );
     Ok(Some(output))
-}
-
-fn structured_outputs_server_tool_response(request_id: &str) -> Response {
-    tracing::warn!(
-        request_id = %request_id,
-        "Structured outputs requested with server-side web tool routing"
-    );
-    (
-        StatusCode::BAD_REQUEST,
-        Json(ErrorResponse::new(
-            "invalid_request_error",
-            "output_config.format.json_schema is not supported together with server-side web_search or web_fetch tools on this Kiro-compatible route",
-        )),
-    )
-        .into_response()
 }
 
 fn built_in_models() -> Vec<Model> {
@@ -424,10 +408,46 @@ pub async fn post_messages(
         Ok(output) => output,
         Err(response) => return response,
     };
-    if structured_output.is_some()
-        && (webfetch::has_web_fetch_tool(&payload) || websearch::has_web_search_tool(&payload))
-    {
-        return structured_outputs_server_tool_response(&request_id);
+    if webfetch::has_server_web_tool(&payload) {
+        tracing::info!(request_id = %request_id, "检测到 server-side Web 工具，路由到统一 Web 工具处理");
+
+        let token_count_started_at = Instant::now();
+        let input_tokens = if structured_output.is_some() {
+            count_billing_input_tokens_with_structured_instruction(&payload).await
+        } else {
+            count_billing_input_tokens(&payload).await
+        };
+        let token_count_ms = token_count_started_at.elapsed().as_millis();
+        let pre_upstream_ms = handler_started_at.elapsed().as_millis();
+        if body_bytes >= LARGE_ANTHROPIC_REQUEST_WARN_THRESHOLD_BYTES
+            || pre_upstream_ms >= SLOW_ANTHROPIC_PRE_UPSTREAM_PHASE_MS
+        {
+            tracing::warn!(
+                request_id = %request_id,
+                route = "server_web_tool",
+                model = %payload.model,
+                body_bytes,
+                content_length_header = ?content_length_header,
+                body_buffer_ms,
+                json_parse_ms,
+                normalize_ms,
+                token_count_ms,
+                pre_upstream_ms,
+                input_tokens,
+                structured_output = structured_output.is_some(),
+                "Anthropic request pre-upstream phases completed"
+            );
+        }
+
+        return webfetch::handle_server_web_tool_request(
+            provider,
+            &payload,
+            input_tokens,
+            probe.clone(),
+            &request_id,
+            structured_output,
+        )
+        .await;
     }
     if let Some(output) = structured_output.clone() {
         if payload.stream {
@@ -448,74 +468,6 @@ pub async fn post_messages(
             output,
         )
         .await;
-    }
-
-    // 检查是否为 WebFetch 请求
-    if webfetch::has_web_fetch_tool(&payload) {
-        tracing::info!(request_id = %request_id, "检测到 WebFetch 工具，路由到 WebFetch 处理");
-
-        let token_count_started_at = Instant::now();
-        let input_tokens = count_billing_input_tokens(&payload).await;
-        let token_count_ms = token_count_started_at.elapsed().as_millis();
-        let pre_upstream_ms = handler_started_at.elapsed().as_millis();
-        if body_bytes >= LARGE_ANTHROPIC_REQUEST_WARN_THRESHOLD_BYTES
-            || pre_upstream_ms >= SLOW_ANTHROPIC_PRE_UPSTREAM_PHASE_MS
-        {
-            tracing::warn!(
-                request_id = %request_id,
-                route = "webfetch",
-                model = %payload.model,
-                body_bytes,
-                content_length_header = ?content_length_header,
-                body_buffer_ms,
-                json_parse_ms,
-                normalize_ms,
-                token_count_ms,
-                pre_upstream_ms,
-                input_tokens,
-                "Anthropic request pre-upstream phases completed"
-            );
-        }
-
-        return webfetch::handle_webfetch_request(
-            provider,
-            &payload,
-            input_tokens,
-            probe.clone(),
-            &request_id,
-        )
-        .await;
-    }
-
-    // 检查是否为 WebSearch 请求
-    if websearch::has_web_search_tool(&payload) {
-        tracing::info!(request_id = %request_id, "检测到 WebSearch 工具，路由到 WebSearch 处理");
-
-        // 下游 usage 计费使用远端计数优先。
-        let token_count_started_at = Instant::now();
-        let input_tokens = count_billing_input_tokens(&payload).await;
-        let token_count_ms = token_count_started_at.elapsed().as_millis();
-        let pre_upstream_ms = handler_started_at.elapsed().as_millis();
-        if body_bytes >= LARGE_ANTHROPIC_REQUEST_WARN_THRESHOLD_BYTES
-            || pre_upstream_ms >= SLOW_ANTHROPIC_PRE_UPSTREAM_PHASE_MS
-        {
-            tracing::warn!(
-                request_id = %request_id,
-                route = "websearch",
-                model = %payload.model,
-                body_bytes,
-                content_length_header = ?content_length_header,
-                body_buffer_ms,
-                json_parse_ms,
-                normalize_ms,
-                token_count_ms,
-                pre_upstream_ms,
-                input_tokens,
-                "Anthropic request pre-upstream phases completed"
-            );
-        }
-
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
     }
 
     // 转换请求
@@ -1689,10 +1641,24 @@ pub async fn post_messages_cc(
         Ok(output) => output,
         Err(response) => return response,
     };
-    if structured_output.is_some()
-        && (webfetch::has_web_fetch_tool(&payload) || websearch::has_web_search_tool(&payload))
-    {
-        return structured_outputs_server_tool_response(&request_id);
+    if webfetch::has_server_web_tool(&payload) {
+        tracing::info!(request_id = %request_id, "检测到 server-side Web 工具，路由到统一 Web 工具处理");
+
+        let input_tokens = if structured_output.is_some() {
+            count_billing_input_tokens_with_structured_instruction(&payload).await
+        } else {
+            count_billing_input_tokens(&payload).await
+        };
+
+        return webfetch::handle_server_web_tool_request(
+            provider,
+            &payload,
+            input_tokens,
+            probe.clone(),
+            &request_id,
+            structured_output,
+        )
+        .await;
     }
     if let Some(output) = structured_output.clone() {
         if payload.stream {
@@ -1713,32 +1679,6 @@ pub async fn post_messages_cc(
             output,
         )
         .await;
-    }
-
-    // 检查是否为 WebFetch 请求
-    if webfetch::has_web_fetch_tool(&payload) {
-        tracing::info!(request_id = %request_id, "检测到 WebFetch 工具，路由到 WebFetch 处理");
-
-        let input_tokens = count_billing_input_tokens(&payload).await;
-
-        return webfetch::handle_webfetch_request(
-            provider,
-            &payload,
-            input_tokens,
-            probe.clone(),
-            &request_id,
-        )
-        .await;
-    }
-
-    // 检查是否为 WebSearch 请求
-    if websearch::has_web_search_tool(&payload) {
-        tracing::info!(request_id = %request_id, "检测到 WebSearch 工具，路由到 WebSearch 处理");
-
-        // 下游 usage 计费使用远端计数优先。
-        let input_tokens = count_billing_input_tokens(&payload).await;
-
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
     }
 
     // 转换请求

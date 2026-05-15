@@ -2,23 +2,15 @@
 //!
 //! 实现 Anthropic WebSearch 请求到 Kiro MCP 的转换和响应生成
 
-use std::convert::Infallible;
-
-use axum::{
-    body::Body,
-    http::{StatusCode, header},
-    response::{IntoResponse, Json, Response},
-};
-use bytes::Bytes;
-use futures::{Stream, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
 use crate::common::logging::summarize_text_for_log;
 
+#[cfg(test)]
 use super::stream::SseEvent;
-use super::types::{ErrorResponse, MessagesRequest, Tool};
+use super::types::{MessagesRequest, Tool};
 
 /// MCP 请求
 #[derive(Debug, Serialize)]
@@ -121,6 +113,7 @@ pub(crate) enum WebSearchOutcome {
 /// 如果最后一条 user turn 只有 tool_result / image 等非文本内容，说明这是一次
 /// 工具调用后的 continuation，而不是“直接发起一次 web search”，应回落到普通
 /// Anthropic -> Kiro 转换链路处理。
+#[cfg(test)]
 pub fn has_web_search_tool(req: &MessagesRequest) -> bool {
     req.tools.as_ref().is_some_and(|tools| {
         tools.len() == 1
@@ -270,6 +263,7 @@ pub fn create_mcp_request(query: &str) -> (String, McpRequest) {
 }
 
 /// 解析 MCP 响应中的搜索结果
+#[cfg(test)]
 pub fn parse_search_results(mcp_response: &McpResponse) -> Option<WebSearchResults> {
     parse_search_results_checked(mcp_response).ok()
 }
@@ -299,24 +293,8 @@ fn parse_search_results_checked(mcp_response: &McpResponse) -> Result<WebSearchR
         .map_err(|err| format!("invalid MCP search result JSON: {}", err))
 }
 
-/// 生成 WebSearch SSE 响应流
-fn create_websearch_sse_stream(
-    model: String,
-    query: String,
-    tool_use_id: String,
-    outcome: WebSearchOutcome,
-    input_tokens: i32,
-) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    let events = generate_websearch_events(&model, &query, &tool_use_id, &outcome, input_tokens);
-
-    stream::iter(
-        events
-            .into_iter()
-            .map(|e| Ok(Bytes::from(e.to_sse_string()))),
-    )
-}
-
 /// 生成 WebSearch SSE 事件序列
+#[cfg(test)]
 fn generate_websearch_events(
     model: &str,
     query: &str,
@@ -510,6 +488,7 @@ fn generate_websearch_events(
 }
 
 /// 生成 WebSearch 非流式 Anthropic Messages 响应
+#[cfg(test)]
 fn create_websearch_json_response(
     model: &str,
     query: &str,
@@ -587,6 +566,7 @@ pub(crate) fn build_search_content(outcome: &WebSearchOutcome) -> Vec<serde_json
     }
 }
 
+#[cfg(test)]
 fn estimate_websearch_output_tokens(summary: &str) -> i32 {
     ((summary.len() as i32 + 3) / 4).max(1)
 }
@@ -631,54 +611,6 @@ pub(crate) fn generate_search_summary(query: &str, outcome: &WebSearchOutcome) -
     summary.push_str("\nPlease note that these are web search results and may not be fully accurate or up-to-date.");
 
     summary
-}
-
-/// 处理 WebSearch 请求
-pub async fn handle_websearch_request(
-    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
-    payload: &MessagesRequest,
-    input_tokens: i32,
-) -> Response {
-    // 1. 提取搜索查询
-    let query = match extract_search_query(payload) {
-        Some(q) => q,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(
-                    "invalid_request_error",
-                    "无法从消息中提取搜索查询",
-                )),
-            )
-                .into_response();
-        }
-    };
-
-    tracing::info!(query = %query, "处理 WebSearch 请求");
-
-    // 2. 创建 MCP 请求
-    let (tool_use_id, _) = create_mcp_request(&query);
-
-    // 3. 调用 Kiro MCP API
-    let outcome = perform_web_search(&provider, &query).await;
-
-    // 4. 根据 stream 参数生成响应
-    let model = payload.model.clone();
-    if !payload.stream {
-        let response_body =
-            create_websearch_json_response(&model, &query, &tool_use_id, &outcome, input_tokens);
-        return (StatusCode::OK, Json(response_body)).into_response();
-    }
-
-    let stream = create_websearch_sse_stream(model, query, tool_use_id, outcome, input_tokens);
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::CONNECTION, "keep-alive")
-        .body(Body::from_stream(stream))
-        .unwrap()
 }
 
 /// 调用 Kiro MCP API
