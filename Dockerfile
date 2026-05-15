@@ -1,8 +1,8 @@
 FROM --platform=$BUILDPLATFORM node:22-alpine AS frontend-builder
 
 WORKDIR /app/admin-ui
-COPY admin-ui/package.json ./
-RUN npm install -g pnpm && pnpm install
+COPY admin-ui/package.json admin-ui/pnpm-lock.yaml ./
+RUN npm install -g pnpm@10.33.4 && pnpm install --frozen-lockfile
 COPY admin-ui ./
 RUN pnpm build
 
