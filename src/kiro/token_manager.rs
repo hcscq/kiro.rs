@@ -495,10 +495,14 @@ struct CredentialEntry {
     active_requests: usize,
     /// 限流或临时避让冷却到期时间
     rate_limit_cooldown_until: Option<Instant>,
+    /// 后台 Token 刷新期间的本地避让冷却到期时间
+    background_refresh_cooldown_until: Option<Instant>,
     /// 本地 token bucket 与自适应退避状态
     rate_limit_bucket: Option<AdaptiveTokenBucket>,
     /// 连续 429 次数，用于放大冷却时间
     rate_limit_hit_streak: u32,
+    /// 本实例是否已经为该凭据启动后台刷新
+    background_refresh_in_progress: bool,
     /// 凭据级刷新锁，避免不同账号刷新 token 时互相串行阻塞
     refresh_lock: Arc<TokioMutex<()>>,
 }
@@ -1102,6 +1106,11 @@ const SHARED_DISPATCH_LEASE_TTL_MS: u64 = 120_000;
 const SHARED_DISPATCH_LEASE_HEARTBEAT_INTERVAL_MS: u64 = 30_000;
 /// 共享调度运行态下，等待队列需要短周期轮询 Redis 以观察跨副本释放。
 const SHARED_DISPATCH_WAIT_POLL_INTERVAL_MS: u64 = 200;
+/// 后台刷新进行中时，本地/共享调度避让该凭据的窗口。
+///
+/// 刷新 HTTP 客户端默认 60s 超时，使用与分布式 refresh lease 相同的 90s 上限，
+/// 刷新完成后会主动清理该冷却。
+const BACKGROUND_REFRESH_IN_PROGRESS_COOLDOWN: StdDuration = RUNTIME_REFRESH_LEASE_TTL;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 
@@ -1187,6 +1196,12 @@ enum ReservationFailure {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundRefreshOutcome {
+    Success,
+    RetryLater,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelRequirement {
     Any,
     PaidOpus,
@@ -1267,10 +1282,12 @@ impl MultiTokenManager {
                     last_used_at: None,
                     active_requests: 0,
                     rate_limit_cooldown_until: None,
+                    background_refresh_cooldown_until: None,
                     rate_limit_bucket: dispatch_config
                         .bucket_policy_for(&cred)
                         .map(|policy| AdaptiveTokenBucket::new(policy, now)),
                     rate_limit_hit_streak: 0,
+                    background_refresh_in_progress: false,
                     refresh_lock: Arc::new(TokioMutex::new(())),
                 }
             })
@@ -1574,6 +1591,18 @@ impl MultiTokenManager {
         }
     }
 
+    fn needs_token_refresh(credentials: &KiroCredentials) -> bool {
+        credentials.access_token.is_none()
+            || is_token_expired(credentials)
+            || is_token_expiring_soon(credentials)
+    }
+
+    fn has_usable_access_token(credentials: &KiroCredentials) -> bool {
+        credentials.access_token.is_some()
+            && !is_token_expired(credentials)
+            && !is_token_expiring_soon(credentials)
+    }
+
     fn model_preference_rank(credentials: &KiroCredentials, requirement: ModelRequirement) -> u8 {
         match requirement {
             ModelRequirement::RealOpus47 => credentials.opus_4_7_preference_rank(),
@@ -1605,6 +1634,12 @@ impl MultiTokenManager {
         {
             entry.rate_limit_cooldown_until = None;
         }
+        if entry
+            .background_refresh_cooldown_until
+            .is_some_and(|until| until <= now)
+        {
+            entry.background_refresh_cooldown_until = None;
+        }
         if let Some(bucket) = entry.rate_limit_bucket.as_mut() {
             bucket.refill(now);
         }
@@ -1624,6 +1659,7 @@ impl MultiTokenManager {
         let mut entries = self.entries.lock();
         for entry in entries.iter_mut() {
             entry.rate_limit_cooldown_until = None;
+            entry.background_refresh_cooldown_until = None;
         }
     }
 
@@ -1633,6 +1669,7 @@ impl MultiTokenManager {
         now: Instant,
     ) {
         entry.rate_limit_cooldown_until = None;
+        entry.background_refresh_cooldown_until = None;
         entry.rate_limit_hit_streak = 0;
         if let Some(bucket) = entry.rate_limit_bucket.as_mut() {
             bucket.refill(now);
@@ -1722,6 +1759,9 @@ impl MultiTokenManager {
         entry
             .rate_limit_cooldown_until
             .is_some_and(|until| until > now)
+            || entry
+                .background_refresh_cooldown_until
+                .is_some_and(|until| until > now)
     }
 
     fn bucket_is_ready(entry: &CredentialEntry) -> bool {
@@ -1744,19 +1784,22 @@ impl MultiTokenManager {
         request_weight: f64,
     ) -> Option<Instant> {
         let cooldown_ready_at = entry.rate_limit_cooldown_until.filter(|until| *until > now);
+        let background_refresh_ready_at = entry
+            .background_refresh_cooldown_until
+            .filter(|until| *until > now);
         let bucket_ready_at = entry
             .rate_limit_bucket
             .as_mut()
             .and_then(|bucket| bucket.ready_at(now, request_weight));
 
-        match (cooldown_ready_at, bucket_ready_at) {
-            (Some(cooldown_ready_at), Some(bucket_ready_at)) => {
-                Some(cooldown_ready_at.max(bucket_ready_at))
-            }
-            (Some(cooldown_ready_at), None) => Some(cooldown_ready_at),
-            (None, Some(bucket_ready_at)) => Some(bucket_ready_at),
-            (None, None) => None,
-        }
+        [
+            cooldown_ready_at,
+            background_refresh_ready_at,
+            bucket_ready_at,
+        ]
+        .into_iter()
+        .flatten()
+        .max()
     }
 
     fn update_min_ready_at_for(
@@ -1805,6 +1848,170 @@ impl MultiTokenManager {
             .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))
     }
 
+    fn entry_dispatchable_for_background_refresh(
+        dispatch: &DispatchConfig,
+        entry: &CredentialEntry,
+        snapshots: Option<&HashMap<u64, DispatchRuntimeSnapshot>>,
+        now: Instant,
+        now_epoch_ms: u64,
+        request_weight: f64,
+    ) -> bool {
+        if entry
+            .background_refresh_cooldown_until
+            .is_some_and(|until| until > now)
+        {
+            return false;
+        }
+
+        if let Some(snapshots) = snapshots {
+            let runtime = Self::shared_dispatch_snapshot_for_entry(entry, dispatch, snapshots);
+            runtime
+                .cooldown_until_epoch_ms
+                .map_or(true, |until| until <= now_epoch_ms)
+                && Self::shared_bucket_is_ready_for(&runtime, request_weight)
+                && Self::has_capacity(dispatch, &entry.credentials, runtime.active_requests)
+        } else {
+            !Self::is_rate_limited(entry, now)
+                && Self::bucket_is_ready_for(entry, request_weight)
+                && Self::has_capacity(dispatch, &entry.credentials, entry.active_requests)
+        }
+    }
+
+    fn maybe_schedule_background_refreshes_for_request(
+        self: &Arc<Self>,
+        model: Option<&str>,
+        request_weight: f64,
+        excluded_credential_ids: &HashSet<u64>,
+    ) -> usize {
+        let dispatch = self.dispatch_config();
+        let model_requirement = Self::model_requirement(model);
+        let now = Instant::now();
+        let now_epoch_ms = current_epoch_ms();
+        let shared_snapshots = if self.shared_dispatch_runtime_enabled() {
+            match self.load_shared_dispatch_runtime_snapshots(&dispatch, now_epoch_ms) {
+                Ok(snapshots) => Some(snapshots),
+                Err(err) => {
+                    tracing::warn!(
+                        "后台刷新预选读取共享调度热态失败，跳过本轮异步刷新: {}",
+                        err
+                    );
+                    return 0;
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut spawn_ids = Vec::new();
+        let mut deferred_ids = Vec::new();
+        {
+            let mut entries = self.entries.lock();
+            Self::refresh_runtime_state(&mut entries, now);
+
+            let has_fresh_dispatchable_alternate = entries.iter().any(|entry| {
+                !entry.disabled
+                    && !excluded_credential_ids.contains(&entry.id)
+                    && Self::is_model_supported(
+                        &dispatch,
+                        &entry.credentials,
+                        model,
+                        model_requirement,
+                    )
+                    && Self::has_usable_access_token(&entry.credentials)
+                    && Self::entry_dispatchable_for_background_refresh(
+                        &dispatch,
+                        entry,
+                        shared_snapshots.as_ref(),
+                        now,
+                        now_epoch_ms,
+                        request_weight,
+                    )
+            });
+
+            if !has_fresh_dispatchable_alternate {
+                return 0;
+            }
+
+            let cooldown_until = now + BACKGROUND_REFRESH_IN_PROGRESS_COOLDOWN;
+            for entry in entries.iter_mut() {
+                if entry.disabled
+                    || excluded_credential_ids.contains(&entry.id)
+                    || !Self::is_model_supported(
+                        &dispatch,
+                        &entry.credentials,
+                        model,
+                        model_requirement,
+                    )
+                    || !Self::needs_token_refresh(&entry.credentials)
+                    || !Self::entry_dispatchable_for_background_refresh(
+                        &dispatch,
+                        entry,
+                        shared_snapshots.as_ref(),
+                        now,
+                        now_epoch_ms,
+                        request_weight,
+                    )
+                {
+                    continue;
+                }
+
+                entry.background_refresh_cooldown_until = Some(
+                    entry
+                        .background_refresh_cooldown_until
+                        .map(|until| until.max(cooldown_until))
+                        .unwrap_or(cooldown_until),
+                );
+                entry.last_used_at = Some(Utc::now().to_rfc3339());
+                deferred_ids.push(entry.id);
+
+                if entry.background_refresh_in_progress {
+                    continue;
+                }
+                entry.background_refresh_in_progress = true;
+                spawn_ids.push(entry.id);
+            }
+        }
+
+        if deferred_ids.is_empty() {
+            return 0;
+        }
+
+        if self.shared_dispatch_runtime_enabled() {
+            let cooldown_ms = self
+                .runtime_refresh_coordination_cooldown()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64;
+            let now_epoch_ms = current_epoch_ms();
+            for id in &deferred_ids {
+                if let Err(err) =
+                    self.state_store
+                        .defer_dispatch_credential(*id, cooldown_ms, now_epoch_ms)
+                {
+                    tracing::warn!(
+                        "更新后台刷新共享调度冷却失败（credentialId={}）: {}",
+                        id,
+                        err
+                    );
+                }
+            }
+        }
+
+        for id in &spawn_ids {
+            self.spawn_background_token_refresh(*id);
+        }
+
+        if !deferred_ids.is_empty() {
+            tracing::info!(
+                scheduled = spawn_ids.len(),
+                deferred = deferred_ids.len(),
+                model = model.unwrap_or("unknown"),
+                "已将需刷新凭据转入后台刷新，当前请求将优先调度其他可用凭据"
+            );
+        }
+
+        spawn_ids.len()
+    }
+
     fn sync_rate_limit_bucket_runtime(
         entry: &mut CredentialEntry,
         dispatch: &DispatchConfig,
@@ -1830,6 +2037,7 @@ impl MultiTokenManager {
         now: Instant,
     ) {
         entry.rate_limit_cooldown_until = None;
+        entry.background_refresh_cooldown_until = None;
         entry.rate_limit_hit_streak = 0;
         entry.rate_limit_bucket = dispatch
             .bucket_policy_for(&entry.credentials)
@@ -2413,6 +2621,17 @@ impl MultiTokenManager {
                     }
                     has_supported = true;
 
+                    if let Some(ready_at) = entry
+                        .background_refresh_cooldown_until
+                        .filter(|until| *until > now)
+                    {
+                        next_ready_at = Some(match next_ready_at {
+                            Some(existing) => existing.min(ready_at),
+                            None => ready_at,
+                        });
+                        continue;
+                    }
+
                     let runtime =
                         Self::shared_dispatch_snapshot_for_entry(entry, &dispatch, &snapshots);
                     let is_dispatchable = runtime
@@ -2645,6 +2864,41 @@ impl MultiTokenManager {
         excluded_credential_ids: &HashSet<u64>,
         session_affinity_key: Option<&str>,
     ) -> anyhow::Result<CallContext> {
+        self.acquire_context_with_weight_excluding_and_affinity_inner(
+            model,
+            request_weight,
+            excluded_credential_ids,
+            session_affinity_key,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn acquire_context_with_background_refresh(
+        self: &Arc<Self>,
+        model: Option<&str>,
+        request_weight: f64,
+        excluded_credential_ids: &HashSet<u64>,
+        session_affinity_key: Option<&str>,
+    ) -> anyhow::Result<CallContext> {
+        self.acquire_context_with_weight_excluding_and_affinity_inner(
+            model,
+            request_weight,
+            excluded_credential_ids,
+            session_affinity_key,
+            Some(self),
+        )
+        .await
+    }
+
+    async fn acquire_context_with_weight_excluding_and_affinity_inner(
+        &self,
+        model: Option<&str>,
+        request_weight: f64,
+        excluded_credential_ids: &HashSet<u64>,
+        session_affinity_key: Option<&str>,
+        background_owner: Option<&Arc<Self>>,
+    ) -> anyhow::Result<CallContext> {
         let request_weight = if request_weight.is_finite() && request_weight > 0.0 {
             request_weight
         } else {
@@ -2664,6 +2918,14 @@ impl MultiTokenManager {
                 if let Err(err) = self.maybe_sync_external_state_on_hot_path() {
                     tracing::warn!("按需同步外部状态失败，将继续使用本地状态: {}", err);
                 }
+            }
+
+            if let Some(owner) = background_owner {
+                owner.maybe_schedule_background_refreshes_for_request(
+                    model,
+                    request_weight,
+                    excluded_credential_ids,
+                );
             }
 
             if attempt_count >= max_attempts {
@@ -2977,7 +3239,7 @@ impl MultiTokenManager {
         credentials: &KiroCredentials,
     ) -> anyhow::Result<(KiroCredentials, String)> {
         // 第一次检查（无锁）：快速判断是否需要刷新
-        let needs_refresh = is_token_expired(credentials) || is_token_expiring_soon(credentials);
+        let needs_refresh = Self::needs_token_refresh(credentials);
 
         let creds = if needs_refresh {
             // 获取凭据级刷新锁，仅串行同一账号的刷新流程
@@ -2987,7 +3249,7 @@ impl MultiTokenManager {
             // 第二次检查：获取锁后重新读取凭据，因为其他请求可能已经完成刷新
             let mut current_creds = self.current_credentials(id)?;
 
-            if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
+            if Self::needs_token_refresh(&current_creds) {
                 if self.state_store.is_external() {
                     if let Err(err) = self.sync_external_state_if_changed() {
                         tracing::warn!("按需同步共享凭据状态失败，将继续使用本地状态: {}", err);
@@ -2995,7 +3257,7 @@ impl MultiTokenManager {
                     current_creds = self.current_credentials(id)?;
                 }
 
-                if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
+                if Self::needs_token_refresh(&current_creds) {
                     self.refresh_credentials_with_runtime_coordination(id, &current_creds)
                         .await?
                 } else {
@@ -3331,6 +3593,113 @@ impl MultiTokenManager {
             || err.downcast_ref::<RuntimeRefreshLeaseBusyError>().is_some()
     }
 
+    fn spawn_background_token_refresh(self: &Arc<Self>, id: u64) {
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            manager.run_background_token_refresh(id).await;
+        });
+    }
+
+    async fn run_background_token_refresh(self: Arc<Self>, id: u64) {
+        let started_at = Instant::now();
+        tracing::info!("凭据 #{} Token 后台刷新已启动", id);
+
+        let refresh_lock = match self.refresh_lock_for(id) {
+            Ok(lock) => lock,
+            Err(err) => {
+                tracing::warn!("凭据 #{} Token 后台刷新无法获取刷新锁: {}", id, err);
+                self.finish_background_token_refresh(id, BackgroundRefreshOutcome::RetryLater);
+                return;
+            }
+        };
+        let _guard = refresh_lock.lock().await;
+
+        if self.state_store.is_external() {
+            if let Err(err) = self.sync_external_state_if_changed() {
+                tracing::warn!("凭据 #{} 后台刷新前同步共享状态失败: {}", id, err);
+            }
+        }
+
+        let credentials = match self.current_credentials(id) {
+            Ok(credentials) => credentials,
+            Err(err) => {
+                tracing::warn!("凭据 #{} Token 后台刷新读取凭据失败: {}", id, err);
+                self.finish_background_token_refresh(id, BackgroundRefreshOutcome::RetryLater);
+                return;
+            }
+        };
+
+        if !Self::needs_token_refresh(&credentials) {
+            tracing::debug!("凭据 #{} 已被其他路径刷新，后台刷新跳过", id);
+            self.finish_background_token_refresh(id, BackgroundRefreshOutcome::Success);
+            return;
+        }
+
+        match self
+            .refresh_credentials_with_runtime_coordination(id, &credentials)
+            .await
+        {
+            Ok(_) => {
+                tracing::info!(
+                    credential_id = id,
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    "凭据 Token 后台刷新成功"
+                );
+                self.finish_background_token_refresh(id, BackgroundRefreshOutcome::Success);
+            }
+            Err(err) => {
+                if Self::is_runtime_refresh_coordination_error(&err) {
+                    tracing::warn!(
+                        credential_id = id,
+                        elapsed_ms = started_at.elapsed().as_millis(),
+                        error = %err,
+                        "凭据 Token 后台刷新等待运行时协调，稍后重试"
+                    );
+                    self.finish_background_token_refresh(id, BackgroundRefreshOutcome::RetryLater);
+                    return;
+                }
+
+                if err.downcast_ref::<RefreshTokenInvalidError>().is_some() {
+                    tracing::warn!("凭据 #{} 后台刷新发现 refreshToken 永久失效: {}", id, err);
+                    self.report_refresh_token_invalid(id);
+                } else {
+                    tracing::warn!(
+                        credential_id = id,
+                        elapsed_ms = started_at.elapsed().as_millis(),
+                        error = %err,
+                        "凭据 Token 后台刷新失败"
+                    );
+                    self.report_refresh_failure(id);
+                }
+                self.finish_background_token_refresh(id, BackgroundRefreshOutcome::RetryLater);
+            }
+        }
+    }
+
+    fn finish_background_token_refresh(&self, id: u64, outcome: BackgroundRefreshOutcome) {
+        let retry_cooldown_until = Instant::now() + self.runtime_refresh_coordination_cooldown();
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+                entry.background_refresh_in_progress = false;
+                match outcome {
+                    BackgroundRefreshOutcome::Success => {
+                        entry.background_refresh_cooldown_until = None;
+                        entry.refresh_failure_count = 0;
+                    }
+                    BackgroundRefreshOutcome::RetryLater => {
+                        if !entry.disabled {
+                            entry.background_refresh_cooldown_until = Some(retry_cooldown_until);
+                        } else {
+                            entry.background_refresh_cooldown_until = None;
+                        }
+                    }
+                }
+            }
+        }
+        self.availability_notify.notify_waiters();
+    }
+
     fn refresh_token_still_current_in_shared_state(
         &self,
         id: u64,
@@ -3514,6 +3883,8 @@ impl MultiTokenManager {
 
                 if persisted.disabled {
                     entry.disabled_reason = Some(persisted_disabled_reason(&persisted));
+                    entry.background_refresh_in_progress = false;
+                    entry.background_refresh_cooldown_until = None;
                 } else {
                     entry.disabled_reason = None;
                     if was_disabled {
@@ -3522,6 +3893,10 @@ impl MultiTokenManager {
                         Self::reset_rate_limit_runtime(entry, &dispatch, now);
                     } else {
                         Self::sync_rate_limit_bucket_runtime(entry, &dispatch, now);
+                    }
+                    if !Self::needs_token_refresh(&entry.credentials) {
+                        entry.background_refresh_in_progress = false;
+                        entry.background_refresh_cooldown_until = None;
                     }
                 }
             }
@@ -3543,10 +3918,12 @@ impl MultiTokenManager {
                     last_used_at: None,
                     active_requests: 0,
                     rate_limit_cooldown_until: None,
+                    background_refresh_cooldown_until: None,
                     rate_limit_bucket: dispatch
                         .bucket_policy_for(&credential)
                         .map(|policy| AdaptiveTokenBucket::new(policy, now)),
                     rate_limit_hit_streak: 0,
+                    background_refresh_in_progress: false,
                     refresh_lock: Arc::new(TokioMutex::new(())),
                 });
             }
@@ -3725,6 +4102,12 @@ impl MultiTokenManager {
                     .is_some_and(|until| until <= now)
                 {
                     entry.rate_limit_cooldown_until = None;
+                }
+                if entry
+                    .background_refresh_cooldown_until
+                    .is_some_and(|until| until <= now)
+                {
+                    entry.background_refresh_cooldown_until = None;
                 }
                 if let Some(bucket) = entry.rate_limit_bucket.as_mut() {
                     bucket.on_success(now);
@@ -5432,8 +5815,10 @@ impl MultiTokenManager {
                 last_used_at: None,
                 active_requests: 0,
                 rate_limit_cooldown_until: None,
+                background_refresh_cooldown_until: None,
                 rate_limit_bucket,
                 rate_limit_hit_streak: 0,
+                background_refresh_in_progress: false,
                 refresh_lock: Arc::new(TokioMutex::new(())),
             });
         }
@@ -7946,6 +8331,75 @@ mod tests {
             err.contains("所有凭据均已禁用"),
             "错误应提示所有凭据禁用，实际: {}",
             err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_background_refresh_switches_request_to_fresh_alternate() {
+        let mut primary = available_credential(0);
+        primary.expires_at = Some((Utc::now() + Duration::minutes(2)).to_rfc3339());
+        primary.refresh_token = Some("r".repeat(150));
+        let secondary = available_credential(1);
+
+        let manager = std::sync::Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![primary, secondary],
+                Some(ProxyConfig::new("http://127.0.0.1:9")),
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        let refresh_lock = manager.refresh_lock_for(1).unwrap();
+        let _guard = refresh_lock.lock().await;
+
+        let excluded = HashSet::new();
+        let ctx = manager
+            .acquire_context_with_background_refresh(None, 1.0, &excluded, None)
+            .await
+            .unwrap();
+
+        assert_eq!(ctx.id, 2);
+        let entries = manager.entries.lock();
+        let primary_entry = entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert!(primary_entry.background_refresh_in_progress);
+        assert!(primary_entry.background_refresh_cooldown_until.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_background_refresh_not_scheduled_without_fresh_alternate() {
+        let mut primary = available_credential(0);
+        primary.expires_at = Some((Utc::now() + Duration::minutes(2)).to_rfc3339());
+        let mut secondary = available_credential(1);
+        secondary.expires_at = Some((Utc::now() + Duration::minutes(3)).to_rfc3339());
+
+        let manager = std::sync::Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![primary, secondary],
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        let excluded = HashSet::new();
+
+        let scheduled =
+            manager.maybe_schedule_background_refreshes_for_request(None, 1.0, &excluded);
+
+        assert_eq!(scheduled, 0);
+        let entries = manager.entries.lock();
+        assert!(
+            entries
+                .iter()
+                .all(|entry| !entry.background_refresh_in_progress)
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.background_refresh_cooldown_until.is_none())
         );
     }
 

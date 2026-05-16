@@ -1135,10 +1135,11 @@ impl KiroProvider {
             );
             let ctx = match self
                 .token_manager
-                .acquire_context_with_weight_excluding(
+                .acquire_context_with_background_refresh(
                     None,
                     1.0,
                     &request_scoped_excluded_credentials,
+                    None,
                 )
                 .await
             {
@@ -1484,13 +1485,12 @@ impl KiroProvider {
                 &request_scoped_transient_error_credentials,
             );
             let acquire_context = || {
-                self.token_manager
-                    .acquire_context_with_weight_excluding_and_affinity(
-                        model.as_deref(),
-                        request_weight,
-                        &request_scoped_excluded_credentials,
-                        options.session_affinity_key.as_deref(),
-                    )
+                self.token_manager.acquire_context_with_background_refresh(
+                    model.as_deref(),
+                    request_weight,
+                    &request_scoped_excluded_credentials,
+                    options.session_affinity_key.as_deref(),
+                )
             };
             let acquire_result = if is_stream {
                 let remaining = Self::remaining_stream_pre_sse_response_budget(
