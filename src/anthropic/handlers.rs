@@ -1257,6 +1257,8 @@ async fn execute_non_stream_request_body(
     prefer_context_input_tokens: bool,
     request_options: RequestOptions,
 ) -> Result<NonStreamMessageResponse, Response> {
+    let request_id_for_log = request_options.request_id.clone();
+
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider
         .call_api_with_options(request_body, request_options)
@@ -1270,7 +1272,11 @@ async fn execute_non_stream_request_body(
     let body_bytes = match response.bytes().await {
         Ok(bytes) => bytes,
         Err(e) => {
-            tracing::error!("读取响应体失败: {}", e);
+            if let Some(request_id) = request_id_for_log.as_deref() {
+                tracing::error!(request_id = %request_id, error = %e, "读取响应体失败");
+            } else {
+                tracing::error!(error = %e, "读取响应体失败");
+            }
             return Err((
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(

@@ -7,7 +7,7 @@
 use bytes::{Bytes, BytesMut};
 use futures::stream::BoxStream;
 use futures::{StreamExt, stream};
-use reqwest::Client;
+use reqwest::{Client, header::HeaderMap};
 use std::collections::{HashMap, HashSet};
 use std::error::Error as StdError;
 use std::fmt;
@@ -84,6 +84,7 @@ pub struct ManagedResponse {
 enum ManagedResponseBody {
     Response(reqwest::Response),
     Stream(BoxStream<'static, Result<Bytes, reqwest::Error>>),
+    Bytes(Bytes),
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +179,15 @@ impl PublicProviderError {
         }
     }
 
+    pub fn bad_gateway(log_message: impl Into<String>, public_message: impl Into<String>) -> Self {
+        Self {
+            status_code: 502,
+            error_type: "api_error",
+            public_message: public_message.into(),
+            log_message: log_message.into(),
+        }
+    }
+
     pub fn status_code(&self) -> u16 {
         self.status_code
     }
@@ -213,6 +223,10 @@ struct ResponseTrace {
     overall_started_at: Instant,
     upstream_request_started_at: Instant,
     response_headers_at: Instant,
+    response_content_type: Option<String>,
+    response_content_encoding: Option<String>,
+    response_content_length: Option<String>,
+    response_transfer_encoding: Option<String>,
     slow_model_cooldown: Option<SlowModelCooldownTrace>,
 }
 
@@ -245,6 +259,15 @@ impl ManagedResponse {
         }
     }
 
+    fn new_bytes(bytes: Bytes, lease: CallLease) -> Self {
+        Self {
+            body: ManagedResponseBody::Bytes(bytes),
+            _lease: lease,
+            trace: None,
+            stream_first_chunk_already_logged: false,
+        }
+    }
+
     pub async fn bytes(self) -> reqwest::Result<Bytes> {
         let Self {
             body,
@@ -252,20 +275,26 @@ impl ManagedResponse {
             trace,
             stream_first_chunk_already_logged: _,
         } = self;
-        let bytes = match body {
-            ManagedResponseBody::Response(response) => response.bytes().await?,
+        match body {
+            ManagedResponseBody::Response(response) => {
+                let Some(trace) = trace.as_ref() else {
+                    return response.bytes().await;
+                };
+                read_response_body_with_trace(response, trace).await
+            }
             ManagedResponseBody::Stream(mut body_stream) => {
                 let mut buffer = BytesMut::new();
                 while let Some(chunk) = body_stream.next().await {
                     buffer.extend_from_slice(&chunk?);
                 }
-                buffer.freeze()
+                let bytes = buffer.freeze();
+                if let Some(trace) = trace {
+                    trace.log_body_complete(bytes.len());
+                }
+                Ok(bytes)
             }
-        };
-        if let Some(trace) = trace {
-            trace.log_body_complete(bytes.len());
+            ManagedResponseBody::Bytes(bytes) => Ok(bytes),
         }
-        Ok(bytes)
     }
 
     pub async fn text(self) -> reqwest::Result<String> {
@@ -284,6 +313,7 @@ impl ManagedResponse {
                 }
                 String::from_utf8_lossy(&buffer).into_owned()
             }
+            ManagedResponseBody::Bytes(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         };
         if let Some(trace) = trace {
             trace.log_body_complete(text.len());
@@ -301,6 +331,7 @@ impl ManagedResponse {
         let body_stream = match body {
             ManagedResponseBody::Response(response) => response.bytes_stream().boxed(),
             ManagedResponseBody::Stream(stream) => stream,
+            ManagedResponseBody::Bytes(bytes) => stream::once(async move { Ok(bytes) }).boxed(),
         };
 
         stream::unfold(
@@ -405,6 +436,46 @@ impl ResponseTrace {
             total_elapsed_ms = self.overall_started_at.elapsed().as_millis(),
             upstream_elapsed_ms = self.upstream_request_started_at.elapsed().as_millis(),
             "上游响应体读取完成"
+        );
+    }
+
+    fn log_body_error(
+        &self,
+        partial_body_len: usize,
+        partial_body: &BytesMut,
+        error: &reqwest::Error,
+    ) {
+        let error_sources = summarize_error_sources(error);
+        let partial_body_prefix_hex = format_body_prefix_hex(partial_body);
+        let partial_body_prefix_text = format_body_prefix_text(partial_body);
+        tracing::warn!(
+            request_id = %self.request_id,
+            api_type = self.api_type,
+            model = self.model_label(),
+            request_body_bytes = self.request_body_bytes,
+            credential_id = self.credential_id,
+            attempt = self.attempt,
+            max_retries = self.max_retries,
+            region = %self.region,
+            status_code = self.status_code,
+            response_content_type = self.response_content_type.as_deref().unwrap_or("unknown"),
+            response_content_encoding = self.response_content_encoding.as_deref().unwrap_or("unknown"),
+            response_content_length = self.response_content_length.as_deref().unwrap_or("unknown"),
+            response_transfer_encoding = self.response_transfer_encoding.as_deref().unwrap_or("unknown"),
+            partial_body_len,
+            partial_body_prefix_hex = %partial_body_prefix_hex,
+            partial_body_prefix_text = %partial_body_prefix_text,
+            total_elapsed_ms = self.overall_started_at.elapsed().as_millis(),
+            upstream_elapsed_ms = self.upstream_request_started_at.elapsed().as_millis(),
+            body_read_elapsed_ms = self.response_headers_at.elapsed().as_millis(),
+            error = %error,
+            error_debug = ?error,
+            error_is_timeout = error.is_timeout(),
+            error_is_connect = error.is_connect(),
+            error_is_request = error.is_request(),
+            error_status = error.status().map(|status| status.as_u16()).unwrap_or(0),
+            error_sources = %error_sources,
+            "上游响应体读取失败"
         );
     }
 
@@ -528,6 +599,66 @@ fn summarize_error_sources(error: &reqwest::Error) -> String {
         current = source.source();
     }
     sources.join(" | ")
+}
+
+fn response_header_for_log(headers: &HeaderMap, name: &'static str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| summarize_text_for_log(value, 160))
+        .filter(|value| value != "<empty>")
+}
+
+fn format_body_prefix_hex(bytes: &BytesMut) -> String {
+    const BODY_ERROR_PREFIX_BYTES: usize = 96;
+
+    if bytes.is_empty() {
+        return "<empty>".to_string();
+    }
+
+    let prefix_len = bytes.len().min(BODY_ERROR_PREFIX_BYTES);
+    let mut output = String::with_capacity(prefix_len * 2);
+    for byte in &bytes[..prefix_len] {
+        use std::fmt::Write as _;
+        let _ = write!(output, "{byte:02x}");
+    }
+    if bytes.len() > prefix_len {
+        output.push_str("...");
+    }
+    output
+}
+
+fn format_body_prefix_text(bytes: &BytesMut) -> String {
+    const BODY_ERROR_PREFIX_BYTES: usize = 96;
+
+    if bytes.is_empty() {
+        return "<empty>".to_string();
+    }
+
+    let prefix_len = bytes.len().min(BODY_ERROR_PREFIX_BYTES);
+    summarize_text_for_log(&String::from_utf8_lossy(&bytes[..prefix_len]), 120)
+}
+
+async fn read_response_body_with_trace(
+    response: reqwest::Response,
+    trace: &ResponseTrace,
+) -> reqwest::Result<Bytes> {
+    let mut body_stream = response.bytes_stream();
+    let mut buffer = BytesMut::new();
+
+    while let Some(chunk_result) = body_stream.next().await {
+        match chunk_result {
+            Ok(chunk) => buffer.extend_from_slice(&chunk),
+            Err(err) => {
+                trace.log_body_error(buffer.len(), &buffer, &err);
+                return Err(err);
+            }
+        }
+    }
+
+    let bytes = buffer.freeze();
+    trace.log_body_complete(bytes.len());
+    Ok(bytes)
 }
 
 struct StreamContentStartProbe {
@@ -1802,12 +1933,64 @@ impl KiroProvider {
                     overall_started_at,
                     upstream_request_started_at,
                     response_headers_at,
+                    response_content_type: response_header_for_log(
+                        response.headers(),
+                        "content-type",
+                    ),
+                    response_content_encoding: response_header_for_log(
+                        response.headers(),
+                        "content-encoding",
+                    ),
+                    response_content_length: response_header_for_log(
+                        response.headers(),
+                        "content-length",
+                    ),
+                    response_transfer_encoding: response_header_for_log(
+                        response.headers(),
+                        "transfer-encoding",
+                    ),
                     slow_model_cooldown: (is_stream && is_real_opus_4_7).then(|| {
                         SlowModelCooldownTrace {
                             token_manager: Arc::clone(&self.token_manager),
                         }
                     }),
                 };
+
+                if !is_stream {
+                    let body_bytes = match read_response_body_with_trace(response, &trace).await {
+                        Ok(bytes) => bytes,
+                        Err(err) => {
+                            last_error = Some(anyhow::Error::new(
+                                PublicProviderError::bad_gateway(
+                                    format!(
+                                        "{} API 响应体读取失败: request_id={} credential_id={} attempt={} status={} total_elapsed_ms={} error={}",
+                                        api_type,
+                                        request_id,
+                                        ctx_id,
+                                        attempt + 1,
+                                        status.as_u16(),
+                                        overall_started_at.elapsed().as_millis(),
+                                        err
+                                    ),
+                                    "Upstream response body could not be read. Retry later.",
+                                ),
+                            ));
+                            request_scoped_transient_error_credentials.insert(ctx_id);
+                            if attempt + 1 < max_retries {
+                                sleep(Self::retry_delay(attempt)).await;
+                            }
+                            continue;
+                        }
+                    };
+
+                    self.token_manager.record_session_affinity(
+                        model.as_deref(),
+                        options.session_affinity_key.as_deref(),
+                        ctx_id,
+                    );
+                    self.token_manager.report_success(ctx_id);
+                    return Ok(ManagedResponse::new_bytes(body_bytes, lease));
+                }
 
                 let retryable_excluded_count = Self::request_scoped_retryable_exclusion_count(
                     &request_scoped_rate_limited_credentials,
