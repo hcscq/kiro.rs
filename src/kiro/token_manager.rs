@@ -1111,6 +1111,10 @@ const SHARED_DISPATCH_WAIT_POLL_INTERVAL_MS: u64 = 200;
 /// 刷新 HTTP 客户端默认 60s 超时，使用与分布式 refresh lease 相同的 90s 上限，
 /// 刷新完成后会主动清理该冷却。
 const BACKGROUND_REFRESH_IN_PROGRESS_COOLDOWN: StdDuration = RUNTIME_REFRESH_LEASE_TTL;
+/// 机会性后台刷新遇到瞬态失败时的重试冷却。
+///
+/// 后台刷新不服务当前请求，失败通常是 429/网络抖动，使用较长冷却避免把刷新端点打成重试风暴。
+const BACKGROUND_REFRESH_RETRY_COOLDOWN: StdDuration = StdDuration::from_secs(5 * 60);
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 
@@ -1756,6 +1760,10 @@ impl MultiTokenManager {
     }
 
     fn is_rate_limited(entry: &CredentialEntry, now: Instant) -> bool {
+        if entry.background_refresh_in_progress {
+            return true;
+        }
+
         entry
             .rate_limit_cooldown_until
             .is_some_and(|until| until > now)
@@ -1856,6 +1864,10 @@ impl MultiTokenManager {
         now_epoch_ms: u64,
         request_weight: f64,
     ) -> bool {
+        if entry.background_refresh_in_progress {
+            return false;
+        }
+
         if entry
             .background_refresh_cooldown_until
             .is_some_and(|until| until > now)
@@ -1877,14 +1889,15 @@ impl MultiTokenManager {
         }
     }
 
-    fn maybe_schedule_background_refreshes_for_request(
+    fn background_refresh_exclusions_for_request(
         self: &Arc<Self>,
         model: Option<&str>,
         request_weight: f64,
         excluded_credential_ids: &HashSet<u64>,
-    ) -> usize {
+    ) -> HashSet<u64> {
         let dispatch = self.dispatch_config();
         let model_requirement = Self::model_requirement(model);
+        let is_balanced = dispatch.mode == "balanced";
         let now = Instant::now();
         let now_epoch_ms = current_epoch_ms();
         let shared_snapshots = if self.shared_dispatch_runtime_enabled() {
@@ -1895,15 +1908,15 @@ impl MultiTokenManager {
                         "后台刷新预选读取共享调度热态失败，跳过本轮异步刷新: {}",
                         err
                     );
-                    return 0;
+                    return HashSet::new();
                 }
             }
         } else {
             None
         };
 
-        let mut spawn_ids = Vec::new();
-        let mut deferred_ids = Vec::new();
+        let mut request_exclusions = HashSet::new();
+        let mut spawn_id: Option<u64> = None;
         {
             let mut entries = self.entries.lock();
             Self::refresh_runtime_state(&mut entries, now);
@@ -1929,11 +1942,13 @@ impl MultiTokenManager {
             });
 
             if !has_fresh_dispatchable_alternate {
-                return 0;
+                return HashSet::new();
             }
 
+            let mut selected_candidate_key: Option<(u32, u8, usize, u64, u64)> = None;
+            let mut selected_candidate_id: Option<u64> = None;
             let cooldown_until = now + BACKGROUND_REFRESH_IN_PROGRESS_COOLDOWN;
-            for entry in entries.iter_mut() {
+            for entry in entries.iter() {
                 if entry.disabled
                     || excluded_credential_ids.contains(&entry.id)
                     || !Self::is_model_supported(
@@ -1955,34 +1970,88 @@ impl MultiTokenManager {
                     continue;
                 }
 
-                entry.background_refresh_cooldown_until = Some(
-                    entry
-                        .background_refresh_cooldown_until
-                        .map(|until| until.max(cooldown_until))
-                        .unwrap_or(cooldown_until),
-                );
-                entry.last_used_at = Some(Utc::now().to_rfc3339());
-                deferred_ids.push(entry.id);
+                request_exclusions.insert(entry.id);
 
                 if entry.background_refresh_in_progress {
                     continue;
                 }
-                entry.background_refresh_in_progress = true;
-                spawn_ids.push(entry.id);
+
+                let candidate_key = if is_balanced {
+                    (
+                        u32::from(Self::model_preference_rank(
+                            &entry.credentials,
+                            model_requirement,
+                        )),
+                        0,
+                        entry.active_requests,
+                        entry.success_count,
+                        entry.id,
+                    )
+                } else {
+                    (
+                        entry.credentials.priority,
+                        Self::model_preference_rank(&entry.credentials, model_requirement),
+                        entry.active_requests,
+                        entry.success_count,
+                        entry.id,
+                    )
+                };
+                let should_select = selected_candidate_key
+                    .as_ref()
+                    .map(|best_key| candidate_key < *best_key)
+                    .unwrap_or(true);
+                if should_select {
+                    selected_candidate_key = Some(candidate_key);
+                    selected_candidate_id = Some(entry.id);
+                }
+            }
+
+            if let Some(id) = selected_candidate_id {
+                if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+                    entry.background_refresh_cooldown_until = Some(
+                        entry
+                            .background_refresh_cooldown_until
+                            .map(|until| until.max(cooldown_until))
+                            .unwrap_or(cooldown_until),
+                    );
+                    entry.last_used_at = Some(Utc::now().to_rfc3339());
+                    entry.background_refresh_in_progress = true;
+                    spawn_id = Some(id);
+                }
             }
         }
 
-        if deferred_ids.is_empty() {
-            return 0;
+        if request_exclusions.is_empty() {
+            return HashSet::new();
         }
 
-        if self.shared_dispatch_runtime_enabled() {
+        if let Some(id) = spawn_id {
+            if self.shared_dispatch_runtime_enabled() {
+                let cooldown_ms = BACKGROUND_REFRESH_IN_PROGRESS_COOLDOWN
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64;
+                if let Err(err) =
+                    self.state_store
+                        .defer_dispatch_credential(id, cooldown_ms, current_epoch_ms())
+                {
+                    tracing::warn!(
+                        "更新后台刷新共享调度冷却失败（credentialId={}）: {}",
+                        id,
+                        err
+                    );
+                }
+            }
+
+            self.spawn_background_token_refresh(id);
+        }
+
+        if self.shared_dispatch_runtime_enabled() && spawn_id.is_none() {
             let cooldown_ms = self
                 .runtime_refresh_coordination_cooldown()
                 .as_millis()
                 .min(u128::from(u64::MAX)) as u64;
             let now_epoch_ms = current_epoch_ms();
-            for id in &deferred_ids {
+            for id in &request_exclusions {
                 if let Err(err) =
                     self.state_store
                         .defer_dispatch_credential(*id, cooldown_ms, now_epoch_ms)
@@ -1996,20 +2065,14 @@ impl MultiTokenManager {
             }
         }
 
-        for id in &spawn_ids {
-            self.spawn_background_token_refresh(*id);
-        }
+        tracing::info!(
+            scheduled = usize::from(spawn_id.is_some()),
+            excluded = request_exclusions.len(),
+            model = model.unwrap_or("unknown"),
+            "当前请求跳过需刷新凭据并择机后台刷新"
+        );
 
-        if !deferred_ids.is_empty() {
-            tracing::info!(
-                scheduled = spawn_ids.len(),
-                deferred = deferred_ids.len(),
-                model = model.unwrap_or("unknown"),
-                "已将需刷新凭据转入后台刷新，当前请求将优先调度其他可用凭据"
-            );
-        }
-
-        spawn_ids.len()
+        request_exclusions
     }
 
     fn sync_rate_limit_bucket_runtime(
@@ -2920,13 +2983,26 @@ impl MultiTokenManager {
                 }
             }
 
-            if let Some(owner) = background_owner {
-                owner.maybe_schedule_background_refreshes_for_request(
-                    model,
-                    request_weight,
-                    excluded_credential_ids,
-                );
-            }
+            let background_refresh_exclusions = background_owner
+                .map(|owner| {
+                    owner.background_refresh_exclusions_for_request(
+                        model,
+                        request_weight,
+                        excluded_credential_ids,
+                    )
+                })
+                .unwrap_or_default();
+            let effective_excluded_credential_ids;
+            let reservation_excluded_credential_ids = if background_refresh_exclusions.is_empty() {
+                excluded_credential_ids
+            } else {
+                effective_excluded_credential_ids = {
+                    let mut ids = excluded_credential_ids.clone();
+                    ids.extend(background_refresh_exclusions);
+                    ids
+                };
+                &effective_excluded_credential_ids
+            };
 
             if attempt_count >= max_attempts {
                 if let Some(err) = last_runtime_coordination_error {
@@ -2943,14 +3019,14 @@ impl MultiTokenManager {
                 self.reserve_next_credential_shared(
                     model,
                     request_weight,
-                    excluded_credential_ids,
+                    reservation_excluded_credential_ids,
                     session_affinity_cache_key.as_deref(),
                 )
             } else {
                 self.reserve_next_credential(
                     model,
                     request_weight,
-                    excluded_credential_ids,
+                    reservation_excluded_credential_ids,
                     session_affinity_cache_key.as_deref(),
                 )
             } {
@@ -3667,9 +3743,8 @@ impl MultiTokenManager {
                         credential_id = id,
                         elapsed_ms = started_at.elapsed().as_millis(),
                         error = %err,
-                        "凭据 Token 后台刷新失败"
+                        "凭据 Token 后台刷新失败，保留凭据并延后重试"
                     );
-                    self.report_refresh_failure(id);
                 }
                 self.finish_background_token_refresh(id, BackgroundRefreshOutcome::RetryLater);
             }
@@ -3677,7 +3752,7 @@ impl MultiTokenManager {
     }
 
     fn finish_background_token_refresh(&self, id: u64, outcome: BackgroundRefreshOutcome) {
-        let retry_cooldown_until = Instant::now() + self.runtime_refresh_coordination_cooldown();
+        let retry_cooldown_until = Instant::now() + BACKGROUND_REFRESH_RETRY_COOLDOWN;
         {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
@@ -8386,10 +8461,10 @@ mod tests {
         );
         let excluded = HashSet::new();
 
-        let scheduled =
-            manager.maybe_schedule_background_refreshes_for_request(None, 1.0, &excluded);
+        let request_exclusions =
+            manager.background_refresh_exclusions_for_request(None, 1.0, &excluded);
 
-        assert_eq!(scheduled, 0);
+        assert!(request_exclusions.is_empty());
         let entries = manager.entries.lock();
         assert!(
             entries
@@ -8401,6 +8476,78 @@ mod tests {
                 .iter()
                 .all(|entry| entry.background_refresh_cooldown_until.is_none())
         );
+    }
+
+    #[tokio::test]
+    async fn test_background_refresh_excludes_all_stale_but_schedules_only_one() {
+        let mut stale_a = available_credential(0);
+        stale_a.expires_at = Some((Utc::now() + Duration::minutes(2)).to_rfc3339());
+        stale_a.refresh_token = Some("a".repeat(150));
+        let mut stale_b = available_credential(1);
+        stale_b.expires_at = Some((Utc::now() + Duration::minutes(2)).to_rfc3339());
+        stale_b.refresh_token = Some("b".repeat(150));
+        let fresh = available_credential(2);
+
+        let manager = std::sync::Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![stale_a, stale_b, fresh],
+                Some(ProxyConfig::new("http://127.0.0.1:9")),
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        let refresh_lock = manager.refresh_lock_for(1).unwrap();
+        let _guard = refresh_lock.lock().await;
+        let excluded = HashSet::new();
+
+        let request_exclusions =
+            manager.background_refresh_exclusions_for_request(None, 1.0, &excluded);
+
+        assert_eq!(request_exclusions.len(), 2);
+        assert!(request_exclusions.contains(&1));
+        assert!(request_exclusions.contains(&2));
+        let entries = manager.entries.lock();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.background_refresh_in_progress)
+                .count(),
+            1
+        );
+        assert!(
+            entries
+                .iter()
+                .find(|entry| entry.id == 1)
+                .unwrap()
+                .background_refresh_in_progress
+        );
+    }
+
+    #[tokio::test]
+    async fn test_background_refresh_transient_failure_does_not_increment_disable_counter() {
+        let mut stale = available_credential(0);
+        stale.expires_at = Some((Utc::now() + Duration::minutes(2)).to_rfc3339());
+        stale.refresh_token = Some("r".repeat(150));
+
+        let manager = std::sync::Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![stale],
+                Some(ProxyConfig::new("http://127.0.0.1:9")),
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+
+        Arc::clone(&manager).run_background_token_refresh(1).await;
+
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert!(!entry.disabled);
+        assert_eq!(entry.refresh_failure_count, 0);
     }
 
     #[test]
