@@ -10,7 +10,6 @@ use postgres::{Client, NoTls};
 use redis::{Client as RedisClient, Commands, Script};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use tokio::runtime::RuntimeFlavor;
 
 use crate::admin::types::BalanceResponse;
 use crate::kiro::model::credentials::{CredentialsConfig, KiroCredentials};
@@ -1591,15 +1590,9 @@ where
     R: Send + 'static,
 {
     match tokio::runtime::Handle::try_current() {
-        Ok(handle) => match handle.runtime_flavor() {
-            RuntimeFlavor::MultiThread => tokio::task::block_in_place(operation),
-            RuntimeFlavor::CurrentThread => std::thread::spawn(operation)
-                .join()
-                .expect("state blocking operation thread panicked"),
-            _ => std::thread::spawn(operation)
-                .join()
-                .expect("state blocking operation thread panicked"),
-        },
+        Ok(_) => std::thread::spawn(operation)
+            .join()
+            .expect("state blocking operation thread panicked"),
         Err(_) => operation(),
     }
 }
@@ -3287,6 +3280,23 @@ mod tests {
         let path = std::env::temp_dir().join(format!("kiro-state-{name}-{}", Uuid::new_v4()));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_blocking_state_op_allows_nested_runtime_from_tokio_worker() {
+        let caller_thread_id = std::thread::current().id();
+
+        let operation_thread_id = run_blocking_state_op(move || {
+            let operation_thread_id = std::thread::current().id();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async { 1 + 1 });
+            operation_thread_id
+        });
+
+        assert_ne!(operation_thread_id, caller_thread_id);
     }
 
     #[test]
