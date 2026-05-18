@@ -125,6 +125,8 @@ impl AdminService {
                     suspicious_activity_last_seen_at: entry.suspicious_activity_last_seen_at,
                     suspicious_activity_quarantine_until: entry
                         .suspicious_activity_quarantine_until,
+                    suspicious_activity_recovery_success_count: entry
+                        .suspicious_activity_recovery_success_count,
                     suspicious_activity_quarantine_remaining_ms: entry
                         .suspicious_activity_quarantine_remaining_ms,
                     cooldown_remaining_ms: entry.cooldown_remaining_ms,
@@ -233,6 +235,14 @@ impl AdminService {
 
         self.token_manager
             .clear_runtime_model_restrictions_for_credential(id)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    pub fn clear_suspicious_activity(&self, id: u64) -> Result<bool, AdminServiceError> {
+        self.ensure_runtime_write_leader()?;
+
+        self.token_manager
+            .clear_suspicious_activity_for_credential(id)
             .map_err(|e| self.classify_error(e, id))
     }
 
@@ -358,6 +368,7 @@ impl AdminService {
             suspicious_activity_first_seen_at: None,
             suspicious_activity_last_seen_at: None,
             suspicious_activity_quarantine_until: None,
+            suspicious_activity_recovery_success_count: 0,
         };
 
         // 调用 token_manager 添加凭据
@@ -451,6 +462,11 @@ impl AdminService {
                 .suspicious_activity_auto_disable_threshold,
             suspicious_activity_auto_disable_window_ms: snapshot
                 .suspicious_activity_auto_disable_window_ms,
+            suspicious_activity_auto_clear_enabled: snapshot.suspicious_activity_auto_clear_enabled,
+            suspicious_activity_auto_clear_success_threshold: snapshot
+                .suspicious_activity_auto_clear_success_threshold,
+            suspicious_activity_auto_clear_after_ms: snapshot
+                .suspicious_activity_auto_clear_after_ms,
             model_cooldown_enabled: snapshot.model_cooldown_enabled,
             default_max_concurrency: snapshot.default_max_concurrency,
             rate_limit_bucket_capacity: snapshot.rate_limit_bucket_capacity,
@@ -523,6 +539,11 @@ impl AdminService {
             && req.suspicious_activity_auto_disable_enabled.is_none()
             && req.suspicious_activity_auto_disable_threshold.is_none()
             && req.suspicious_activity_auto_disable_window_ms.is_none()
+            && req.suspicious_activity_auto_clear_enabled.is_none()
+            && req
+                .suspicious_activity_auto_clear_success_threshold
+                .is_none()
+            && req.suspicious_activity_auto_clear_after_ms.is_none()
             && req.model_cooldown_enabled.is_none()
             && req.default_max_concurrency.is_none()
             && req.rate_limit_bucket_capacity.is_none()
@@ -555,6 +576,9 @@ impl AdminService {
                 req.suspicious_activity_auto_disable_enabled,
                 req.suspicious_activity_auto_disable_threshold,
                 req.suspicious_activity_auto_disable_window_ms,
+                req.suspicious_activity_auto_clear_enabled,
+                req.suspicious_activity_auto_clear_success_threshold,
+                req.suspicious_activity_auto_clear_after_ms,
                 req.model_cooldown_enabled,
                 req.default_max_concurrency,
                 req.rate_limit_bucket_capacity,

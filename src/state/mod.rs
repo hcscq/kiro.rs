@@ -651,6 +651,7 @@ pub struct CredentialHealthPatch {
     pub suspicious_activity_first_seen_at: Option<Option<String>>,
     pub suspicious_activity_last_seen_at: Option<Option<String>>,
     pub suspicious_activity_quarantine_until: Option<Option<String>>,
+    pub suspicious_activity_recovery_success_count: Option<u32>,
 }
 
 impl CredentialHealthPatch {
@@ -685,6 +686,12 @@ impl CredentialHealthPatch {
         {
             credential.suspicious_activity_quarantine_until =
                 suspicious_activity_quarantine_until.clone();
+        }
+        if let Some(suspicious_activity_recovery_success_count) =
+            self.suspicious_activity_recovery_success_count
+        {
+            credential.suspicious_activity_recovery_success_count =
+                suspicious_activity_recovery_success_count;
         }
     }
 }
@@ -821,6 +828,12 @@ pub struct PersistedDispatchConfig {
     pub suspicious_activity_auto_disable_threshold: u32,
     #[serde(default = "default_persisted_suspicious_activity_auto_disable_window_ms")]
     pub suspicious_activity_auto_disable_window_ms: u64,
+    #[serde(default = "default_persisted_suspicious_activity_auto_clear_enabled")]
+    pub suspicious_activity_auto_clear_enabled: bool,
+    #[serde(default = "default_persisted_suspicious_activity_auto_clear_success_threshold")]
+    pub suspicious_activity_auto_clear_success_threshold: u32,
+    #[serde(default = "default_persisted_suspicious_activity_auto_clear_after_ms")]
+    pub suspicious_activity_auto_clear_after_ms: u64,
     #[serde(default = "default_persisted_model_cooldown_enabled")]
     pub model_cooldown_enabled: bool,
     pub default_max_concurrency: Option<u32>,
@@ -865,6 +878,18 @@ fn default_persisted_suspicious_activity_auto_disable_window_ms() -> u64 {
     86_400_000
 }
 
+fn default_persisted_suspicious_activity_auto_clear_enabled() -> bool {
+    true
+}
+
+fn default_persisted_suspicious_activity_auto_clear_success_threshold() -> u32 {
+    10
+}
+
+fn default_persisted_suspicious_activity_auto_clear_after_ms() -> u64 {
+    604_800_000
+}
+
 fn default_persisted_model_cooldown_enabled() -> bool {
     true
 }
@@ -906,6 +931,10 @@ impl PersistedDispatchConfig {
                 .suspicious_activity_auto_disable_threshold,
             suspicious_activity_auto_disable_window_ms: config
                 .suspicious_activity_auto_disable_window_ms,
+            suspicious_activity_auto_clear_enabled: config.suspicious_activity_auto_clear_enabled,
+            suspicious_activity_auto_clear_success_threshold: config
+                .suspicious_activity_auto_clear_success_threshold,
+            suspicious_activity_auto_clear_after_ms: config.suspicious_activity_auto_clear_after_ms,
             model_cooldown_enabled: config.model_cooldown_enabled,
             default_max_concurrency: config.default_max_concurrency,
             rate_limit_bucket_capacity: config.rate_limit_bucket_capacity,
@@ -937,6 +966,11 @@ impl PersistedDispatchConfig {
             self.suspicious_activity_auto_disable_threshold;
         config.suspicious_activity_auto_disable_window_ms =
             self.suspicious_activity_auto_disable_window_ms;
+        config.suspicious_activity_auto_clear_enabled = self.suspicious_activity_auto_clear_enabled;
+        config.suspicious_activity_auto_clear_success_threshold =
+            self.suspicious_activity_auto_clear_success_threshold;
+        config.suspicious_activity_auto_clear_after_ms =
+            self.suspicious_activity_auto_clear_after_ms;
         config.model_cooldown_enabled = self.model_cooldown_enabled;
         config.default_max_concurrency = self.default_max_concurrency;
         config.rate_limit_bucket_capacity = self.rate_limit_bucket_capacity;
@@ -3468,6 +3502,9 @@ mod tests {
             suspicious_activity_auto_disable_enabled: true,
             suspicious_activity_auto_disable_threshold: 3,
             suspicious_activity_auto_disable_window_ms: 86_400_000,
+            suspicious_activity_auto_clear_enabled: true,
+            suspicious_activity_auto_clear_success_threshold: 10,
+            suspicious_activity_auto_clear_after_ms: 604_800_000,
             model_cooldown_enabled: true,
             default_max_concurrency: Some(4),
             rate_limit_bucket_capacity: 6.0,
@@ -3519,6 +3556,15 @@ mod tests {
         assert_eq!(
             dispatch.suspicious_activity_auto_disable_window_ms,
             86_400_000
+        );
+        assert!(dispatch.suspicious_activity_auto_clear_enabled);
+        assert_eq!(
+            dispatch.suspicious_activity_auto_clear_success_threshold,
+            10
+        );
+        assert_eq!(
+            dispatch.suspicious_activity_auto_clear_after_ms,
+            604_800_000
         );
         assert!(dispatch.model_cooldown_enabled);
         assert!(dispatch.request_weighting.enabled);

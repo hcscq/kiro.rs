@@ -135,6 +135,8 @@ pub struct CredentialStatusItem {
     /// suspicious activity 账号级隔离到期时间
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suspicious_activity_quarantine_until: Option<String>,
+    /// 最近一次 suspicious activity 后累计的成功请求次数
+    pub suspicious_activity_recovery_success_count: u32,
     /// suspicious activity 隔离剩余时间（毫秒）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suspicious_activity_quarantine_remaining_ms: Option<u64>,
@@ -378,6 +380,12 @@ pub struct LoadBalancingModeResponse {
     pub suspicious_activity_auto_disable_threshold: u32,
     /// suspicious activity 自动禁用统计窗口（毫秒）
     pub suspicious_activity_auto_disable_window_ms: u64,
+    /// 是否在账号恢复稳定后自动清除 suspicious activity 标记
+    pub suspicious_activity_auto_clear_enabled: bool,
+    /// 自动清除 suspicious activity 标记所需的连续成功请求次数
+    pub suspicious_activity_auto_clear_success_threshold: u32,
+    /// 最近一次 suspicious activity 后经过多久自动清除标记（毫秒）
+    pub suspicious_activity_auto_clear_after_ms: u64,
     /// 是否启用“模型不支持”后的运行时模型冷却
     pub model_cooldown_enabled: bool,
     /// 全局默认单账号并发上限（null 表示不限制）
@@ -426,6 +434,12 @@ pub struct SetLoadBalancingModeRequest {
     pub suspicious_activity_auto_disable_threshold: Option<u32>,
     /// suspicious activity 自动禁用统计窗口（毫秒）
     pub suspicious_activity_auto_disable_window_ms: Option<u64>,
+    /// 是否在账号恢复稳定后自动清除 suspicious activity 标记
+    pub suspicious_activity_auto_clear_enabled: Option<bool>,
+    /// 自动清除 suspicious activity 标记所需的连续成功请求次数
+    pub suspicious_activity_auto_clear_success_threshold: Option<u32>,
+    /// 最近一次 suspicious activity 后经过多久自动清除标记（毫秒）
+    pub suspicious_activity_auto_clear_after_ms: Option<u64>,
     /// 是否启用“模型不支持”后的运行时模型冷却
     pub model_cooldown_enabled: Option<bool>,
     /// 全局默认单账号并发上限（0 表示不限制；字段缺失表示不修改）

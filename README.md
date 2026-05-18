@@ -40,7 +40,7 @@
 - **429 冷却开关**: `rateLimitCooldownEnabled` 控制是否在上游 `429` 后施加本地账号冷却与退避，默认关闭
 - **429 冷却**: 当 `rateLimitCooldownEnabled=true` 时，单账号触发上游 `429` 后会按 `rateLimitCooldownMs` 做固定短冷却，避免重试继续打到同一账号
 - **Suspicious activity 长冷却**: 命中 Kiro `suspicious activity` 临时限制时，会按 `suspiciousActivityCooldownMs` 对该凭据做独立的账号级全局冷却，默认启用 2 小时
-- **Suspicious activity 标记与停调**: 命中过 `suspicious activity` 的账号会被标记并降级为兜底候选；默认 24 小时内命中 3 次会自动禁用
+- **Suspicious activity 标记、停调与恢复**: 命中过 `suspicious activity` 的账号会被标记并降级为兜底候选；默认 24 小时内命中 3 次会自动禁用，隔离结束后连续成功 10 次或 7 天未再命中会自动清除标记
 - **Token Bucket 限速**: 支持为每个账号设置 token bucket；配置 Redis 共享运行态后可在多副本间共享限速状态
 - **429 自适应回填调节**: 遭遇 `429` 时会清空该账号 bucket 并下调回填速率，成功后再逐步恢复
 - **智能重试**: 单凭据最多重试 3 次，单请求最多重试 9 次
@@ -223,6 +223,9 @@ GitHub Actions 镜像构建：
 | `suspiciousActivityAutoDisableEnabled` | boolean | `true` | 是否在同一统计窗口内多次触发 `suspicious activity` 后自动禁用账号 |
 | `suspiciousActivityAutoDisableThreshold` | number | `3` | 自动禁用阈值；同一窗口内达到该命中次数即停调 |
 | `suspiciousActivityAutoDisableWindowMs` | number | `86400000` | 自动禁用统计窗口（毫秒）；`0` 表示不重置窗口计数 |
+| `suspiciousActivityAutoClearEnabled` | boolean | `true` | 是否在账号恢复稳定后自动清除 `suspicious activity` 标记 |
+| `suspiciousActivityAutoClearSuccessThreshold` | number | `10` | 隔离结束后连续成功达到该次数时清除标记；`0` 表示不按成功次数清除 |
+| `suspiciousActivityAutoClearAfterMs` | number | `604800000` | 最近一次命中后超过该时间未再命中时清除标记；`0` 表示不按时间清除 |
 | `modelCooldownEnabled` | boolean | `true` | 是否启用“模型不支持”后的运行时模型冷却；关闭后不再记录 `INVALID_MODEL_ID` 触发的账号级临时模型限制 |
 | `rateLimitBucketCapacity` | number | `6.0` | 单账号 token bucket 容量；默认允许连续承接两次以上重请求，`<= 0` 表示禁用 token bucket |
 | `rateLimitRefillPerSecond` | number | `2.0` | 单账号 token bucket 基础回填速率（token/s）；默认与轻/重请求加权联动调优，`<= 0` 表示禁用 token bucket |
@@ -279,6 +282,9 @@ GitHub Actions 镜像构建：
    "suspiciousActivityAutoDisableEnabled": true,
    "suspiciousActivityAutoDisableThreshold": 3,
    "suspiciousActivityAutoDisableWindowMs": 86400000,
+   "suspiciousActivityAutoClearEnabled": true,
+   "suspiciousActivityAutoClearSuccessThreshold": 10,
+   "suspiciousActivityAutoClearAfterMs": 604800000,
    "modelCooldownEnabled": true,
    "rateLimitBucketCapacity": 6.0,
    "rateLimitRefillPerSecond": 2.0,
@@ -486,7 +492,7 @@ kiro-rs \
 - `rateLimitCooldownEnabled` 控制是否启用上游 `429` 后的本地冷却与 bucket 退避；默认关闭
 - `rateLimitCooldownMs` 可控制单账号触发上游 `429` 后的固定冷却时长；仅在 `rateLimitCooldownEnabled=true` 时生效，设为 `0` 可仅关闭固定冷却
 - `suspiciousActivityCooldownEnabled` / `suspiciousActivityCooldownMs` 专门处理 Kiro `suspicious activity` 临时限制；默认启用 2 小时账号级全局冷却，避免同一凭据被并发请求持续探测
-- `suspiciousActivityPreferCleanCredentials` 会让从未命中过 `suspicious activity` 的账号优先承载请求；`suspiciousActivityAutoDisable*` 控制多次命中后的自动停调策略
+- `suspiciousActivityPreferCleanCredentials` 会让从未命中过 `suspicious activity` 的账号优先承载请求；`suspiciousActivityAutoDisable*` 控制多次命中后的自动停调策略，`suspiciousActivityAutoClear*` 控制隔离结束后的自动恢复与标记清除
 - `modelCooldownEnabled` 控制“模型不支持”后的运行时模型冷却；默认开启，关闭时不会把 `INVALID_MODEL_ID` 记成账号级临时模型限制
 - `rateLimitBucketCapacity` / `rateLimitRefillPerSecond` 可限制单账号单位时间内的发放速率，适合给“真实承载能力偏弱”的账号单独降速
 - `requestWeighting` 默认开启，但默认曲线已经压平；重代码/重 thinking 请求会比轻请求多消耗一些 bucket 配额，同时默认 bucket 与 429 退避参数已同步调优

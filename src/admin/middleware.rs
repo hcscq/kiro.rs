@@ -336,7 +336,9 @@ fn retryable_credential_admin_action(path: &str) -> bool {
         );
     }
 
-    segments.len() == 4 && segments[2] == "runtime-model-restrictions" && segments[3] == "clear"
+    segments.len() == 4
+        && ((segments[2] == "runtime-model-restrictions" && segments[3] == "clear")
+            || (segments[2] == "suspicious-activity" && segments[3] == "clear"))
 }
 
 #[cfg(test)]
@@ -376,6 +378,10 @@ mod tests {
         assert!(is_retryable_admin_write_route(
             &Method::POST,
             "/api/admin/credentials/12/runtime-model-restrictions/clear",
+        ));
+        assert!(is_retryable_admin_write_route(
+            &Method::POST,
+            "/api/admin/credentials/12/suspicious-activity/clear",
         ));
 
         assert!(!is_retryable_admin_write_route(

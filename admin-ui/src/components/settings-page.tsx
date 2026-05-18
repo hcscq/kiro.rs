@@ -192,6 +192,9 @@ export function SettingsPage() {
   const [suspiciousActivityAutoDisableEnabled, setSuspiciousActivityAutoDisableEnabled] = useState(true)
   const [suspiciousActivityAutoDisableThresholdInput, setSuspiciousActivityAutoDisableThresholdInput] = useState('3')
   const [suspiciousActivityAutoDisableWindowMsInput, setSuspiciousActivityAutoDisableWindowMsInput] = useState('86400000')
+  const [suspiciousActivityAutoClearEnabled, setSuspiciousActivityAutoClearEnabled] = useState(true)
+  const [suspiciousActivityAutoClearSuccessThresholdInput, setSuspiciousActivityAutoClearSuccessThresholdInput] = useState('10')
+  const [suspiciousActivityAutoClearAfterMsInput, setSuspiciousActivityAutoClearAfterMsInput] = useState('604800000')
   const [modelCooldownEnabled, setModelCooldownEnabled] = useState(false)
   const [sessionAffinityEnabled, setSessionAffinityEnabled] = useState(false)
   const [defaultMaxConcurrencyInput, setDefaultMaxConcurrencyInput] = useState('')
@@ -219,6 +222,9 @@ export function SettingsPage() {
     setSuspiciousActivityAutoDisableEnabled(loadBalancingData.suspiciousActivityAutoDisableEnabled ?? true)
     setSuspiciousActivityAutoDisableThresholdInput(String(loadBalancingData.suspiciousActivityAutoDisableThreshold ?? 3))
     setSuspiciousActivityAutoDisableWindowMsInput(String(loadBalancingData.suspiciousActivityAutoDisableWindowMs ?? 86400000))
+    setSuspiciousActivityAutoClearEnabled(loadBalancingData.suspiciousActivityAutoClearEnabled ?? true)
+    setSuspiciousActivityAutoClearSuccessThresholdInput(String(loadBalancingData.suspiciousActivityAutoClearSuccessThreshold ?? 10))
+    setSuspiciousActivityAutoClearAfterMsInput(String(loadBalancingData.suspiciousActivityAutoClearAfterMs ?? 604800000))
     setModelCooldownEnabled(loadBalancingData.modelCooldownEnabled ?? true)
     setSessionAffinityEnabled(loadBalancingData.sessionAffinityEnabled ?? false)
     setDefaultMaxConcurrencyInput(loadBalancingData.defaultMaxConcurrency ? String(loadBalancingData.defaultMaxConcurrency) : '')
@@ -249,6 +255,8 @@ export function SettingsPage() {
     const parsedSuspiciousActivityCooldownMs = suspiciousActivityCooldownMsInput.trim() === '' ? 0 : parseInt(suspiciousActivityCooldownMsInput, 10)
     const parsedSuspiciousActivityAutoDisableThreshold = suspiciousActivityAutoDisableThresholdInput.trim() === '' ? 0 : parseInt(suspiciousActivityAutoDisableThresholdInput, 10)
     const parsedSuspiciousActivityAutoDisableWindowMs = suspiciousActivityAutoDisableWindowMsInput.trim() === '' ? 0 : parseInt(suspiciousActivityAutoDisableWindowMsInput, 10)
+    const parsedSuspiciousActivityAutoClearSuccessThreshold = suspiciousActivityAutoClearSuccessThresholdInput.trim() === '' ? 0 : parseInt(suspiciousActivityAutoClearSuccessThresholdInput, 10)
+    const parsedSuspiciousActivityAutoClearAfterMs = suspiciousActivityAutoClearAfterMsInput.trim() === '' ? 0 : parseInt(suspiciousActivityAutoClearAfterMsInput, 10)
     const parsedDefaultMaxConcurrency = defaultMaxConcurrencyInput.trim() === '' ? 0 : parseInt(defaultMaxConcurrencyInput, 10)
     const parsedRateLimitBucketCapacity = rateLimitBucketCapacityInput.trim() === '' ? 0 : Number.parseFloat(rateLimitBucketCapacityInput)
     const parsedRateLimitRefillPerSecond = rateLimitRefillPerSecondInput.trim() === '' ? 0 : Number.parseFloat(rateLimitRefillPerSecondInput)
@@ -278,6 +286,8 @@ export function SettingsPage() {
       Number.isNaN(parsedSuspiciousActivityCooldownMs) ||
       Number.isNaN(parsedSuspiciousActivityAutoDisableThreshold) ||
       Number.isNaN(parsedSuspiciousActivityAutoDisableWindowMs) ||
+      Number.isNaN(parsedSuspiciousActivityAutoClearSuccessThreshold) ||
+      Number.isNaN(parsedSuspiciousActivityAutoClearAfterMs) ||
       Number.isNaN(parsedDefaultMaxConcurrency) ||
       Number.isNaN(parsedRateLimitBucketCapacity) ||
       Number.isNaN(parsedRateLimitRefillPerSecond) ||
@@ -290,6 +300,8 @@ export function SettingsPage() {
       parsedSuspiciousActivityCooldownMs < 0 ||
       parsedSuspiciousActivityAutoDisableThreshold < 0 ||
       parsedSuspiciousActivityAutoDisableWindowMs < 0 ||
+      parsedSuspiciousActivityAutoClearSuccessThreshold < 0 ||
+      parsedSuspiciousActivityAutoClearAfterMs < 0 ||
       parsedDefaultMaxConcurrency < 0 ||
       parsedRateLimitBucketCapacity < 0 ||
       parsedRateLimitRefillPerSecond < 0 ||
@@ -302,6 +314,15 @@ export function SettingsPage() {
 
     if (suspiciousActivityAutoDisableEnabled && parsedSuspiciousActivityAutoDisableThreshold <= 0) {
       toast.error('Suspicious 自动停调阈值必须大于 0')
+      return
+    }
+
+    if (
+      suspiciousActivityAutoClearEnabled &&
+      parsedSuspiciousActivityAutoClearSuccessThreshold <= 0 &&
+      parsedSuspiciousActivityAutoClearAfterMs <= 0
+    ) {
+      toast.error('Suspicious 自动恢复需要至少配置成功次数或时间阈值')
       return
     }
 
@@ -365,6 +386,9 @@ export function SettingsPage() {
         suspiciousActivityAutoDisableEnabled,
         suspiciousActivityAutoDisableThreshold: parsedSuspiciousActivityAutoDisableThreshold,
         suspiciousActivityAutoDisableWindowMs: parsedSuspiciousActivityAutoDisableWindowMs,
+        suspiciousActivityAutoClearEnabled,
+        suspiciousActivityAutoClearSuccessThreshold: parsedSuspiciousActivityAutoClearSuccessThreshold,
+        suspiciousActivityAutoClearAfterMs: parsedSuspiciousActivityAutoClearAfterMs,
         modelCooldownEnabled,
         sessionAffinityEnabled,
         defaultMaxConcurrency: parsedDefaultMaxConcurrency,
@@ -462,9 +486,9 @@ export function SettingsPage() {
             </div>
           </div>
 
-          <div className="space-y-4">
-            <h3 className="text-sm font-semibold flex items-center text-primary">网络及接口限流</h3>
-            <div className="grid gap-4 bg-muted/30 p-4 rounded-lg">
+          <div className="space-y-4 md:col-span-2">
+            <h3 className="text-sm font-semibold flex items-center text-primary">限流与恢复策略</h3>
+            <div className="grid gap-4 bg-muted/30 p-4 rounded-lg lg:grid-cols-2 2xl:grid-cols-3">
               <div className="space-y-2">
                 <label className="text-sm font-medium" htmlFor="rateLimitCooldownMs">
                   429 异常冷却时间 (毫秒)
@@ -610,6 +634,57 @@ export function SettingsPage() {
                       value={suspiciousActivityAutoDisableWindowMsInput}
                       onChange={(e) => setSuspiciousActivityAutoDisableWindowMsInput(e.target.value)}
                       placeholder="默认 86400000，即 24 小时"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex flex-col gap-3 rounded-lg border bg-background/70 p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="space-y-1">
+                    <div className="text-sm font-medium">Suspicious activity 自动恢复</div>
+                    <p className="text-sm text-muted-foreground">
+                      隔离结束后，账号连续成功或长期未再命中 suspicious activity 时自动清除历史标记。
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <Badge variant={suspiciousActivityAutoClearEnabled ? 'secondary' : 'outline'}>
+                      {suspiciousActivityAutoClearEnabled ? '已启用' : '已关闭'}
+                    </Badge>
+                    <Switch
+                      checked={suspiciousActivityAutoClearEnabled}
+                      onCheckedChange={setSuspiciousActivityAutoClearEnabled}
+                      aria-label="切换 suspicious activity 自动恢复"
+                    />
+                  </div>
+                </div>
+                <div className="grid gap-3 md:grid-cols-2">
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium" htmlFor="suspiciousActivityAutoClearSuccessThreshold">
+                      恢复成功次数
+                    </label>
+                    <Input
+                      id="suspiciousActivityAutoClearSuccessThreshold"
+                      type="number"
+                      min="0"
+                      step="1"
+                      value={suspiciousActivityAutoClearSuccessThresholdInput}
+                      onChange={(e) => setSuspiciousActivityAutoClearSuccessThresholdInput(e.target.value)}
+                      placeholder="默认 10"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium" htmlFor="suspiciousActivityAutoClearAfterMs">
+                      未命中恢复时间 (毫秒)
+                    </label>
+                    <Input
+                      id="suspiciousActivityAutoClearAfterMs"
+                      type="number"
+                      min="0"
+                      step="60000"
+                      value={suspiciousActivityAutoClearAfterMsInput}
+                      onChange={(e) => setSuspiciousActivityAutoClearAfterMsInput(e.target.value)}
+                      placeholder="默认 604800000，即 7 天"
                     />
                   </div>
                 </div>

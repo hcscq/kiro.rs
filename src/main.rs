@@ -973,6 +973,9 @@ mod tests {
             suspicious_activity_auto_disable_enabled: true,
             suspicious_activity_auto_disable_threshold: 3,
             suspicious_activity_auto_disable_window_ms: 86_400_000,
+            suspicious_activity_auto_clear_enabled: true,
+            suspicious_activity_auto_clear_success_threshold: 10,
+            suspicious_activity_auto_clear_after_ms: 604_800_000,
             model_cooldown_enabled: true,
             default_max_concurrency: Some(3),
             rate_limit_bucket_capacity: 5.0,
@@ -1007,6 +1010,15 @@ mod tests {
         assert_eq!(
             rollback.suspicious_activity_auto_disable_window_ms,
             86_400_000
+        );
+        assert!(rollback.suspicious_activity_auto_clear_enabled);
+        assert_eq!(
+            rollback.suspicious_activity_auto_clear_success_threshold,
+            10
+        );
+        assert_eq!(
+            rollback.suspicious_activity_auto_clear_after_ms,
+            604_800_000
         );
         assert_eq!(rollback.default_max_concurrency, Some(3));
         assert_eq!(rollback.rate_limit_bucket_capacity, 5.0);

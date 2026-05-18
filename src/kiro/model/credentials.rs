@@ -227,6 +227,11 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub suspicious_activity_quarantine_until: Option<String>,
+
+    /// 最近一次 suspicious activity 后累计的成功请求次数
+    #[serde(default)]
+    #[serde(skip_serializing_if = "is_zero")]
+    pub suspicious_activity_recovery_success_count: u32,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -871,6 +876,7 @@ mod tests {
             suspicious_activity_first_seen_at: None,
             suspicious_activity_last_seen_at: None,
             suspicious_activity_quarantine_until: None,
+            suspicious_activity_recovery_success_count: 0,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -1178,6 +1184,7 @@ mod tests {
             suspicious_activity_first_seen_at: None,
             suspicious_activity_last_seen_at: None,
             suspicious_activity_quarantine_until: None,
+            suspicious_activity_recovery_success_count: 0,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -1226,6 +1233,7 @@ mod tests {
             suspicious_activity_first_seen_at: None,
             suspicious_activity_last_seen_at: None,
             suspicious_activity_quarantine_until: None,
+            suspicious_activity_recovery_success_count: 0,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -1356,6 +1364,7 @@ mod tests {
             suspicious_activity_first_seen_at: None,
             suspicious_activity_last_seen_at: None,
             suspicious_activity_quarantine_until: None,
+            suspicious_activity_recovery_success_count: 0,
         };
 
         let json = original.to_pretty_json().unwrap();

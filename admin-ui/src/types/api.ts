@@ -47,6 +47,7 @@ export interface CredentialStatusItem {
   suspiciousActivityFirstSeenAt?: string | null
   suspiciousActivityLastSeenAt?: string | null
   suspiciousActivityQuarantineUntil?: string | null
+  suspiciousActivityRecoverySuccessCount: number
   suspiciousActivityQuarantineRemainingMs?: number | null
   cooldownRemainingMs?: number | null
   rateLimitBucketTokens?: number | null
@@ -208,6 +209,9 @@ export interface LoadBalancingConfigResponse {
   suspiciousActivityAutoDisableEnabled: boolean
   suspiciousActivityAutoDisableThreshold: number
   suspiciousActivityAutoDisableWindowMs: number
+  suspiciousActivityAutoClearEnabled: boolean
+  suspiciousActivityAutoClearSuccessThreshold: number
+  suspiciousActivityAutoClearAfterMs: number
   modelCooldownEnabled: boolean
   defaultMaxConcurrency: number | null
   rateLimitBucketCapacity: number
@@ -232,6 +236,9 @@ export interface UpdateLoadBalancingConfigRequest {
   suspiciousActivityAutoDisableEnabled?: boolean
   suspiciousActivityAutoDisableThreshold?: number
   suspiciousActivityAutoDisableWindowMs?: number
+  suspiciousActivityAutoClearEnabled?: boolean
+  suspiciousActivityAutoClearSuccessThreshold?: number
+  suspiciousActivityAutoClearAfterMs?: number
   modelCooldownEnabled?: boolean
   defaultMaxConcurrency?: number
   rateLimitBucketCapacity?: number

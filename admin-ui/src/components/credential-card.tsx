@@ -6,6 +6,7 @@ import {
   ChevronDown,
   ChevronUp,
   Clock3,
+  Eraser,
   KeyRound,
   Layers,
   Loader2,
@@ -43,6 +44,7 @@ import type {
 import {
   useSetDisabled,
   useClearCredentialRuntimeModelRestrictions,
+  useClearCredentialSuspiciousActivity,
   useSetCredentialModelPolicy,
   useSetCredentialRateLimitConfig,
   useSetMaxConcurrency,
@@ -297,6 +299,7 @@ export function CredentialCard({
 
   const setDisabled = useSetDisabled()
   const clearRuntimeModelCooldown = useClearCredentialRuntimeModelRestrictions()
+  const clearSuspiciousActivity = useClearCredentialSuspiciousActivity()
   const setModelPolicy = useSetCredentialModelPolicy()
   const setMaxConcurrency = useSetMaxConcurrency()
   const setRateLimitConfig = useSetCredentialRateLimitConfig()
@@ -431,6 +434,17 @@ export function CredentialCard({
 
   const handleClearRuntimeModelRestrictions = () => {
     clearRuntimeModelCooldown.mutate(credential.id, {
+      onSuccess: (res) => {
+        toast.success(res.message)
+      },
+      onError: (err) => {
+        toast.error('清除失败: ' + (err as Error).message)
+      },
+    })
+  }
+
+  const handleClearSuspiciousActivity = () => {
+    clearSuspiciousActivity.mutate(credential.id, {
       onSuccess: (res) => {
         toast.success(res.message)
       },
@@ -917,14 +931,34 @@ export function CredentialCard({
 
           {hasSuspiciousActivity && (
             <div className="space-y-1 rounded-lg border border-dashed border-amber-300 bg-amber-50/40 px-3 py-2.5 text-xs">
-              <div className="flex flex-wrap items-center gap-2 text-muted-foreground">
-                <Badge variant={suspiciousQuarantineSummary ? 'warning' : 'outline'}>
-                  suspicious activity {credential.suspiciousActivityCount}
-                </Badge>
-                {suspiciousLastSeenSummary && <span>最近命中 {suspiciousLastSeenSummary}</span>}
-                {suspiciousQuarantineUntilSummary && (
-                  <span>隔离至 {suspiciousQuarantineUntilSummary}</span>
-                )}
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex flex-wrap items-center gap-2 text-muted-foreground">
+                  <Badge variant={suspiciousQuarantineSummary ? 'warning' : 'outline'}>
+                    suspicious activity {credential.suspiciousActivityCount}
+                  </Badge>
+                  <Badge variant="outline">
+                    恢复成功 {credential.suspiciousActivityRecoverySuccessCount}
+                  </Badge>
+                  {suspiciousLastSeenSummary && <span>最近命中 {suspiciousLastSeenSummary}</span>}
+                  {suspiciousQuarantineUntilSummary && (
+                    <span>隔离至 {suspiciousQuarantineUntilSummary}</span>
+                  )}
+                </div>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 px-2 text-xs"
+                  onClick={handleClearSuspiciousActivity}
+                  disabled={clearSuspiciousActivity.isPending}
+                  title="清除 suspicious activity 标记与隔离"
+                >
+                  {clearSuspiciousActivity.isPending ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Eraser className="h-3.5 w-3.5" />
+                  )}
+                  清除
+                </Button>
               </div>
             </div>
           )}

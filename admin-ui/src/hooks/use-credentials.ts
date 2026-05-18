@@ -6,6 +6,7 @@ import {
   setCredentialRateLimitConfig,
   setCredentialModelPolicy,
   clearCredentialRuntimeModelRestrictions,
+  clearCredentialSuspiciousActivity,
   setCredentialPriority,
   resetCredentialFailure,
   forceRefreshToken,
@@ -121,6 +122,17 @@ export function useClearCredentialRuntimeModelRestrictions() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (id: number) => clearCredentialRuntimeModelRestrictions(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 清除 suspicious activity 标记与隔离
+export function useClearCredentialSuspiciousActivity() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => clearCredentialSuspiciousActivity(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },

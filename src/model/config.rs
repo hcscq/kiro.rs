@@ -329,6 +329,18 @@ pub struct Config {
     #[serde(default = "default_suspicious_activity_auto_disable_window_ms")]
     pub suspicious_activity_auto_disable_window_ms: u64,
 
+    /// 是否在账号恢复稳定后自动清除 suspicious activity 标记
+    #[serde(default = "default_suspicious_activity_auto_clear_enabled")]
+    pub suspicious_activity_auto_clear_enabled: bool,
+
+    /// 自动清除 suspicious activity 标记所需的连续成功请求次数（0 表示不按成功次数清除）
+    #[serde(default = "default_suspicious_activity_auto_clear_success_threshold")]
+    pub suspicious_activity_auto_clear_success_threshold: u32,
+
+    /// 最近一次 suspicious activity 后经过多久自动清除标记（毫秒，0 表示不按时间清除）
+    #[serde(default = "default_suspicious_activity_auto_clear_after_ms")]
+    pub suspicious_activity_auto_clear_after_ms: u64,
+
     /// 是否启用“模型不支持”后的运行时模型冷却
     #[serde(default = "default_model_cooldown_enabled")]
     pub model_cooldown_enabled: bool,
@@ -441,6 +453,18 @@ fn default_suspicious_activity_auto_disable_threshold() -> u32 {
 
 fn default_suspicious_activity_auto_disable_window_ms() -> u64 {
     86_400_000
+}
+
+fn default_suspicious_activity_auto_clear_enabled() -> bool {
+    true
+}
+
+fn default_suspicious_activity_auto_clear_success_threshold() -> u32 {
+    10
+}
+
+fn default_suspicious_activity_auto_clear_after_ms() -> u64 {
+    604_800_000
 }
 
 fn default_model_cooldown_enabled() -> bool {
@@ -578,6 +602,12 @@ impl Default for Config {
                 default_suspicious_activity_auto_disable_threshold(),
             suspicious_activity_auto_disable_window_ms:
                 default_suspicious_activity_auto_disable_window_ms(),
+            suspicious_activity_auto_clear_enabled: default_suspicious_activity_auto_clear_enabled(
+            ),
+            suspicious_activity_auto_clear_success_threshold:
+                default_suspicious_activity_auto_clear_success_threshold(),
+            suspicious_activity_auto_clear_after_ms:
+                default_suspicious_activity_auto_clear_after_ms(),
             model_cooldown_enabled: default_model_cooldown_enabled(),
             rate_limit_bucket_capacity: default_rate_limit_bucket_capacity(),
             rate_limit_refill_per_second: default_rate_limit_refill_per_second(),
@@ -697,6 +727,15 @@ impl Config {
         {
             anyhow::bail!(
                 "suspiciousActivityAutoDisableThreshold 必须大于 0，或关闭 suspiciousActivityAutoDisableEnabled"
+            );
+        }
+
+        if self.suspicious_activity_auto_clear_enabled
+            && self.suspicious_activity_auto_clear_success_threshold == 0
+            && self.suspicious_activity_auto_clear_after_ms == 0
+        {
+            anyhow::bail!(
+                "suspiciousActivityAutoClearSuccessThreshold 和 suspiciousActivityAutoClearAfterMs 不能同时为 0，或关闭 suspiciousActivityAutoClearEnabled"
             );
         }
 
@@ -862,6 +901,9 @@ mod tests {
             config.suspicious_activity_auto_disable_window_ms,
             86_400_000
         );
+        assert!(config.suspicious_activity_auto_clear_enabled);
+        assert_eq!(config.suspicious_activity_auto_clear_success_threshold, 10);
+        assert_eq!(config.suspicious_activity_auto_clear_after_ms, 604_800_000);
         assert!(config.model_cooldown_enabled);
         assert!(config.request_weighting.enabled);
         assert!((config.rate_limit_bucket_capacity - 6.0).abs() < f64::EPSILON);

@@ -793,6 +793,8 @@ pub struct CredentialEntrySnapshot {
     /// suspicious activity 账号级隔离到期时间
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suspicious_activity_quarantine_until: Option<String>,
+    /// 最近一次 suspicious activity 后累计的成功请求次数
+    pub suspicious_activity_recovery_success_count: u32,
     /// suspicious activity 隔离剩余时间（毫秒）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suspicious_activity_quarantine_remaining_ms: Option<u64>,
@@ -860,6 +862,9 @@ pub struct LoadBalancingConfigSnapshot {
     pub suspicious_activity_auto_disable_enabled: bool,
     pub suspicious_activity_auto_disable_threshold: u32,
     pub suspicious_activity_auto_disable_window_ms: u64,
+    pub suspicious_activity_auto_clear_enabled: bool,
+    pub suspicious_activity_auto_clear_success_threshold: u32,
+    pub suspicious_activity_auto_clear_after_ms: u64,
     pub model_cooldown_enabled: bool,
     pub default_max_concurrency: Option<u32>,
     pub rate_limit_bucket_capacity: f64,
@@ -892,6 +897,9 @@ struct DispatchConfig {
     suspicious_activity_auto_disable_enabled: bool,
     suspicious_activity_auto_disable_threshold: u32,
     suspicious_activity_auto_disable_window_ms: u64,
+    suspicious_activity_auto_clear_enabled: bool,
+    suspicious_activity_auto_clear_success_threshold: u32,
+    suspicious_activity_auto_clear_after_ms: u64,
     model_cooldown_enabled: bool,
     default_max_concurrency: Option<u32>,
     rate_limit_bucket_capacity: f64,
@@ -942,6 +950,10 @@ impl DispatchConfig {
                 .suspicious_activity_auto_disable_threshold,
             suspicious_activity_auto_disable_window_ms: config
                 .suspicious_activity_auto_disable_window_ms,
+            suspicious_activity_auto_clear_enabled: config.suspicious_activity_auto_clear_enabled,
+            suspicious_activity_auto_clear_success_threshold: config
+                .suspicious_activity_auto_clear_success_threshold,
+            suspicious_activity_auto_clear_after_ms: config.suspicious_activity_auto_clear_after_ms,
             model_cooldown_enabled: config.model_cooldown_enabled,
             default_max_concurrency: config.default_max_concurrency.filter(|limit| *limit > 0),
             rate_limit_bucket_capacity: normalize_non_negative(
@@ -1831,6 +1843,33 @@ impl MultiTokenManager {
             || credentials.suspicious_activity_last_seen_at.is_some()
     }
 
+    fn clear_suspicious_activity_fields(credentials: &mut KiroCredentials) -> bool {
+        let changed = credentials.suspicious_activity_count != 0
+            || credentials.suspicious_activity_first_seen_at.is_some()
+            || credentials.suspicious_activity_last_seen_at.is_some()
+            || credentials.suspicious_activity_quarantine_until.is_some()
+            || credentials.suspicious_activity_recovery_success_count != 0;
+
+        credentials.suspicious_activity_count = 0;
+        credentials.suspicious_activity_first_seen_at = None;
+        credentials.suspicious_activity_last_seen_at = None;
+        credentials.suspicious_activity_quarantine_until = None;
+        credentials.suspicious_activity_recovery_success_count = 0;
+
+        changed
+    }
+
+    fn suspicious_activity_clear_patch() -> CredentialHealthPatch {
+        CredentialHealthPatch {
+            suspicious_activity_count: Some(0),
+            suspicious_activity_first_seen_at: Some(None),
+            suspicious_activity_last_seen_at: Some(None),
+            suspicious_activity_quarantine_until: Some(None),
+            suspicious_activity_recovery_success_count: Some(0),
+            ..CredentialHealthPatch::default()
+        }
+    }
+
     fn suspicious_activity_preference_rank(
         dispatch: &DispatchConfig,
         credentials: &KiroCredentials,
@@ -1933,6 +1972,107 @@ impl MultiTokenManager {
             quarantine_until: quarantine_until.map(|until| until.to_rfc3339()),
             should_auto_disable,
         }
+    }
+
+    fn suspicious_activity_auto_clear_due_to_age(
+        credentials: &KiroCredentials,
+        dispatch: &DispatchConfig,
+        now_utc: &DateTime<Utc>,
+    ) -> bool {
+        if !dispatch.suspicious_activity_auto_clear_enabled
+            || dispatch.suspicious_activity_auto_clear_after_ms == 0
+            || !Self::suspicious_activity_seen(credentials)
+            || Self::is_suspicious_activity_quarantined_at(credentials, now_utc)
+        {
+            return false;
+        }
+
+        let Some(last_seen) =
+            Self::parse_utc_timestamp(credentials.suspicious_activity_last_seen_at.as_deref())
+        else {
+            return false;
+        };
+
+        let elapsed = now_utc.signed_duration_since(last_seen);
+        elapsed >= Duration::zero()
+            && elapsed.num_milliseconds()
+                >= i64::try_from(dispatch.suspicious_activity_auto_clear_after_ms)
+                    .unwrap_or(i64::MAX)
+    }
+
+    fn suspicious_activity_auto_clear_due_to_success(
+        credentials: &KiroCredentials,
+        dispatch: &DispatchConfig,
+        now_utc: &DateTime<Utc>,
+        next_recovery_success_count: u32,
+    ) -> bool {
+        dispatch.suspicious_activity_auto_clear_enabled
+            && dispatch.suspicious_activity_auto_clear_success_threshold > 0
+            && Self::suspicious_activity_seen(credentials)
+            && !Self::is_suspicious_activity_quarantined_at(credentials, now_utc)
+            && next_recovery_success_count
+                >= dispatch.suspicious_activity_auto_clear_success_threshold
+    }
+
+    fn suspicious_activity_recovery_count_patch(count: u32) -> CredentialHealthPatch {
+        CredentialHealthPatch {
+            suspicious_activity_recovery_success_count: Some(count),
+            ..CredentialHealthPatch::default()
+        }
+    }
+
+    fn maybe_clear_stale_suspicious_activity_markers(&self, dispatch: &DispatchConfig) -> bool {
+        if !dispatch.suspicious_activity_auto_clear_enabled
+            || dispatch.suspicious_activity_auto_clear_after_ms == 0
+        {
+            return false;
+        }
+
+        let now_utc = Utc::now();
+        let cleared_ids: Vec<u64> = {
+            let mut entries = self.entries.lock();
+            entries
+                .iter_mut()
+                .filter_map(|entry| {
+                    if entry.disabled
+                        || !Self::suspicious_activity_auto_clear_due_to_age(
+                            &entry.credentials,
+                            dispatch,
+                            &now_utc,
+                        )
+                    {
+                        return None;
+                    }
+                    Self::clear_suspicious_activity_fields(&mut entry.credentials)
+                        .then_some(entry.id)
+                })
+                .collect()
+        };
+
+        for id in &cleared_ids {
+            if let Err(err) = self
+                .state_store
+                .patch_credential_health(*id, &Self::suspicious_activity_clear_patch())
+            {
+                tracing::warn!(
+                    credential_id = id,
+                    "自动清除过期 suspicious activity 标记持久化失败: {}",
+                    err
+                );
+            }
+        }
+
+        if !cleared_ids.is_empty() {
+            self.try_bump_state_change_revision(StateChangeKind::Credentials);
+            self.availability_notify.notify_waiters();
+            tracing::info!(
+                cleared_credentials = cleared_ids.len(),
+                "已自动清除过期 suspicious activity 标记"
+            );
+            return true;
+        }
+
+        false
     }
 
     fn bucket_is_ready(entry: &CredentialEntry) -> bool {
@@ -3185,6 +3325,8 @@ impl MultiTokenManager {
                     tracing::warn!("按需同步外部状态失败，将继续使用本地状态: {}", err);
                 }
             }
+            let dispatch_for_recovery = self.dispatch_config();
+            self.maybe_clear_stale_suspicious_activity_markers(&dispatch_for_recovery);
 
             let background_refresh_exclusions = background_owner
                 .map(|owner| {
@@ -3721,6 +3863,7 @@ impl MultiTokenManager {
             suspicious_activity_first_seen_at: None,
             suspicious_activity_last_seen_at: None,
             suspicious_activity_quarantine_until: None,
+            suspicious_activity_recovery_success_count: None,
         };
 
         match self.state_store.patch_credential_health(id, &patch) {
@@ -4134,7 +4277,7 @@ impl MultiTokenManager {
 
         self.availability_notify.notify_waiters();
         tracing::info!(
-            "已从外部状态热加载调度配置: mode={}, sessionAffinityEnabled={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, rateLimitCooldownEnabled={}, suspiciousActivityCooldownMs={}, suspiciousActivityCooldownEnabled={}, modelCooldownEnabled={}, defaultMaxConcurrency={:?}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}",
+            "已从外部状态热加载调度配置: mode={}, sessionAffinityEnabled={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, rateLimitCooldownEnabled={}, suspiciousActivityCooldownMs={}, suspiciousActivityCooldownEnabled={}, suspiciousActivityAutoClearEnabled={}, suspiciousActivityAutoClearSuccessThreshold={}, suspiciousActivityAutoClearAfterMs={}, modelCooldownEnabled={}, defaultMaxConcurrency={:?}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}",
             next.mode,
             next.session_affinity_enabled,
             next.queue_max_size,
@@ -4143,6 +4286,9 @@ impl MultiTokenManager {
             next.rate_limit_cooldown_enabled,
             next.suspicious_activity_cooldown_ms,
             next.suspicious_activity_cooldown_enabled,
+            next.suspicious_activity_auto_clear_enabled,
+            next.suspicious_activity_auto_clear_success_threshold,
+            next.suspicious_activity_auto_clear_after_ms,
             next.model_cooldown_enabled,
             next.default_max_concurrency,
             next.rate_limit_bucket_capacity,
@@ -4413,8 +4559,11 @@ impl MultiTokenManager {
     /// * `id` - 凭据 ID（来自 CallContext）
     pub fn report_success(&self, id: u64) {
         let now = Instant::now();
+        let now_utc = Utc::now();
         let dispatch = self.dispatch_config();
         let mut shared_bucket_policy = None;
+        let mut suspicious_activity_patch = None;
+        let mut cleared_suspicious_activity = false;
         {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
@@ -4438,7 +4587,54 @@ impl MultiTokenManager {
                 entry.rate_limit_hit_streak = 0;
                 entry.success_count += 1;
                 entry.pending_success_count_delta += 1;
-                entry.last_used_at = Some(Utc::now().to_rfc3339());
+                entry.last_used_at = Some(now_utc.to_rfc3339());
+
+                if Self::suspicious_activity_seen(&entry.credentials) && !entry.disabled {
+                    let next_recovery_success_count = entry
+                        .credentials
+                        .suspicious_activity_recovery_success_count
+                        .saturating_add(1);
+                    let should_clear_by_age = Self::suspicious_activity_auto_clear_due_to_age(
+                        &entry.credentials,
+                        &dispatch,
+                        &now_utc,
+                    );
+                    let should_clear_by_success =
+                        Self::suspicious_activity_auto_clear_due_to_success(
+                            &entry.credentials,
+                            &dispatch,
+                            &now_utc,
+                            next_recovery_success_count,
+                        );
+
+                    if should_clear_by_age || should_clear_by_success {
+                        cleared_suspicious_activity =
+                            Self::clear_suspicious_activity_fields(&mut entry.credentials);
+                        if cleared_suspicious_activity {
+                            suspicious_activity_patch =
+                                Some(Self::suspicious_activity_clear_patch());
+                            tracing::info!(
+                                credential_id = id,
+                                recovery_success_count = next_recovery_success_count,
+                                auto_clear_success_threshold =
+                                    dispatch.suspicious_activity_auto_clear_success_threshold,
+                                auto_clear_after_ms =
+                                    dispatch.suspicious_activity_auto_clear_after_ms,
+                                "凭据 suspicious activity 标记已自动恢复清除"
+                            );
+                        }
+                    } else if entry.credentials.suspicious_activity_recovery_success_count
+                        != next_recovery_success_count
+                    {
+                        entry.credentials.suspicious_activity_recovery_success_count =
+                            next_recovery_success_count;
+                        suspicious_activity_patch =
+                            Some(Self::suspicious_activity_recovery_count_patch(
+                                next_recovery_success_count,
+                            ));
+                    }
+                }
+
                 shared_bucket_policy = dispatch.shared_bucket_policy_for(&entry.credentials);
                 tracing::debug!(
                     "凭据 #{} API 调用成功（累计 {} 次）",
@@ -4455,6 +4651,20 @@ impl MultiTokenManager {
             ) {
                 tracing::warn!("更新共享调度成功态失败（credentialId={}）: {}", id, err);
             }
+        }
+        if let Some(patch) = suspicious_activity_patch {
+            match self.state_store.patch_credential_health(id, &patch) {
+                Ok(true) => self.try_bump_state_change_revision(StateChangeKind::Credentials),
+                Ok(false) => {}
+                Err(err) => tracing::warn!(
+                    credential_id = id,
+                    "持久化 suspicious activity 恢复状态失败: {}",
+                    err
+                ),
+            }
+        }
+        if cleared_suspicious_activity {
+            self.availability_notify.notify_waiters();
         }
         self.save_stats_debounced();
     }
@@ -4554,6 +4764,7 @@ impl MultiTokenManager {
                 entry.credentials.suspicious_activity_last_seen_at = update.last_seen_at.clone();
                 entry.credentials.suspicious_activity_quarantine_until =
                     update.quarantine_until.clone();
+                entry.credentials.suspicious_activity_recovery_success_count = 0;
                 entry.last_used_at = Some(now_utc.to_rfc3339());
 
                 if update.should_auto_disable {
@@ -4624,6 +4835,7 @@ impl MultiTokenManager {
                 suspicious_activity_first_seen_at: Some(update.first_seen_at),
                 suspicious_activity_last_seen_at: Some(update.last_seen_at),
                 suspicious_activity_quarantine_until: Some(update.quarantine_until),
+                suspicious_activity_recovery_success_count: Some(0),
             };
             (patch, notify_waiters)
         };
@@ -5752,6 +5964,7 @@ impl MultiTokenManager {
     /// 获取管理器状态快照（用于 Admin API）
     pub fn snapshot(&self) -> ManagerSnapshot {
         let dispatch = self.dispatch_config();
+        self.maybe_clear_stale_suspicious_activity_markers(&dispatch);
         let now = Instant::now();
         let now_utc = Utc::now();
         let now_epoch_ms = current_epoch_ms();
@@ -5899,6 +6112,9 @@ impl MultiTokenManager {
                             .credentials
                             .suspicious_activity_quarantine_until
                             .clone(),
+                        suspicious_activity_recovery_success_count: e
+                            .credentials
+                            .suspicious_activity_recovery_success_count,
                         suspicious_activity_quarantine_remaining_ms,
                         cooldown_remaining_ms,
                         rate_limit_bucket_tokens: shared_runtime
@@ -6185,13 +6401,72 @@ impl MultiTokenManager {
         Ok(changed)
     }
 
+    /// 清除单个凭据的 suspicious activity 标记与隔离（Admin API）
+    pub fn clear_suspicious_activity_for_credential(&self, id: u64) -> anyhow::Result<bool> {
+        let dispatch = self.dispatch_config();
+        let now = Instant::now();
+        let _state_write_guard = self.state_write_lock.lock();
+        let mut persisted = self.persisted_credentials_snapshot();
+        let credential = Self::persisted_credential_mut(&mut persisted, id)?;
+        let changed = Self::clear_suspicious_activity_fields(credential);
+        let updated_credential = credential.clone();
+
+        if changed {
+            self.persist_credentials_snapshot(&persisted)?;
+        }
+
+        let mut shared_bucket_policy = None;
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            if changed {
+                entry.credentials.suspicious_activity_count =
+                    updated_credential.suspicious_activity_count;
+                entry.credentials.suspicious_activity_first_seen_at =
+                    updated_credential.suspicious_activity_first_seen_at.clone();
+                entry.credentials.suspicious_activity_last_seen_at =
+                    updated_credential.suspicious_activity_last_seen_at.clone();
+                entry.credentials.suspicious_activity_quarantine_until = updated_credential
+                    .suspicious_activity_quarantine_until
+                    .clone();
+                entry.credentials.suspicious_activity_recovery_success_count =
+                    updated_credential.suspicious_activity_recovery_success_count;
+                Self::clear_rate_limit_penalty_runtime(entry, &dispatch, now);
+                shared_bucket_policy = dispatch.shared_bucket_policy_for(&entry.credentials);
+            }
+        }
+
+        if changed {
+            if self.shared_dispatch_runtime_enabled() {
+                if let Err(err) = self.state_store.reset_dispatch_runtime(
+                    id,
+                    shared_bucket_policy,
+                    current_epoch_ms(),
+                ) {
+                    tracing::warn!(
+                        "清除 suspicious activity 后重置共享调度运行态失败（credentialId={}）: {}",
+                        id,
+                        err
+                    );
+                }
+            }
+            self.availability_notify.notify_waiters();
+        }
+        Ok(changed)
+    }
+
     /// 重置凭据失败计数并重新启用（Admin API）
     pub fn reset_and_enable(&self, id: u64) -> anyhow::Result<()> {
         let dispatch = self.dispatch_config();
         let now = Instant::now();
         let _state_write_guard = self.state_write_lock.lock();
         let mut persisted = self.persisted_credentials_snapshot();
-        Self::clear_disabled_metadata(Self::persisted_credential_mut(&mut persisted, id)?);
+        let persisted_credential = Self::persisted_credential_mut(&mut persisted, id)?;
+        Self::clear_disabled_metadata(persisted_credential);
+        Self::clear_suspicious_activity_fields(persisted_credential);
         self.persist_credentials_snapshot(&persisted)?;
 
         {
@@ -6205,6 +6480,7 @@ impl MultiTokenManager {
             entry.disabled = false;
             entry.disabled_reason = None;
             Self::clear_disabled_metadata(&mut entry.credentials);
+            Self::clear_suspicious_activity_fields(&mut entry.credentials);
             Self::reset_rate_limit_runtime(entry, &dispatch, now);
         }
         if self.shared_dispatch_runtime_enabled() {
@@ -6527,6 +6803,11 @@ impl MultiTokenManager {
                 .suspicious_activity_auto_disable_threshold,
             suspicious_activity_auto_disable_window_ms: dispatch
                 .suspicious_activity_auto_disable_window_ms,
+            suspicious_activity_auto_clear_enabled: dispatch.suspicious_activity_auto_clear_enabled,
+            suspicious_activity_auto_clear_success_threshold: dispatch
+                .suspicious_activity_auto_clear_success_threshold,
+            suspicious_activity_auto_clear_after_ms: dispatch
+                .suspicious_activity_auto_clear_after_ms,
             model_cooldown_enabled: dispatch.model_cooldown_enabled,
             default_max_concurrency: dispatch.default_max_concurrency,
             rate_limit_bucket_capacity: dispatch.rate_limit_bucket_capacity,
@@ -6588,6 +6869,12 @@ impl MultiTokenManager {
                     .suspicious_activity_auto_disable_threshold,
                 suspicious_activity_auto_disable_window_ms: dispatch
                     .suspicious_activity_auto_disable_window_ms,
+                suspicious_activity_auto_clear_enabled: dispatch
+                    .suspicious_activity_auto_clear_enabled,
+                suspicious_activity_auto_clear_success_threshold: dispatch
+                    .suspicious_activity_auto_clear_success_threshold,
+                suspicious_activity_auto_clear_after_ms: dispatch
+                    .suspicious_activity_auto_clear_after_ms,
                 model_cooldown_enabled: dispatch.model_cooldown_enabled,
                 default_max_concurrency: dispatch.default_max_concurrency,
                 rate_limit_bucket_capacity: dispatch.rate_limit_bucket_capacity,
@@ -6608,6 +6895,9 @@ impl MultiTokenManager {
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
         self.set_load_balancing_config(
             Some(mode),
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -6696,6 +6986,9 @@ impl MultiTokenManager {
         suspicious_activity_auto_disable_enabled: Option<bool>,
         suspicious_activity_auto_disable_threshold: Option<u32>,
         suspicious_activity_auto_disable_window_ms: Option<u64>,
+        suspicious_activity_auto_clear_enabled: Option<bool>,
+        suspicious_activity_auto_clear_success_threshold: Option<u32>,
+        suspicious_activity_auto_clear_after_ms: Option<u64>,
         model_cooldown_enabled: Option<bool>,
         default_max_concurrency: Option<u32>,
         rate_limit_bucket_capacity: Option<f64>,
@@ -6759,6 +7052,21 @@ impl MultiTokenManager {
             next.suspicious_activity_auto_disable_window_ms =
                 suspicious_activity_auto_disable_window_ms;
         }
+        if let Some(suspicious_activity_auto_clear_enabled) = suspicious_activity_auto_clear_enabled
+        {
+            next.suspicious_activity_auto_clear_enabled = suspicious_activity_auto_clear_enabled;
+        }
+        if let Some(suspicious_activity_auto_clear_success_threshold) =
+            suspicious_activity_auto_clear_success_threshold
+        {
+            next.suspicious_activity_auto_clear_success_threshold =
+                suspicious_activity_auto_clear_success_threshold;
+        }
+        if let Some(suspicious_activity_auto_clear_after_ms) =
+            suspicious_activity_auto_clear_after_ms
+        {
+            next.suspicious_activity_auto_clear_after_ms = suspicious_activity_auto_clear_after_ms;
+        }
         if let Some(model_cooldown_enabled) = model_cooldown_enabled {
             next.model_cooldown_enabled = model_cooldown_enabled;
         }
@@ -6788,6 +7096,22 @@ impl MultiTokenManager {
         }
         if let Some(session_affinity_enabled) = session_affinity_enabled {
             next.session_affinity_enabled = session_affinity_enabled;
+        }
+
+        if next.suspicious_activity_auto_disable_enabled
+            && next.suspicious_activity_auto_disable_threshold == 0
+        {
+            anyhow::bail!(
+                "suspiciousActivityAutoDisableThreshold 必须大于 0，或关闭 suspiciousActivityAutoDisableEnabled"
+            );
+        }
+        if next.suspicious_activity_auto_clear_enabled
+            && next.suspicious_activity_auto_clear_success_threshold == 0
+            && next.suspicious_activity_auto_clear_after_ms == 0
+        {
+            anyhow::bail!(
+                "suspiciousActivityAutoClearSuccessThreshold 和 suspiciousActivityAutoClearAfterMs 不能同时为 0，或关闭 suspiciousActivityAutoClearEnabled"
+            );
         }
 
         Self::validate_dispatch_rate_limit_config(&next)?;
@@ -6838,7 +7162,7 @@ impl MultiTokenManager {
 
         self.availability_notify.notify_waiters();
         tracing::info!(
-            "调度配置已更新: mode={}, sessionAffinityEnabled={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, rateLimitCooldownEnabled={}, suspiciousActivityCooldownMs={}, suspiciousActivityCooldownEnabled={}, modelCooldownEnabled={}, defaultMaxConcurrency={:?}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}, requestWeightingEnabled={}, requestWeightingBaseWeight={}, requestWeightingMaxWeight={}",
+            "调度配置已更新: mode={}, sessionAffinityEnabled={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, rateLimitCooldownEnabled={}, suspiciousActivityCooldownMs={}, suspiciousActivityCooldownEnabled={}, suspiciousActivityAutoClearEnabled={}, suspiciousActivityAutoClearSuccessThreshold={}, suspiciousActivityAutoClearAfterMs={}, modelCooldownEnabled={}, defaultMaxConcurrency={:?}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}, requestWeightingEnabled={}, requestWeightingBaseWeight={}, requestWeightingMaxWeight={}",
             next.mode,
             next.session_affinity_enabled,
             next.queue_max_size,
@@ -6847,6 +7171,9 @@ impl MultiTokenManager {
             next.rate_limit_cooldown_enabled,
             next.suspicious_activity_cooldown_ms,
             next.suspicious_activity_cooldown_enabled,
+            next.suspicious_activity_auto_clear_enabled,
+            next.suspicious_activity_auto_clear_success_threshold,
+            next.suspicious_activity_auto_clear_after_ms,
             next.model_cooldown_enabled,
             next.default_max_concurrency,
             next.rate_limit_bucket_capacity,
@@ -8465,6 +8792,14 @@ mod tests {
 
         let ctx = manager.acquire_context(None).await.unwrap();
         assert_eq!(ctx.id, 2);
+
+        manager.reset_and_enable(1).unwrap();
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert!(!entry.disabled);
+        assert_eq!(entry.suspicious_activity_count, 0);
+        assert_eq!(entry.suspicious_activity_recovery_success_count, 0);
+        assert_eq!(entry.suspicious_activity_quarantine_remaining_ms, None);
     }
 
     #[test]
@@ -8488,6 +8823,81 @@ mod tests {
             entry.cooldown_remaining_ms.unwrap_or_default() > 50_000,
             "后续普通 429 不应缩短 suspicious activity 的长冷却"
         );
+    }
+
+    #[test]
+    fn test_clear_suspicious_activity_marker_removes_quarantine_and_runtime_cooldown() {
+        let mut config = Config::default();
+        config.suspicious_activity_cooldown_enabled = true;
+        config.suspicious_activity_cooldown_ms = 60_000;
+        config.suspicious_activity_auto_disable_threshold = 10;
+
+        let manager =
+            MultiTokenManager::new(config, vec![available_credential(0)], None, None, false)
+                .unwrap();
+
+        manager.report_suspicious_activity_limited(1, Some("suspicious activity"));
+        assert!(manager.clear_suspicious_activity_for_credential(1).unwrap());
+        assert!(!manager.clear_suspicious_activity_for_credential(1).unwrap());
+
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert_eq!(entry.suspicious_activity_count, 0);
+        assert_eq!(entry.suspicious_activity_recovery_success_count, 0);
+        assert_eq!(entry.suspicious_activity_quarantine_remaining_ms, None);
+        assert_eq!(entry.cooldown_remaining_ms, None);
+    }
+
+    #[test]
+    fn test_suspicious_activity_auto_clear_after_success_threshold() {
+        let mut config = Config::default();
+        config.suspicious_activity_cooldown_ms = 0;
+        config.suspicious_activity_auto_disable_threshold = 10;
+        config.suspicious_activity_auto_clear_enabled = true;
+        config.suspicious_activity_auto_clear_success_threshold = 2;
+        config.suspicious_activity_auto_clear_after_ms = 0;
+
+        let manager =
+            MultiTokenManager::new(config, vec![available_credential(0)], None, None, false)
+                .unwrap();
+
+        manager.report_suspicious_activity_limited(1, Some("suspicious activity"));
+        manager.report_success(1);
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert_eq!(entry.suspicious_activity_count, 1);
+        assert_eq!(entry.suspicious_activity_recovery_success_count, 1);
+
+        manager.report_success(1);
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert_eq!(entry.suspicious_activity_count, 0);
+        assert_eq!(entry.suspicious_activity_recovery_success_count, 0);
+        assert!(entry.suspicious_activity_last_seen_at.is_none());
+    }
+
+    #[test]
+    fn test_suspicious_activity_auto_clear_after_quiet_window() {
+        let mut config = Config::default();
+        config.suspicious_activity_auto_clear_enabled = true;
+        config.suspicious_activity_auto_clear_success_threshold = 0;
+        config.suspicious_activity_auto_clear_after_ms = 1_000;
+
+        let mut tainted = available_credential(0);
+        tainted.suspicious_activity_count = 1;
+        tainted.suspicious_activity_first_seen_at =
+            Some((Utc::now() - Duration::days(8)).to_rfc3339());
+        tainted.suspicious_activity_last_seen_at =
+            Some((Utc::now() - Duration::days(8)).to_rfc3339());
+        tainted.suspicious_activity_recovery_success_count = 1;
+
+        let manager = MultiTokenManager::new(config, vec![tainted], None, None, false).unwrap();
+
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert_eq!(entry.suspicious_activity_count, 0);
+        assert_eq!(entry.suspicious_activity_recovery_success_count, 0);
+        assert!(entry.suspicious_activity_last_seen_at.is_none());
     }
 
     #[test]
@@ -8665,6 +9075,9 @@ mod tests {
             suspicious_activity_auto_disable_enabled: true,
             suspicious_activity_auto_disable_threshold: 3,
             suspicious_activity_auto_disable_window_ms: 86_400_000,
+            suspicious_activity_auto_clear_enabled: true,
+            suspicious_activity_auto_clear_success_threshold: 10,
+            suspicious_activity_auto_clear_after_ms: 604_800_000,
             model_cooldown_enabled: true,
             default_max_concurrency: Some(3),
             rate_limit_bucket_capacity: 4.0,
@@ -8698,6 +9111,15 @@ mod tests {
         assert_eq!(
             snapshot.suspicious_activity_auto_disable_window_ms,
             86_400_000
+        );
+        assert!(snapshot.suspicious_activity_auto_clear_enabled);
+        assert_eq!(
+            snapshot.suspicious_activity_auto_clear_success_threshold,
+            10
+        );
+        assert_eq!(
+            snapshot.suspicious_activity_auto_clear_after_ms,
+            604_800_000
         );
         assert!(snapshot.model_cooldown_enabled);
         assert_eq!(snapshot.default_max_concurrency, Some(3));
@@ -8823,6 +9245,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                None,
                 Some(1.0),
                 Some(1.2),
                 None,
@@ -8869,6 +9294,9 @@ mod tests {
                 Some(2),
                 Some(3_600_000),
                 Some(true),
+                Some(5),
+                Some(7_200_000),
+                Some(true),
                 Some(3),
                 Some(4.0),
                 Some(1.2),
@@ -8900,6 +9328,12 @@ mod tests {
             persisted.suspicious_activity_auto_disable_window_ms,
             3_600_000
         );
+        assert!(persisted.suspicious_activity_auto_clear_enabled);
+        assert_eq!(
+            persisted.suspicious_activity_auto_clear_success_threshold,
+            5
+        );
+        assert_eq!(persisted.suspicious_activity_auto_clear_after_ms, 7_200_000);
         assert!(persisted.model_cooldown_enabled);
         assert_eq!(persisted.default_max_concurrency, Some(3));
         assert_eq!(persisted.rate_limit_bucket_capacity, 4.0);
@@ -8955,6 +9389,9 @@ mod tests {
                 None,
                 None,
                 Some(false),
+                None,
+                None,
+                None,
                 None,
                 None,
                 None,

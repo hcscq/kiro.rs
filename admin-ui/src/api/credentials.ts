@@ -193,6 +193,16 @@ export async function clearCredentialRuntimeModelRestrictions(
   return data
 }
 
+// 清除 suspicious activity 标记与隔离
+export async function clearCredentialSuspiciousActivity(
+  id: number
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/${id}/suspicious-activity/clear`
+  )
+  return data
+}
+
 // 重置失败计数
 export async function resetCredentialFailure(
   id: number
