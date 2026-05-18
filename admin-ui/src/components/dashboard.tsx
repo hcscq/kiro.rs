@@ -79,6 +79,7 @@ function normalizeSubscriptionTitle(credential: CredentialStatusItem): string | 
 function isRateLimitedCredential(credential: CredentialStatusItem): boolean {
   return (
     (credential.cooldownRemainingMs ?? 0) > 0 ||
+    (credential.suspiciousActivityQuarantineRemainingMs ?? 0) > 0 ||
     credential.rateLimitHitStreak > 0 ||
     (credential.nextReadyInMs ?? 0) > 0
   )
@@ -88,6 +89,7 @@ function isAbnormalCredential(credential: CredentialStatusItem): boolean {
   return (
     credential.failureCount > 0 ||
     credential.refreshFailureCount > 0 ||
+    credential.suspiciousActivityCount > 0 ||
     (credential.disabledReason !== undefined &&
       credential.disabledReason !== null &&
       credential.disabledReason !== 'Manual')
@@ -262,6 +264,7 @@ export function Dashboard() {
           credential.standardAccountType,
           credential.proxyUrl,
           credential.disabledReason,
+          credential.suspiciousActivityCount > 0 ? 'suspicious activity' : null,
         ]
           .filter(Boolean)
           .join(' ')

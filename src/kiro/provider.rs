@@ -910,6 +910,12 @@ impl KiroProvider {
             || error_summary.contains("reason=INSUFFICIENT_MODEL_CAPACITY")
     }
 
+    fn is_suspicious_activity_limited(body: &str, error_summary: &str) -> bool {
+        let body = body.to_ascii_lowercase();
+        let error_summary = error_summary.to_ascii_lowercase();
+        body.contains("suspicious activity") || error_summary.contains("suspicious activity")
+    }
+
     fn public_client_error_for_status(
         status: reqwest::StatusCode,
         api_type: &str,
@@ -1462,7 +1468,12 @@ impl KiroProvider {
             // 瞬态错误
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
                 if status.as_u16() == 429 {
-                    self.token_manager.report_rate_limited(ctx_id);
+                    if Self::is_suspicious_activity_limited(&body, &error_summary) {
+                        self.token_manager
+                            .report_suspicious_activity_limited(ctx_id, Some(&error_summary));
+                    } else {
+                        self.token_manager.report_rate_limited(ctx_id);
+                    }
                     request_scoped_rate_limited_credentials.insert(ctx_id);
                     let empty_model_unsupported = HashSet::new();
                     let empty_slow_first_content = HashSet::new();
@@ -2419,6 +2430,9 @@ impl KiroProvider {
                             model.as_deref().unwrap_or("unknown"),
                             INSUFFICIENT_CAPACITY_COOLDOWN,
                         );
+                    } else if Self::is_suspicious_activity_limited(&body, &error_summary) {
+                        self.token_manager
+                            .report_suspicious_activity_limited(ctx_id, Some(&error_summary));
                     } else {
                         self.token_manager.report_rate_limited(ctx_id);
                     }
@@ -3054,6 +3068,22 @@ mod tests {
         assert!(!KiroProvider::is_insufficient_model_capacity(
             r#"{"reason":"RATE_LIMIT"}"#,
             "status=429 body_len=24 reason=RATE_LIMIT"
+        ));
+    }
+
+    #[test]
+    fn test_suspicious_activity_limit_detection_uses_body_or_summary() {
+        assert!(KiroProvider::is_suspicious_activity_limited(
+            r#"{"message":"Due to suspicious activity, we are imposing temporary limits"}"#,
+            "status=429 body_len=80"
+        ));
+        assert!(KiroProvider::is_suspicious_activity_limited(
+            "{}",
+            "status=429 message=\"Due to suspicious activity, temporary limits\""
+        ));
+        assert!(!KiroProvider::is_suspicious_activity_limited(
+            r#"{"reason":"RATE_LIMIT"}"#,
+            "status=429 reason=RATE_LIMIT"
         ));
     }
 

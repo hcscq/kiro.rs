@@ -124,6 +124,20 @@ pub struct CredentialStatusItem {
     /// 最近一次异常摘要
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error_summary: Option<String>,
+    /// suspicious activity 命中次数（当前统计窗口内）
+    pub suspicious_activity_count: u32,
+    /// 当前统计窗口内首次命中 suspicious activity 的时间
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suspicious_activity_first_seen_at: Option<String>,
+    /// 最近一次命中 suspicious activity 的时间
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suspicious_activity_last_seen_at: Option<String>,
+    /// suspicious activity 账号级隔离到期时间
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suspicious_activity_quarantine_until: Option<String>,
+    /// suspicious activity 隔离剩余时间（毫秒）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suspicious_activity_quarantine_remaining_ms: Option<u64>,
     /// 429 冷却剩余时间（毫秒）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cooldown_remaining_ms: Option<u64>,
@@ -352,6 +366,18 @@ pub struct LoadBalancingModeResponse {
     pub rate_limit_cooldown_ms: u64,
     /// 是否启用上游 429 后的本地冷却与 bucket 退避
     pub rate_limit_cooldown_enabled: bool,
+    /// suspicious activity 临时限制后的账号级全局冷却时间（毫秒）
+    pub suspicious_activity_cooldown_ms: u64,
+    /// 是否启用 suspicious activity 临时限制后的账号级全局冷却
+    pub suspicious_activity_cooldown_enabled: bool,
+    /// 是否优先调度从未触发 suspicious activity 的账号
+    pub suspicious_activity_prefer_clean_credentials: bool,
+    /// 是否在 suspicious activity 多次命中后自动禁用账号
+    pub suspicious_activity_auto_disable_enabled: bool,
+    /// suspicious activity 自动禁用阈值
+    pub suspicious_activity_auto_disable_threshold: u32,
+    /// suspicious activity 自动禁用统计窗口（毫秒）
+    pub suspicious_activity_auto_disable_window_ms: u64,
     /// 是否启用“模型不支持”后的运行时模型冷却
     pub model_cooldown_enabled: bool,
     /// 全局默认单账号并发上限（null 表示不限制）
@@ -388,6 +414,18 @@ pub struct SetLoadBalancingModeRequest {
     pub rate_limit_cooldown_ms: Option<u64>,
     /// 是否启用上游 429 后的本地冷却与 bucket 退避
     pub rate_limit_cooldown_enabled: Option<bool>,
+    /// suspicious activity 临时限制后的账号级全局冷却时间（毫秒）
+    pub suspicious_activity_cooldown_ms: Option<u64>,
+    /// 是否启用 suspicious activity 临时限制后的账号级全局冷却
+    pub suspicious_activity_cooldown_enabled: Option<bool>,
+    /// 是否优先调度从未触发 suspicious activity 的账号
+    pub suspicious_activity_prefer_clean_credentials: Option<bool>,
+    /// 是否在 suspicious activity 多次命中后自动禁用账号
+    pub suspicious_activity_auto_disable_enabled: Option<bool>,
+    /// suspicious activity 自动禁用阈值
+    pub suspicious_activity_auto_disable_threshold: Option<u32>,
+    /// suspicious activity 自动禁用统计窗口（毫秒）
+    pub suspicious_activity_auto_disable_window_ms: Option<u64>,
     /// 是否启用“模型不支持”后的运行时模型冷却
     pub model_cooldown_enabled: Option<bool>,
     /// 全局默认单账号并发上限（0 表示不限制；字段缺失表示不修改）

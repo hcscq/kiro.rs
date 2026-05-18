@@ -120,6 +120,13 @@ impl AdminService {
                     disabled_at: entry.disabled_at,
                     last_error_status: entry.last_error_status,
                     last_error_summary: entry.last_error_summary,
+                    suspicious_activity_count: entry.suspicious_activity_count,
+                    suspicious_activity_first_seen_at: entry.suspicious_activity_first_seen_at,
+                    suspicious_activity_last_seen_at: entry.suspicious_activity_last_seen_at,
+                    suspicious_activity_quarantine_until: entry
+                        .suspicious_activity_quarantine_until,
+                    suspicious_activity_quarantine_remaining_ms: entry
+                        .suspicious_activity_quarantine_remaining_ms,
                     cooldown_remaining_ms: entry.cooldown_remaining_ms,
                     rate_limit_bucket_tokens: entry.rate_limit_bucket_tokens,
                     rate_limit_bucket_capacity: entry.rate_limit_bucket_capacity,
@@ -347,6 +354,10 @@ impl AdminService {
             disabled_at: None,
             last_error_status: None,
             last_error_summary: None,
+            suspicious_activity_count: 0,
+            suspicious_activity_first_seen_at: None,
+            suspicious_activity_last_seen_at: None,
+            suspicious_activity_quarantine_until: None,
         };
 
         // 调用 token_manager 添加凭据
@@ -430,6 +441,16 @@ impl AdminService {
             queue_max_wait_ms: snapshot.queue_max_wait_ms,
             rate_limit_cooldown_ms: snapshot.rate_limit_cooldown_ms,
             rate_limit_cooldown_enabled: snapshot.rate_limit_cooldown_enabled,
+            suspicious_activity_cooldown_ms: snapshot.suspicious_activity_cooldown_ms,
+            suspicious_activity_cooldown_enabled: snapshot.suspicious_activity_cooldown_enabled,
+            suspicious_activity_prefer_clean_credentials: snapshot
+                .suspicious_activity_prefer_clean_credentials,
+            suspicious_activity_auto_disable_enabled: snapshot
+                .suspicious_activity_auto_disable_enabled,
+            suspicious_activity_auto_disable_threshold: snapshot
+                .suspicious_activity_auto_disable_threshold,
+            suspicious_activity_auto_disable_window_ms: snapshot
+                .suspicious_activity_auto_disable_window_ms,
             model_cooldown_enabled: snapshot.model_cooldown_enabled,
             default_max_concurrency: snapshot.default_max_concurrency,
             rate_limit_bucket_capacity: snapshot.rate_limit_bucket_capacity,
@@ -496,6 +517,12 @@ impl AdminService {
             && req.queue_max_wait_ms.is_none()
             && req.rate_limit_cooldown_ms.is_none()
             && req.rate_limit_cooldown_enabled.is_none()
+            && req.suspicious_activity_cooldown_ms.is_none()
+            && req.suspicious_activity_cooldown_enabled.is_none()
+            && req.suspicious_activity_prefer_clean_credentials.is_none()
+            && req.suspicious_activity_auto_disable_enabled.is_none()
+            && req.suspicious_activity_auto_disable_threshold.is_none()
+            && req.suspicious_activity_auto_disable_window_ms.is_none()
             && req.model_cooldown_enabled.is_none()
             && req.default_max_concurrency.is_none()
             && req.rate_limit_bucket_capacity.is_none()
@@ -522,6 +549,12 @@ impl AdminService {
                 req.queue_max_wait_ms,
                 req.rate_limit_cooldown_ms,
                 req.rate_limit_cooldown_enabled,
+                req.suspicious_activity_cooldown_ms,
+                req.suspicious_activity_cooldown_enabled,
+                req.suspicious_activity_prefer_clean_credentials,
+                req.suspicious_activity_auto_disable_enabled,
+                req.suspicious_activity_auto_disable_threshold,
+                req.suspicious_activity_auto_disable_window_ms,
                 req.model_cooldown_enabled,
                 req.default_max_concurrency,
                 req.rate_limit_bucket_capacity,

@@ -186,6 +186,12 @@ export function SettingsPage() {
   const [queueMaxWaitMsInput, setQueueMaxWaitMsInput] = useState('0')
   const [rateLimitCooldownMsInput, setRateLimitCooldownMsInput] = useState('2000')
   const [rateLimitCooldownEnabled, setRateLimitCooldownEnabled] = useState(false)
+  const [suspiciousActivityCooldownMsInput, setSuspiciousActivityCooldownMsInput] = useState('7200000')
+  const [suspiciousActivityCooldownEnabled, setSuspiciousActivityCooldownEnabled] = useState(true)
+  const [suspiciousActivityPreferCleanCredentials, setSuspiciousActivityPreferCleanCredentials] = useState(true)
+  const [suspiciousActivityAutoDisableEnabled, setSuspiciousActivityAutoDisableEnabled] = useState(true)
+  const [suspiciousActivityAutoDisableThresholdInput, setSuspiciousActivityAutoDisableThresholdInput] = useState('3')
+  const [suspiciousActivityAutoDisableWindowMsInput, setSuspiciousActivityAutoDisableWindowMsInput] = useState('86400000')
   const [modelCooldownEnabled, setModelCooldownEnabled] = useState(false)
   const [sessionAffinityEnabled, setSessionAffinityEnabled] = useState(false)
   const [defaultMaxConcurrencyInput, setDefaultMaxConcurrencyInput] = useState('')
@@ -207,6 +213,12 @@ export function SettingsPage() {
     setQueueMaxWaitMsInput(String(loadBalancingData.queueMaxWaitMs))
     setRateLimitCooldownMsInput(String(loadBalancingData.rateLimitCooldownMs))
     setRateLimitCooldownEnabled(loadBalancingData.rateLimitCooldownEnabled ?? false)
+    setSuspiciousActivityCooldownMsInput(String(loadBalancingData.suspiciousActivityCooldownMs ?? 7200000))
+    setSuspiciousActivityCooldownEnabled(loadBalancingData.suspiciousActivityCooldownEnabled ?? true)
+    setSuspiciousActivityPreferCleanCredentials(loadBalancingData.suspiciousActivityPreferCleanCredentials ?? true)
+    setSuspiciousActivityAutoDisableEnabled(loadBalancingData.suspiciousActivityAutoDisableEnabled ?? true)
+    setSuspiciousActivityAutoDisableThresholdInput(String(loadBalancingData.suspiciousActivityAutoDisableThreshold ?? 3))
+    setSuspiciousActivityAutoDisableWindowMsInput(String(loadBalancingData.suspiciousActivityAutoDisableWindowMs ?? 86400000))
     setModelCooldownEnabled(loadBalancingData.modelCooldownEnabled ?? true)
     setSessionAffinityEnabled(loadBalancingData.sessionAffinityEnabled ?? false)
     setDefaultMaxConcurrencyInput(loadBalancingData.defaultMaxConcurrency ? String(loadBalancingData.defaultMaxConcurrency) : '')
@@ -234,6 +246,9 @@ export function SettingsPage() {
     const parsedQueueMaxSize = queueMaxSizeInput.trim() === '' ? 0 : parseInt(queueMaxSizeInput, 10)
     const parsedQueueMaxWaitMs = queueMaxWaitMsInput.trim() === '' ? 0 : parseInt(queueMaxWaitMsInput, 10)
     const parsedRateLimitCooldownMs = rateLimitCooldownMsInput.trim() === '' ? 0 : parseInt(rateLimitCooldownMsInput, 10)
+    const parsedSuspiciousActivityCooldownMs = suspiciousActivityCooldownMsInput.trim() === '' ? 0 : parseInt(suspiciousActivityCooldownMsInput, 10)
+    const parsedSuspiciousActivityAutoDisableThreshold = suspiciousActivityAutoDisableThresholdInput.trim() === '' ? 0 : parseInt(suspiciousActivityAutoDisableThresholdInput, 10)
+    const parsedSuspiciousActivityAutoDisableWindowMs = suspiciousActivityAutoDisableWindowMsInput.trim() === '' ? 0 : parseInt(suspiciousActivityAutoDisableWindowMsInput, 10)
     const parsedDefaultMaxConcurrency = defaultMaxConcurrencyInput.trim() === '' ? 0 : parseInt(defaultMaxConcurrencyInput, 10)
     const parsedRateLimitBucketCapacity = rateLimitBucketCapacityInput.trim() === '' ? 0 : Number.parseFloat(rateLimitBucketCapacityInput)
     const parsedRateLimitRefillPerSecond = rateLimitRefillPerSecondInput.trim() === '' ? 0 : Number.parseFloat(rateLimitRefillPerSecondInput)
@@ -260,6 +275,9 @@ export function SettingsPage() {
       Number.isNaN(parsedQueueMaxSize) ||
       Number.isNaN(parsedQueueMaxWaitMs) ||
       Number.isNaN(parsedRateLimitCooldownMs) ||
+      Number.isNaN(parsedSuspiciousActivityCooldownMs) ||
+      Number.isNaN(parsedSuspiciousActivityAutoDisableThreshold) ||
+      Number.isNaN(parsedSuspiciousActivityAutoDisableWindowMs) ||
       Number.isNaN(parsedDefaultMaxConcurrency) ||
       Number.isNaN(parsedRateLimitBucketCapacity) ||
       Number.isNaN(parsedRateLimitRefillPerSecond) ||
@@ -269,6 +287,9 @@ export function SettingsPage() {
       parsedQueueMaxSize < 0 ||
       parsedQueueMaxWaitMs < 0 ||
       parsedRateLimitCooldownMs < 0 ||
+      parsedSuspiciousActivityCooldownMs < 0 ||
+      parsedSuspiciousActivityAutoDisableThreshold < 0 ||
+      parsedSuspiciousActivityAutoDisableWindowMs < 0 ||
       parsedDefaultMaxConcurrency < 0 ||
       parsedRateLimitBucketCapacity < 0 ||
       parsedRateLimitRefillPerSecond < 0 ||
@@ -276,6 +297,11 @@ export function SettingsPage() {
       parsedRateLimitRefillRecoveryStep < 0
     ) {
       toast.error('调度参数必须是大于等于 0 的数字')
+      return
+    }
+
+    if (suspiciousActivityAutoDisableEnabled && parsedSuspiciousActivityAutoDisableThreshold <= 0) {
+      toast.error('Suspicious 自动停调阈值必须大于 0')
       return
     }
 
@@ -333,6 +359,12 @@ export function SettingsPage() {
         queueMaxWaitMs: parsedQueueMaxWaitMs,
         rateLimitCooldownMs: parsedRateLimitCooldownMs,
         rateLimitCooldownEnabled,
+        suspiciousActivityCooldownMs: parsedSuspiciousActivityCooldownMs,
+        suspiciousActivityCooldownEnabled,
+        suspiciousActivityPreferCleanCredentials,
+        suspiciousActivityAutoDisableEnabled,
+        suspiciousActivityAutoDisableThreshold: parsedSuspiciousActivityAutoDisableThreshold,
+        suspiciousActivityAutoDisableWindowMs: parsedSuspiciousActivityAutoDisableWindowMs,
         modelCooldownEnabled,
         sessionAffinityEnabled,
         defaultMaxConcurrency: parsedDefaultMaxConcurrency,
@@ -470,6 +502,117 @@ export function SettingsPage() {
                 <p className="text-xs text-muted-foreground">
                   默认关闭。关闭后遇到 429 只保留请求级重试，不再写入本地冷却，也不会继续压低 bucket 回填速率。
                 </p>
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-sm font-medium" htmlFor="suspiciousActivityCooldownMs">
+                  Suspicious activity 全局冷却时间 (毫秒)
+                </label>
+                <Input
+                  id="suspiciousActivityCooldownMs"
+                  type="number"
+                  min="0"
+                  step="60000"
+                  value={suspiciousActivityCooldownMsInput}
+                  onChange={(e) => setSuspiciousActivityCooldownMsInput(e.target.value)}
+                  placeholder="默认 7200000，即 2 小时"
+                />
+              </div>
+
+              <div className="flex flex-col gap-3 rounded-lg border bg-background/70 p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="space-y-1">
+                    <div className="text-sm font-medium">Suspicious activity 长冷却</div>
+                    <p className="text-sm text-muted-foreground">
+                      命中 Kiro 风控临时限制后，对该凭据写入独立的账号级长冷却。
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <Badge variant={suspiciousActivityCooldownEnabled ? 'secondary' : 'outline'}>
+                      {suspiciousActivityCooldownEnabled ? '已启用' : '已关闭'}
+                    </Badge>
+                    <Switch
+                      checked={suspiciousActivityCooldownEnabled}
+                      onCheckedChange={setSuspiciousActivityCooldownEnabled}
+                      aria-label="切换 suspicious activity 长冷却"
+                    />
+                  </div>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  默认启用，且独立于普通 429 冷却开关；设为 0 时只做 bucket 退避，不写入固定冷却。
+                </p>
+              </div>
+
+              <div className="flex flex-col gap-3 rounded-lg border bg-background/70 p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="space-y-1">
+                    <div className="text-sm font-medium">优先干净账号</div>
+                    <p className="text-sm text-muted-foreground">
+                      调度时优先选择从未命中过 suspicious activity 的凭据；历史命中过的账号仅作为兜底候选。
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <Badge variant={suspiciousActivityPreferCleanCredentials ? 'secondary' : 'outline'}>
+                      {suspiciousActivityPreferCleanCredentials ? '已启用' : '已关闭'}
+                    </Badge>
+                    <Switch
+                      checked={suspiciousActivityPreferCleanCredentials}
+                      onCheckedChange={setSuspiciousActivityPreferCleanCredentials}
+                      aria-label="切换优先干净账号"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex flex-col gap-3 rounded-lg border bg-background/70 p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="space-y-1">
+                    <div className="text-sm font-medium">Suspicious activity 自动停调</div>
+                    <p className="text-sm text-muted-foreground">
+                      同一账号在统计窗口内多次命中 suspicious activity 后自动禁用，避免继续探测上游风控。
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <Badge variant={suspiciousActivityAutoDisableEnabled ? 'secondary' : 'outline'}>
+                      {suspiciousActivityAutoDisableEnabled ? '已启用' : '已关闭'}
+                    </Badge>
+                    <Switch
+                      checked={suspiciousActivityAutoDisableEnabled}
+                      onCheckedChange={setSuspiciousActivityAutoDisableEnabled}
+                      aria-label="切换 suspicious activity 自动停调"
+                    />
+                  </div>
+                </div>
+                <div className="grid gap-3 md:grid-cols-2">
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium" htmlFor="suspiciousActivityAutoDisableThreshold">
+                      自动停调阈值
+                    </label>
+                    <Input
+                      id="suspiciousActivityAutoDisableThreshold"
+                      type="number"
+                      min="0"
+                      step="1"
+                      value={suspiciousActivityAutoDisableThresholdInput}
+                      onChange={(e) => setSuspiciousActivityAutoDisableThresholdInput(e.target.value)}
+                      placeholder="默认 3"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium" htmlFor="suspiciousActivityAutoDisableWindowMs">
+                      统计窗口 (毫秒)
+                    </label>
+                    <Input
+                      id="suspiciousActivityAutoDisableWindowMs"
+                      type="number"
+                      min="0"
+                      step="60000"
+                      value={suspiciousActivityAutoDisableWindowMsInput}
+                      onChange={(e) => setSuspiciousActivityAutoDisableWindowMsInput(e.target.value)}
+                      placeholder="默认 86400000，即 24 小时"
+                    />
+                  </div>
+                </div>
               </div>
 
               <div className="space-y-2">

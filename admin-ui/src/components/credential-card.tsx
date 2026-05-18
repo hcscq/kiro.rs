@@ -540,6 +540,21 @@ export function CredentialCard({
     credential.cooldownRemainingMs && credential.cooldownRemainingMs > 0
       ? `${(credential.cooldownRemainingMs / 1000).toFixed(1)}s`
       : null
+  const suspiciousQuarantineSummary =
+    credential.suspiciousActivityQuarantineRemainingMs &&
+    credential.suspiciousActivityQuarantineRemainingMs > 0
+      ? `${(credential.suspiciousActivityQuarantineRemainingMs / 1000).toFixed(1)}s`
+      : null
+  const suspiciousQuarantineUntilSummary = credential.suspiciousActivityQuarantineUntil
+    ? formatRestrictionExpiresAt(credential.suspiciousActivityQuarantineUntil)
+    : null
+  const suspiciousLastSeenSummary = credential.suspiciousActivityLastSeenAt
+    ? formatRestrictionExpiresAt(credential.suspiciousActivityLastSeenAt)
+    : null
+  const hasSuspiciousActivity =
+    credential.suspiciousActivityCount > 0 ||
+    Boolean(credential.suspiciousActivityLastSeenAt) ||
+    Boolean(suspiciousQuarantineSummary)
   const nextReadySummary =
     credential.nextReadyInMs !== undefined &&
     credential.nextReadyInMs !== null &&
@@ -578,6 +593,11 @@ export function CredentialCard({
                 )}
                 {credential.disabled && credential.disabledReason && (
                   <Badge variant="outline">{credential.disabledReason}</Badge>
+                )}
+                {hasSuspiciousActivity && (
+                  <Badge variant={suspiciousQuarantineSummary ? 'warning' : 'outline'}>
+                    Suspicious {credential.suspiciousActivityCount}
+                  </Badge>
                 )}
               </CardTitle>
             </div>
@@ -884,6 +904,9 @@ export function CredentialCard({
             {bucketSummary && <Badge variant="outline">Bucket {bucketSummary}</Badge>}
             {refillSummary && <Badge variant="outline">回填 {refillSummary}</Badge>}
             {cooldownSummary && <Badge variant="warning">429 冷却 {cooldownSummary}</Badge>}
+            {suspiciousQuarantineSummary && (
+              <Badge variant="warning">Suspicious 隔离 {suspiciousQuarantineSummary}</Badge>
+            )}
             {credential.rateLimitHitStreak > 0 && (
               <Badge variant="warning">连续 429 {credential.rateLimitHitStreak}</Badge>
             )}
@@ -891,6 +914,20 @@ export function CredentialCard({
             {credential.hasProxy && <Badge variant="outline">已配置代理</Badge>}
             {credential.hasProfileArn && <Badge variant="secondary">有 Profile ARN</Badge>}
           </div>
+
+          {hasSuspiciousActivity && (
+            <div className="space-y-1 rounded-lg border border-dashed border-amber-300 bg-amber-50/40 px-3 py-2.5 text-xs">
+              <div className="flex flex-wrap items-center gap-2 text-muted-foreground">
+                <Badge variant={suspiciousQuarantineSummary ? 'warning' : 'outline'}>
+                  suspicious activity {credential.suspiciousActivityCount}
+                </Badge>
+                {suspiciousLastSeenSummary && <span>最近命中 {suspiciousLastSeenSummary}</span>}
+                {suspiciousQuarantineUntilSummary && (
+                  <span>隔离至 {suspiciousQuarantineUntilSummary}</span>
+                )}
+              </div>
+            </div>
+          )}
 
           {hasRuntimeRestrictions && (
             <div className="space-y-2 rounded-lg border border-dashed border-amber-300 bg-amber-50/40 px-3 py-2.5">

@@ -207,6 +207,26 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub last_error_summary: Option<String>,
+
+    /// suspicious activity 命中次数（当前自动禁用统计窗口内）
+    #[serde(default)]
+    #[serde(skip_serializing_if = "is_zero")]
+    pub suspicious_activity_count: u32,
+
+    /// 当前统计窗口内首次命中 suspicious activity 的时间
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub suspicious_activity_first_seen_at: Option<String>,
+
+    /// 最近一次命中 suspicious activity 的时间
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub suspicious_activity_last_seen_at: Option<String>,
+
+    /// suspicious activity 账号级隔离到期时间
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub suspicious_activity_quarantine_until: Option<String>,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -847,6 +867,10 @@ mod tests {
             disabled_at: None,
             last_error_status: None,
             last_error_summary: None,
+            suspicious_activity_count: 0,
+            suspicious_activity_first_seen_at: None,
+            suspicious_activity_last_seen_at: None,
+            suspicious_activity_quarantine_until: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -1150,6 +1174,10 @@ mod tests {
             disabled_at: None,
             last_error_status: None,
             last_error_summary: None,
+            suspicious_activity_count: 0,
+            suspicious_activity_first_seen_at: None,
+            suspicious_activity_last_seen_at: None,
+            suspicious_activity_quarantine_until: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -1194,6 +1222,10 @@ mod tests {
             disabled_at: None,
             last_error_status: None,
             last_error_summary: None,
+            suspicious_activity_count: 0,
+            suspicious_activity_first_seen_at: None,
+            suspicious_activity_last_seen_at: None,
+            suspicious_activity_quarantine_until: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -1320,6 +1352,10 @@ mod tests {
             disabled_at: None,
             last_error_status: None,
             last_error_summary: None,
+            suspicious_activity_count: 0,
+            suspicious_activity_first_seen_at: None,
+            suspicious_activity_last_seen_at: None,
+            suspicious_activity_quarantine_until: None,
         };
 
         let json = original.to_pretty_json().unwrap();

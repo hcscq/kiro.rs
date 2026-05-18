@@ -305,6 +305,30 @@ pub struct Config {
     #[serde(default = "default_rate_limit_cooldown_enabled")]
     pub rate_limit_cooldown_enabled: bool,
 
+    /// 上游 suspicious activity 临时限制后的账号级全局冷却时间（毫秒，0 表示不写入固定冷却）
+    #[serde(default = "default_suspicious_activity_cooldown_ms")]
+    pub suspicious_activity_cooldown_ms: u64,
+
+    /// 是否启用上游 suspicious activity 临时限制后的账号级全局冷却
+    #[serde(default = "default_suspicious_activity_cooldown_enabled")]
+    pub suspicious_activity_cooldown_enabled: bool,
+
+    /// 调度时是否优先选择从未触发 suspicious activity 的账号
+    #[serde(default = "default_suspicious_activity_prefer_clean_credentials")]
+    pub suspicious_activity_prefer_clean_credentials: bool,
+
+    /// 是否在同一窗口内多次触发 suspicious activity 后自动禁用账号
+    #[serde(default = "default_suspicious_activity_auto_disable_enabled")]
+    pub suspicious_activity_auto_disable_enabled: bool,
+
+    /// suspicious activity 自动禁用阈值（同一窗口内命中次数，0 表示不自动禁用）
+    #[serde(default = "default_suspicious_activity_auto_disable_threshold")]
+    pub suspicious_activity_auto_disable_threshold: u32,
+
+    /// suspicious activity 自动禁用统计窗口（毫秒，0 表示不重置窗口计数）
+    #[serde(default = "default_suspicious_activity_auto_disable_window_ms")]
+    pub suspicious_activity_auto_disable_window_ms: u64,
+
     /// 是否启用“模型不支持”后的运行时模型冷却
     #[serde(default = "default_model_cooldown_enabled")]
     pub model_cooldown_enabled: bool,
@@ -393,6 +417,30 @@ fn default_rate_limit_cooldown_ms() -> u64 {
 
 fn default_rate_limit_cooldown_enabled() -> bool {
     false
+}
+
+fn default_suspicious_activity_cooldown_ms() -> u64 {
+    7_200_000
+}
+
+fn default_suspicious_activity_cooldown_enabled() -> bool {
+    true
+}
+
+fn default_suspicious_activity_prefer_clean_credentials() -> bool {
+    true
+}
+
+fn default_suspicious_activity_auto_disable_enabled() -> bool {
+    true
+}
+
+fn default_suspicious_activity_auto_disable_threshold() -> u32 {
+    3
+}
+
+fn default_suspicious_activity_auto_disable_window_ms() -> u64 {
+    86_400_000
 }
 
 fn default_model_cooldown_enabled() -> bool {
@@ -520,6 +568,16 @@ impl Default for Config {
             queue_max_wait_ms: 0,
             rate_limit_cooldown_ms: default_rate_limit_cooldown_ms(),
             rate_limit_cooldown_enabled: default_rate_limit_cooldown_enabled(),
+            suspicious_activity_cooldown_ms: default_suspicious_activity_cooldown_ms(),
+            suspicious_activity_cooldown_enabled: default_suspicious_activity_cooldown_enabled(),
+            suspicious_activity_prefer_clean_credentials:
+                default_suspicious_activity_prefer_clean_credentials(),
+            suspicious_activity_auto_disable_enabled:
+                default_suspicious_activity_auto_disable_enabled(),
+            suspicious_activity_auto_disable_threshold:
+                default_suspicious_activity_auto_disable_threshold(),
+            suspicious_activity_auto_disable_window_ms:
+                default_suspicious_activity_auto_disable_window_ms(),
             model_cooldown_enabled: default_model_cooldown_enabled(),
             rate_limit_bucket_capacity: default_rate_limit_bucket_capacity(),
             rate_limit_refill_per_second: default_rate_limit_refill_per_second(),
@@ -632,6 +690,14 @@ impl Config {
 
         if self.state_redis_heartbeat_interval_secs >= self.state_redis_leader_lease_ttl_secs {
             anyhow::bail!("stateRedisHeartbeatIntervalSecs 必须小于 stateRedisLeaderLeaseTtlSecs");
+        }
+
+        if self.suspicious_activity_auto_disable_enabled
+            && self.suspicious_activity_auto_disable_threshold == 0
+        {
+            anyhow::bail!(
+                "suspiciousActivityAutoDisableThreshold 必须大于 0，或关闭 suspiciousActivityAutoDisableEnabled"
+            );
         }
 
         self.request_weighting.validate()?;
@@ -787,6 +853,15 @@ mod tests {
         let config = Config::default();
 
         assert!(!config.rate_limit_cooldown_enabled);
+        assert!(config.suspicious_activity_cooldown_enabled);
+        assert_eq!(config.suspicious_activity_cooldown_ms, 7_200_000);
+        assert!(config.suspicious_activity_prefer_clean_credentials);
+        assert!(config.suspicious_activity_auto_disable_enabled);
+        assert_eq!(config.suspicious_activity_auto_disable_threshold, 3);
+        assert_eq!(
+            config.suspicious_activity_auto_disable_window_ms,
+            86_400_000
+        );
         assert!(config.model_cooldown_enabled);
         assert!(config.request_weighting.enabled);
         assert!((config.rate_limit_bucket_capacity - 6.0).abs() < f64::EPSILON);

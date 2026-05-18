@@ -967,6 +967,12 @@ mod tests {
             queue_max_wait_ms: 1500,
             rate_limit_cooldown_ms: 5000,
             rate_limit_cooldown_enabled: false,
+            suspicious_activity_cooldown_ms: 1_800_000,
+            suspicious_activity_cooldown_enabled: true,
+            suspicious_activity_prefer_clean_credentials: true,
+            suspicious_activity_auto_disable_enabled: true,
+            suspicious_activity_auto_disable_threshold: 3,
+            suspicious_activity_auto_disable_window_ms: 86_400_000,
             model_cooldown_enabled: true,
             default_max_concurrency: Some(3),
             rate_limit_bucket_capacity: 5.0,
@@ -993,6 +999,15 @@ mod tests {
         assert_eq!(rollback.queue_max_size, 16);
         assert_eq!(rollback.queue_max_wait_ms, 1500);
         assert_eq!(rollback.rate_limit_cooldown_ms, 5000);
+        assert_eq!(rollback.suspicious_activity_cooldown_ms, 1_800_000);
+        assert!(rollback.suspicious_activity_cooldown_enabled);
+        assert!(rollback.suspicious_activity_prefer_clean_credentials);
+        assert!(rollback.suspicious_activity_auto_disable_enabled);
+        assert_eq!(rollback.suspicious_activity_auto_disable_threshold, 3);
+        assert_eq!(
+            rollback.suspicious_activity_auto_disable_window_ms,
+            86_400_000
+        );
         assert_eq!(rollback.default_max_concurrency, Some(3));
         assert_eq!(rollback.rate_limit_bucket_capacity, 5.0);
         assert_eq!(rollback.rate_limit_refill_per_second, 1.5);

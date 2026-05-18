@@ -43,6 +43,11 @@ export interface CredentialStatusItem {
   disabledAt?: string | null
   lastErrorStatus?: number | null
   lastErrorSummary?: string | null
+  suspiciousActivityCount: number
+  suspiciousActivityFirstSeenAt?: string | null
+  suspiciousActivityLastSeenAt?: string | null
+  suspiciousActivityQuarantineUntil?: string | null
+  suspiciousActivityQuarantineRemainingMs?: number | null
   cooldownRemainingMs?: number | null
   rateLimitBucketTokens?: number | null
   rateLimitBucketCapacity?: number | null
@@ -197,6 +202,12 @@ export interface LoadBalancingConfigResponse {
   queueMaxWaitMs: number
   rateLimitCooldownMs: number
   rateLimitCooldownEnabled: boolean
+  suspiciousActivityCooldownMs: number
+  suspiciousActivityCooldownEnabled: boolean
+  suspiciousActivityPreferCleanCredentials: boolean
+  suspiciousActivityAutoDisableEnabled: boolean
+  suspiciousActivityAutoDisableThreshold: number
+  suspiciousActivityAutoDisableWindowMs: number
   modelCooldownEnabled: boolean
   defaultMaxConcurrency: number | null
   rateLimitBucketCapacity: number
@@ -215,6 +226,12 @@ export interface UpdateLoadBalancingConfigRequest {
   queueMaxWaitMs?: number
   rateLimitCooldownMs?: number
   rateLimitCooldownEnabled?: boolean
+  suspiciousActivityCooldownMs?: number
+  suspiciousActivityCooldownEnabled?: boolean
+  suspiciousActivityPreferCleanCredentials?: boolean
+  suspiciousActivityAutoDisableEnabled?: boolean
+  suspiciousActivityAutoDisableThreshold?: number
+  suspiciousActivityAutoDisableWindowMs?: number
   modelCooldownEnabled?: boolean
   defaultMaxConcurrency?: number
   rateLimitBucketCapacity?: number

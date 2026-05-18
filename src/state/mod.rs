@@ -430,7 +430,8 @@ local values = redis.call(
   'bucket_last_refill_at_ms',
   'bucket_capacity',
   'bucket_base_refill_per_second',
-  'rate_limit_hit_streak'
+  'rate_limit_hit_streak',
+  'cooldown_until_ms'
 )
 
 local bucket_tokens = tonumber(values[1])
@@ -439,6 +440,7 @@ local bucket_last_refill_at_ms = tonumber(values[3])
 local stored_capacity = tonumber(values[4])
 local stored_base_refill_per_second = tonumber(values[5])
 local rate_limit_hit_streak = tonumber(values[6]) or 0
+local current_cooldown_until_ms = tonumber(values[7])
 
 local function normalize_bucket()
   if not bucket_enabled then
@@ -500,10 +502,14 @@ normalize_bucket()
 rate_limit_hit_streak = rate_limit_hit_streak + 1
 local cooldown_until_ms = ''
 if cooldown_ms > 0 then
-  cooldown_until_ms = tostring(now_ms + cooldown_ms)
+  local target_until_ms = now_ms + cooldown_ms
+  if current_cooldown_until_ms and current_cooldown_until_ms > target_until_ms then
+    target_until_ms = current_cooldown_until_ms
+  end
+  cooldown_until_ms = tostring(target_until_ms)
   redis.call('HSET', KEYS[1], 'cooldown_until_ms', cooldown_until_ms)
-else
-  redis.call('HDEL', KEYS[1], 'cooldown_until_ms')
+elseif current_cooldown_until_ms and current_cooldown_until_ms > now_ms then
+  cooldown_until_ms = tostring(current_cooldown_until_ms)
 end
 redis.call('HSET', KEYS[1], 'rate_limit_hit_streak', rate_limit_hit_streak)
 
@@ -641,6 +647,10 @@ pub struct CredentialHealthPatch {
     pub disabled_at: Option<Option<String>>,
     pub last_error_status: Option<Option<u16>>,
     pub last_error_summary: Option<Option<String>>,
+    pub suspicious_activity_count: Option<u32>,
+    pub suspicious_activity_first_seen_at: Option<Option<String>>,
+    pub suspicious_activity_last_seen_at: Option<Option<String>>,
+    pub suspicious_activity_quarantine_until: Option<Option<String>>,
 }
 
 impl CredentialHealthPatch {
@@ -659,6 +669,22 @@ impl CredentialHealthPatch {
         }
         if let Some(last_error_summary) = &self.last_error_summary {
             credential.last_error_summary = last_error_summary.clone();
+        }
+        if let Some(suspicious_activity_count) = self.suspicious_activity_count {
+            credential.suspicious_activity_count = suspicious_activity_count;
+        }
+        if let Some(suspicious_activity_first_seen_at) = &self.suspicious_activity_first_seen_at {
+            credential.suspicious_activity_first_seen_at =
+                suspicious_activity_first_seen_at.clone();
+        }
+        if let Some(suspicious_activity_last_seen_at) = &self.suspicious_activity_last_seen_at {
+            credential.suspicious_activity_last_seen_at = suspicious_activity_last_seen_at.clone();
+        }
+        if let Some(suspicious_activity_quarantine_until) =
+            &self.suspicious_activity_quarantine_until
+        {
+            credential.suspicious_activity_quarantine_until =
+                suspicious_activity_quarantine_until.clone();
         }
     }
 }
@@ -783,6 +809,18 @@ pub struct PersistedDispatchConfig {
     pub rate_limit_cooldown_ms: u64,
     #[serde(default = "default_persisted_rate_limit_cooldown_enabled")]
     pub rate_limit_cooldown_enabled: bool,
+    #[serde(default = "default_persisted_suspicious_activity_cooldown_ms")]
+    pub suspicious_activity_cooldown_ms: u64,
+    #[serde(default = "default_persisted_suspicious_activity_cooldown_enabled")]
+    pub suspicious_activity_cooldown_enabled: bool,
+    #[serde(default = "default_persisted_suspicious_activity_prefer_clean_credentials")]
+    pub suspicious_activity_prefer_clean_credentials: bool,
+    #[serde(default = "default_persisted_suspicious_activity_auto_disable_enabled")]
+    pub suspicious_activity_auto_disable_enabled: bool,
+    #[serde(default = "default_persisted_suspicious_activity_auto_disable_threshold")]
+    pub suspicious_activity_auto_disable_threshold: u32,
+    #[serde(default = "default_persisted_suspicious_activity_auto_disable_window_ms")]
+    pub suspicious_activity_auto_disable_window_ms: u64,
     #[serde(default = "default_persisted_model_cooldown_enabled")]
     pub model_cooldown_enabled: bool,
     pub default_max_concurrency: Option<u32>,
@@ -801,6 +839,30 @@ pub struct PersistedDispatchConfig {
 
 fn default_persisted_rate_limit_cooldown_enabled() -> bool {
     false
+}
+
+fn default_persisted_suspicious_activity_cooldown_ms() -> u64 {
+    7_200_000
+}
+
+fn default_persisted_suspicious_activity_cooldown_enabled() -> bool {
+    true
+}
+
+fn default_persisted_suspicious_activity_prefer_clean_credentials() -> bool {
+    true
+}
+
+fn default_persisted_suspicious_activity_auto_disable_enabled() -> bool {
+    true
+}
+
+fn default_persisted_suspicious_activity_auto_disable_threshold() -> u32 {
+    3
+}
+
+fn default_persisted_suspicious_activity_auto_disable_window_ms() -> u64 {
+    86_400_000
 }
 
 fn default_persisted_model_cooldown_enabled() -> bool {
@@ -834,6 +896,16 @@ impl PersistedDispatchConfig {
             queue_max_wait_ms: config.queue_max_wait_ms,
             rate_limit_cooldown_ms: config.rate_limit_cooldown_ms,
             rate_limit_cooldown_enabled: config.rate_limit_cooldown_enabled,
+            suspicious_activity_cooldown_ms: config.suspicious_activity_cooldown_ms,
+            suspicious_activity_cooldown_enabled: config.suspicious_activity_cooldown_enabled,
+            suspicious_activity_prefer_clean_credentials: config
+                .suspicious_activity_prefer_clean_credentials,
+            suspicious_activity_auto_disable_enabled: config
+                .suspicious_activity_auto_disable_enabled,
+            suspicious_activity_auto_disable_threshold: config
+                .suspicious_activity_auto_disable_threshold,
+            suspicious_activity_auto_disable_window_ms: config
+                .suspicious_activity_auto_disable_window_ms,
             model_cooldown_enabled: config.model_cooldown_enabled,
             default_max_concurrency: config.default_max_concurrency,
             rate_limit_bucket_capacity: config.rate_limit_bucket_capacity,
@@ -855,6 +927,16 @@ impl PersistedDispatchConfig {
         config.queue_max_wait_ms = self.queue_max_wait_ms;
         config.rate_limit_cooldown_ms = self.rate_limit_cooldown_ms;
         config.rate_limit_cooldown_enabled = self.rate_limit_cooldown_enabled;
+        config.suspicious_activity_cooldown_ms = self.suspicious_activity_cooldown_ms;
+        config.suspicious_activity_cooldown_enabled = self.suspicious_activity_cooldown_enabled;
+        config.suspicious_activity_prefer_clean_credentials =
+            self.suspicious_activity_prefer_clean_credentials;
+        config.suspicious_activity_auto_disable_enabled =
+            self.suspicious_activity_auto_disable_enabled;
+        config.suspicious_activity_auto_disable_threshold =
+            self.suspicious_activity_auto_disable_threshold;
+        config.suspicious_activity_auto_disable_window_ms =
+            self.suspicious_activity_auto_disable_window_ms;
         config.model_cooldown_enabled = self.model_cooldown_enabled;
         config.default_max_concurrency = self.default_max_concurrency;
         config.rate_limit_bucket_capacity = self.rate_limit_bucket_capacity;
@@ -1692,12 +1774,14 @@ impl StateBackend for FileStateBackend {
             Some(path) => path,
             None => {
                 tracing::warn!(
-                    "配置文件路径未知，调度配置仅在当前进程生效: mode={}, sessionAffinityEnabled={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, defaultMaxConcurrency={:?}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}",
+                    "配置文件路径未知，调度配置仅在当前进程生效: mode={}, sessionAffinityEnabled={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, suspiciousActivityCooldownMs={}, suspiciousActivityCooldownEnabled={}, defaultMaxConcurrency={:?}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}",
                     dispatch.mode,
                     dispatch.session_affinity_enabled,
                     dispatch.queue_max_size,
                     dispatch.queue_max_wait_ms,
                     dispatch.rate_limit_cooldown_ms,
+                    dispatch.suspicious_activity_cooldown_ms,
+                    dispatch.suspicious_activity_cooldown_enabled,
                     dispatch.default_max_concurrency,
                     dispatch.rate_limit_bucket_capacity,
                     dispatch.rate_limit_refill_per_second,
@@ -3378,6 +3462,12 @@ mod tests {
             queue_max_wait_ms: 2000,
             rate_limit_cooldown_ms: 5000,
             rate_limit_cooldown_enabled: false,
+            suspicious_activity_cooldown_ms: 1_800_000,
+            suspicious_activity_cooldown_enabled: true,
+            suspicious_activity_prefer_clean_credentials: true,
+            suspicious_activity_auto_disable_enabled: true,
+            suspicious_activity_auto_disable_threshold: 3,
+            suspicious_activity_auto_disable_window_ms: 86_400_000,
             model_cooldown_enabled: true,
             default_max_concurrency: Some(4),
             rate_limit_bucket_capacity: 6.0,
@@ -3421,6 +3511,15 @@ mod tests {
         .unwrap();
 
         assert!(!dispatch.rate_limit_cooldown_enabled);
+        assert!(dispatch.suspicious_activity_cooldown_enabled);
+        assert_eq!(dispatch.suspicious_activity_cooldown_ms, 7_200_000);
+        assert!(dispatch.suspicious_activity_prefer_clean_credentials);
+        assert!(dispatch.suspicious_activity_auto_disable_enabled);
+        assert_eq!(dispatch.suspicious_activity_auto_disable_threshold, 3);
+        assert_eq!(
+            dispatch.suspicious_activity_auto_disable_window_ms,
+            86_400_000
+        );
         assert!(dispatch.model_cooldown_enabled);
         assert!(dispatch.request_weighting.enabled);
     }
