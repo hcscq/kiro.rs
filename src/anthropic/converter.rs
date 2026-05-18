@@ -2,7 +2,7 @@
 //!
 //! 负责将 Anthropic API 请求格式转换为 Kiro API 请求格式
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufReader, Cursor};
 use std::time::Instant;
 
@@ -358,6 +358,16 @@ pub fn convert_request_with_probe(
     // 9. 从历史中移除孤立的 tool_use（Kiro API 要求 tool_use 必须有对应的 tool_result）
     remove_orphaned_tool_uses(&mut history, &orphaned_tool_use_ids);
 
+    // 9.4. Bedrock/Kiro 要求 current tool_results 只能对应紧邻上一条 assistant
+    // 的 tool_uses。部分客户端会把多个历史轮次的 tool_result 一起批量发到
+    // current，这里只调整协议轮次形状，不改 tool_result 内容。
+    let moved_tool_results_to_history = repair_current_tool_result_adjacency(
+        &mut history,
+        &model_id,
+        &probe,
+        &mut validated_tool_results,
+    );
+
     // 9.5. Kiro 上游对同一个 user turn 同时携带 tool_results 和 images 的容忍度较差，
     // 会触发 400 Improperly formed request。将 tool_results 下沉为紧邻 current 之前的
     // history user turn，并补一个最小 assistant 占位，尽量保持原始语义顺序。
@@ -374,7 +384,10 @@ pub fn convert_request_with_probe(
         &probe,
         &mut merged_current,
     );
-    inject_current_tool_result_fallback_text(&mut merged_current, &validated_tool_results);
+    inject_current_tool_result_fallback_text(
+        &mut merged_current,
+        !validated_tool_results.is_empty() || moved_tool_results_to_history > 0,
+    );
 
     // 10. 收集历史中使用的工具名称，为缺失的工具生成占位符定义
     // Kiro API 要求：历史消息中引用的工具必须在 tools 列表中有定义
@@ -441,9 +454,12 @@ pub fn convert_request_with_probe(
 
 fn inject_current_tool_result_fallback_text(
     merged_current: &mut MergedUserMessageParts,
-    validated_tool_results: &[ToolResult],
+    has_relevant_tool_results: bool,
 ) {
-    if validated_tool_results.is_empty() || !merged_current.content.trim().is_empty() {
+    if !has_relevant_tool_results
+        || !merged_current.content.trim().is_empty()
+        || !merged_current.images.is_empty()
+    {
         return;
     }
 
@@ -1602,6 +1618,121 @@ fn move_current_tool_results_to_history_for_image_compat(
     let user_msg = build_history_user_message_from_parts("", model_id, Vec::new(), moved_results);
     push_history_user_message(history, probe, user_msg);
     history.push(Message::Assistant(HistoryAssistantMessage::new("OK")));
+}
+
+fn previous_assistant_available_tool_use_ids(history: &[Message]) -> HashSet<String> {
+    let Some(Message::Assistant(assistant_msg)) = history.last() else {
+        return HashSet::new();
+    };
+
+    assistant_msg
+        .assistant_response_message
+        .tool_uses
+        .as_ref()
+        .map(|tool_uses| {
+            tool_uses
+                .iter()
+                .map(|tool_use| tool_use.tool_use_id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn find_history_assistant_for_tool_use(history: &[Message], tool_use_id: &str) -> Option<usize> {
+    history.iter().enumerate().rev().find_map(|(index, msg)| {
+        let Message::Assistant(assistant_msg) = msg else {
+            return None;
+        };
+
+        assistant_msg
+            .assistant_response_message
+            .tool_uses
+            .as_ref()
+            .is_some_and(|tool_uses| {
+                tool_uses
+                    .iter()
+                    .any(|tool_use| tool_use.tool_use_id.as_str() == tool_use_id)
+            })
+            .then_some(index)
+    })
+}
+
+fn insert_tool_result_history_turn(
+    history: &mut Vec<Message>,
+    model_id: &str,
+    probe: &UpstreamProbe,
+    assistant_index: usize,
+    tool_results: Vec<ToolResult>,
+) {
+    if tool_results.is_empty() {
+        return;
+    }
+
+    let tool_result_count = tool_results.len();
+    let user_msg = build_history_user_message_from_parts("", model_id, Vec::new(), tool_results);
+    let mut history_msg = Message::User(user_msg);
+    if let Message::User(user_msg) = &mut history_msg {
+        probe.apply_origin(&mut user_msg.user_input_message.origin);
+    }
+
+    let insert_at = assistant_index + 1;
+    history.insert(insert_at, history_msg);
+    history.insert(
+        insert_at + 1,
+        Message::Assistant(HistoryAssistantMessage::new("OK")),
+    );
+
+    tracing::info!(
+        assistant_index,
+        tool_result_count,
+        "将非相邻 current tool_result 回填到对应 assistant 后，兼容 Bedrock toolUse/toolResult 顺序要求"
+    );
+}
+
+fn repair_current_tool_result_adjacency(
+    history: &mut Vec<Message>,
+    model_id: &str,
+    probe: &UpstreamProbe,
+    validated_tool_results: &mut Vec<ToolResult>,
+) -> usize {
+    if validated_tool_results.is_empty() {
+        return 0;
+    }
+
+    let previous_tool_use_ids = previous_assistant_available_tool_use_ids(history);
+    let mut current_results = Vec::with_capacity(validated_tool_results.len());
+    let mut deferred_by_assistant: BTreeMap<usize, Vec<ToolResult>> = BTreeMap::new();
+    let mut moved_count = 0usize;
+
+    for result in std::mem::take(validated_tool_results) {
+        if previous_tool_use_ids.contains(&result.tool_use_id) {
+            current_results.push(result);
+            continue;
+        }
+
+        let tool_use_id = result.tool_use_id.clone();
+        if let Some(assistant_index) = find_history_assistant_for_tool_use(history, &tool_use_id) {
+            deferred_by_assistant
+                .entry(assistant_index)
+                .or_default()
+                .push(result);
+            moved_count += 1;
+        } else {
+            tracing::warn!(
+                tool_use_id,
+                "无法定位 tool_result 对应的历史 assistant，保留在 current 以避免丢失内容"
+            );
+            current_results.push(result);
+        }
+    }
+
+    *validated_tool_results = current_results;
+
+    for (assistant_index, tool_results) in deferred_by_assistant.into_iter().rev() {
+        insert_tool_result_history_turn(history, model_id, probe, assistant_index, tool_results);
+    }
+
+    moved_count
 }
 
 fn move_current_extra_images_to_history_for_image_compat(
@@ -3238,6 +3369,213 @@ mod tests {
             "toolu_err_01"
         );
         assert!(current.user_input_message_context.tool_results[0].is_error);
+    }
+
+    #[test]
+    fn test_convert_request_moves_non_adjacent_current_tool_result_into_history() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Read two files"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "text", "text": "I'll read the first file."},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_old",
+                            "name": "read_file",
+                            "input": {"path": "/tmp/old.txt"}
+                        }
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Also read the latest file."),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "text", "text": "I'll read the latest file."},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_latest",
+                            "name": "read_file",
+                            "input": {"path": "/tmp/latest.txt"}
+                        }
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_old",
+                            "content": "old file content"
+                        },
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_latest",
+                            "content": "latest file content"
+                        },
+                        {
+                            "type": "text",
+                            "text": "Use both results."
+                        }
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let state = convert_request(&req)
+            .expect("non-adjacent current tool_result should be rewritten into history")
+            .conversation_state;
+
+        let current = &state.current_message.user_input_message;
+        assert_eq!(current.content, "Use both results.");
+        assert_eq!(current.user_input_message_context.tool_results.len(), 1);
+        assert_eq!(
+            current.user_input_message_context.tool_results[0].tool_use_id,
+            "toolu_latest"
+        );
+
+        assert_eq!(state.history.len(), 6);
+
+        match &state.history[2] {
+            Message::User(user) => {
+                assert_eq!(user.user_input_message.content, "");
+                assert_eq!(
+                    user.user_input_message
+                        .user_input_message_context
+                        .tool_results
+                        .len(),
+                    1
+                );
+                assert_eq!(
+                    user.user_input_message
+                        .user_input_message_context
+                        .tool_results[0]
+                        .tool_use_id,
+                    "toolu_old"
+                );
+            }
+            other => panic!(
+                "history[2] should be inserted old tool_result user, got {:?}",
+                other
+            ),
+        }
+
+        match &state.history[3] {
+            Message::Assistant(assistant) => {
+                assert_eq!(assistant.assistant_response_message.content, "OK");
+            }
+            other => panic!(
+                "history[3] should be inserted assistant ack, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_convert_request_moves_all_non_adjacent_tool_results_and_injects_fallback() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Read the file"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "text", "text": "I'll read the file."},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_only_old",
+                            "name": "read_file",
+                            "input": {"path": "/tmp/old.txt"}
+                        }
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Continue once it is available."),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("Waiting for the previous result."),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_only_old",
+                            "content": "old file content"
+                        }
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let state = convert_request(&req)
+            .expect("all non-adjacent current tool_results should be moved safely")
+            .conversation_state;
+
+        let current = &state.current_message.user_input_message;
+        assert_eq!(current.content, CURRENT_TOOL_RESULT_FALLBACK_TEXT);
+        assert!(current.user_input_message_context.tool_results.is_empty());
+
+        assert_eq!(state.history.len(), 6);
+
+        match &state.history[2] {
+            Message::User(user) => {
+                assert_eq!(
+                    user.user_input_message
+                        .user_input_message_context
+                        .tool_results[0]
+                        .tool_use_id,
+                    "toolu_only_old"
+                );
+            }
+            other => panic!(
+                "history[2] should be inserted old tool_result user, got {:?}",
+                other
+            ),
+        }
+
+        match &state.history[3] {
+            Message::Assistant(assistant) => {
+                assert_eq!(assistant.assistant_response_message.content, "OK");
+            }
+            other => panic!(
+                "history[3] should be inserted assistant ack, got {:?}",
+                other
+            ),
+        }
     }
 
     #[test]
