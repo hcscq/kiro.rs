@@ -393,14 +393,15 @@ pub fn convert_request_with_probe(
     // Kiro API 要求：历史消息中引用的工具必须在 tools 列表中有定义
     // 注意：Kiro 匹配工具名称时忽略大小写，所以这里也需要忽略大小写比较
     let history_tool_names = collect_history_tool_names(&history);
-    let existing_tool_names: std::collections::HashSet<_> = tools
+    let mut existing_tool_names: HashSet<_> = tools
         .iter()
-        .map(|t| t.tool_specification.name.to_lowercase())
+        .map(|t| tool_name_lookup_key(&t.tool_specification.name))
         .collect();
 
     for tool_name in history_tool_names {
-        if !existing_tool_names.contains(&tool_name.to_lowercase()) {
-            tools.push(create_placeholder_tool(&tool_name));
+        let compatible_tool_name = map_tool_name(&tool_name, &mut tool_name_map);
+        if existing_tool_names.insert(tool_name_lookup_key(&compatible_tool_name)) {
+            tools.push(create_placeholder_tool(&compatible_tool_name));
         }
     }
 
@@ -1246,6 +1247,10 @@ fn map_tool_name(name: &str, tool_name_map: &mut HashMap<String, String>) -> Str
     short
 }
 
+fn tool_name_lookup_key(name: &str) -> String {
+    name.trim().to_lowercase()
+}
+
 /// 转换工具定义
 fn convert_tools(
     tools: &Option<Vec<super::types::Tool>>,
@@ -1255,44 +1260,51 @@ fn convert_tools(
         return Vec::new();
     };
 
-    tools
-        .iter()
-        .map(|t| {
-            let mut description = t.description.clone();
+    let mut converted = Vec::with_capacity(tools.len());
+    let mut seen_tool_names = HashSet::new();
 
-            // 对 Write/Edit 工具追加自定义描述后缀
-            let suffix = match t.name.as_str() {
-                "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
-                "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
-                _ => "",
-            };
-            if !suffix.is_empty() {
-                description.push('\n');
-                description.push_str(suffix);
-            }
+    for t in tools {
+        let tool_name = map_tool_name(&t.name, tool_name_map);
+        if !seen_tool_names.insert(tool_name_lookup_key(&tool_name)) {
+            continue;
+        }
 
-            // 限制描述长度为 10000 字符（安全截断 UTF-8，单次遍历）
-            let description = match description.char_indices().nth(10000) {
-                Some((idx, _)) => description[..idx].to_string(),
-                None => description,
-            };
-            let description = if description.trim().is_empty() {
-                DEFAULT_TOOL_DESCRIPTION.to_string()
-            } else {
-                description
-            };
+        let mut description = t.description.clone();
 
-            Tool {
-                tool_specification: ToolSpecification {
-                    name: map_tool_name(&t.name, tool_name_map),
-                    description,
-                    input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(
-                        t.input_schema
-                    ))),
-                },
-            }
-        })
-        .collect()
+        // 对 Write/Edit 工具追加自定义描述后缀
+        let suffix = match t.name.as_str() {
+            "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
+            "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
+            _ => "",
+        };
+        if !suffix.is_empty() {
+            description.push('\n');
+            description.push_str(suffix);
+        }
+
+        // 限制描述长度为 10000 字符（安全截断 UTF-8，单次遍历）
+        let description = match description.char_indices().nth(10000) {
+            Some((idx, _)) => description[..idx].to_string(),
+            None => description,
+        };
+        let description = if description.trim().is_empty() {
+            DEFAULT_TOOL_DESCRIPTION.to_string()
+        } else {
+            description
+        };
+
+        converted.push(Tool {
+            tool_specification: ToolSpecification {
+                name: tool_name,
+                description,
+                input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(
+                    t.input_schema
+                ))),
+            },
+        });
+    }
+
+    converted
 }
 
 /// 生成thinking标签前缀
@@ -2430,6 +2442,50 @@ mod tests {
     }
 
     #[test]
+    fn test_convert_tools_deduplicates_duplicate_names() {
+        let schema = HashMap::from([
+            ("type".to_string(), serde_json::json!("object")),
+            ("properties".to_string(), serde_json::json!({})),
+        ]);
+        let tools = Some(vec![
+            super::super::types::Tool {
+                tool_type: None,
+                name: "mcp__list__files".to_string(),
+                description: "first declaration".to_string(),
+                input_schema: schema.clone(),
+                max_uses: None,
+                ..super::super::types::Tool::default()
+            },
+            super::super::types::Tool {
+                tool_type: None,
+                name: "mcp__list__files".to_string(),
+                description: "duplicate declaration".to_string(),
+                input_schema: schema.clone(),
+                max_uses: None,
+                ..super::super::types::Tool::default()
+            },
+            super::super::types::Tool {
+                tool_type: None,
+                name: "mcp__read__file".to_string(),
+                description: "read declaration".to_string(),
+                input_schema: schema,
+                max_uses: None,
+                ..super::super::types::Tool::default()
+            },
+        ]);
+
+        let converted = convert_tools(&tools, &mut HashMap::new());
+
+        assert_eq!(converted.len(), 2);
+        assert_eq!(converted[0].tool_specification.name, "mcp__list__files");
+        assert_eq!(
+            converted[0].tool_specification.description,
+            "first declaration"
+        );
+        assert_eq!(converted[1].tool_specification.name, "mcp__read__file");
+    }
+
+    #[test]
     fn test_shorten_tool_name_deterministic() {
         let long_name =
             "mcp__some_very_long_server_name__some_very_long_tool_name_that_exceeds_limit";
@@ -2647,6 +2703,55 @@ mod tests {
             tools.iter().any(|t| t.tool_specification.name == "read"),
             "tools 列表应包含 'read' 工具的占位符定义"
         );
+    }
+
+    #[test]
+    fn test_history_tools_added_to_tools_list_deduplicates_case_insensitively() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Read the files"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "text", "text": "I'll read the files."},
+                        {"type": "tool_use", "id": "tool-1", "name": "Read", "input": {"path": "/a.txt"}},
+                        {"type": "tool_use", "id": "tool-2", "name": "read", "input": {"path": "/b.txt"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tool-1", "content": "a"},
+                        {"type": "tool_result", "tool_use_id": "tool-2", "content": "b"}
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        let tools = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools;
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].tool_specification.name, "Read");
     }
 
     #[test]
