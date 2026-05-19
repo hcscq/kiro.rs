@@ -305,7 +305,24 @@ fn validate_thinking_signature_payload(
             Ok(())
         }
         Err(err) => {
-            tracing::warn!(request_id = %request_id, error = %err, "thinking 签名校验失败");
+            if let Some(diagnostic) = err.diagnostic() {
+                tracing::warn!(
+                    request_id = %request_id,
+                    error = %err,
+                    message_index = diagnostic.message_index,
+                    thinking_ordinal = diagnostic.thinking_ordinal,
+                    invalid_reason = diagnostic.reason.as_str(),
+                    signed_ordinal = diagnostic.signed_ordinal,
+                    raw_signature_len = diagnostic.raw_signature_len,
+                    signature_sha256_prefix = %diagnostic.signature_sha256_prefix.as_str(),
+                    canonical_thinking_len = diagnostic.canonical_thinking_len,
+                    signed_thinking_hash_prefix = %diagnostic.signed_thinking_hash_prefix.as_str(),
+                    computed_thinking_hash_prefix = %diagnostic.computed_thinking_hash_prefix.as_str(),
+                    "thinking 签名校验失败"
+                );
+            } else {
+                tracing::warn!(request_id = %request_id, error = %err, "thinking 签名校验失败");
+            }
             Err((
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse::new("invalid_request_error", err.to_string())),

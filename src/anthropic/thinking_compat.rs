@@ -33,13 +33,25 @@ pub(crate) struct ThinkingSignatureValidationStats {
 #[derive(Debug)]
 pub(crate) struct ThinkingSignatureValidationError {
     message: String,
+    diagnostic: Option<ThinkingSignatureInvalidDiagnostic>,
 }
 
 impl ThinkingSignatureValidationError {
-    fn new(message: impl Into<String>) -> Self {
+    fn invalid_signature(
+        message_index: usize,
+        thinking_ordinal: u32,
+        detail: InvalidOwnSignatureDetail,
+    ) -> Self {
         Self {
-            message: message.into(),
+            message: format!(
+                "Invalid thinking signature at messages[{message_index}] thinking block {thinking_ordinal}"
+            ),
+            diagnostic: Some(detail.into_diagnostic(message_index, thinking_ordinal)),
         }
+    }
+
+    pub(crate) fn diagnostic(&self) -> Option<&ThinkingSignatureInvalidDiagnostic> {
+        self.diagnostic.as_ref()
     }
 }
 
@@ -51,10 +63,71 @@ impl std::fmt::Display for ThinkingSignatureValidationError {
 
 impl std::error::Error for ThinkingSignatureValidationError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ThinkingSignatureInvalidReason {
+    OrdinalMismatch,
+    MacMismatch,
+    ThinkingHashMismatch,
+}
+
+impl ThinkingSignatureInvalidReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::OrdinalMismatch => "ordinal_mismatch",
+            Self::MacMismatch => "mac_mismatch",
+            Self::ThinkingHashMismatch => "thinking_hash_mismatch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ThinkingSignatureInvalidDiagnostic {
+    pub(crate) message_index: usize,
+    pub(crate) thinking_ordinal: u32,
+    pub(crate) reason: ThinkingSignatureInvalidReason,
+    pub(crate) signed_ordinal: u32,
+    pub(crate) raw_signature_len: usize,
+    pub(crate) signature_sha256_prefix: String,
+    pub(crate) canonical_thinking_len: usize,
+    pub(crate) signed_thinking_hash_prefix: String,
+    pub(crate) computed_thinking_hash_prefix: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InvalidOwnSignatureDetail {
+    reason: ThinkingSignatureInvalidReason,
+    signed_ordinal: u32,
+    raw_signature_len: usize,
+    signature_sha256_prefix: String,
+    canonical_thinking_len: usize,
+    signed_thinking_hash_prefix: String,
+    computed_thinking_hash_prefix: String,
+}
+
+impl InvalidOwnSignatureDetail {
+    fn into_diagnostic(
+        self,
+        message_index: usize,
+        thinking_ordinal: u32,
+    ) -> ThinkingSignatureInvalidDiagnostic {
+        ThinkingSignatureInvalidDiagnostic {
+            message_index,
+            thinking_ordinal,
+            reason: self.reason,
+            signed_ordinal: self.signed_ordinal,
+            raw_signature_len: self.raw_signature_len,
+            signature_sha256_prefix: self.signature_sha256_prefix,
+            canonical_thinking_len: self.canonical_thinking_len,
+            signed_thinking_hash_prefix: self.signed_thinking_hash_prefix,
+            computed_thinking_hash_prefix: self.computed_thinking_hash_prefix,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum SignatureClass {
     ValidOwn,
-    InvalidOwn,
+    InvalidOwn(InvalidOwnSignatureDetail),
     Foreign,
 }
 
@@ -137,10 +210,12 @@ pub(crate) fn validate_thinking_signatures(
                     match classify_signature(signature, thinking_ordinal, thinking) {
                         SignatureClass::ValidOwn => stats.valid_own_signatures += 1,
                         SignatureClass::Foreign => stats.foreign_signatures += 1,
-                        SignatureClass::InvalidOwn => {
-                            return Err(ThinkingSignatureValidationError::new(format!(
-                                "Invalid thinking signature at messages[{message_index}] thinking block {thinking_ordinal}"
-                            )));
+                        SignatureClass::InvalidOwn(detail) => {
+                            return Err(ThinkingSignatureValidationError::invalid_signature(
+                                message_index,
+                                thinking_ordinal,
+                                detail,
+                            ));
                         }
                     }
                 }
@@ -182,7 +257,13 @@ fn classify_signature(signature: &str, thinking_ordinal: u32, thinking: &str) ->
         raw[ordinal_start + 3],
     ]);
     if signed_ordinal != thinking_ordinal {
-        return SignatureClass::InvalidOwn;
+        return SignatureClass::InvalidOwn(invalid_own_signature_detail(
+            signature,
+            &raw,
+            signed_ordinal,
+            ThinkingSignatureInvalidReason::OrdinalMismatch,
+            thinking,
+        ));
     }
 
     let hash_start = ordinal_end;
@@ -191,14 +272,58 @@ fn classify_signature(signature: &str, thinking_ordinal: u32, thinking: &str) ->
     let mac_start = body_end;
     let expected_mac = signature_mac(&key, &raw[..body_end]);
     if raw[mac_start..].ct_eq(&expected_mac).unwrap_u8() != 1 {
-        return SignatureClass::InvalidOwn;
+        return SignatureClass::InvalidOwn(invalid_own_signature_detail(
+            signature,
+            &raw,
+            signed_ordinal,
+            ThinkingSignatureInvalidReason::MacMismatch,
+            thinking,
+        ));
     }
 
     if thinking_hash_matches(&raw[hash_start..hash_end], thinking) {
         SignatureClass::ValidOwn
     } else {
-        SignatureClass::InvalidOwn
+        SignatureClass::InvalidOwn(invalid_own_signature_detail(
+            signature,
+            &raw,
+            signed_ordinal,
+            ThinkingSignatureInvalidReason::ThinkingHashMismatch,
+            thinking,
+        ))
     }
+}
+
+fn invalid_own_signature_detail(
+    signature: &str,
+    raw: &[u8],
+    signed_ordinal: u32,
+    reason: ThinkingSignatureInvalidReason,
+    thinking: &str,
+) -> InvalidOwnSignatureDetail {
+    let hash_start = 1 + ISSUER_TAG_LEN + 4;
+    let hash_end = hash_start + HASH_LEN;
+    let canonical = canonicalize_thinking_for_signature(thinking);
+    let computed_thinking_hash = sha256_bytes(canonical.as_bytes());
+    let signature_hash = sha256_bytes(signature.as_bytes());
+
+    InvalidOwnSignatureDetail {
+        reason,
+        signed_ordinal,
+        raw_signature_len: raw.len(),
+        signature_sha256_prefix: hex_prefix(&signature_hash),
+        canonical_thinking_len: canonical.len(),
+        signed_thinking_hash_prefix: raw
+            .get(hash_start..hash_end)
+            .map(hex_prefix)
+            .unwrap_or_default(),
+        computed_thinking_hash_prefix: hex_prefix(&computed_thinking_hash),
+    }
+}
+
+fn hex_prefix(bytes: &[u8]) -> String {
+    const PREFIX_BYTES: usize = 8;
+    hex::encode(&bytes[..bytes.len().min(PREFIX_BYTES)])
 }
 
 fn thinking_hash_matches(signed_hash: &[u8], thinking: &str) -> bool {
@@ -351,10 +476,10 @@ pub(crate) fn canonicalize_thinking_for_signature(thinking: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        HASH_LEN, HMAC_LEN, ISSUER_TAG_LEN, SIGNATURE_VERSION, STANDARD_NO_PAD, SignatureClass,
-        classify_signature, decode_signature, extract_thinking_and_text, hmac_sha256, issuer_tag,
-        sha256_bytes, sign_thinking_block, signature_mac, signing_key,
-        validate_thinking_signatures, validation_keys_for_material,
+        HASH_LEN, HMAC_LEN, ISSUER_TAG_LEN, SIGNATURE_RAW_LEN, SIGNATURE_VERSION, STANDARD_NO_PAD,
+        SignatureClass, ThinkingSignatureInvalidReason, classify_signature, decode_signature,
+        extract_thinking_and_text, hmac_sha256, issuer_tag, sha256_bytes, sign_thinking_block,
+        signature_mac, signing_key, validate_thinking_signatures, validation_keys_for_material,
     };
     use crate::anthropic::types::{Message, MessagesRequest};
     use base64::Engine;
@@ -422,14 +547,17 @@ mod tests {
             classify_signature(&signature, 0, "hello"),
             SignatureClass::ValidOwn
         );
-        assert_eq!(
+        assert!(matches!(
             classify_signature(&signature, 0, "world"),
-            SignatureClass::InvalidOwn
-        );
-        assert_eq!(
+            SignatureClass::InvalidOwn(detail)
+                if detail.reason == ThinkingSignatureInvalidReason::ThinkingHashMismatch
+        ));
+        assert!(matches!(
             classify_signature(&signature, 1, "hello"),
-            SignatureClass::InvalidOwn
-        );
+            SignatureClass::InvalidOwn(detail)
+                if detail.reason == ThinkingSignatureInvalidReason::OrdinalMismatch
+                    && detail.signed_ordinal == 0
+        ));
     }
 
     #[test]
@@ -510,6 +638,19 @@ mod tests {
         let err = validate_thinking_signatures(&req).expect_err("tampered thinking should fail");
 
         assert!(err.to_string().contains("Invalid thinking signature"));
+        let diagnostic = err.diagnostic().expect("diagnostic should be attached");
+        assert_eq!(
+            diagnostic.reason,
+            ThinkingSignatureInvalidReason::ThinkingHashMismatch
+        );
+        assert_eq!(diagnostic.message_index, 0);
+        assert_eq!(diagnostic.thinking_ordinal, 0);
+        assert_eq!(diagnostic.signed_ordinal, 0);
+        assert_eq!(diagnostic.canonical_thinking_len, "changed".len());
+        assert_eq!(diagnostic.raw_signature_len, SIGNATURE_RAW_LEN);
+        assert!(!diagnostic.signature_sha256_prefix.is_empty());
+        assert!(!diagnostic.signed_thinking_hash_prefix.is_empty());
+        assert!(!diagnostic.computed_thinking_hash_prefix.is_empty());
     }
 
     #[test]
@@ -538,7 +679,12 @@ mod tests {
             {"type":"thinking","thinking":"step 1","signature": signature}
         ]));
 
-        validate_thinking_signatures(&req).expect_err("tampered signature should fail");
+        let err = validate_thinking_signatures(&req).expect_err("tampered signature should fail");
+        let diagnostic = err.diagnostic().expect("diagnostic should be attached");
+        assert_eq!(
+            diagnostic.reason,
+            ThinkingSignatureInvalidReason::MacMismatch
+        );
     }
 
     #[test]
