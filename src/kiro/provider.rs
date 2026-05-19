@@ -873,6 +873,10 @@ impl KiroProvider {
     }
 
     fn invalid_request_public_message(body: &str) -> String {
+        if Self::is_invalid_thinking_signature_error(body, "") {
+            return "Upstream rejected a historical thinking signature. Retry with unmodified thinking blocks or start a new conversation."
+                .to_string();
+        }
         if body.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
             return "Context window is full. Reduce conversation history, system prompt, or tools."
                 .to_string();
@@ -914,6 +918,13 @@ impl KiroProvider {
         let body = body.to_ascii_lowercase();
         let error_summary = error_summary.to_ascii_lowercase();
         body.contains("suspicious activity") || error_summary.contains("suspicious activity")
+    }
+
+    fn is_invalid_thinking_signature_error(body: &str, error_summary: &str) -> bool {
+        let body = body.to_ascii_lowercase();
+        let error_summary = error_summary.to_ascii_lowercase();
+        body.contains("invalid thinking signature")
+            || error_summary.contains("invalid thinking signature")
     }
 
     fn public_client_error_for_status(
@@ -2318,6 +2329,25 @@ impl KiroProvider {
                     continue;
                 }
 
+                if Self::is_invalid_thinking_signature_error(&body, &error_summary) {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        api_type,
+                        model = model.as_deref().unwrap_or("unknown"),
+                        credential_id = ctx_id,
+                        attempt = attempt + 1,
+                        max_retries,
+                        region = %region,
+                        stream = is_stream,
+                        request_body_bytes,
+                        status_code = status.as_u16(),
+                        error_summary = %error_summary,
+                        upstream_invalid_thinking_signature = true,
+                        total_elapsed_ms = overall_started_at.elapsed().as_millis(),
+                        "API 请求失败（上游拒绝 thinking signature）"
+                    );
+                }
+
                 return Err(anyhow::Error::new(PublicProviderError::invalid_request(
                     format!("{} API 请求失败: {}", api_type, error_summary),
                     Self::invalid_request_public_message(&body),
@@ -2955,6 +2985,21 @@ mod tests {
             message,
             "Upstream rejected the request as malformed. Review message ordering, tool payloads, and oversized inputs."
         );
+    }
+
+    #[test]
+    fn test_invalid_request_public_message_special_cases_invalid_thinking_signature() {
+        let message = KiroProvider::invalid_request_public_message(
+            r#"{"error":{"message":"Invalid thinking signature at messages[315] thinking block 0"}}"#,
+        );
+        assert_eq!(
+            message,
+            "Upstream rejected a historical thinking signature. Retry with unmodified thinking blocks or start a new conversation."
+        );
+        assert!(KiroProvider::is_invalid_thinking_signature_error(
+            "",
+            "body_excerpt=\"Invalid thinking signature at messages[315] thinking block 0\""
+        ));
     }
 
     #[test]

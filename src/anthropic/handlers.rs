@@ -325,7 +325,10 @@ fn validate_thinking_signature_payload(
             }
             Err((
                 StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new("invalid_request_error", err.to_string())),
+                Json(ErrorResponse::new(
+                    "invalid_request_error",
+                    err.public_message(),
+                )),
             )
                 .into_response())
         }

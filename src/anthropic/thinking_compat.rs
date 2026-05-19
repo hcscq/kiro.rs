@@ -53,6 +53,23 @@ impl ThinkingSignatureValidationError {
     pub(crate) fn diagnostic(&self) -> Option<&ThinkingSignatureInvalidDiagnostic> {
         self.diagnostic.as_ref()
     }
+
+    pub(crate) fn public_message(&self) -> String {
+        let Some(diagnostic) = self.diagnostic() else {
+            return self.message.clone();
+        };
+
+        format!(
+            "{} (reason={}, signed_ordinal={}, canonical_thinking_len={}, signature_sha256_prefix={}, signed_thinking_hash_prefix={}, computed_thinking_hash_prefix={})",
+            self.message,
+            diagnostic.reason.as_str(),
+            diagnostic.signed_ordinal,
+            diagnostic.canonical_thinking_len,
+            diagnostic.signature_sha256_prefix,
+            diagnostic.signed_thinking_hash_prefix,
+            diagnostic.computed_thinking_hash_prefix
+        )
+    }
 }
 
 impl std::fmt::Display for ThinkingSignatureValidationError {
@@ -651,6 +668,11 @@ mod tests {
         assert!(!diagnostic.signature_sha256_prefix.is_empty());
         assert!(!diagnostic.signed_thinking_hash_prefix.is_empty());
         assert!(!diagnostic.computed_thinking_hash_prefix.is_empty());
+        let public_message = err.public_message();
+        assert!(public_message.contains("reason=thinking_hash_mismatch"));
+        assert!(public_message.contains("signature_sha256_prefix="));
+        assert!(public_message.contains("signed_thinking_hash_prefix="));
+        assert!(public_message.contains("computed_thinking_hash_prefix="));
     }
 
     #[test]
