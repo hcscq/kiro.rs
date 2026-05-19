@@ -55,20 +55,8 @@ impl ThinkingSignatureValidationError {
     }
 
     pub(crate) fn public_message(&self) -> String {
-        let Some(diagnostic) = self.diagnostic() else {
-            return self.message.clone();
-        };
-
-        format!(
-            "{} (reason={}, signed_ordinal={}, canonical_thinking_len={}, signature_sha256_prefix={}, signed_thinking_hash_prefix={}, computed_thinking_hash_prefix={})",
-            self.message,
-            diagnostic.reason.as_str(),
-            diagnostic.signed_ordinal,
-            diagnostic.canonical_thinking_len,
-            diagnostic.signature_sha256_prefix,
-            diagnostic.signed_thinking_hash_prefix,
-            diagnostic.computed_thinking_hash_prefix
-        )
+        "Invalid thinking signature. Retry with unmodified thinking blocks or start a new conversation."
+            .to_string()
     }
 }
 
@@ -669,10 +657,14 @@ mod tests {
         assert!(!diagnostic.signed_thinking_hash_prefix.is_empty());
         assert!(!diagnostic.computed_thinking_hash_prefix.is_empty());
         let public_message = err.public_message();
-        assert!(public_message.contains("reason=thinking_hash_mismatch"));
-        assert!(public_message.contains("signature_sha256_prefix="));
-        assert!(public_message.contains("signed_thinking_hash_prefix="));
-        assert!(public_message.contains("computed_thinking_hash_prefix="));
+        assert_eq!(
+            public_message,
+            "Invalid thinking signature. Retry with unmodified thinking blocks or start a new conversation."
+        );
+        assert!(!public_message.contains("thinking_hash_mismatch"));
+        assert!(!public_message.contains("signature_sha256_prefix="));
+        assert!(!public_message.contains("signed_thinking_hash_prefix="));
+        assert!(!public_message.contains("computed_thinking_hash_prefix="));
     }
 
     #[test]

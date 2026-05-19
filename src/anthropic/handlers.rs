@@ -33,7 +33,8 @@ use super::probe::{UpstreamProbe, parse_upstream_probe};
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::structured_outputs::{self, JsonSchemaOutput, StructuredOutputError};
 use super::thinking_compat::{
-    extract_thinking_and_text, sign_thinking_block, validate_thinking_signatures,
+    ThinkingSignatureValidationStats, extract_thinking_and_text, sign_thinking_block,
+    validate_thinking_signatures,
 };
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
@@ -43,7 +44,10 @@ use super::webfetch;
 use crate::kiro::provider::{PublicProviderError, RequestOptions};
 
 const LARGE_ANTHROPIC_REQUEST_WARN_THRESHOLD_BYTES: usize = 16 * 1024 * 1024;
+const DETAILED_ANTHROPIC_PRE_UPSTREAM_TRACE_THRESHOLD_BYTES: usize = 512 * 1024;
+const DETAILED_ANTHROPIC_PRE_UPSTREAM_TRACE_MESSAGE_THRESHOLD: usize = 250;
 const SLOW_ANTHROPIC_PRE_UPSTREAM_PHASE_MS: u128 = 1_000;
+const SLOW_ANTHROPIC_PRE_UPSTREAM_STAGE_MS: u128 = 250;
 
 #[derive(Debug, Clone)]
 pub(crate) struct NonStreamMessageResponse {
@@ -287,7 +291,7 @@ async fn normalize_multimodal_payload(
 fn validate_thinking_signature_payload(
     payload: &MessagesRequest,
     request_id: &str,
-) -> Result<(), Response> {
+) -> Result<ThinkingSignatureValidationStats, Response> {
     match validate_thinking_signatures(payload) {
         Ok(stats) => {
             if stats.valid_own_signatures > 0
@@ -302,7 +306,7 @@ fn validate_thinking_signature_payload(
                     "validated historical thinking signatures"
                 );
             }
-            Ok(())
+            Ok(stats)
         }
         Err(err) => {
             if let Some(diagnostic) = err.diagnostic() {
@@ -332,6 +336,227 @@ fn validate_thinking_signature_payload(
             )
                 .into_response())
         }
+    }
+}
+
+fn should_trace_anthropic_pre_upstream(body_bytes: usize, message_count: usize) -> bool {
+    body_bytes >= DETAILED_ANTHROPIC_PRE_UPSTREAM_TRACE_THRESHOLD_BYTES
+        || message_count >= DETAILED_ANTHROPIC_PRE_UPSTREAM_TRACE_MESSAGE_THRESHOLD
+}
+
+struct PreUpstreamTrace {
+    enabled: bool,
+    request_id: String,
+    route: &'static str,
+    model: String,
+    stream: bool,
+    body_bytes: usize,
+    content_length_header: Option<u64>,
+    message_count: usize,
+    started_at: Instant,
+    last_stage: &'static str,
+    completed: bool,
+}
+
+impl PreUpstreamTrace {
+    fn new(
+        enabled: bool,
+        request_id: &str,
+        route: &'static str,
+        model: &str,
+        stream: bool,
+        body_bytes: usize,
+        content_length_header: Option<u64>,
+        message_count: usize,
+    ) -> Self {
+        Self {
+            enabled,
+            request_id: request_id.to_string(),
+            route,
+            model: model.to_string(),
+            stream,
+            body_bytes,
+            content_length_header,
+            message_count,
+            started_at: Instant::now(),
+            last_stage: "signature_validation_completed",
+            completed: false,
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    fn elapsed_ms(&self) -> u128 {
+        self.started_at.elapsed().as_millis()
+    }
+
+    fn mark_signature_validation_completed(
+        &mut self,
+        signature_validation_ms: u128,
+        stats: ThinkingSignatureValidationStats,
+    ) {
+        if !self.enabled && signature_validation_ms < SLOW_ANTHROPIC_PRE_UPSTREAM_STAGE_MS {
+            return;
+        }
+        let elapsed_since_validation_ms = self.elapsed_ms();
+        if signature_validation_ms >= SLOW_ANTHROPIC_PRE_UPSTREAM_STAGE_MS {
+            tracing::warn!(
+                request_id = %self.request_id,
+                route = self.route,
+                model = %self.model,
+                stream = self.stream,
+                body_bytes = self.body_bytes,
+                content_length_header = ?self.content_length_header,
+                message_count = self.message_count,
+                signature_validation_ms,
+                elapsed_since_validation_ms,
+                valid_own_signatures = stats.valid_own_signatures,
+                foreign_signatures = stats.foreign_signatures,
+                missing_signatures = stats.missing_signatures,
+                "Anthropic thinking signature validation completed slowly"
+            );
+        } else {
+            tracing::info!(
+                request_id = %self.request_id,
+                route = self.route,
+                model = %self.model,
+                stream = self.stream,
+                body_bytes = self.body_bytes,
+                content_length_header = ?self.content_length_header,
+                message_count = self.message_count,
+                signature_validation_ms,
+                elapsed_since_validation_ms,
+                valid_own_signatures = stats.valid_own_signatures,
+                foreign_signatures = stats.foreign_signatures,
+                missing_signatures = stats.missing_signatures,
+                "Anthropic thinking signature validation completed"
+            );
+        }
+    }
+
+    fn mark_stage_started(&mut self, stage: &'static str) {
+        self.last_stage = stage;
+        if !self.enabled {
+            return;
+        }
+        tracing::info!(
+            request_id = %self.request_id,
+            route = self.route,
+            model = %self.model,
+            stream = self.stream,
+            body_bytes = self.body_bytes,
+            content_length_header = ?self.content_length_header,
+            message_count = self.message_count,
+            stage,
+            elapsed_since_validation_ms = self.elapsed_ms(),
+            "Anthropic pre-upstream phase started"
+        );
+    }
+
+    fn mark_stage_completed(&mut self, stage: &'static str, stage_ms: u128) {
+        if !self.enabled && stage_ms < SLOW_ANTHROPIC_PRE_UPSTREAM_STAGE_MS {
+            return;
+        }
+        if stage_ms >= SLOW_ANTHROPIC_PRE_UPSTREAM_STAGE_MS {
+            tracing::warn!(
+                request_id = %self.request_id,
+                route = self.route,
+                model = %self.model,
+                stream = self.stream,
+                body_bytes = self.body_bytes,
+                content_length_header = ?self.content_length_header,
+                message_count = self.message_count,
+                stage,
+                stage_ms,
+                elapsed_since_validation_ms = self.elapsed_ms(),
+                "Anthropic pre-upstream phase completed slowly"
+            );
+        } else {
+            tracing::info!(
+                request_id = %self.request_id,
+                route = self.route,
+                model = %self.model,
+                stream = self.stream,
+                body_bytes = self.body_bytes,
+                content_length_header = ?self.content_length_header,
+                message_count = self.message_count,
+                stage,
+                stage_ms,
+                elapsed_since_validation_ms = self.elapsed_ms(),
+                "Anthropic pre-upstream phase completed"
+            );
+        }
+    }
+
+    fn mark_terminal(&mut self, outcome: &'static str) {
+        self.completed = true;
+        if !self.enabled {
+            return;
+        }
+        tracing::info!(
+            request_id = %self.request_id,
+            route = self.route,
+            model = %self.model,
+            stream = self.stream,
+            body_bytes = self.body_bytes,
+            content_length_header = ?self.content_length_header,
+            message_count = self.message_count,
+            outcome,
+            elapsed_since_validation_ms = self.elapsed_ms(),
+            "Anthropic pre-upstream trace ended before provider dispatch"
+        );
+    }
+
+    fn mark_dispatching(
+        &mut self,
+        request_body_bytes: usize,
+        estimated_input_tokens: i32,
+        billing_input_tokens: i32,
+        request_weight: f64,
+        thinking_enabled: bool,
+    ) {
+        self.completed = true;
+        if !self.enabled {
+            return;
+        }
+        tracing::info!(
+            request_id = %self.request_id,
+            route = self.route,
+            model = %self.model,
+            stream = self.stream,
+            body_bytes = self.body_bytes,
+            content_length_header = ?self.content_length_header,
+            message_count = self.message_count,
+            request_body_bytes,
+            estimated_input_tokens,
+            billing_input_tokens,
+            request_weight,
+            thinking_enabled,
+            elapsed_since_validation_ms = self.elapsed_ms(),
+            "Anthropic pre-upstream trace dispatching to provider"
+        );
+    }
+}
+
+impl Drop for PreUpstreamTrace {
+    fn drop(&mut self) {
+        if !self.enabled || self.completed {
+            return;
+        }
+        tracing::warn!(
+            request_id = %self.request_id,
+            route = self.route,
+            model = %self.model,
+            stream = self.stream,
+            body_bytes = self.body_bytes,
+            content_length_header = ?self.content_length_header,
+            message_count = self.message_count,
+            last_stage = self.last_stage,
+            elapsed_since_validation_ms = self.elapsed_ms(),
+            "Anthropic pre-upstream trace dropped before provider dispatch"
+        );
     }
 }
 
@@ -414,23 +639,71 @@ pub async fn post_messages(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
-    if let Err(response) = validate_thinking_signature_payload(&payload, &request_id) {
-        return response;
-    }
+    let signature_validation_started_at = Instant::now();
+    let signature_stats = match validate_thinking_signature_payload(&payload, &request_id) {
+        Ok(stats) => stats,
+        Err(response) => {
+            tracing::warn!(
+                request_id = %request_id,
+                route = "messages",
+                model = %payload.model,
+                stream = payload.stream,
+                body_bytes,
+                content_length_header = ?content_length_header,
+                message_count = payload.messages.len(),
+                signature_validation_ms = signature_validation_started_at.elapsed().as_millis(),
+                "Anthropic request rejected during thinking signature validation"
+            );
+            return response;
+        }
+    };
+    let signature_validation_ms = signature_validation_started_at.elapsed().as_millis();
+    let mut pre_upstream_trace = PreUpstreamTrace::new(
+        should_trace_anthropic_pre_upstream(body_bytes, payload.messages.len()),
+        &request_id,
+        "messages",
+        &payload.model,
+        payload.stream,
+        body_bytes,
+        content_length_header,
+        payload.messages.len(),
+    );
+    pre_upstream_trace
+        .mark_signature_validation_completed(signature_validation_ms, signature_stats);
 
+    pre_upstream_trace.mark_stage_started("normalize_multimodal");
     let normalize_started_at = Instant::now();
     if let Err(response) = normalize_multimodal_payload(&mut payload, &request_id).await {
+        pre_upstream_trace.mark_terminal("normalize_multimodal_failed");
         return response;
     }
     let normalize_ms = normalize_started_at.elapsed().as_millis();
+    pre_upstream_trace.mark_stage_completed("normalize_multimodal", normalize_ms);
 
+    pre_upstream_trace.mark_stage_started("structured_output_detection");
+    let structured_output_started_at = Instant::now();
     let structured_output = match json_schema_output_or_response(&payload, &request_id) {
         Ok(output) => output,
-        Err(response) => return response,
+        Err(response) => {
+            pre_upstream_trace.mark_terminal("structured_output_schema_rejected");
+            return response;
+        }
     };
+    let structured_output_ms = structured_output_started_at.elapsed().as_millis();
+    pre_upstream_trace.mark_stage_completed("structured_output_detection", structured_output_ms);
+    if pre_upstream_trace.enabled() {
+        tracing::info!(
+            request_id = %request_id,
+            route = "messages",
+            structured_output = structured_output.is_some(),
+            structured_output_ms,
+            "Anthropic structured output detection completed"
+        );
+    }
     if webfetch::has_server_web_tool(&payload) {
         tracing::info!(request_id = %request_id, "检测到 server-side Web 工具，路由到统一 Web 工具处理");
 
+        pre_upstream_trace.mark_stage_started("server_web_tool_token_count");
         let token_count_started_at = Instant::now();
         let input_tokens = if structured_output.is_some() {
             count_billing_input_tokens_with_structured_instruction(&payload).await
@@ -438,8 +711,20 @@ pub async fn post_messages(
             count_billing_input_tokens(&payload).await
         };
         let token_count_ms = token_count_started_at.elapsed().as_millis();
+        pre_upstream_trace.mark_stage_completed("server_web_tool_token_count", token_count_ms);
+        if pre_upstream_trace.enabled() {
+            tracing::info!(
+                request_id = %request_id,
+                route = "server_web_tool",
+                token_count_ms,
+                input_tokens,
+                structured_output = structured_output.is_some(),
+                "Anthropic server web tool token count completed"
+            );
+        }
         let pre_upstream_ms = handler_started_at.elapsed().as_millis();
-        if body_bytes >= LARGE_ANTHROPIC_REQUEST_WARN_THRESHOLD_BYTES
+        if pre_upstream_trace.enabled()
+            || body_bytes >= LARGE_ANTHROPIC_REQUEST_WARN_THRESHOLD_BYTES
             || pre_upstream_ms >= SLOW_ANTHROPIC_PRE_UPSTREAM_PHASE_MS
         {
             tracing::warn!(
@@ -459,6 +744,7 @@ pub async fn post_messages(
             );
         }
 
+        pre_upstream_trace.mark_terminal("server_web_tool_handoff");
         return webfetch::handle_server_web_tool_request(
             provider,
             &payload,
@@ -471,6 +757,7 @@ pub async fn post_messages(
     }
     if let Some(output) = structured_output.clone() {
         if payload.stream {
+            pre_upstream_trace.mark_terminal("structured_output_stream_handoff");
             return handle_structured_stream_request(
                 provider,
                 payload,
@@ -480,6 +767,7 @@ pub async fn post_messages(
             )
             .await;
         }
+        pre_upstream_trace.mark_terminal("structured_output_non_stream_handoff");
         return handle_structured_non_stream_request(
             provider,
             &payload,
@@ -491,10 +779,14 @@ pub async fn post_messages(
     }
 
     // 转换请求
+    pre_upstream_trace.mark_stage_started("convert_request");
     let convert_started_at = Instant::now();
     let conversion_result = match convert_request_with_probe(&payload, probe.clone()) {
         Ok(result) => result,
         Err(e) => {
+            pre_upstream_trace
+                .mark_stage_completed("convert_request", convert_started_at.elapsed().as_millis());
+            pre_upstream_trace.mark_terminal("convert_request_failed");
             let (error_type, message) = match &e {
                 ConversionError::UnsupportedModel(model) => {
                     ("invalid_request_error", format!("模型不支持: {}", model))
@@ -512,6 +804,18 @@ pub async fn post_messages(
         }
     };
     let convert_ms = convert_started_at.elapsed().as_millis();
+    pre_upstream_trace.mark_stage_completed("convert_request", convert_ms);
+    if pre_upstream_trace.enabled() {
+        tracing::info!(
+            request_id = %request_id,
+            route = "messages",
+            convert_ms,
+            mapped_model_id = %conversion_result.model_id,
+            session_affinity_present = conversion_result.session_id.is_some(),
+            tool_name_map_len = conversion_result.tool_name_map.len(),
+            "Anthropic request conversion completed"
+        );
+    }
 
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
     let kiro_request = KiroRequest {
@@ -519,10 +823,16 @@ pub async fn post_messages(
         profile_arn: None,
     };
 
+    pre_upstream_trace.mark_stage_started("serialize_kiro_request");
     let serialize_started_at = Instant::now();
     let request_body = match serde_json::to_string(&kiro_request) {
         Ok(body) => body,
         Err(e) => {
+            pre_upstream_trace.mark_stage_completed(
+                "serialize_kiro_request",
+                serialize_started_at.elapsed().as_millis(),
+            );
+            pre_upstream_trace.mark_terminal("serialize_kiro_request_failed");
             tracing::error!("序列化请求失败: {}", e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -535,6 +845,7 @@ pub async fn post_messages(
         }
     };
     let serialize_ms = serialize_started_at.elapsed().as_millis();
+    pre_upstream_trace.mark_stage_completed("serialize_kiro_request", serialize_ms);
 
     tracing::debug!(
         request_id = %request_id,
@@ -547,15 +858,38 @@ pub async fn post_messages(
     let request_weighting = provider.request_weighting_config();
 
     // 调度使用本地估算，返回给下游的 usage 使用远端计数优先。
+    pre_upstream_trace.mark_stage_started("estimate_input_tokens");
     let token_count_started_at = Instant::now();
     let estimated_input_tokens = estimate_input_tokens(&payload);
     let token_count_ms = token_count_started_at.elapsed().as_millis();
+    pre_upstream_trace.mark_stage_completed("estimate_input_tokens", token_count_ms);
+    if pre_upstream_trace.enabled() {
+        tracing::info!(
+            request_id = %request_id,
+            route = "messages",
+            token_count_ms,
+            estimated_input_tokens,
+            "Anthropic local token estimate completed"
+        );
+    }
+    pre_upstream_trace.mark_stage_started("billing_input_token_count");
     let billing_token_count_started_at = Instant::now();
     let billing_input_tokens = count_billing_input_tokens(&payload).await;
     let billing_token_count_ms = billing_token_count_started_at.elapsed().as_millis();
+    pre_upstream_trace.mark_stage_completed("billing_input_token_count", billing_token_count_ms);
     let request_weight =
         payload.request_weight_with_config(&request_weighting, Some(estimated_input_tokens));
     let pre_upstream_ms = handler_started_at.elapsed().as_millis();
+    if pre_upstream_trace.enabled() {
+        tracing::info!(
+            request_id = %request_id,
+            route = "messages",
+            billing_token_count_ms,
+            billing_input_tokens,
+            request_weight,
+            "Anthropic billing token count and request weighting completed"
+        );
+    }
 
     tracing::debug!(
         request_id = %request_id,
@@ -564,7 +898,8 @@ pub async fn post_messages(
         request_weight,
         "已完成请求轻重分级"
     );
-    if body_bytes >= LARGE_ANTHROPIC_REQUEST_WARN_THRESHOLD_BYTES
+    if pre_upstream_trace.enabled()
+        || body_bytes >= LARGE_ANTHROPIC_REQUEST_WARN_THRESHOLD_BYTES
         || pre_upstream_ms >= SLOW_ANTHROPIC_PRE_UPSTREAM_PHASE_MS
         || convert_ms >= SLOW_ANTHROPIC_PRE_UPSTREAM_PHASE_MS
         || serialize_ms >= SLOW_ANTHROPIC_PRE_UPSTREAM_PHASE_MS
@@ -598,6 +933,14 @@ pub async fn post_messages(
     let session_affinity_key = conversion_result.session_id.clone();
     let tool_name_map = conversion_result.tool_name_map;
 
+    pre_upstream_trace.mark_stage_started("provider_dispatch");
+    pre_upstream_trace.mark_dispatching(
+        request_body.len(),
+        estimated_input_tokens,
+        billing_input_tokens,
+        request_weight,
+        thinking_enabled,
+    );
     if payload.stream {
         // 流式响应
         handle_stream_request(
@@ -1653,29 +1996,91 @@ pub async fn post_messages_cc(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
-    if let Err(response) = validate_thinking_signature_payload(&payload, &request_id) {
-        return response;
-    }
+    let signature_validation_started_at = Instant::now();
+    let signature_stats = match validate_thinking_signature_payload(&payload, &request_id) {
+        Ok(stats) => stats,
+        Err(response) => {
+            tracing::warn!(
+                request_id = %request_id,
+                route = "cc_messages",
+                model = %payload.model,
+                stream = payload.stream,
+                body_bytes,
+                content_length_header = ?content_length_header,
+                message_count = payload.messages.len(),
+                signature_validation_ms = signature_validation_started_at.elapsed().as_millis(),
+                "Anthropic request rejected during thinking signature validation"
+            );
+            return response;
+        }
+    };
+    let signature_validation_ms = signature_validation_started_at.elapsed().as_millis();
+    let mut pre_upstream_trace = PreUpstreamTrace::new(
+        should_trace_anthropic_pre_upstream(body_bytes, payload.messages.len()),
+        &request_id,
+        "cc_messages",
+        &payload.model,
+        payload.stream,
+        body_bytes,
+        content_length_header,
+        payload.messages.len(),
+    );
+    pre_upstream_trace
+        .mark_signature_validation_completed(signature_validation_ms, signature_stats);
 
+    pre_upstream_trace.mark_stage_started("normalize_multimodal");
     let normalize_started_at = Instant::now();
     if let Err(response) = normalize_multimodal_payload(&mut payload, &request_id).await {
+        pre_upstream_trace.mark_terminal("normalize_multimodal_failed");
         return response;
     }
     let normalize_ms = normalize_started_at.elapsed().as_millis();
+    pre_upstream_trace.mark_stage_completed("normalize_multimodal", normalize_ms);
 
+    pre_upstream_trace.mark_stage_started("structured_output_detection");
+    let structured_output_started_at = Instant::now();
     let structured_output = match json_schema_output_or_response(&payload, &request_id) {
         Ok(output) => output,
-        Err(response) => return response,
+        Err(response) => {
+            pre_upstream_trace.mark_terminal("structured_output_schema_rejected");
+            return response;
+        }
     };
+    let structured_output_ms = structured_output_started_at.elapsed().as_millis();
+    pre_upstream_trace.mark_stage_completed("structured_output_detection", structured_output_ms);
+    if pre_upstream_trace.enabled() {
+        tracing::info!(
+            request_id = %request_id,
+            route = "cc_messages",
+            structured_output = structured_output.is_some(),
+            structured_output_ms,
+            "Anthropic structured output detection completed"
+        );
+    }
     if webfetch::has_server_web_tool(&payload) {
         tracing::info!(request_id = %request_id, "检测到 server-side Web 工具，路由到统一 Web 工具处理");
 
+        pre_upstream_trace.mark_stage_started("server_web_tool_token_count");
+        let token_count_started_at = Instant::now();
         let input_tokens = if structured_output.is_some() {
             count_billing_input_tokens_with_structured_instruction(&payload).await
         } else {
             count_billing_input_tokens(&payload).await
         };
+        let token_count_ms = token_count_started_at.elapsed().as_millis();
+        pre_upstream_trace.mark_stage_completed("server_web_tool_token_count", token_count_ms);
+        if pre_upstream_trace.enabled() {
+            tracing::info!(
+                request_id = %request_id,
+                route = "cc_server_web_tool",
+                token_count_ms,
+                input_tokens,
+                structured_output = structured_output.is_some(),
+                "Anthropic server web tool token count completed"
+            );
+        }
 
+        pre_upstream_trace.mark_terminal("server_web_tool_handoff");
         return webfetch::handle_server_web_tool_request(
             provider,
             &payload,
@@ -1688,6 +2093,7 @@ pub async fn post_messages_cc(
     }
     if let Some(output) = structured_output.clone() {
         if payload.stream {
+            pre_upstream_trace.mark_terminal("structured_output_stream_handoff");
             return handle_structured_stream_request(
                 provider,
                 payload,
@@ -1697,6 +2103,7 @@ pub async fn post_messages_cc(
             )
             .await;
         }
+        pre_upstream_trace.mark_terminal("structured_output_non_stream_handoff");
         return handle_structured_non_stream_request(
             provider,
             &payload,
@@ -1708,10 +2115,14 @@ pub async fn post_messages_cc(
     }
 
     // 转换请求
+    pre_upstream_trace.mark_stage_started("convert_request");
     let convert_started_at = Instant::now();
     let conversion_result = match convert_request_with_probe(&payload, probe.clone()) {
         Ok(result) => result,
         Err(e) => {
+            pre_upstream_trace
+                .mark_stage_completed("convert_request", convert_started_at.elapsed().as_millis());
+            pre_upstream_trace.mark_terminal("convert_request_failed");
             let (error_type, message) = match &e {
                 ConversionError::UnsupportedModel(model) => {
                     ("invalid_request_error", format!("模型不支持: {}", model))
@@ -1729,6 +2140,18 @@ pub async fn post_messages_cc(
         }
     };
     let convert_ms = convert_started_at.elapsed().as_millis();
+    pre_upstream_trace.mark_stage_completed("convert_request", convert_ms);
+    if pre_upstream_trace.enabled() {
+        tracing::info!(
+            request_id = %request_id,
+            route = "cc_messages",
+            convert_ms,
+            mapped_model_id = %conversion_result.model_id,
+            session_affinity_present = conversion_result.session_id.is_some(),
+            tool_name_map_len = conversion_result.tool_name_map.len(),
+            "Anthropic request conversion completed"
+        );
+    }
 
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
     let kiro_request = KiroRequest {
@@ -1736,10 +2159,16 @@ pub async fn post_messages_cc(
         profile_arn: None,
     };
 
+    pre_upstream_trace.mark_stage_started("serialize_kiro_request");
     let serialize_started_at = Instant::now();
     let request_body = match serde_json::to_string(&kiro_request) {
         Ok(body) => body,
         Err(e) => {
+            pre_upstream_trace.mark_stage_completed(
+                "serialize_kiro_request",
+                serialize_started_at.elapsed().as_millis(),
+            );
+            pre_upstream_trace.mark_terminal("serialize_kiro_request_failed");
             tracing::error!("序列化请求失败: {}", e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1752,6 +2181,7 @@ pub async fn post_messages_cc(
         }
     };
     let serialize_ms = serialize_started_at.elapsed().as_millis();
+    pre_upstream_trace.mark_stage_completed("serialize_kiro_request", serialize_ms);
 
     tracing::debug!(
         request_id = %request_id,
@@ -1764,15 +2194,38 @@ pub async fn post_messages_cc(
     let request_weighting = provider.request_weighting_config();
 
     // 调度使用本地估算，返回给下游的 usage 使用远端计数优先。
+    pre_upstream_trace.mark_stage_started("estimate_input_tokens");
     let token_count_started_at = Instant::now();
     let estimated_input_tokens = estimate_input_tokens(&payload);
     let token_count_ms = token_count_started_at.elapsed().as_millis();
+    pre_upstream_trace.mark_stage_completed("estimate_input_tokens", token_count_ms);
+    if pre_upstream_trace.enabled() {
+        tracing::info!(
+            request_id = %request_id,
+            route = "cc_messages",
+            token_count_ms,
+            estimated_input_tokens,
+            "Anthropic local token estimate completed"
+        );
+    }
+    pre_upstream_trace.mark_stage_started("billing_input_token_count");
     let billing_token_count_started_at = Instant::now();
     let billing_input_tokens = count_billing_input_tokens(&payload).await;
     let billing_token_count_ms = billing_token_count_started_at.elapsed().as_millis();
+    pre_upstream_trace.mark_stage_completed("billing_input_token_count", billing_token_count_ms);
     let request_weight =
         payload.request_weight_with_config(&request_weighting, Some(estimated_input_tokens));
     let pre_upstream_ms = handler_started_at.elapsed().as_millis();
+    if pre_upstream_trace.enabled() {
+        tracing::info!(
+            request_id = %request_id,
+            route = "cc_messages",
+            billing_token_count_ms,
+            billing_input_tokens,
+            request_weight,
+            "Anthropic billing token count and request weighting completed"
+        );
+    }
 
     tracing::debug!(
         request_id = %request_id,
@@ -1781,7 +2234,8 @@ pub async fn post_messages_cc(
         request_weight,
         "已完成请求轻重分级"
     );
-    if body_bytes >= LARGE_ANTHROPIC_REQUEST_WARN_THRESHOLD_BYTES
+    if pre_upstream_trace.enabled()
+        || body_bytes >= LARGE_ANTHROPIC_REQUEST_WARN_THRESHOLD_BYTES
         || pre_upstream_ms >= SLOW_ANTHROPIC_PRE_UPSTREAM_PHASE_MS
         || convert_ms >= SLOW_ANTHROPIC_PRE_UPSTREAM_PHASE_MS
         || serialize_ms >= SLOW_ANTHROPIC_PRE_UPSTREAM_PHASE_MS
@@ -1815,6 +2269,14 @@ pub async fn post_messages_cc(
     let session_affinity_key = conversion_result.session_id.clone();
     let tool_name_map = conversion_result.tool_name_map;
 
+    pre_upstream_trace.mark_stage_started("provider_dispatch");
+    pre_upstream_trace.mark_dispatching(
+        request_body.len(),
+        estimated_input_tokens,
+        billing_input_tokens,
+        request_weight,
+        thinking_enabled,
+    );
     if payload.stream {
         // 流式响应（缓冲模式）
         handle_stream_request_buffered(
