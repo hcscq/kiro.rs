@@ -2679,6 +2679,26 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_map_provider_error_preserves_public_503_mapping() {
+        let response = map_provider_error(anyhow::Error::new(
+            PublicProviderError::service_unavailable(
+                "流式 API 请求失败: status=429 body_len=110 reason=INSUFFICIENT_MODEL_CAPACITY",
+                "Upstream model capacity is temporarily unavailable. Retry later or choose another model.",
+            ),
+        ));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["error"]["type"], "service_unavailable");
+        assert_eq!(
+            json["error"]["message"],
+            "Upstream model capacity is temporarily unavailable. Retry later or choose another model."
+        );
+    }
+
     #[test]
     fn test_coerce_structured_response_rewrites_text_to_minified_json() {
         let output = JsonSchemaOutput {

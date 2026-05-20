@@ -179,6 +179,18 @@ impl PublicProviderError {
         }
     }
 
+    pub fn service_unavailable(
+        log_message: impl Into<String>,
+        public_message: impl Into<String>,
+    ) -> Self {
+        Self {
+            status_code: 503,
+            error_type: "service_unavailable",
+            public_message: public_message.into(),
+            log_message: log_message.into(),
+        }
+    }
+
     pub fn bad_gateway(log_message: impl Into<String>, public_message: impl Into<String>) -> Self {
         Self {
             status_code: 502,
@@ -912,6 +924,20 @@ impl KiroProvider {
     fn is_insufficient_model_capacity(body: &str, error_summary: &str) -> bool {
         body.contains("INSUFFICIENT_MODEL_CAPACITY")
             || error_summary.contains("reason=INSUFFICIENT_MODEL_CAPACITY")
+    }
+
+    fn insufficient_model_capacity_public_message() -> &'static str {
+        "Upstream model capacity is temporarily unavailable. Retry later or choose another model."
+    }
+
+    fn insufficient_model_capacity_error(
+        api_type: &str,
+        error_summary: &str,
+    ) -> PublicProviderError {
+        PublicProviderError::service_unavailable(
+            format!("{} API 请求失败: {}", api_type, error_summary),
+            Self::insufficient_model_capacity_public_message(),
+        )
     }
 
     fn is_suspicious_activity_limited(body: &str, error_summary: &str) -> bool {
@@ -2450,9 +2476,9 @@ impl KiroProvider {
             // 429/408/5xx - 瞬态上游错误：重试但不禁用凭据，并在当前请求内切换候选。
             // 429 会额外进入短冷却/桶退避。
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
+                let insufficient_capacity = status.as_u16() == 429
+                    && Self::is_insufficient_model_capacity(&body, &error_summary);
                 if status.as_u16() == 429 {
-                    let insufficient_capacity =
-                        Self::is_insufficient_model_capacity(&body, &error_summary);
                     if insufficient_capacity {
                         capacity_429_count = capacity_429_count.saturating_add(1);
                         self.token_manager.defer_capacity_limited_credential(
@@ -2500,18 +2526,20 @@ impl KiroProvider {
                     request_body_bytes,
                     status_code = status.as_u16(),
                     error_summary = %error_summary,
-                    insufficient_capacity = status.as_u16() == 429
-                        && Self::is_insufficient_model_capacity(&body, &error_summary),
+                    insufficient_capacity,
                     capacity_429_count,
                     effective_retry_cap = max_retries,
                     total_elapsed_ms = overall_started_at.elapsed().as_millis(),
                     "API 请求失败（上游瞬态错误）"
                 );
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {}",
-                    api_type,
-                    error_summary
-                ));
+                last_error = Some(if insufficient_capacity {
+                    anyhow::Error::new(Self::insufficient_model_capacity_error(
+                        api_type,
+                        &error_summary,
+                    ))
+                } else {
+                    anyhow::anyhow!("{} API 请求失败: {}", api_type, error_summary)
+                });
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
                 }
@@ -3114,6 +3142,26 @@ mod tests {
             r#"{"reason":"RATE_LIMIT"}"#,
             "status=429 body_len=24 reason=RATE_LIMIT"
         ));
+    }
+
+    #[test]
+    fn test_insufficient_model_capacity_public_error_is_503() {
+        let public_error = KiroProvider::insufficient_model_capacity_error(
+            "流式",
+            "status=429 body_len=110 reason=INSUFFICIENT_MODEL_CAPACITY",
+        );
+
+        assert_eq!(public_error.status_code(), 503);
+        assert_eq!(public_error.error_type(), "service_unavailable");
+        assert_eq!(
+            public_error.public_message(),
+            KiroProvider::insufficient_model_capacity_public_message()
+        );
+        assert!(
+            public_error
+                .to_string()
+                .contains("INSUFFICIENT_MODEL_CAPACITY")
+        );
     }
 
     #[test]
