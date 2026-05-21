@@ -11,7 +11,7 @@ import {
 } from '@/hooks/use-credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import { Save, AlertCircle } from 'lucide-react'
-import type { RequestWeightingConfig } from '@/types/api'
+import type { RequestWeightingConfig, ThinkingSignatureValidationMode } from '@/types/api'
 
 type RequestWeightingNumericField = Exclude<keyof RequestWeightingConfig, 'enabled'>
 
@@ -32,6 +32,33 @@ const DEFAULT_REQUEST_WEIGHTING: RequestWeightingConfig = {
   heavyThinkingBudgetThreshold: 24000,
   heavyThinkingBudgetBonus: 0.35,
 }
+
+const THINKING_SIGNATURE_VALIDATION_OPTIONS: Array<{
+  value: ThinkingSignatureValidationMode
+  label: string
+  description: string
+}> = [
+  {
+    value: 'strict',
+    label: '严格拒绝',
+    description: '校验失败直接拒绝请求，保持默认安全边界。',
+  },
+  {
+    value: 'warn_only',
+    label: '只告警放行',
+    description: '记录异常诊断日志，但继续转发到上游。',
+  },
+  {
+    value: 'strip_invalid',
+    label: '剥离后放行',
+    description: '移除本服务签发但失效的签名，再继续转发。',
+  },
+  {
+    value: 'disabled',
+    label: '关闭校验',
+    description: '完全跳过本地 thinking signature 校验。',
+  },
+]
 
 const REQUEST_WEIGHTING_FIELD_SECTIONS: Array<{
   title: string
@@ -207,6 +234,8 @@ export function SettingsPage() {
   const [requestWeightingInputs, setRequestWeightingInputs] = useState<RequestWeightingInputState>(
     () => createRequestWeightingInputs(DEFAULT_REQUEST_WEIGHTING)
   )
+  const [thinkingSignatureValidationMode, setThinkingSignatureValidationMode] =
+    useState<ThinkingSignatureValidationMode>('strict')
 
   useEffect(() => {
     if (!loadBalancingData) {
@@ -236,6 +265,7 @@ export function SettingsPage() {
     const requestWeighting = loadBalancingData.requestWeighting ?? DEFAULT_REQUEST_WEIGHTING
     setRequestWeightingEnabled(requestWeighting.enabled)
     setRequestWeightingInputs(createRequestWeightingInputs(requestWeighting))
+    setThinkingSignatureValidationMode(loadBalancingData.thinkingSignatureValidationMode ?? 'strict')
   }, [loadBalancingData])
 
   const handleRequestWeightingInputChange = (
@@ -398,6 +428,7 @@ export function SettingsPage() {
         rateLimitRefillRecoveryStepPerSuccess: parsedRateLimitRefillRecoveryStep,
         rateLimitRefillBackoffFactor: parsedRateLimitRefillBackoffFactor,
         requestWeighting: parsedRequestWeighting,
+        thinkingSignatureValidationMode,
       },
       {
         onSuccess: () => {
@@ -449,11 +480,10 @@ export function SettingsPage() {
           </div>
         </CardHeader>
 
-        <CardContent className="grid gap-x-8 gap-y-6 md:grid-cols-2">
-          
+        <CardContent className="space-y-6">
           <div className="space-y-4">
             <h3 className="text-sm font-semibold flex items-center text-primary">队列控制配置</h3>
-            <div className="grid gap-4 bg-muted/30 p-4 rounded-lg">
+            <div className="grid gap-4 bg-muted/30 p-4 rounded-lg md:grid-cols-2">
               <div className="space-y-2">
                 <label className="text-sm font-medium" htmlFor="queueMaxSize">
                   最大排队数量 (请求数)
@@ -486,128 +516,208 @@ export function SettingsPage() {
             </div>
           </div>
 
-          <div className="space-y-4 md:col-span-2">
+          <div className="space-y-4">
             <h3 className="text-sm font-semibold flex items-center text-primary">限流与恢复策略</h3>
-            <div className="grid gap-4 bg-muted/30 p-4 rounded-lg lg:grid-cols-2 2xl:grid-cols-3">
-              <div className="space-y-2">
-                <label className="text-sm font-medium" htmlFor="rateLimitCooldownMs">
-                  429 异常冷却时间 (毫秒)
-                </label>
-                <Input
-                  id="rateLimitCooldownMs"
-                  type="number"
-                  min="0"
-                  step="100"
-                  value={rateLimitCooldownMsInput}
-                  onChange={(e) => setRateLimitCooldownMsInput(e.target.value)}
-                  placeholder="0 表示关闭 429 冷却"
-                />
-              </div>
-
-              <div className="flex flex-col gap-3 rounded-lg border bg-background/70 p-4">
-                <div className="flex items-center justify-between gap-3">
-                  <div className="space-y-1">
-                    <div className="text-sm font-medium">429 冷却与退避</div>
-                    <p className="text-sm text-muted-foreground">
-                      控制上游 429 后是否写入账号级冷却，并同步下调 token bucket 的当前回填速率。
-                    </p>
+            <div className="space-y-4 bg-muted/30 p-4 rounded-lg">
+              <div className="grid gap-4 lg:grid-cols-2 2xl:grid-cols-3">
+                <div className="flex flex-col gap-3 rounded-lg border bg-background/70 p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="space-y-1">
+                      <div className="text-sm font-medium">429 冷却与退避</div>
+                      <p className="text-sm text-muted-foreground">
+                        控制上游 429 后是否写入账号级冷却，并同步下调 token bucket 的当前回填速率。
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <Badge variant={rateLimitCooldownEnabled ? 'secondary' : 'outline'}>
+                        {rateLimitCooldownEnabled ? '已启用' : '已关闭'}
+                      </Badge>
+                      <Switch
+                        checked={rateLimitCooldownEnabled}
+                        onCheckedChange={setRateLimitCooldownEnabled}
+                        aria-label="切换 429 冷却与退避"
+                      />
+                    </div>
                   </div>
-                  <div className="flex items-center gap-3">
-                    <Badge variant={rateLimitCooldownEnabled ? 'secondary' : 'outline'}>
-                      {rateLimitCooldownEnabled ? '已启用' : '已关闭'}
-                    </Badge>
-                    <Switch
-                      checked={rateLimitCooldownEnabled}
-                      onCheckedChange={setRateLimitCooldownEnabled}
-                      aria-label="切换 429 冷却与退避"
-                    />
+                  <p className="text-xs text-muted-foreground">
+                    默认关闭。关闭后遇到 429 只保留请求级重试，不再写入本地冷却，也不会继续压低 bucket 回填速率。
+                  </p>
+                </div>
+
+                <div className="flex flex-col gap-3 rounded-lg border bg-background/70 p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="space-y-1">
+                      <div className="text-sm font-medium">Suspicious activity 长冷却</div>
+                      <p className="text-sm text-muted-foreground">
+                        命中 Kiro 风控临时限制后，对该凭据写入独立的账号级长冷却。
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <Badge variant={suspiciousActivityCooldownEnabled ? 'secondary' : 'outline'}>
+                        {suspiciousActivityCooldownEnabled ? '已启用' : '已关闭'}
+                      </Badge>
+                      <Switch
+                        checked={suspiciousActivityCooldownEnabled}
+                        onCheckedChange={setSuspiciousActivityCooldownEnabled}
+                        aria-label="切换 suspicious activity 长冷却"
+                      />
+                    </div>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    默认启用，且独立于普通 429 冷却开关；设为 0 时只做 bucket 退避，不写入固定冷却。
+                  </p>
+                </div>
+
+                <div className="flex flex-col gap-3 rounded-lg border bg-background/70 p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="space-y-1">
+                      <div className="text-sm font-medium">优先干净账号</div>
+                      <p className="text-sm text-muted-foreground">
+                        调度时优先选择从未命中过 suspicious activity 的凭据；历史命中过的账号仅作为兜底候选。
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <Badge variant={suspiciousActivityPreferCleanCredentials ? 'secondary' : 'outline'}>
+                        {suspiciousActivityPreferCleanCredentials ? '已启用' : '已关闭'}
+                      </Badge>
+                      <Switch
+                        checked={suspiciousActivityPreferCleanCredentials}
+                        onCheckedChange={setSuspiciousActivityPreferCleanCredentials}
+                        aria-label="切换优先干净账号"
+                      />
+                    </div>
                   </div>
                 </div>
-                <p className="text-xs text-muted-foreground">
-                  默认关闭。关闭后遇到 429 只保留请求级重试，不再写入本地冷却，也不会继续压低 bucket 回填速率。
-                </p>
-              </div>
 
-              <div className="space-y-2">
-                <label className="text-sm font-medium" htmlFor="suspiciousActivityCooldownMs">
-                  Suspicious activity 全局冷却时间 (毫秒)
-                </label>
-                <Input
-                  id="suspiciousActivityCooldownMs"
-                  type="number"
-                  min="0"
-                  step="60000"
-                  value={suspiciousActivityCooldownMsInput}
-                  onChange={(e) => setSuspiciousActivityCooldownMsInput(e.target.value)}
-                  placeholder="默认 7200000，即 2 小时"
-                />
-              </div>
-
-              <div className="flex flex-col gap-3 rounded-lg border bg-background/70 p-4">
-                <div className="flex items-center justify-between gap-3">
-                  <div className="space-y-1">
-                    <div className="text-sm font-medium">Suspicious activity 长冷却</div>
-                    <p className="text-sm text-muted-foreground">
-                      命中 Kiro 风控临时限制后，对该凭据写入独立的账号级长冷却。
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-3">
-                    <Badge variant={suspiciousActivityCooldownEnabled ? 'secondary' : 'outline'}>
-                      {suspiciousActivityCooldownEnabled ? '已启用' : '已关闭'}
-                    </Badge>
-                    <Switch
-                      checked={suspiciousActivityCooldownEnabled}
-                      onCheckedChange={setSuspiciousActivityCooldownEnabled}
-                      aria-label="切换 suspicious activity 长冷却"
-                    />
+                <div className="flex flex-col gap-3 rounded-lg border bg-background/70 p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="space-y-1">
+                      <div className="text-sm font-medium">Suspicious activity 自动停调</div>
+                      <p className="text-sm text-muted-foreground">
+                        同一账号在统计窗口内多次命中 suspicious activity 后自动禁用，避免继续探测上游风控。
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <Badge variant={suspiciousActivityAutoDisableEnabled ? 'secondary' : 'outline'}>
+                        {suspiciousActivityAutoDisableEnabled ? '已启用' : '已关闭'}
+                      </Badge>
+                      <Switch
+                        checked={suspiciousActivityAutoDisableEnabled}
+                        onCheckedChange={setSuspiciousActivityAutoDisableEnabled}
+                        aria-label="切换 suspicious activity 自动停调"
+                      />
+                    </div>
                   </div>
                 </div>
-                <p className="text-xs text-muted-foreground">
-                  默认启用，且独立于普通 429 冷却开关；设为 0 时只做 bucket 退避，不写入固定冷却。
-                </p>
-              </div>
 
-              <div className="flex flex-col gap-3 rounded-lg border bg-background/70 p-4">
-                <div className="flex items-center justify-between gap-3">
-                  <div className="space-y-1">
-                    <div className="text-sm font-medium">优先干净账号</div>
-                    <p className="text-sm text-muted-foreground">
-                      调度时优先选择从未命中过 suspicious activity 的凭据；历史命中过的账号仅作为兜底候选。
-                    </p>
+                <div className="flex flex-col gap-3 rounded-lg border bg-background/70 p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="space-y-1">
+                      <div className="text-sm font-medium">Suspicious activity 自动恢复</div>
+                      <p className="text-sm text-muted-foreground">
+                        隔离结束后，账号连续成功或长期未再命中 suspicious activity 时自动清除历史标记。
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <Badge variant={suspiciousActivityAutoClearEnabled ? 'secondary' : 'outline'}>
+                        {suspiciousActivityAutoClearEnabled ? '已启用' : '已关闭'}
+                      </Badge>
+                      <Switch
+                        checked={suspiciousActivityAutoClearEnabled}
+                        onCheckedChange={setSuspiciousActivityAutoClearEnabled}
+                        aria-label="切换 suspicious activity 自动恢复"
+                      />
+                    </div>
                   </div>
-                  <div className="flex items-center gap-3">
-                    <Badge variant={suspiciousActivityPreferCleanCredentials ? 'secondary' : 'outline'}>
-                      {suspiciousActivityPreferCleanCredentials ? '已启用' : '已关闭'}
-                    </Badge>
-                    <Switch
-                      checked={suspiciousActivityPreferCleanCredentials}
-                      onCheckedChange={setSuspiciousActivityPreferCleanCredentials}
-                      aria-label="切换优先干净账号"
-                    />
+                </div>
+
+                <div className="flex flex-col gap-3 rounded-lg border bg-background/70 p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="space-y-1">
+                      <div className="text-sm font-medium">模型冷却</div>
+                      <p className="text-sm text-muted-foreground">
+                        遇到上游 `INVALID_MODEL_ID` 时，是否把该模型族加入账号级运行时临时限制。
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <Badge variant={modelCooldownEnabled ? 'secondary' : 'outline'}>
+                        {modelCooldownEnabled ? '已启用' : '已关闭'}
+                      </Badge>
+                      <Switch
+                        checked={modelCooldownEnabled}
+                        onCheckedChange={setModelCooldownEnabled}
+                        aria-label="切换模型冷却"
+                      />
+                    </div>
                   </div>
+                  <p className="text-xs text-muted-foreground">
+                    默认开启。关闭后不再新增模型临时限制，已有运行时模型限制也会被清空。
+                  </p>
+                </div>
+
+                <div className="flex flex-col gap-3 rounded-lg border bg-background/70 p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="space-y-1">
+                      <div className="text-sm font-medium">会话凭据亲和</div>
+                      <p className="text-sm text-muted-foreground">
+                        同一 Claude 会话优先复用上次成功的 Kiro 凭据；凭据不可调度时自动回退现有策略。
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <Badge variant={sessionAffinityEnabled ? 'secondary' : 'outline'}>
+                        {sessionAffinityEnabled ? '已启用' : '已关闭'}
+                      </Badge>
+                      <Switch
+                        checked={sessionAffinityEnabled}
+                        onCheckedChange={setSessionAffinityEnabled}
+                        aria-label="切换会话凭据亲和"
+                      />
+                    </div>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    默认关闭。启用后按模型和会话维度缓存 1 小时，优先使用 Redis 共享缓存，多副本未配置 Redis 时退回本地缓存。
+                  </p>
                 </div>
               </div>
 
-              <div className="flex flex-col gap-3 rounded-lg border bg-background/70 p-4">
-                <div className="flex items-center justify-between gap-3">
-                  <div className="space-y-1">
-                    <div className="text-sm font-medium">Suspicious activity 自动停调</div>
-                    <p className="text-sm text-muted-foreground">
-                      同一账号在统计窗口内多次命中 suspicious activity 后自动禁用，避免继续探测上游风控。
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-3">
-                    <Badge variant={suspiciousActivityAutoDisableEnabled ? 'secondary' : 'outline'}>
-                      {suspiciousActivityAutoDisableEnabled ? '已启用' : '已关闭'}
-                    </Badge>
-                    <Switch
-                      checked={suspiciousActivityAutoDisableEnabled}
-                      onCheckedChange={setSuspiciousActivityAutoDisableEnabled}
-                      aria-label="切换 suspicious activity 自动停调"
+              <div className="space-y-3 rounded-lg border bg-background/50 p-4">
+                <div className="space-y-1">
+                  <div className="text-sm font-medium">数值参数</div>
+                  <p className="text-sm text-muted-foreground">
+                    集中管理冷却时长、统计窗口、自动恢复阈值和默认并发上限。
+                  </p>
+                </div>
+                <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium" htmlFor="rateLimitCooldownMs">
+                      429 异常冷却时间 (毫秒)
+                    </label>
+                    <Input
+                      id="rateLimitCooldownMs"
+                      type="number"
+                      min="0"
+                      step="100"
+                      value={rateLimitCooldownMsInput}
+                      onChange={(e) => setRateLimitCooldownMsInput(e.target.value)}
+                      placeholder="0 表示关闭 429 冷却"
                     />
                   </div>
-                </div>
-                <div className="grid gap-3 md:grid-cols-2">
+
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium" htmlFor="suspiciousActivityCooldownMs">
+                      Suspicious activity 全局冷却时间 (毫秒)
+                    </label>
+                    <Input
+                      id="suspiciousActivityCooldownMs"
+                      type="number"
+                      min="0"
+                      step="60000"
+                      value={suspiciousActivityCooldownMsInput}
+                      onChange={(e) => setSuspiciousActivityCooldownMsInput(e.target.value)}
+                      placeholder="默认 7200000，即 2 小时"
+                    />
+                  </div>
+
                   <div className="space-y-2">
                     <label className="text-sm font-medium" htmlFor="suspiciousActivityAutoDisableThreshold">
                       自动停调阈值
@@ -622,9 +732,10 @@ export function SettingsPage() {
                       placeholder="默认 3"
                     />
                   </div>
+
                   <div className="space-y-2">
                     <label className="text-sm font-medium" htmlFor="suspiciousActivityAutoDisableWindowMs">
-                      统计窗口 (毫秒)
+                      自动停调统计窗口 (毫秒)
                     </label>
                     <Input
                       id="suspiciousActivityAutoDisableWindowMs"
@@ -636,32 +747,10 @@ export function SettingsPage() {
                       placeholder="默认 86400000，即 24 小时"
                     />
                   </div>
-                </div>
-              </div>
 
-              <div className="flex flex-col gap-3 rounded-lg border bg-background/70 p-4">
-                <div className="flex items-center justify-between gap-3">
-                  <div className="space-y-1">
-                    <div className="text-sm font-medium">Suspicious activity 自动恢复</div>
-                    <p className="text-sm text-muted-foreground">
-                      隔离结束后，账号连续成功或长期未再命中 suspicious activity 时自动清除历史标记。
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-3">
-                    <Badge variant={suspiciousActivityAutoClearEnabled ? 'secondary' : 'outline'}>
-                      {suspiciousActivityAutoClearEnabled ? '已启用' : '已关闭'}
-                    </Badge>
-                    <Switch
-                      checked={suspiciousActivityAutoClearEnabled}
-                      onCheckedChange={setSuspiciousActivityAutoClearEnabled}
-                      aria-label="切换 suspicious activity 自动恢复"
-                    />
-                  </div>
-                </div>
-                <div className="grid gap-3 md:grid-cols-2">
                   <div className="space-y-2">
                     <label className="text-sm font-medium" htmlFor="suspiciousActivityAutoClearSuccessThreshold">
-                      恢复成功次数
+                      自动恢复成功次数
                     </label>
                     <Input
                       id="suspiciousActivityAutoClearSuccessThreshold"
@@ -673,9 +762,10 @@ export function SettingsPage() {
                       placeholder="默认 10"
                     />
                   </div>
+
                   <div className="space-y-2">
                     <label className="text-sm font-medium" htmlFor="suspiciousActivityAutoClearAfterMs">
-                      未命中恢复时间 (毫秒)
+                      自动恢复未命中时间 (毫秒)
                     </label>
                     <Input
                       id="suspiciousActivityAutoClearAfterMs"
@@ -687,75 +777,27 @@ export function SettingsPage() {
                       placeholder="默认 604800000，即 7 天"
                     />
                   </div>
-                </div>
-              </div>
 
-              <div className="space-y-2">
-                <label className="text-sm font-medium" htmlFor="defaultMaxConcurrency">
-                  默认账号并发上限
-                </label>
-                <Input
-                  id="defaultMaxConcurrency"
-                  type="number"
-                  min="0"
-                  step="1"
-                  value={defaultMaxConcurrencyInput}
-                  onChange={(e) => setDefaultMaxConcurrencyInput(e.target.value)}
-                  placeholder="留空或 0 表示全局不限制"
-                />
-              </div>
-
-              <div className="flex flex-col gap-3 rounded-lg border bg-background/70 p-4">
-                <div className="flex items-center justify-between gap-3">
-                  <div className="space-y-1">
-                    <div className="text-sm font-medium">模型冷却</div>
-                    <p className="text-sm text-muted-foreground">
-                      遇到上游 `INVALID_MODEL_ID` 时，是否把该模型族加入账号级运行时临时限制。
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-3">
-                    <Badge variant={modelCooldownEnabled ? 'secondary' : 'outline'}>
-                      {modelCooldownEnabled ? '已启用' : '已关闭'}
-                    </Badge>
-                    <Switch
-                      checked={modelCooldownEnabled}
-                      onCheckedChange={setModelCooldownEnabled}
-                      aria-label="切换模型冷却"
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium" htmlFor="defaultMaxConcurrency">
+                      默认账号并发上限
+                    </label>
+                    <Input
+                      id="defaultMaxConcurrency"
+                      type="number"
+                      min="0"
+                      step="1"
+                      value={defaultMaxConcurrencyInput}
+                      onChange={(e) => setDefaultMaxConcurrencyInput(e.target.value)}
+                      placeholder="留空或 0 表示全局不限制"
                     />
                   </div>
                 </div>
-                <p className="text-xs text-muted-foreground">
-                  默认开启。关闭后不再新增模型临时限制，已有运行时模型限制也会被清空。
-                </p>
-              </div>
-
-              <div className="flex flex-col gap-3 rounded-lg border bg-background/70 p-4">
-                <div className="flex items-center justify-between gap-3">
-                  <div className="space-y-1">
-                    <div className="text-sm font-medium">会话凭据亲和</div>
-                    <p className="text-sm text-muted-foreground">
-                      同一 Claude 会话优先复用上次成功的 Kiro 凭据；凭据不可调度时自动回退现有策略。
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-3">
-                    <Badge variant={sessionAffinityEnabled ? 'secondary' : 'outline'}>
-                      {sessionAffinityEnabled ? '已启用' : '已关闭'}
-                    </Badge>
-                    <Switch
-                      checked={sessionAffinityEnabled}
-                      onCheckedChange={setSessionAffinityEnabled}
-                      aria-label="切换会话凭据亲和"
-                    />
-                  </div>
-                </div>
-                <p className="text-xs text-muted-foreground">
-                  默认关闭。启用后按模型和会话维度缓存 1 小时，优先使用 Redis 共享缓存，多副本未配置 Redis 时退回本地缓存。
-                </p>
               </div>
             </div>
           </div>
 
-          <div className="space-y-4 md:col-span-2">
+          <div className="space-y-4">
             <h3 className="text-sm font-semibold flex items-center text-primary">弹性令牌桶流量控制</h3>
             <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 bg-muted/30 p-4 rounded-lg">
               <div className="space-y-2">
@@ -833,7 +875,7 @@ export function SettingsPage() {
             </div>
           </div>
 
-          <div className="space-y-4 md:col-span-2">
+          <div className="space-y-4">
             <h3 className="text-sm font-semibold flex items-center text-primary">轻 / 重请求加权</h3>
             <div className="space-y-4 rounded-lg bg-muted/30 p-4">
               <div className="flex flex-col gap-4 rounded-lg border bg-background/70 p-4 md:flex-row md:items-center md:justify-between">
@@ -883,6 +925,40 @@ export function SettingsPage() {
                   </div>
                 </div>
               ))}
+            </div>
+          </div>
+
+          <div className="space-y-4">
+            <h3 className="text-sm font-semibold flex items-center text-primary">Thinking 签名校验</h3>
+            <div className="space-y-4 rounded-lg bg-muted/30 p-4">
+              <div className="flex flex-col gap-3 rounded-lg border bg-background/70 p-4 md:flex-row md:items-center md:justify-between">
+                <div className="space-y-1">
+                  <div className="text-sm font-medium">历史 thinking signature 处理策略</div>
+                  <p className="text-sm text-muted-foreground">
+                    控制下游请求携带的历史 thinking signature 校验失败时，是拒绝、告警放行、剥离后放行，还是跳过校验。
+                  </p>
+                </div>
+                <Badge variant={thinkingSignatureValidationMode === 'strict' ? 'secondary' : 'outline'}>
+                  {THINKING_SIGNATURE_VALIDATION_OPTIONS.find((option) => option.value === thinkingSignatureValidationMode)?.label}
+                </Badge>
+              </div>
+
+              <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+                {THINKING_SIGNATURE_VALIDATION_OPTIONS.map((option) => (
+                  <Button
+                    key={option.value}
+                    type="button"
+                    variant={thinkingSignatureValidationMode === option.value ? 'default' : 'outline'}
+                    className="h-auto min-h-[108px] flex-col items-start justify-start whitespace-normal px-4 py-3 text-left"
+                    onClick={() => setThinkingSignatureValidationMode(option.value)}
+                  >
+                    <span className="text-sm font-semibold">{option.label}</span>
+                    <span className="text-xs font-normal leading-relaxed opacity-80">
+                      {option.description}
+                    </span>
+                  </Button>
+                ))}
+              </div>
             </div>
           </div>
         </CardContent>

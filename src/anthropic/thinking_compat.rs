@@ -26,8 +26,15 @@ static VALIDATION_KEYS: OnceLock<Vec<[u8; 32]>> = OnceLock::new();
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct ThinkingSignatureValidationStats {
     pub valid_own_signatures: usize,
+    pub invalid_own_signatures: usize,
     pub foreign_signatures: usize,
     pub missing_signatures: usize,
+}
+
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ThinkingSignatureValidationReport {
+    pub stats: ThinkingSignatureValidationStats,
+    pub invalid_diagnostics: Vec<ThinkingSignatureInvalidDiagnostic>,
 }
 
 #[derive(Debug)]
@@ -37,16 +44,13 @@ pub(crate) struct ThinkingSignatureValidationError {
 }
 
 impl ThinkingSignatureValidationError {
-    fn invalid_signature(
-        message_index: usize,
-        thinking_ordinal: u32,
-        detail: InvalidOwnSignatureDetail,
-    ) -> Self {
+    fn invalid_diagnostic(diagnostic: ThinkingSignatureInvalidDiagnostic) -> Self {
         Self {
             message: format!(
-                "Invalid thinking signature at messages[{message_index}] thinking block {thinking_ordinal}"
+                "Invalid thinking signature at messages[{}] thinking block {}",
+                diagnostic.message_index, diagnostic.thinking_ordinal
             ),
-            diagnostic: Some(detail.into_diagnostic(message_index, thinking_ordinal)),
+            diagnostic: Some(diagnostic),
         }
     }
 
@@ -181,7 +185,20 @@ pub(crate) fn sign_thinking_block(thinking_ordinal: u32, thinking: &str) -> Stri
 pub(crate) fn validate_thinking_signatures(
     req: &MessagesRequest,
 ) -> Result<ThinkingSignatureValidationStats, ThinkingSignatureValidationError> {
-    let mut stats = ThinkingSignatureValidationStats::default();
+    let report = inspect_thinking_signatures(req);
+    if let Some(diagnostic) = report.invalid_diagnostics.into_iter().next() {
+        return Err(ThinkingSignatureValidationError::invalid_diagnostic(
+            diagnostic,
+        ));
+    }
+
+    Ok(report.stats)
+}
+
+pub(crate) fn inspect_thinking_signatures(
+    req: &MessagesRequest,
+) -> ThinkingSignatureValidationReport {
+    let mut report = ThinkingSignatureValidationReport::default();
 
     for (message_index, message) in req.messages.iter().enumerate() {
         if message.role != "assistant" {
@@ -213,25 +230,74 @@ pub(crate) fn validate_thinking_signatures(
             match signature {
                 Some(signature) => {
                     match classify_signature(signature, thinking_ordinal, thinking) {
-                        SignatureClass::ValidOwn => stats.valid_own_signatures += 1,
-                        SignatureClass::Foreign => stats.foreign_signatures += 1,
+                        SignatureClass::ValidOwn => report.stats.valid_own_signatures += 1,
+                        SignatureClass::Foreign => report.stats.foreign_signatures += 1,
                         SignatureClass::InvalidOwn(detail) => {
-                            return Err(ThinkingSignatureValidationError::invalid_signature(
-                                message_index,
-                                thinking_ordinal,
-                                detail,
-                            ));
+                            report.stats.invalid_own_signatures += 1;
+                            report
+                                .invalid_diagnostics
+                                .push(detail.into_diagnostic(message_index, thinking_ordinal));
                         }
                     }
                 }
-                None => stats.missing_signatures += 1,
+                None => report.stats.missing_signatures += 1,
             }
 
             thinking_ordinal = thinking_ordinal.saturating_add(1);
         }
     }
 
-    Ok(stats)
+    report
+}
+
+pub(crate) fn strip_invalid_own_thinking_signatures(
+    req: &mut MessagesRequest,
+) -> Vec<ThinkingSignatureInvalidDiagnostic> {
+    let mut diagnostics = Vec::new();
+
+    for (message_index, message) in req.messages.iter_mut().enumerate() {
+        if message.role != "assistant" {
+            continue;
+        }
+        let serde_json::Value::Array(blocks) = &mut message.content else {
+            continue;
+        };
+
+        let mut thinking_ordinal = 0u32;
+        for block in blocks {
+            let serde_json::Value::Object(obj) = block else {
+                continue;
+            };
+            if obj.get("type").and_then(serde_json::Value::as_str) != Some("thinking") {
+                continue;
+            }
+
+            let thinking = obj
+                .get("thinking")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let signature = obj
+                .get("signature")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+
+            if let Some(signature) = signature {
+                if let SignatureClass::InvalidOwn(detail) =
+                    classify_signature(&signature, thinking_ordinal, &thinking)
+                {
+                    diagnostics.push(detail.into_diagnostic(message_index, thinking_ordinal));
+                    obj.remove("signature");
+                }
+            }
+
+            thinking_ordinal = thinking_ordinal.saturating_add(1);
+        }
+    }
+
+    diagnostics
 }
 
 fn classify_signature(signature: &str, thinking_ordinal: u32, thinking: &str) -> SignatureClass {
@@ -483,8 +549,10 @@ mod tests {
     use super::{
         HASH_LEN, HMAC_LEN, ISSUER_TAG_LEN, SIGNATURE_RAW_LEN, SIGNATURE_VERSION, STANDARD_NO_PAD,
         SignatureClass, ThinkingSignatureInvalidReason, classify_signature, decode_signature,
-        extract_thinking_and_text, hmac_sha256, issuer_tag, sha256_bytes, sign_thinking_block,
-        signature_mac, signing_key, validate_thinking_signatures, validation_keys_for_material,
+        extract_thinking_and_text, hmac_sha256, inspect_thinking_signatures, issuer_tag,
+        sha256_bytes, sign_thinking_block, signature_mac, signing_key,
+        strip_invalid_own_thinking_signatures, validate_thinking_signatures,
+        validation_keys_for_material,
     };
     use crate::anthropic::types::{Message, MessagesRequest};
     use base64::Engine;
@@ -699,6 +767,48 @@ mod tests {
             diagnostic.reason,
             ThinkingSignatureInvalidReason::MacMismatch
         );
+    }
+
+    #[test]
+    fn test_inspect_thinking_signatures_counts_invalid_without_short_circuit() {
+        let signature = sign_thinking_block(0, "step 1");
+        let req = request_with_assistant_content(serde_json::json!([
+            {"type":"thinking","thinking":"changed","signature": signature},
+            {"type":"thinking","thinking":"external","signature":"sig_1"},
+            {"type":"thinking","thinking":"legacy"}
+        ]));
+
+        let report = inspect_thinking_signatures(&req);
+
+        assert_eq!(report.stats.valid_own_signatures, 0);
+        assert_eq!(report.stats.invalid_own_signatures, 1);
+        assert_eq!(report.stats.foreign_signatures, 1);
+        assert_eq!(report.stats.missing_signatures, 1);
+        assert_eq!(report.invalid_diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn test_strip_invalid_own_thinking_signatures_removes_only_invalid_own_signature() {
+        let invalid_signature = sign_thinking_block(0, "step 1");
+        let valid_signature = sign_thinking_block(1, "ok");
+        let foreign_signature = foreign_anthropic_shaped_signature(2, "external");
+        let mut req = request_with_assistant_content(serde_json::json!([
+            {"type":"thinking","thinking":"changed","signature": invalid_signature},
+            {"type":"thinking","thinking":"ok","signature": valid_signature},
+            {"type":"thinking","thinking":"external","signature": foreign_signature}
+        ]));
+
+        let diagnostics = strip_invalid_own_thinking_signatures(&mut req);
+
+        assert_eq!(diagnostics.len(), 1);
+        let blocks = req.messages[0].content.as_array().unwrap();
+        assert!(blocks[0].get("signature").is_none());
+        assert!(blocks[1].get("signature").is_some());
+        assert!(blocks[2].get("signature").is_some());
+        let stats = validate_thinking_signatures(&req).expect("stripped request should validate");
+        assert_eq!(stats.valid_own_signatures, 1);
+        assert_eq!(stats.foreign_signatures, 1);
+        assert_eq!(stats.missing_signatures, 1);
     }
 
     #[test]

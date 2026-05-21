@@ -25,7 +25,7 @@ use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
-use crate::model::config::{Config, RequestWeightingConfig};
+use crate::model::config::{Config, RequestWeightingConfig, ThinkingSignatureValidationMode};
 use crate::model::model_policy::{
     AccountTypeDispatchPolicy, ModelSupportPolicy, normalize_account_type_dispatch_policies,
     normalize_account_type_policies, normalize_model_selector,
@@ -873,6 +873,7 @@ pub struct LoadBalancingConfigSnapshot {
     pub rate_limit_refill_recovery_step_per_success: f64,
     pub rate_limit_refill_backoff_factor: f64,
     pub request_weighting: RequestWeightingConfig,
+    pub thinking_signature_validation_mode: ThinkingSignatureValidationMode,
     pub waiting_requests: usize,
 }
 
@@ -908,6 +909,7 @@ struct DispatchConfig {
     rate_limit_refill_recovery_step_per_success: f64,
     rate_limit_refill_backoff_factor: f64,
     request_weighting: RequestWeightingConfig,
+    thinking_signature_validation_mode: ThinkingSignatureValidationMode,
     account_type_policies: BTreeMap<String, ModelSupportPolicy>,
     account_type_dispatch_policies: BTreeMap<String, AccountTypeDispatchPolicy>,
 }
@@ -976,6 +978,7 @@ impl DispatchConfig {
                 config.rate_limit_refill_backoff_factor,
             ),
             request_weighting: config.request_weighting.clone(),
+            thinking_signature_validation_mode: config.thinking_signature_validation_mode,
             account_type_policies,
             account_type_dispatch_policies,
         }
@@ -6817,6 +6820,7 @@ impl MultiTokenManager {
                 .rate_limit_refill_recovery_step_per_success,
             rate_limit_refill_backoff_factor: dispatch.rate_limit_refill_backoff_factor,
             request_weighting: dispatch.request_weighting.clone(),
+            thinking_signature_validation_mode: dispatch.thinking_signature_validation_mode,
             waiting_requests: self.queue_depth(),
         }
     }
@@ -6843,6 +6847,10 @@ impl MultiTokenManager {
 
     pub fn request_weighting_config_snapshot(&self) -> RequestWeightingConfig {
         self.dispatch_config().request_weighting
+    }
+
+    pub fn thinking_signature_validation_mode(&self) -> ThinkingSignatureValidationMode {
+        self.dispatch_config().thinking_signature_validation_mode
     }
 
     /// 获取负载均衡模式（Admin API）
@@ -6884,6 +6892,7 @@ impl MultiTokenManager {
                     .rate_limit_refill_recovery_step_per_success,
                 rate_limit_refill_backoff_factor: dispatch.rate_limit_refill_backoff_factor,
                 request_weighting: dispatch.request_weighting.clone(),
+                thinking_signature_validation_mode: dispatch.thinking_signature_validation_mode,
                 account_type_policies: dispatch.account_type_policies.clone(),
                 account_type_dispatch_policies: dispatch.account_type_dispatch_policies.clone(),
             })?;
@@ -6895,6 +6904,7 @@ impl MultiTokenManager {
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
         self.set_load_balancing_config(
             Some(mode),
+            None,
             None,
             None,
             None,
@@ -6998,6 +7008,7 @@ impl MultiTokenManager {
         rate_limit_refill_backoff_factor: Option<f64>,
         request_weighting: Option<RequestWeightingConfig>,
         session_affinity_enabled: Option<bool>,
+        thinking_signature_validation_mode: Option<ThinkingSignatureValidationMode>,
     ) -> anyhow::Result<()> {
         let previous = self.dispatch_config();
         let mut next = previous.clone();
@@ -7097,6 +7108,9 @@ impl MultiTokenManager {
         if let Some(session_affinity_enabled) = session_affinity_enabled {
             next.session_affinity_enabled = session_affinity_enabled;
         }
+        if let Some(thinking_signature_validation_mode) = thinking_signature_validation_mode {
+            next.thinking_signature_validation_mode = thinking_signature_validation_mode;
+        }
 
         if next.suspicious_activity_auto_disable_enabled
             && next.suspicious_activity_auto_disable_threshold == 0
@@ -7162,7 +7176,7 @@ impl MultiTokenManager {
 
         self.availability_notify.notify_waiters();
         tracing::info!(
-            "调度配置已更新: mode={}, sessionAffinityEnabled={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, rateLimitCooldownEnabled={}, suspiciousActivityCooldownMs={}, suspiciousActivityCooldownEnabled={}, suspiciousActivityAutoClearEnabled={}, suspiciousActivityAutoClearSuccessThreshold={}, suspiciousActivityAutoClearAfterMs={}, modelCooldownEnabled={}, defaultMaxConcurrency={:?}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}, requestWeightingEnabled={}, requestWeightingBaseWeight={}, requestWeightingMaxWeight={}",
+            "调度配置已更新: mode={}, sessionAffinityEnabled={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, rateLimitCooldownEnabled={}, suspiciousActivityCooldownMs={}, suspiciousActivityCooldownEnabled={}, suspiciousActivityAutoClearEnabled={}, suspiciousActivityAutoClearSuccessThreshold={}, suspiciousActivityAutoClearAfterMs={}, modelCooldownEnabled={}, defaultMaxConcurrency={:?}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}, requestWeightingEnabled={}, requestWeightingBaseWeight={}, requestWeightingMaxWeight={}, thinkingSignatureValidationMode={}",
             next.mode,
             next.session_affinity_enabled,
             next.queue_max_size,
@@ -7183,7 +7197,8 @@ impl MultiTokenManager {
             next.rate_limit_refill_backoff_factor,
             next.request_weighting.enabled,
             next.request_weighting.base_weight,
-            next.request_weighting.max_weight
+            next.request_weighting.max_weight,
+            next.thinking_signature_validation_mode.as_str()
         );
         Ok(())
     }
@@ -9090,6 +9105,7 @@ mod tests {
                 tools_bonus: 1.0,
                 ..RequestWeightingConfig::default()
             },
+            thinking_signature_validation_mode: ThinkingSignatureValidationMode::WarnOnly,
             account_type_policies: BTreeMap::new(),
             account_type_dispatch_policies: BTreeMap::new(),
         };
@@ -9130,6 +9146,10 @@ mod tests {
         assert_eq!(snapshot.rate_limit_refill_backoff_factor, 0.6);
         assert_eq!(snapshot.request_weighting.max_weight, 4.0);
         assert_eq!(snapshot.request_weighting.tools_bonus, 1.0);
+        assert_eq!(
+            snapshot.thinking_signature_validation_mode,
+            ThinkingSignatureValidationMode::WarnOnly
+        );
 
         assert!(!manager.apply_dispatch_config_from_state(&persisted));
     }
@@ -9254,6 +9274,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap_err()
             .to_string();
@@ -9309,6 +9330,7 @@ mod tests {
                     ..RequestWeightingConfig::default()
                 }),
                 Some(true),
+                Some(ThinkingSignatureValidationMode::StripInvalid),
             )
             .unwrap();
 
@@ -9343,6 +9365,14 @@ mod tests {
         assert_eq!(persisted.rate_limit_refill_backoff_factor, 0.6);
         assert_eq!(persisted.request_weighting.max_weight, 4.0);
         assert_eq!(persisted.request_weighting.tools_bonus, 1.0);
+        assert_eq!(
+            persisted.thinking_signature_validation_mode,
+            ThinkingSignatureValidationMode::StripInvalid
+        );
+        assert_eq!(
+            manager.thinking_signature_validation_mode(),
+            ThinkingSignatureValidationMode::StripInvalid
+        );
         assert_eq!(manager.get_load_balancing_mode(), "balanced");
 
         std::fs::remove_file(&config_path).unwrap();
@@ -9389,6 +9419,7 @@ mod tests {
                 None,
                 None,
                 Some(false),
+                None,
                 None,
                 None,
                 None,

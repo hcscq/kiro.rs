@@ -813,6 +813,10 @@ async fn main() {
     });
 
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
+    tracing::info!(
+        thinking_signature_validation_mode = config.thinking_signature_validation_mode.as_str(),
+        "Anthropic thinking signature validation mode configured"
+    );
     let anthropic_app = anthropic::create_router_with_provider(&api_key, Some(kiro_provider));
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -947,7 +951,7 @@ fn log_runtime_coordination_status(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::config::RequestWeightingConfig;
+    use crate::model::config::{RequestWeightingConfig, ThinkingSignatureValidationMode};
 
     #[test]
     fn build_file_rollback_config_switches_to_file_backend() {
@@ -988,6 +992,7 @@ mod tests {
                 tools_bonus: 1.0,
                 ..RequestWeightingConfig::default()
             },
+            thinking_signature_validation_mode: ThinkingSignatureValidationMode::WarnOnly,
             account_type_policies: std::collections::BTreeMap::new(),
             account_type_dispatch_policies: std::collections::BTreeMap::new(),
         };
@@ -1028,5 +1033,9 @@ mod tests {
         assert_eq!(rollback.rate_limit_refill_backoff_factor, 0.4);
         assert_eq!(rollback.request_weighting.max_weight, 4.0);
         assert_eq!(rollback.request_weighting.tools_bonus, 1.0);
+        assert_eq!(
+            rollback.thinking_signature_validation_mode,
+            ThinkingSignatureValidationMode::WarnOnly
+        );
     }
 }

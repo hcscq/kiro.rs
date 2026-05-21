@@ -9,6 +9,7 @@ use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::parser::error::ParseError;
 use crate::kiro::parser::frame::Frame;
 use crate::kiro::token_manager::{RuntimeRefreshLeaderRequiredError, RuntimeRefreshLeaseBusyError};
+use crate::model::config::ThinkingSignatureValidationMode;
 use crate::model::model_catalog::built_in_model_catalog;
 use crate::token;
 use anyhow::Error;
@@ -33,8 +34,9 @@ use super::probe::{UpstreamProbe, parse_upstream_probe};
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::structured_outputs::{self, JsonSchemaOutput, StructuredOutputError};
 use super::thinking_compat::{
-    ThinkingSignatureValidationStats, extract_thinking_and_text, sign_thinking_block,
-    validate_thinking_signatures,
+    ThinkingSignatureInvalidDiagnostic, ThinkingSignatureValidationStats,
+    extract_thinking_and_text, inspect_thinking_signatures, sign_thinking_block,
+    strip_invalid_own_thinking_signatures, validate_thinking_signatures,
 };
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
@@ -288,19 +290,101 @@ async fn normalize_multimodal_payload(
     }
 }
 
-fn validate_thinking_signature_payload(
-    payload: &MessagesRequest,
+fn log_thinking_signature_invalid_diagnostic(
     request_id: &str,
+    diagnostic: &ThinkingSignatureInvalidDiagnostic,
+    validation_mode: ThinkingSignatureValidationMode,
+    validation_action: &'static str,
+    error: Option<&dyn std::fmt::Display>,
+) {
+    if let Some(err) = error {
+        tracing::warn!(
+            request_id = %request_id,
+            error = %err,
+            validation_mode = validation_mode.as_str(),
+            validation_action,
+            message_index = diagnostic.message_index,
+            thinking_ordinal = diagnostic.thinking_ordinal,
+            invalid_reason = diagnostic.reason.as_str(),
+            signed_ordinal = diagnostic.signed_ordinal,
+            raw_signature_len = diagnostic.raw_signature_len,
+            signature_sha256_prefix = %diagnostic.signature_sha256_prefix.as_str(),
+            canonical_thinking_len = diagnostic.canonical_thinking_len,
+            signed_thinking_hash_prefix = %diagnostic.signed_thinking_hash_prefix.as_str(),
+            computed_thinking_hash_prefix = %diagnostic.computed_thinking_hash_prefix.as_str(),
+            "thinking 签名校验失败"
+        );
+    } else {
+        tracing::warn!(
+            request_id = %request_id,
+            validation_mode = validation_mode.as_str(),
+            validation_action,
+            message_index = diagnostic.message_index,
+            thinking_ordinal = diagnostic.thinking_ordinal,
+            invalid_reason = diagnostic.reason.as_str(),
+            signed_ordinal = diagnostic.signed_ordinal,
+            raw_signature_len = diagnostic.raw_signature_len,
+            signature_sha256_prefix = %diagnostic.signature_sha256_prefix.as_str(),
+            canonical_thinking_len = diagnostic.canonical_thinking_len,
+            signed_thinking_hash_prefix = %diagnostic.signed_thinking_hash_prefix.as_str(),
+            computed_thinking_hash_prefix = %diagnostic.computed_thinking_hash_prefix.as_str(),
+            "thinking 签名校验失败"
+        );
+    }
+}
+
+fn validate_thinking_signature_payload(
+    payload: &mut MessagesRequest,
+    request_id: &str,
+    validation_mode: ThinkingSignatureValidationMode,
 ) -> Result<ThinkingSignatureValidationStats, Response> {
+    if validation_mode == ThinkingSignatureValidationMode::Disabled {
+        tracing::warn!(
+            request_id = %request_id,
+            validation_mode = validation_mode.as_str(),
+            "Anthropic thinking signature validation skipped by configuration"
+        );
+        return Ok(ThinkingSignatureValidationStats::default());
+    }
+
+    let mut stripped_invalid_signatures = 0usize;
+    if validation_mode == ThinkingSignatureValidationMode::StripInvalid {
+        let diagnostics = strip_invalid_own_thinking_signatures(payload);
+        stripped_invalid_signatures = diagnostics.len();
+        for diagnostic in &diagnostics {
+            log_thinking_signature_invalid_diagnostic(
+                request_id,
+                diagnostic,
+                validation_mode,
+                "strip_invalid",
+                None,
+            );
+        }
+        if stripped_invalid_signatures > 0 {
+            tracing::warn!(
+                request_id = %request_id,
+                validation_mode = validation_mode.as_str(),
+                stripped_invalid_thinking_signatures = stripped_invalid_signatures,
+                "stripped invalid thinking signatures before upstream dispatch"
+            );
+        }
+    }
+
     match validate_thinking_signatures(payload) {
-        Ok(stats) => {
+        Ok(mut stats) => {
+            stats.invalid_own_signatures = stats
+                .invalid_own_signatures
+                .saturating_add(stripped_invalid_signatures);
             if stats.valid_own_signatures > 0
+                || stats.invalid_own_signatures > 0
                 || stats.foreign_signatures > 0
                 || stats.missing_signatures > 0
             {
                 tracing::info!(
                     request_id = %request_id,
+                    validation_mode = validation_mode.as_str(),
                     valid_own_signatures = stats.valid_own_signatures,
+                    invalid_own_signatures = stats.invalid_own_signatures,
                     foreign_signatures = stats.foreign_signatures,
                     missing_signatures = stats.missing_signatures,
                     "validated historical thinking signatures"
@@ -310,22 +394,36 @@ fn validate_thinking_signature_payload(
         }
         Err(err) => {
             if let Some(diagnostic) = err.diagnostic() {
+                let validation_action =
+                    if validation_mode == ThinkingSignatureValidationMode::WarnOnly {
+                        "warn_only_continue"
+                    } else {
+                        "reject"
+                    };
+                log_thinking_signature_invalid_diagnostic(
+                    request_id,
+                    diagnostic,
+                    validation_mode,
+                    validation_action,
+                    Some(&err),
+                );
+            } else {
                 tracing::warn!(
                     request_id = %request_id,
                     error = %err,
-                    message_index = diagnostic.message_index,
-                    thinking_ordinal = diagnostic.thinking_ordinal,
-                    invalid_reason = diagnostic.reason.as_str(),
-                    signed_ordinal = diagnostic.signed_ordinal,
-                    raw_signature_len = diagnostic.raw_signature_len,
-                    signature_sha256_prefix = %diagnostic.signature_sha256_prefix.as_str(),
-                    canonical_thinking_len = diagnostic.canonical_thinking_len,
-                    signed_thinking_hash_prefix = %diagnostic.signed_thinking_hash_prefix.as_str(),
-                    computed_thinking_hash_prefix = %diagnostic.computed_thinking_hash_prefix.as_str(),
+                    validation_mode = validation_mode.as_str(),
                     "thinking 签名校验失败"
                 );
-            } else {
-                tracing::warn!(request_id = %request_id, error = %err, "thinking 签名校验失败");
+            }
+            if validation_mode == ThinkingSignatureValidationMode::WarnOnly {
+                let report = inspect_thinking_signatures(payload);
+                tracing::warn!(
+                    request_id = %request_id,
+                    validation_mode = validation_mode.as_str(),
+                    invalid_own_signatures = report.stats.invalid_own_signatures,
+                    "continuing despite invalid thinking signature"
+                );
+                return Ok(report.stats);
             }
             Err((
                 StatusCode::BAD_REQUEST,
@@ -413,6 +511,7 @@ impl PreUpstreamTrace {
                 signature_validation_ms,
                 elapsed_since_validation_ms,
                 valid_own_signatures = stats.valid_own_signatures,
+                invalid_own_signatures = stats.invalid_own_signatures,
                 foreign_signatures = stats.foreign_signatures,
                 missing_signatures = stats.missing_signatures,
                 "Anthropic thinking signature validation completed slowly"
@@ -429,6 +528,7 @@ impl PreUpstreamTrace {
                 signature_validation_ms,
                 elapsed_since_validation_ms,
                 valid_own_signatures = stats.valid_own_signatures,
+                invalid_own_signatures = stats.invalid_own_signatures,
                 foreign_signatures = stats.foreign_signatures,
                 missing_signatures = stats.missing_signatures,
                 "Anthropic thinking signature validation completed"
@@ -639,14 +739,20 @@ pub async fn post_messages(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
+    let thinking_signature_validation_mode = provider.thinking_signature_validation_mode();
     let signature_validation_started_at = Instant::now();
-    let signature_stats = match validate_thinking_signature_payload(&payload, &request_id) {
+    let signature_stats = match validate_thinking_signature_payload(
+        &mut payload,
+        &request_id,
+        thinking_signature_validation_mode,
+    ) {
         Ok(stats) => stats,
         Err(response) => {
             tracing::warn!(
                 request_id = %request_id,
                 route = "messages",
                 model = %payload.model,
+                validation_mode = thinking_signature_validation_mode.as_str(),
                 stream = payload.stream,
                 body_bytes,
                 content_length_header = ?content_length_header,
@@ -1996,14 +2102,20 @@ pub async fn post_messages_cc(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
+    let thinking_signature_validation_mode = provider.thinking_signature_validation_mode();
     let signature_validation_started_at = Instant::now();
-    let signature_stats = match validate_thinking_signature_payload(&payload, &request_id) {
+    let signature_stats = match validate_thinking_signature_payload(
+        &mut payload,
+        &request_id,
+        thinking_signature_validation_mode,
+    ) {
         Ok(stats) => stats,
         Err(response) => {
             tracing::warn!(
                 request_id = %request_id,
                 route = "cc_messages",
                 model = %payload.model,
+                validation_mode = thinking_signature_validation_mode.as_str(),
                 stream = payload.stream,
                 body_bytes,
                 content_length_header = ?content_length_header,
@@ -2475,13 +2587,16 @@ mod tests {
         ANTHROPIC_RUNTIME_LEADER_REQUIRED_HEADER, NonStreamMessageResponse,
         coerce_structured_response, decode_non_stream_message, is_opus_4_7_model,
         map_provider_error, override_thinking_from_model_name, request_thinking_enabled,
+        validate_thinking_signature_payload,
     };
     use crate::anthropic::structured_outputs::JsonSchemaOutput;
+    use crate::anthropic::thinking_compat::sign_thinking_block;
     use crate::anthropic::types::{Message, MessagesRequest, Thinking};
     use crate::kiro::parser::crc::crc32;
     use crate::kiro::parser::frame::PRELUDE_SIZE;
     use crate::kiro::provider::PublicProviderError;
     use crate::kiro::token_manager::RuntimeRefreshLeaderRequiredError;
+    use crate::model::config::ThinkingSignatureValidationMode;
     use axum::{body::to_bytes, http::StatusCode};
     use std::collections::HashMap;
 
@@ -2492,6 +2607,27 @@ mod tests {
             messages: vec![Message {
                 role: "user".to_string(),
                 content: serde_json::Value::String("hi".to_string()),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        }
+    }
+
+    fn request_with_assistant_thinking(thinking: &str, signature: String) -> MessagesRequest {
+        MessagesRequest {
+            model: "claude-sonnet-4-6-thinking".to_string(),
+            max_tokens: 1024,
+            messages: vec![Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {"type":"thinking","thinking": thinking,"signature": signature},
+                    {"type":"text","text":"done"}
+                ]),
             }],
             stream: false,
             system: None,
@@ -2530,6 +2666,73 @@ mod tests {
         let message_crc = crc32(&frame);
         frame.extend_from_slice(&message_crc.to_be_bytes());
         frame
+    }
+
+    #[test]
+    fn test_thinking_signature_validation_strict_rejects_invalid_own_signature() {
+        let signature = sign_thinking_block(0, "step 1");
+        let mut payload = request_with_assistant_thinking("changed", signature);
+
+        let response = validate_thinking_signature_payload(
+            &mut payload,
+            "req-strict",
+            ThinkingSignatureValidationMode::Strict,
+        )
+        .expect_err("strict mode should reject invalid own signatures");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_thinking_signature_validation_warn_only_continues_without_mutating_payload() {
+        let signature = sign_thinking_block(0, "step 1");
+        let mut payload = request_with_assistant_thinking("changed", signature);
+
+        let stats = validate_thinking_signature_payload(
+            &mut payload,
+            "req-warn",
+            ThinkingSignatureValidationMode::WarnOnly,
+        )
+        .expect("warn_only mode should continue");
+
+        assert_eq!(stats.invalid_own_signatures, 1);
+        let blocks = payload.messages[0].content.as_array().unwrap();
+        assert!(blocks[0].get("signature").is_some());
+    }
+
+    #[test]
+    fn test_thinking_signature_validation_disabled_skips_invalid_own_signature() {
+        let signature = sign_thinking_block(0, "step 1");
+        let mut payload = request_with_assistant_thinking("changed", signature);
+
+        let stats = validate_thinking_signature_payload(
+            &mut payload,
+            "req-disabled",
+            ThinkingSignatureValidationMode::Disabled,
+        )
+        .expect("disabled mode should skip validation");
+
+        assert_eq!(stats.invalid_own_signatures, 0);
+        let blocks = payload.messages[0].content.as_array().unwrap();
+        assert!(blocks[0].get("signature").is_some());
+    }
+
+    #[test]
+    fn test_thinking_signature_validation_strip_invalid_removes_signature_and_continues() {
+        let signature = sign_thinking_block(0, "step 1");
+        let mut payload = request_with_assistant_thinking("changed", signature);
+
+        let stats = validate_thinking_signature_payload(
+            &mut payload,
+            "req-strip",
+            ThinkingSignatureValidationMode::StripInvalid,
+        )
+        .expect("strip_invalid mode should remove invalid own signatures");
+
+        assert_eq!(stats.invalid_own_signatures, 1);
+        assert_eq!(stats.missing_signatures, 1);
+        let blocks = payload.messages[0].content.as_array().unwrap();
+        assert!(blocks[0].get("signature").is_none());
     }
 
     #[test]

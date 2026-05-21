@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::admin::types::BalanceResponse;
 use crate::kiro::model::credentials::{CredentialsConfig, KiroCredentials};
-use crate::model::config::{Config, RequestWeightingConfig, StateBackendKind};
+use crate::model::config::{
+    Config, RequestWeightingConfig, StateBackendKind, ThinkingSignatureValidationMode,
+};
 use crate::model::model_policy::{
     AccountTypeDispatchPolicy, ModelSupportPolicy, normalize_account_type_dispatch_policies,
     normalize_account_type_policies,
@@ -843,6 +845,8 @@ pub struct PersistedDispatchConfig {
     pub rate_limit_refill_backoff_factor: f64,
     #[serde(default)]
     pub request_weighting: RequestWeightingConfig,
+    #[serde(default)]
+    pub thinking_signature_validation_mode: ThinkingSignatureValidationMode,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub account_type_policies: BTreeMap<String, ModelSupportPolicy>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -943,6 +947,7 @@ impl PersistedDispatchConfig {
                 .rate_limit_refill_recovery_step_per_success,
             rate_limit_refill_backoff_factor: config.rate_limit_refill_backoff_factor,
             request_weighting: config.request_weighting.clone(),
+            thinking_signature_validation_mode: config.thinking_signature_validation_mode,
             account_type_policies,
             account_type_dispatch_policies,
         }
@@ -979,6 +984,7 @@ impl PersistedDispatchConfig {
             self.rate_limit_refill_recovery_step_per_success;
         config.rate_limit_refill_backoff_factor = self.rate_limit_refill_backoff_factor;
         config.request_weighting = self.request_weighting.clone();
+        config.thinking_signature_validation_mode = self.thinking_signature_validation_mode;
         config.account_type_policies = self.account_type_policies.clone();
         config.account_type_dispatch_policies = self.account_type_dispatch_policies.clone();
     }
@@ -3527,6 +3533,7 @@ mod tests {
                 tools_bonus: 1.0,
                 ..RequestWeightingConfig::default()
             },
+            thinking_signature_validation_mode: ThinkingSignatureValidationMode::StripInvalid,
             account_type_policies: BTreeMap::new(),
             account_type_dispatch_policies: BTreeMap::new(),
         };
@@ -3578,6 +3585,10 @@ mod tests {
         );
         assert!(dispatch.model_cooldown_enabled);
         assert!(dispatch.request_weighting.enabled);
+        assert_eq!(
+            dispatch.thinking_signature_validation_mode,
+            ThinkingSignatureValidationMode::Strict
+        );
     }
 
     #[test]

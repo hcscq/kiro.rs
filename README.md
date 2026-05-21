@@ -233,6 +233,7 @@ GitHub Actions 镜像构建：
 | `rateLimitRefillRecoveryStepPerSuccess` | number | `0.25` | 每次成功请求后恢复的回填速率增量（token/s） |
 | `rateLimitRefillBackoffFactor` | number | `0.75` | 遭遇 `429` 时当前回填速率的衰减系数，范围 `[0.05, 1]` |
 | `requestWeighting` | object | 默认开启 | 轻/重请求加权配置。默认值已按单号/少号场景收敛：重请求会多消耗 bucket，但不会像旧参数那样过快把桶打空 |
+| `thinkingSignatureValidationMode` | string | `strict` | 历史 thinking signature 校验模式：`strict` 拒绝无效自签名，`warn_only` 只告警放行，`disabled` 跳过校验，`strip_invalid` 移除无效自签名后放行；也可在 Admin UI 的“调度与并发配置”页面热更新 |
 
 完整配置示例：
 
@@ -305,7 +306,8 @@ GitHub Actions 镜像构建：
       "thinkingBonus": 0.35,
       "heavyThinkingBudgetThreshold": 24000,
       "heavyThinkingBudgetBonus": 0.35
-   }
+   },
+   "thinkingSignatureValidationMode": "strict"
 }
 ```
 
@@ -324,7 +326,7 @@ GitHub Actions 镜像构建：
 当 `stateBackend` 设为 `postgres` 时，`kiro-rs` 会将以下持久化状态写入 PostgreSQL：
 
 - 凭据列表
-- Admin API 修改后的调度配置
+- Admin API 修改后的调度配置（包括 `thinkingSignatureValidationMode`）
 - 统计缓存
 
 当同时配置 `stateRedisUrl` 时，以下短生命周期状态会优先写入 Redis：
@@ -664,13 +666,14 @@ RUST_LOG=debug ./target/release/kiro-rs
   - `POST /api/admin/credentials/:id/reset` - 重置失败计数
   - `POST /api/admin/credentials/:id/model-policy` - 设置凭据级模型策略
   - `GET /api/admin/credentials/:id/balance` - 获取凭据余额
-  - `GET /api/admin/config/load-balancing` - 获取当前负载均衡、默认并发和限流配置
-  - `PUT /api/admin/config/load-balancing` - 更新负载均衡、默认并发和限流配置
+  - `GET /api/admin/config/load-balancing` - 获取当前负载均衡、默认并发、限流和 thinking 签名校验配置
+  - `PUT /api/admin/config/load-balancing` - 更新负载均衡、默认并发、限流和 thinking 签名校验配置
   - `GET /api/admin/config/model-capabilities` - 获取账号类型模型/调度策略
   - `PUT /api/admin/config/model-capabilities` - 更新账号类型模型/调度策略
 
 - **Admin UI**
   - `GET /admin` - 访问管理页面（需要在编译前构建 `admin-ui/dist`）
+  - “调度与并发配置”页面支持修改 `thinkingSignatureValidationMode`
 
 ## 注意事项
 

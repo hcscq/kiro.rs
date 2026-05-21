@@ -49,6 +49,7 @@
     "heavyThinkingBudgetThreshold": 24000,
     "heavyThinkingBudgetBonus": 0.35
   },
+  "thinkingSignatureValidationMode": "strict",
   "accountTypePolicies": {
     "power": {
       "allowedModels": [

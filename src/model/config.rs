@@ -164,6 +164,34 @@ impl Default for StateBackendKind {
     }
 }
 
+/// 历史 thinking signature 的本地校验策略。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingSignatureValidationMode {
+    /// 校验失败时拒绝请求。
+    #[default]
+    Strict,
+    /// 校验失败只记录告警，继续转发请求。
+    #[serde(alias = "warn-only", alias = "warnOnly")]
+    WarnOnly,
+    /// 完全跳过历史 thinking signature 校验。
+    Disabled,
+    /// 移除本服务签发但校验失败的 signature 后继续转发。
+    #[serde(alias = "strip-invalid", alias = "stripInvalid")]
+    StripInvalid,
+}
+
+impl ThinkingSignatureValidationMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::WarnOnly => "warn_only",
+            Self::Disabled => "disabled",
+            Self::StripInvalid => "strip_invalid",
+        }
+    }
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -368,6 +396,11 @@ pub struct Config {
     /// 轻/重请求的本地令牌消耗权重规则
     #[serde(default)]
     pub request_weighting: RequestWeightingConfig,
+
+    /// 历史 thinking signature 校验模式。
+    /// 支持 strict、warn_only、disabled、strip_invalid；默认 strict。
+    #[serde(default, alias = "thinking_signature_validation_mode")]
+    pub thinking_signature_validation_mode: ThinkingSignatureValidationMode,
 
     /// 账号类型默认模型策略
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -616,6 +649,7 @@ impl Default for Config {
                 default_rate_limit_refill_recovery_step_per_success(),
             rate_limit_refill_backoff_factor: default_rate_limit_refill_backoff_factor(),
             request_weighting: RequestWeightingConfig::default(),
+            thinking_signature_validation_mode: ThinkingSignatureValidationMode::default(),
             account_type_policies: BTreeMap::new(),
             account_type_dispatch_policies: BTreeMap::new(),
             config_path: None,
@@ -812,7 +846,7 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, RequestWeightingConfig};
+    use super::{Config, RequestWeightingConfig, ThinkingSignatureValidationMode};
 
     #[test]
     fn validate_rejects_invalid_redis_runtime_coordination_timing() {
@@ -891,6 +925,10 @@ mod tests {
     fn request_weighting_defaults_to_enabled_and_tuned_for_weighted_bucket() {
         let config = Config::default();
 
+        assert_eq!(
+            config.thinking_signature_validation_mode,
+            ThinkingSignatureValidationMode::Strict
+        );
         assert!(!config.rate_limit_cooldown_enabled);
         assert!(config.suspicious_activity_cooldown_enabled);
         assert_eq!(config.suspicious_activity_cooldown_ms, 7_200_000);
@@ -913,5 +951,23 @@ mod tests {
         assert!((config.rate_limit_refill_backoff_factor - 0.75).abs() < f64::EPSILON);
         assert!((config.request_weighting.max_weight - 2.5).abs() < f64::EPSILON);
         assert!((config.request_weighting.tools_bonus - 0.4).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn thinking_signature_validation_mode_deserializes_supported_values_and_alias() {
+        let camel: Config =
+            serde_json::from_str(r#"{"thinkingSignatureValidationMode":"warn_only"}"#).unwrap();
+        let snake: Config =
+            serde_json::from_str(r#"{"thinking_signature_validation_mode":"strip-invalid"}"#)
+                .unwrap();
+
+        assert_eq!(
+            camel.thinking_signature_validation_mode,
+            ThinkingSignatureValidationMode::WarnOnly
+        );
+        assert_eq!(
+            snake.thinking_signature_validation_mode,
+            ThinkingSignatureValidationMode::StripInvalid
+        );
     }
 }

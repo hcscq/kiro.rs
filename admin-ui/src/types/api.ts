@@ -196,6 +196,8 @@ export interface RequestWeightingConfig {
   heavyThinkingBudgetBonus: number
 }
 
+export type ThinkingSignatureValidationMode = 'strict' | 'warn_only' | 'disabled' | 'strip_invalid'
+
 export interface LoadBalancingConfigResponse {
   mode: 'priority' | 'balanced'
   sessionAffinityEnabled: boolean
@@ -220,6 +222,7 @@ export interface LoadBalancingConfigResponse {
   rateLimitRefillRecoveryStepPerSuccess: number
   rateLimitRefillBackoffFactor: number
   requestWeighting: RequestWeightingConfig
+  thinkingSignatureValidationMode: ThinkingSignatureValidationMode
   waitingRequests: number
 }
 
@@ -247,6 +250,7 @@ export interface UpdateLoadBalancingConfigRequest {
   rateLimitRefillRecoveryStepPerSuccess?: number
   rateLimitRefillBackoffFactor?: number
   requestWeighting?: RequestWeightingConfig
+  thinkingSignatureValidationMode?: ThinkingSignatureValidationMode
 }
 
 export interface ModelCapabilitiesConfigResponse {

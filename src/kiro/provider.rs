@@ -26,7 +26,9 @@ use crate::kiro::token_manager::{
     CallLease, DisabledReason, MultiTokenManager, RuntimeRefreshLeaderRequiredError,
     RuntimeRefreshLeaseBusyError,
 };
-use crate::model::config::{Config, RequestWeightingConfig, TlsBackend};
+use crate::model::config::{
+    Config, RequestWeightingConfig, ThinkingSignatureValidationMode, TlsBackend,
+};
 use parking_lot::Mutex;
 
 /// 每个凭据的最大重试次数
@@ -760,6 +762,10 @@ impl KiroProvider {
 
     pub fn request_weighting_config(&self) -> RequestWeightingConfig {
         self.token_manager.request_weighting_config_snapshot()
+    }
+
+    pub fn thinking_signature_validation_mode(&self) -> ThinkingSignatureValidationMode {
+        self.token_manager.thinking_signature_validation_mode()
     }
 
     pub fn supports_model(&self, model: &str) -> bool {
