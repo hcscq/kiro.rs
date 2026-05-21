@@ -1,16 +1,22 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from '@/components/ui/tooltip'
 import { toast } from 'sonner'
 import {
   useLoadBalancingMode,
   useSetLoadBalancingMode,
 } from '@/hooks/use-credentials'
 import { extractErrorMessage } from '@/lib/utils'
-import { Save, AlertCircle } from 'lucide-react'
+import { Save, AlertCircle, Info } from 'lucide-react'
 import type { RequestWeightingConfig, ThinkingSignatureValidationMode } from '@/types/api'
 
 type RequestWeightingNumericField = Exclude<keyof RequestWeightingConfig, 'enabled'>
@@ -203,6 +209,71 @@ function createRequestWeightingInputs(config: RequestWeightingConfig): RequestWe
     heavyThinkingBudgetThreshold: String(config.heavyThinkingBudgetThreshold),
     heavyThinkingBudgetBonus: String(config.heavyThinkingBudgetBonus),
   }
+}
+
+function SettingInfoTooltip({
+  label,
+  children,
+}: {
+  label: string
+  children: ReactNode
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+          aria-label={`${label}说明`}
+        >
+          <Info className="h-4 w-4" />
+        </button>
+      </TooltipTrigger>
+      <TooltipContent side="top" align="start">
+        <div className="space-y-1 leading-relaxed">{children}</div>
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
+function SwitchSettingCard({
+  title,
+  description,
+  checked,
+  onCheckedChange,
+  ariaLabel,
+  disabledLabel = '已关闭',
+  warning,
+}: {
+  title: string
+  description: ReactNode
+  checked: boolean
+  onCheckedChange: (checked: boolean) => void
+  ariaLabel: string
+  disabledLabel?: string
+  warning?: string
+}) {
+  return (
+    <div className="flex flex-col gap-3 rounded-lg border bg-background/70 p-4">
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex min-w-0 items-center gap-2">
+          <div className="text-sm font-medium">{title}</div>
+          <SettingInfoTooltip label={title}>{description}</SettingInfoTooltip>
+        </div>
+        <div className="flex shrink-0 items-center gap-3">
+          <Badge variant={checked ? 'secondary' : 'outline'}>
+            {checked ? '已启用' : disabledLabel}
+          </Badge>
+          <Switch
+            checked={checked}
+            onCheckedChange={onCheckedChange}
+            aria-label={ariaLabel}
+          />
+        </div>
+      </div>
+      {warning && <p className="text-xs text-muted-foreground">{warning}</p>}
+    </div>
+  )
 }
 
 export function SettingsPage() {
@@ -450,7 +521,8 @@ export function SettingsPage() {
   }
 
   return (
-    <div className="space-y-6">
+    <TooltipProvider delayDuration={250}>
+      <div className="space-y-6">
       <div className="flex flex-col gap-2">
         <h2 className="text-2xl font-semibold tracking-tight">调度与并发配置</h2>
         <p className="text-muted-foreground">管理此节点的全局令牌桶限制以及服务并发上限设置</p>
@@ -520,164 +592,77 @@ export function SettingsPage() {
             <h3 className="text-sm font-semibold flex items-center text-primary">限流与恢复策略</h3>
             <div className="space-y-4 bg-muted/30 p-4 rounded-lg">
               <div className="grid gap-4 lg:grid-cols-2 2xl:grid-cols-3">
-                <div className="flex flex-col gap-3 rounded-lg border bg-background/70 p-4">
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="space-y-1">
-                      <div className="text-sm font-medium">429 冷却与退避</div>
-                      <p className="text-sm text-muted-foreground">
-                        控制上游 429 后是否写入账号级冷却，并同步下调 token bucket 的当前回填速率。
-                      </p>
-                    </div>
-                    <div className="flex items-center gap-3">
-                      <Badge variant={rateLimitCooldownEnabled ? 'secondary' : 'outline'}>
-                        {rateLimitCooldownEnabled ? '已启用' : '已关闭'}
-                      </Badge>
-                      <Switch
-                        checked={rateLimitCooldownEnabled}
-                        onCheckedChange={setRateLimitCooldownEnabled}
-                        aria-label="切换 429 冷却与退避"
-                      />
-                    </div>
-                  </div>
-                  <p className="text-xs text-muted-foreground">
-                    默认关闭。关闭后遇到 429 只保留请求级重试，不再写入本地冷却，也不会继续压低 bucket 回填速率。
-                  </p>
-                </div>
+                <SwitchSettingCard
+                  title="429 冷却与退避"
+                  checked={rateLimitCooldownEnabled}
+                  onCheckedChange={setRateLimitCooldownEnabled}
+                  ariaLabel="切换 429 冷却与退避"
+                  description={
+                    <>
+                      <p>控制上游 429 后是否写入账号级冷却，并同步下调 token bucket 的当前回填速率。</p>
+                      <p>默认关闭。关闭后遇到 429 只保留请求级重试。</p>
+                    </>
+                  }
+                />
 
-                <div className="flex flex-col gap-3 rounded-lg border bg-background/70 p-4">
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="space-y-1">
-                      <div className="text-sm font-medium">Suspicious activity 长冷却</div>
-                      <p className="text-sm text-muted-foreground">
-                        命中 Kiro 风控临时限制后，对该凭据写入独立的账号级长冷却。
-                      </p>
-                    </div>
-                    <div className="flex items-center gap-3">
-                      <Badge variant={suspiciousActivityCooldownEnabled ? 'secondary' : 'outline'}>
-                        {suspiciousActivityCooldownEnabled ? '已启用' : '已关闭'}
-                      </Badge>
-                      <Switch
-                        checked={suspiciousActivityCooldownEnabled}
-                        onCheckedChange={setSuspiciousActivityCooldownEnabled}
-                        aria-label="切换 suspicious activity 长冷却"
-                      />
-                    </div>
-                  </div>
-                  <p className="text-xs text-muted-foreground">
-                    默认启用，且独立于普通 429 冷却开关；设为 0 时只做 bucket 退避，不写入固定冷却。
-                  </p>
-                </div>
+                <SwitchSettingCard
+                  title="Suspicious activity 长冷却"
+                  checked={suspiciousActivityCooldownEnabled}
+                  onCheckedChange={setSuspiciousActivityCooldownEnabled}
+                  ariaLabel="切换 suspicious activity 长冷却"
+                  description={
+                    <>
+                      <p>命中 Kiro 风控临时限制后，对该凭据写入独立的账号级长冷却。</p>
+                      <p>默认启用，且独立于普通 429 冷却开关；冷却时间设为 0 时只做 bucket 退避。</p>
+                    </>
+                  }
+                />
 
-                <div className="flex flex-col gap-3 rounded-lg border bg-background/70 p-4">
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="space-y-1">
-                      <div className="text-sm font-medium">优先干净账号</div>
-                      <p className="text-sm text-muted-foreground">
-                        调度时优先选择从未命中过 suspicious activity 的凭据；历史命中过的账号仅作为兜底候选。
-                      </p>
-                    </div>
-                    <div className="flex items-center gap-3">
-                      <Badge variant={suspiciousActivityPreferCleanCredentials ? 'secondary' : 'outline'}>
-                        {suspiciousActivityPreferCleanCredentials ? '已启用' : '已关闭'}
-                      </Badge>
-                      <Switch
-                        checked={suspiciousActivityPreferCleanCredentials}
-                        onCheckedChange={setSuspiciousActivityPreferCleanCredentials}
-                        aria-label="切换优先干净账号"
-                      />
-                    </div>
-                  </div>
-                </div>
+                <SwitchSettingCard
+                  title="优先干净账号"
+                  checked={suspiciousActivityPreferCleanCredentials}
+                  onCheckedChange={setSuspiciousActivityPreferCleanCredentials}
+                  ariaLabel="切换优先干净账号"
+                  description="调度时优先选择从未命中过 suspicious activity 的凭据；历史命中过的账号仅作为兜底候选。"
+                />
 
-                <div className="flex flex-col gap-3 rounded-lg border bg-background/70 p-4">
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="space-y-1">
-                      <div className="text-sm font-medium">Suspicious activity 自动停调</div>
-                      <p className="text-sm text-muted-foreground">
-                        同一账号在统计窗口内多次命中 suspicious activity 后自动禁用，避免继续探测上游风控。
-                      </p>
-                    </div>
-                    <div className="flex items-center gap-3">
-                      <Badge variant={suspiciousActivityAutoDisableEnabled ? 'secondary' : 'outline'}>
-                        {suspiciousActivityAutoDisableEnabled ? '已启用' : '已关闭'}
-                      </Badge>
-                      <Switch
-                        checked={suspiciousActivityAutoDisableEnabled}
-                        onCheckedChange={setSuspiciousActivityAutoDisableEnabled}
-                        aria-label="切换 suspicious activity 自动停调"
-                      />
-                    </div>
-                  </div>
-                </div>
+                <SwitchSettingCard
+                  title="Suspicious activity 自动停调"
+                  checked={suspiciousActivityAutoDisableEnabled}
+                  onCheckedChange={setSuspiciousActivityAutoDisableEnabled}
+                  ariaLabel="切换 suspicious activity 自动停调"
+                  description="同一账号在统计窗口内多次命中 suspicious activity 后自动禁用，避免继续探测上游风控。"
+                />
 
-                <div className="flex flex-col gap-3 rounded-lg border bg-background/70 p-4">
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="space-y-1">
-                      <div className="text-sm font-medium">Suspicious activity 自动恢复</div>
-                      <p className="text-sm text-muted-foreground">
-                        隔离结束后，账号连续成功或长期未再命中 suspicious activity 时自动清除历史标记。
-                      </p>
-                    </div>
-                    <div className="flex items-center gap-3">
-                      <Badge variant={suspiciousActivityAutoClearEnabled ? 'secondary' : 'outline'}>
-                        {suspiciousActivityAutoClearEnabled ? '已启用' : '已关闭'}
-                      </Badge>
-                      <Switch
-                        checked={suspiciousActivityAutoClearEnabled}
-                        onCheckedChange={setSuspiciousActivityAutoClearEnabled}
-                        aria-label="切换 suspicious activity 自动恢复"
-                      />
-                    </div>
-                  </div>
-                </div>
+                <SwitchSettingCard
+                  title="Suspicious activity 自动恢复"
+                  checked={suspiciousActivityAutoClearEnabled}
+                  onCheckedChange={setSuspiciousActivityAutoClearEnabled}
+                  ariaLabel="切换 suspicious activity 自动恢复"
+                  description="隔离结束后，账号连续成功或长期未再命中 suspicious activity 时自动清除历史标记。"
+                />
 
-                <div className="flex flex-col gap-3 rounded-lg border bg-background/70 p-4">
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="space-y-1">
-                      <div className="text-sm font-medium">模型冷却</div>
-                      <p className="text-sm text-muted-foreground">
-                        遇到上游 `INVALID_MODEL_ID` 时，是否把该模型族加入账号级运行时临时限制。
-                      </p>
-                    </div>
-                    <div className="flex items-center gap-3">
-                      <Badge variant={modelCooldownEnabled ? 'secondary' : 'outline'}>
-                        {modelCooldownEnabled ? '已启用' : '已关闭'}
-                      </Badge>
-                      <Switch
-                        checked={modelCooldownEnabled}
-                        onCheckedChange={setModelCooldownEnabled}
-                        aria-label="切换模型冷却"
-                      />
-                    </div>
-                  </div>
-                  <p className="text-xs text-muted-foreground">
-                    默认开启。关闭后不再新增模型临时限制，已有运行时模型限制也会被清空。
-                  </p>
-                </div>
+                <SwitchSettingCard
+                  title="模型冷却"
+                  checked={modelCooldownEnabled}
+                  onCheckedChange={setModelCooldownEnabled}
+                  ariaLabel="切换模型冷却"
+                  description="遇到上游 `INVALID_MODEL_ID` 时，是否把该模型族加入账号级运行时临时限制。默认开启。"
+                  warning="关闭后会清空已有运行时模型限制。"
+                />
 
-                <div className="flex flex-col gap-3 rounded-lg border bg-background/70 p-4">
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="space-y-1">
-                      <div className="text-sm font-medium">会话凭据亲和</div>
-                      <p className="text-sm text-muted-foreground">
-                        同一 Claude 会话优先复用上次成功的 Kiro 凭据；凭据不可调度时自动回退现有策略。
-                      </p>
-                    </div>
-                    <div className="flex items-center gap-3">
-                      <Badge variant={sessionAffinityEnabled ? 'secondary' : 'outline'}>
-                        {sessionAffinityEnabled ? '已启用' : '已关闭'}
-                      </Badge>
-                      <Switch
-                        checked={sessionAffinityEnabled}
-                        onCheckedChange={setSessionAffinityEnabled}
-                        aria-label="切换会话凭据亲和"
-                      />
-                    </div>
-                  </div>
-                  <p className="text-xs text-muted-foreground">
-                    默认关闭。启用后按模型和会话维度缓存 1 小时，优先使用 Redis 共享缓存，多副本未配置 Redis 时退回本地缓存。
-                  </p>
-                </div>
+                <SwitchSettingCard
+                  title="会话凭据亲和"
+                  checked={sessionAffinityEnabled}
+                  onCheckedChange={setSessionAffinityEnabled}
+                  ariaLabel="切换会话凭据亲和"
+                  description={
+                    <>
+                      <p>同一 Claude 会话优先复用上次成功的 Kiro 凭据；凭据不可调度时自动回退现有策略。</p>
+                      <p>默认关闭。启用后按模型和会话维度缓存 1 小时，多副本优先使用 Redis 共享缓存。</p>
+                    </>
+                  }
+                />
               </div>
 
               <div className="space-y-3 rounded-lg border bg-background/50 p-4">
@@ -878,25 +863,14 @@ export function SettingsPage() {
           <div className="space-y-4">
             <h3 className="text-sm font-semibold flex items-center text-primary">轻 / 重请求加权</h3>
             <div className="space-y-4 rounded-lg bg-muted/30 p-4">
-              <div className="flex flex-col gap-4 rounded-lg border bg-background/70 p-4 md:flex-row md:items-center md:justify-between">
-                <div className="space-y-1">
-                  <div className="text-sm font-medium">按请求复杂度动态消耗 bucket</div>
-                  <p className="text-sm text-muted-foreground">
-                    适配“轻请求 / 重代码请求”混跑。启用后，`tools`、`thinking`、大输入和高 `maxTokens`
-                    请求会消耗更多本地 bucket 配额。
-                  </p>
-                </div>
-                <div className="flex items-center gap-3">
-                  <Badge variant={requestWeightingEnabled ? 'secondary' : 'outline'}>
-                    {requestWeightingEnabled ? '已启用' : '已禁用'}
-                  </Badge>
-                  <Switch
-                    checked={requestWeightingEnabled}
-                    onCheckedChange={setRequestWeightingEnabled}
-                    aria-label="切换轻重请求加权"
-                  />
-                </div>
-              </div>
+              <SwitchSettingCard
+                title="按请求复杂度动态消耗 bucket"
+                checked={requestWeightingEnabled}
+                onCheckedChange={setRequestWeightingEnabled}
+                ariaLabel="切换轻重请求加权"
+                disabledLabel="已禁用"
+                description="适配轻请求和重代码请求混跑。启用后，tools、thinking、大输入和高 maxTokens 请求会消耗更多本地 bucket 配额。"
+              />
 
               {REQUEST_WEIGHTING_FIELD_SECTIONS.map((section) => (
                 <div key={section.title} className="space-y-3 rounded-lg border bg-background/50 p-4">
@@ -985,6 +959,7 @@ export function SettingsPage() {
           </Button>
         </div>
       </Card>
-    </div>
+      </div>
+    </TooltipProvider>
   )
 }
