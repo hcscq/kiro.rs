@@ -175,14 +175,13 @@ pub(crate) fn map_provider_error(err: Error) -> Response {
         } else {
             tracing::error!(error = %err_summary, "Kiro API 调用失败（公开错误映射）");
         }
-        return (
-            status,
-            Json(ErrorResponse::new(
-                public_err.error_type(),
-                public_err.public_message(),
-            )),
-        )
-            .into_response();
+        let error_response = match public_err.error_code() {
+            Some(code) => {
+                ErrorResponse::with_code(public_err.error_type(), code, public_err.public_message())
+            }
+            None => ErrorResponse::new(public_err.error_type(), public_err.public_message()),
+        };
+        return (status, Json(error_response)).into_response();
     }
 
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
@@ -190,10 +189,7 @@ pub(crate) fn map_provider_error(err: Error) -> Response {
         tracing::warn!(error = %err_summary, "上游拒绝请求：上下文窗口已满（不应重试）");
         return (
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Context window is full. Reduce conversation history, system prompt, or tools.",
-            )),
+            Json(ErrorResponse::context_length_exceeded()),
         )
             .into_response();
     }
@@ -2840,6 +2836,30 @@ mod tests {
         assert_eq!(
             json["error"]["message"],
             "Upstream rejected the request as malformed. Review message ordering, tool payloads, and oversized inputs."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_map_provider_error_marks_context_length_exceeded_for_claude_code() {
+        let response = map_provider_error(anyhow::Error::new(
+            PublicProviderError::context_length_exceeded(
+                400,
+                "非流式 API 请求失败: status=400 reason=CONTENT_LENGTH_EXCEEDS_THRESHOLD",
+            ),
+        ));
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["type"], "error");
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+        assert_eq!(json["error"]["code"], "context_length_exceeded");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("prompt is too long")
         );
     }
 

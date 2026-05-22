@@ -60,6 +60,8 @@ const SLOW_FIRST_CHUNK_MS: u128 = 3_000;
 const SLOW_HEADERS_TO_FIRST_CHUNK_MS: u128 = 1_000;
 const ERROR_BODY_EXCERPT_CHARS: usize = 240;
 const LARGE_PROVIDER_REQUEST_WARN_THRESHOLD_BYTES: usize = 16 * 1024 * 1024;
+const CONTEXT_LENGTH_EXCEEDED_CODE: &str = "context_length_exceeded";
+const CONTEXT_LENGTH_EXCEEDED_PUBLIC_MESSAGE: &str = "prompt is too long: context window is full. Reduce conversation history, system prompt, or tools.";
 
 /// Kiro API Provider
 ///
@@ -128,6 +130,7 @@ impl RequestOptions {
 pub struct PublicProviderError {
     status_code: u16,
     error_type: &'static str,
+    error_code: Option<&'static str>,
     public_message: String,
     log_message: String,
 }
@@ -140,7 +143,18 @@ impl PublicProviderError {
         Self {
             status_code: 400,
             error_type: "invalid_request_error",
+            error_code: None,
             public_message: public_message.into(),
+            log_message: log_message.into(),
+        }
+    }
+
+    pub fn context_length_exceeded(status_code: u16, log_message: impl Into<String>) -> Self {
+        Self {
+            status_code,
+            error_type: "invalid_request_error",
+            error_code: Some(CONTEXT_LENGTH_EXCEEDED_CODE),
+            public_message: CONTEXT_LENGTH_EXCEEDED_PUBLIC_MESSAGE.to_string(),
             log_message: log_message.into(),
         }
     }
@@ -152,6 +166,7 @@ impl PublicProviderError {
         Self {
             status_code: 413,
             error_type: "invalid_request_error",
+            error_code: None,
             public_message: public_message.into(),
             log_message: log_message.into(),
         }
@@ -164,6 +179,7 @@ impl PublicProviderError {
         Self {
             status_code: 422,
             error_type: "invalid_request_error",
+            error_code: None,
             public_message: public_message.into(),
             log_message: log_message.into(),
         }
@@ -176,6 +192,7 @@ impl PublicProviderError {
         Self {
             status_code: 504,
             error_type: "api_error",
+            error_code: None,
             public_message: public_message.into(),
             log_message: log_message.into(),
         }
@@ -188,6 +205,7 @@ impl PublicProviderError {
         Self {
             status_code: 503,
             error_type: "service_unavailable",
+            error_code: None,
             public_message: public_message.into(),
             log_message: log_message.into(),
         }
@@ -197,6 +215,7 @@ impl PublicProviderError {
         Self {
             status_code: 502,
             error_type: "api_error",
+            error_code: None,
             public_message: public_message.into(),
             log_message: log_message.into(),
         }
@@ -208,6 +227,10 @@ impl PublicProviderError {
 
     pub fn error_type(&self) -> &'static str {
         self.error_type
+    }
+
+    pub fn error_code(&self) -> Option<&'static str> {
+        self.error_code
     }
 
     pub fn public_message(&self) -> &str {
@@ -890,14 +913,17 @@ impl KiroProvider {
         summarize_upstream_error(status.as_u16(), body, ERROR_BODY_EXCERPT_CHARS)
     }
 
+    fn is_context_length_exceeded_body(body: &str) -> bool {
+        body.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD")
+    }
+
     fn invalid_request_public_message(body: &str) -> String {
         if Self::is_invalid_thinking_signature_error(body, "") {
             return "Upstream rejected a historical thinking signature. Retry with unmodified thinking blocks or start a new conversation."
                 .to_string();
         }
-        if body.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
-            return "Context window is full. Reduce conversation history, system prompt, or tools."
-                .to_string();
+        if Self::is_context_length_exceeded_body(body) {
+            return CONTEXT_LENGTH_EXCEEDED_PUBLIC_MESSAGE.to_string();
         }
         if body.contains("Input is too long") {
             return "Input is too long. Reduce the size of your messages.".to_string();
@@ -910,9 +936,8 @@ impl KiroProvider {
     }
 
     fn request_too_large_public_message(body: &str) -> String {
-        if body.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
-            return "Context window is full. Reduce conversation history, system prompt, or tools."
-                .to_string();
+        if Self::is_context_length_exceeded_body(body) {
+            return CONTEXT_LENGTH_EXCEEDED_PUBLIC_MESSAGE.to_string();
         }
         if body.contains("Input is too long") {
             return "Input is too long. Reduce the size of your messages.".to_string();
@@ -966,6 +991,17 @@ impl KiroProvider {
         body: &str,
     ) -> Option<PublicProviderError> {
         match status.as_u16() {
+            413 if Self::is_context_length_exceeded_body(body) => {
+                Some(PublicProviderError::context_length_exceeded(
+                    status.as_u16(),
+                    format!(
+                        "{} API 请求失败: status={} {}",
+                        api_type,
+                        status.as_u16(),
+                        error_summary
+                    ),
+                ))
+            }
             413 => Some(PublicProviderError::request_too_large(
                 format!(
                     "{} API 请求失败: status={} {}",
@@ -2380,10 +2416,16 @@ impl KiroProvider {
                     );
                 }
 
-                return Err(anyhow::Error::new(PublicProviderError::invalid_request(
-                    format!("{} API 请求失败: {}", api_type, error_summary),
-                    Self::invalid_request_public_message(&body),
-                )));
+                let log_message = format!("{} API 请求失败: {}", api_type, error_summary);
+                let public_error = if Self::is_context_length_exceeded_body(&body) {
+                    PublicProviderError::context_length_exceeded(400, log_message)
+                } else {
+                    PublicProviderError::invalid_request(
+                        log_message,
+                        Self::invalid_request_public_message(&body),
+                    )
+                };
+                return Err(anyhow::Error::new(public_error));
             }
 
             // 401/403 - 更可能是凭据/权限问题：停调该凭据并故障转移
@@ -3022,6 +3064,14 @@ mod tests {
     }
 
     #[test]
+    fn test_invalid_request_public_message_special_cases_context_length() {
+        let message = KiroProvider::invalid_request_public_message(
+            r#"{"reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD","message":"Input is too long and must be reduced immediately"}"#,
+        );
+        assert_eq!(message, CONTEXT_LENGTH_EXCEEDED_PUBLIC_MESSAGE);
+    }
+
+    #[test]
     fn test_invalid_request_public_message_special_cases_invalid_thinking_signature() {
         let message = KiroProvider::invalid_request_public_message(
             r#"{"error":{"message":"Invalid thinking signature at messages[315] thinking block 0"}}"#,
@@ -3044,6 +3094,21 @@ mod tests {
             message,
             "Input is too long. Reduce the size of your messages."
         );
+    }
+
+    #[test]
+    fn test_public_client_error_for_413_context_length_has_claude_code_code() {
+        let err = KiroProvider::public_client_error_for_status(
+            reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+            "非流式",
+            "reason=CONTENT_LENGTH_EXCEEDS_THRESHOLD",
+            r#"{"reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(err.status_code(), 413);
+        assert_eq!(err.error_code(), Some(CONTEXT_LENGTH_EXCEEDED_CODE));
+        assert_eq!(err.public_message(), CONTEXT_LENGTH_EXCEEDED_PUBLIC_MESSAGE);
     }
 
     #[test]

@@ -9,6 +9,8 @@ use std::collections::HashMap;
 /// API 错误响应
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {
+    #[serde(rename = "type")]
+    pub response_type: &'static str,
     pub error: ErrorDetail,
 }
 
@@ -17,23 +19,82 @@ pub struct ErrorResponse {
 pub struct ErrorDetail {
     #[serde(rename = "type")]
     pub error_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
     pub message: String,
 }
 
 impl ErrorResponse {
     /// 创建新的错误响应
     pub fn new(error_type: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::with_optional_code(error_type, None, message)
+    }
+
+    /// 创建带错误码的错误响应
+    pub fn with_code(
+        error_type: impl Into<String>,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::with_optional_code(error_type, Some(code.into()), message)
+    }
+
+    fn with_optional_code(
+        error_type: impl Into<String>,
+        code: Option<String>,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
+            response_type: "error",
             error: ErrorDetail {
                 error_type: error_type.into(),
+                code,
                 message: message.into(),
             },
         }
     }
 
+    /// 创建上下文窗口超限错误响应
+    pub fn context_length_exceeded() -> Self {
+        Self::with_code(
+            "invalid_request_error",
+            "context_length_exceeded",
+            "prompt is too long: context window is full. Reduce conversation history, system prompt, or tools.",
+        )
+    }
+
     /// 创建认证错误响应
     pub fn authentication_error() -> Self {
         Self::new("authentication_error", "Invalid API key")
+    }
+}
+
+#[cfg(test)]
+mod error_response_tests {
+    use super::ErrorResponse;
+
+    #[test]
+    fn context_length_exceeded_serializes_claude_code_compatible_shape() {
+        let json = serde_json::to_value(ErrorResponse::context_length_exceeded()).unwrap();
+
+        assert_eq!(json["type"], "error");
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+        assert_eq!(json["error"]["code"], "context_length_exceeded");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("prompt is too long")
+        );
+    }
+
+    #[test]
+    fn ordinary_errors_omit_code() {
+        let json =
+            serde_json::to_value(ErrorResponse::new("api_error", "upstream failed")).unwrap();
+
+        assert_eq!(json["type"], "error");
+        assert!(json["error"].get("code").is_none());
     }
 }
 
