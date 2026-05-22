@@ -1074,7 +1074,9 @@ impl StreamContext {
             }
         }
 
-        // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
+        // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值。
+        // 普通流式路径可能在 contextUsageEvent 到达前已经发送 message_start；
+        // 这种情况下在最终 message_delta 中补充 input_tokens，便于客户端和网关修正本轮 usage。
         let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
 
         // 生成最终事件
@@ -1082,7 +1084,25 @@ impl StreamContext {
             self.state_manager
                 .generate_final_events(final_input_tokens, self.output_tokens),
         );
+        if self.context_input_tokens.is_some() {
+            patch_message_delta_input_tokens(&mut events, final_input_tokens);
+        }
         events
+    }
+}
+
+fn patch_message_delta_input_tokens(events: &mut [SseEvent], input_tokens: i32) {
+    if input_tokens <= 0 {
+        return;
+    }
+
+    for event in events {
+        if event.event != "message_delta" {
+            continue;
+        }
+        if let Some(usage) = event.data.get_mut("usage") {
+            usage["input_tokens"] = serde_json::json!(input_tokens);
+        }
     }
 }
 
@@ -1297,6 +1317,44 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data["message"]["usage"]["input_tokens"], 500_000);
+    }
+
+    #[test]
+    fn test_message_delta_carries_late_context_usage_input_tokens() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-7", 123, false, HashMap::new());
+
+        let initial_events = ctx.generate_initial_events();
+        assert_eq!(
+            initial_events[0].data["message"]["usage"]["input_tokens"],
+            123
+        );
+
+        let _ = ctx.process_kiro_event(&Event::ContextUsage(
+            crate::kiro::model::events::ContextUsageEvent {
+                context_usage_percentage: 50.0,
+            },
+        ));
+        let final_events = ctx.generate_final_events();
+        let message_delta = final_events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta should be emitted");
+
+        assert_eq!(message_delta.data["usage"]["input_tokens"], 500_000);
+        assert_eq!(message_delta.data["usage"]["output_tokens"], 0);
+        assert!(
+            message_delta.data["usage"]
+                .get("cache_creation_input_tokens")
+                .is_none(),
+            "message_delta usage should leave cache fields to downstream usage rewrite"
+        );
+        assert!(
+            message_delta.data["usage"]
+                .get("cache_read_input_tokens")
+                .is_none(),
+            "message_delta usage should leave cache fields to downstream usage rewrite"
+        );
     }
 
     #[test]
