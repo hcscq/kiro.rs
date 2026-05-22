@@ -1106,15 +1106,13 @@ async fn handle_stream_request(
         Err(e) => return map_provider_error(e),
     };
 
-    // 创建流处理上下文
-    let mut ctx =
+    // 创建流处理上下文。普通 /v1 流式路径也延迟 message_start，
+    // 以便 Kiro 的 contextUsageEvent 能修正首包 usage.input_tokens。
+    let ctx =
         StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
 
-    // 生成初始事件
-    let initial_events = ctx.generate_initial_events();
-
     // 创建 SSE 流
-    let stream = create_sse_stream(response, ctx, initial_events, request_id);
+    let stream = create_sse_stream(response, ctx, request_id);
 
     // 返回 SSE 响应
     Response::builder()
@@ -1188,17 +1186,11 @@ fn decode_error_sse_if_fatal(error: &ParseError, decoder: &EventStreamDecoder) -
 fn create_sse_stream(
     response: crate::kiro::provider::ManagedResponse,
     ctx: StreamContext,
-    initial_events: Vec<SseEvent>,
     request_id: Option<String>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    // 先发送初始事件
-    let initial_stream = stream::iter(
-        initial_events
-            .into_iter()
-            .map(|e| Ok(Bytes::from(e.to_sse_string()))),
-    );
-
-    // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
+    // 处理 Kiro 响应流，同时每25秒发送 ping 保活。
+    // message_start 会延迟到 contextUsageEvent 或首个可见内容事件之后发送，
+    // 这样 Claude Code 能在首包 usage 中看到真实上下文占用。
     let body_stream = response.into_bytes_stream();
 
     let processing_stream = stream::unfold(
@@ -1206,6 +1198,7 @@ fn create_sse_stream(
             body_stream,
             ctx,
             EventStreamDecoder::new(),
+            false,
             false,
             interval_at(
                 Instant::now() + Duration::from_secs(PING_INTERVAL_SECS),
@@ -1219,6 +1212,7 @@ fn create_sse_stream(
             mut ctx,
             mut decoder,
             finished,
+            message_started,
             mut ping_interval,
             can_ping,
             request_id,
@@ -1242,7 +1236,7 @@ fn create_sse_stream(
                                     "Kiro Event Stream 缓冲失败"
                                 );
                                 if let Some(error_bytes) = decode_error_sse_if_fatal(&e, &decoder) {
-                                    return Some((stream::iter(vec![Ok(error_bytes)]), (body_stream, ctx, decoder, true, ping_interval, can_ping, request_id)));
+                                    return Some((stream::iter(vec![Ok(error_bytes)]), (body_stream, ctx, decoder, true, message_started, ping_interval, can_ping, request_id)));
                                 }
                             }
 
@@ -1275,12 +1269,18 @@ fn create_sse_stream(
                                             "Kiro Event Stream frame 解码失败"
                                         );
                                         if let Some(error_bytes) = decode_error_sse_if_fatal(&e, &decoder) {
-                                            return Some((stream::iter(vec![Ok(error_bytes)]), (body_stream, ctx, decoder, true, ping_interval, can_ping, request_id)));
+                                            return Some((stream::iter(vec![Ok(error_bytes)]), (body_stream, ctx, decoder, true, message_started, ping_interval, can_ping, request_id)));
                                         }
                                     }
                                 }
                             }
 
+                            let mut message_started = message_started;
+                            let events = prepare_stream_events_for_emit(
+                                &mut ctx,
+                                &mut message_started,
+                                events,
+                            );
                             let next_can_ping = can_ping
                                 || events.iter().any(|event| event.event == "content_block_start");
 
@@ -1290,7 +1290,7 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, next_can_ping, request_id)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, message_started, ping_interval, next_can_ping, request_id)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
@@ -1298,16 +1298,17 @@ fn create_sse_stream(
                             let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_stream_error_sse(
                                 "Upstream stream ended with a transport error.",
                             ))];
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, can_ping, request_id)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, message_started, ping_interval, can_ping, request_id)))
                         }
                         None => {
                             // 流结束，发送最终事件
-                            let final_events = ctx.generate_final_events();
+                            let mut message_started = message_started;
+                            let final_events = finalize_stream_events(&mut ctx, &mut message_started);
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, can_ping, request_id)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, message_started, ping_interval, can_ping, request_id)))
                         }
                     }
                 }
@@ -1315,14 +1316,44 @@ fn create_sse_stream(
                 _ = ping_interval.tick(), if can_ping => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, can_ping, request_id)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, message_started, ping_interval, can_ping, request_id)))
                 }
             }
         },
     )
     .flatten();
 
-    initial_stream.chain(processing_stream)
+    processing_stream
+}
+
+fn prepare_stream_events_for_emit(
+    ctx: &mut StreamContext,
+    message_started: &mut bool,
+    mut events: Vec<SseEvent>,
+) -> Vec<SseEvent> {
+    let should_start_message =
+        !*message_started && (ctx.context_input_tokens.is_some() || !events.is_empty());
+    if !*message_started && !should_start_message {
+        return Vec::new();
+    }
+
+    let mut output = Vec::new();
+    if !*message_started {
+        output.extend(ctx.generate_initial_events());
+        *message_started = true;
+    }
+    output.append(&mut events);
+    output
+}
+
+fn finalize_stream_events(ctx: &mut StreamContext, message_started: &mut bool) -> Vec<SseEvent> {
+    let mut events = Vec::new();
+    if !*message_started {
+        events.extend(ctx.generate_initial_events());
+        *message_started = true;
+    }
+    events.extend(ctx.generate_final_events());
+    events
 }
 
 use super::converter::get_context_window_size;
@@ -2581,13 +2612,16 @@ fn create_buffered_sse_stream(
 mod tests {
     use super::{
         ANTHROPIC_RUNTIME_LEADER_REQUIRED_HEADER, NonStreamMessageResponse,
-        coerce_structured_response, decode_non_stream_message, is_opus_4_7_model,
-        map_provider_error, override_thinking_from_model_name, request_thinking_enabled,
+        coerce_structured_response, decode_non_stream_message, finalize_stream_events,
+        is_opus_4_7_model, map_provider_error, override_thinking_from_model_name,
+        prepare_stream_events_for_emit, request_thinking_enabled,
         validate_thinking_signature_payload,
     };
+    use crate::anthropic::stream::{SseEvent, StreamContext};
     use crate::anthropic::structured_outputs::JsonSchemaOutput;
     use crate::anthropic::thinking_compat::sign_thinking_block;
     use crate::anthropic::types::{Message, MessagesRequest, Thinking};
+    use crate::kiro::model::events::{ContextUsageEvent, Event};
     use crate::kiro::parser::crc::crc32;
     use crate::kiro::parser::frame::PRELUDE_SIZE;
     use crate::kiro::provider::PublicProviderError;
@@ -2633,6 +2667,57 @@ mod tests {
             output_config: None,
             metadata: None,
         }
+    }
+
+    #[test]
+    fn delayed_stream_start_uses_context_usage_before_first_visible_event() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-7", 123, false, HashMap::new());
+        let mut message_started = false;
+
+        let context_events = ctx.process_kiro_event(&Event::ContextUsage(ContextUsageEvent {
+            context_usage_percentage: 82.5,
+        }));
+        let emitted =
+            prepare_stream_events_for_emit(&mut ctx, &mut message_started, context_events);
+
+        assert!(message_started);
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].event, "message_start");
+        assert_eq!(emitted[0].data["message"]["usage"]["input_tokens"], 825_000);
+    }
+
+    #[test]
+    fn delayed_stream_start_flushes_before_first_content_event_without_context_usage() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-7", 123, false, HashMap::new());
+        let mut message_started = false;
+        let content_events = vec![SseEvent::new(
+            "content_block_start",
+            serde_json::json!({"type":"content_block_start","index":0}),
+        )];
+
+        let emitted =
+            prepare_stream_events_for_emit(&mut ctx, &mut message_started, content_events);
+
+        assert!(message_started);
+        assert_eq!(emitted.len(), 2);
+        assert_eq!(emitted[0].event, "message_start");
+        assert_eq!(emitted[1].event, "content_block_start");
+        assert_eq!(emitted[0].data["message"]["usage"]["input_tokens"], 123);
+    }
+
+    #[test]
+    fn delayed_stream_finalize_starts_message_if_upstream_ended_without_visible_events() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-7", 123, false, HashMap::new());
+        let mut message_started = false;
+
+        let emitted = finalize_stream_events(&mut ctx, &mut message_started);
+
+        assert!(message_started);
+        assert_eq!(emitted.first().unwrap().event, "message_start");
+        assert!(emitted.iter().any(|event| event.event == "message_stop"));
     }
 
     fn string_header(name: &str, value: &str) -> Vec<u8> {

@@ -523,6 +523,7 @@ impl StreamContext {
 
     /// 生成 message_start 事件
     pub fn create_message_start_event(&self) -> serde_json::Value {
+        let input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
         json!({
             "type": "message_start",
             "message": {
@@ -534,7 +535,7 @@ impl StreamContext {
                 "stop_reason": null,
                 "stop_sequence": null,
                 "usage": {
-                    "input_tokens": self.input_tokens,
+                    "input_tokens": input_tokens,
                     "output_tokens": 1
                 }
             }
@@ -1280,6 +1281,22 @@ mod tests {
                 .is_none(),
             "message_delta usage must not include cache_read_input_tokens"
         );
+    }
+
+    #[test]
+    fn test_message_start_prefers_context_usage_input_tokens() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-7", 123, false, HashMap::new());
+
+        let _ = ctx.process_kiro_event(&Event::ContextUsage(
+            crate::kiro::model::events::ContextUsageEvent {
+                context_usage_percentage: 50.0,
+            },
+        ));
+        let events = ctx.generate_initial_events();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data["message"]["usage"]["input_tokens"], 500_000);
     }
 
     #[test]
