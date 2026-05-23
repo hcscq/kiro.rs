@@ -37,6 +37,7 @@ postgres = "0.19"
 redis = "0.32"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+font8x8 = "0.3"
 html2text = "0.13"
 pdf-extract = "0.7"
 regex = "1.11"
