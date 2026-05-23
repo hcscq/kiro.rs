@@ -19,10 +19,24 @@ const ISSUER_TAG_LEN: usize = 16;
 const HMAC_LEN: usize = 32;
 const HASH_LEN: usize = 32;
 const SIGNATURE_RAW_LEN: usize = 1 + ISSUER_TAG_LEN + 4 + HASH_LEN + HMAC_LEN;
-const AWS_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN: usize = 3249;
-const AWS_SHAPED_SYNTHETIC_SIGNATURE_PREFIX: [u8; 24] = [
-    0x12, 0x9a, 0x13, 0x0a, 0x63, 0x08, 0x0d, 0x18, 0x02, 0x2a, 0x40, 0x0b, 0xea, 0x3f, 0x40, 0xd2,
-    0x98, 0x2a, 0xdb, 0xce, 0x9e, 0x7e, 0xca, 0xf6,
+const AWS_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN: usize = 2463;
+const AWS_SHAPED_SYNTHETIC_OUTER_PAYLOAD_LEN: usize = 2458;
+const AWS_SHAPED_SYNTHETIC_HEADER_RANDOM_LEN: usize = 64;
+const AWS_SHAPED_SYNTHETIC_FIELD2_LEN: usize = 12;
+const AWS_SHAPED_SYNTHETIC_FIELD3_LEN: usize = 12;
+const AWS_SHAPED_SYNTHETIC_FIELD4_LEN: usize = 48;
+const AWS_SHAPED_SYNTHETIC_FIELD5_LEN: usize = 2276;
+const AWS_SHAPED_SYNTHETIC_FIELD5_VALUE_OFFSET: usize = 185;
+const AWS_SHAPED_SYNTHETIC_SELF_OFFSET: usize =
+    AWS_SHAPED_SYNTHETIC_FIELD5_VALUE_OFFSET + AWS_SHAPED_SYNTHETIC_HEADER_RANDOM_LEN;
+const AWS_SHAPED_SYNTHETIC_SIGNATURE_PREFIX: [u8; 11] = [
+    0x12, 0x9a, 0x13, 0x0a, 0x63, 0x08, 0x0d, 0x18, 0x02, 0x2a, 0x40,
+];
+const AWS_SHAPED_SYNTHETIC_HEADER_RANDOM_TEMPLATE: [u8; AWS_SHAPED_SYNTHETIC_HEADER_RANDOM_LEN] = [
+    0x0b, 0xea, 0x3f, 0x40, 0xd2, 0x98, 0x2a, 0xdb, 0xce, 0x9e, 0x7e, 0xca, 0xf6, 0xa5, 0x4d, 0x68,
+    0x35, 0x7b, 0x5c, 0x93, 0x59, 0xf0, 0xf3, 0xf4, 0x73, 0x11, 0xa8, 0x65, 0x0d, 0x84, 0x0b, 0x95,
+    0xe0, 0xfc, 0x18, 0x3c, 0x53, 0xc4, 0xd6, 0x9b, 0x6e, 0x7b, 0x29, 0xde, 0x2c, 0x2a, 0x09, 0x51,
+    0x84, 0x6f, 0x70, 0x06, 0xad, 0xbb, 0xc7, 0x57, 0xe5, 0x67, 0xb0, 0xf6, 0x6b, 0xbf, 0xa6, 0x3a,
 ];
 
 static SIGNING_KEY: OnceLock<[u8; 32]> = OnceLock::new();
@@ -190,9 +204,9 @@ pub(crate) fn sign_thinking_block(thinking_ordinal: u32, thinking: &str) -> Stri
 /// 签发用于隐藏 synthetic thinking block 的动态 AWS-shaped signature。
 ///
 /// Kiro 上游有时不会返回可见 thinking 内容；为了响应侧仍符合 Claude thinking
-/// SSE 形状，这里签发一个可由本服务后续校验的空 thinking signature。签名长度和
-/// 前缀按 AWS Claude 常见形态组织，但主体中包含本服务 issuer、thinking hash、
-/// nonce 和 MAC，因此不是固定捕获值。
+/// SSE 形状，这里按 AWS Claude 样本的 protobuf 线框组织外层结构、长度、model
+/// 和 block type，并在随机载荷区写入本服务可校验的 issuer、thinking hash、
+/// nonce 和 MAC，因此不是整段固定捕获值。
 pub(crate) fn sign_synthetic_hidden_thinking_block(
     thinking_ordinal: u32,
     thinking: &str,
@@ -204,19 +218,63 @@ pub(crate) fn sign_synthetic_hidden_thinking_block(
     let thinking_hash = sha256_bytes(thinking.as_bytes());
     let nonce = synthetic_signature_nonce(nonce_material);
 
-    let mut body = Vec::with_capacity(AWS_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN - HMAC_LEN);
-    body.extend_from_slice(&AWS_SHAPED_SYNTHETIC_SIGNATURE_PREFIX);
-    body.extend_from_slice(&issuer);
-    body.extend_from_slice(&thinking_ordinal.to_be_bytes());
-    body.extend_from_slice(&thinking_hash);
-    body.extend_from_slice(&nonce);
+    let mut inner = Vec::with_capacity(AWS_SHAPED_SYNTHETIC_OUTER_PAYLOAD_LEN);
+    let header = aws_shaped_synthetic_header();
+    push_protobuf_len_field(&mut inner, 1, &header);
+    push_protobuf_len_field(
+        &mut inner,
+        2,
+        &synthetic_signature_chunk(
+            &key,
+            b"aws-field-2",
+            &nonce,
+            AWS_SHAPED_SYNTHETIC_FIELD2_LEN,
+        ),
+    );
+    push_protobuf_len_field(
+        &mut inner,
+        3,
+        &synthetic_signature_chunk(
+            &key,
+            b"aws-field-3",
+            &nonce,
+            AWS_SHAPED_SYNTHETIC_FIELD3_LEN,
+        ),
+    );
+    push_protobuf_len_field(
+        &mut inner,
+        4,
+        &synthetic_signature_chunk(
+            &key,
+            b"aws-field-4",
+            &nonce,
+            AWS_SHAPED_SYNTHETIC_FIELD4_LEN,
+        ),
+    );
 
-    let filler_len = AWS_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN - HMAC_LEN - body.len();
-    body.extend_from_slice(&synthetic_signature_filler(&key, &body, filler_len));
+    inner.push(0x2a);
+    push_varint(&mut inner, AWS_SHAPED_SYNTHETIC_FIELD5_LEN as u64);
+    inner.extend_from_slice(&AWS_SHAPED_SYNTHETIC_HEADER_RANDOM_TEMPLATE);
+    inner.extend_from_slice(&issuer);
+    inner.extend_from_slice(&thinking_ordinal.to_be_bytes());
+    inner.extend_from_slice(&thinking_hash);
 
-    let mac = signature_mac(&key, &body);
-    let mut raw = body;
-    raw.extend_from_slice(&mac);
+    let mut mac_body = Vec::with_capacity(3 + inner.len());
+    mac_body.extend_from_slice(&[0x12, 0x9a, 0x13]);
+    mac_body.extend_from_slice(&inner);
+    let mac = signature_mac(&key, &mac_body);
+    inner.extend_from_slice(&mac);
+    inner.extend_from_slice(&nonce);
+
+    let filler_len = AWS_SHAPED_SYNTHETIC_OUTER_PAYLOAD_LEN - inner.len();
+    inner.extend_from_slice(&synthetic_signature_filler(&key, &inner, filler_len));
+    debug_assert_eq!(inner.len(), AWS_SHAPED_SYNTHETIC_OUTER_PAYLOAD_LEN);
+
+    let mut raw = Vec::with_capacity(AWS_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN);
+    raw.extend_from_slice(&[0x12, 0x9a, 0x13]);
+    raw.extend_from_slice(&inner);
+    raw.extend_from_slice(&[0x18, 0x01]);
+    debug_assert_eq!(raw.len(), AWS_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN);
 
     STANDARD_NO_PAD.encode(raw)
 }
@@ -355,6 +413,7 @@ fn classify_signature(signature: &str, thinking_ordinal: u32, thinking: &str) ->
                 ordinal_start: 1 + ISSUER_TAG_LEN,
                 hash_start: 1 + ISSUER_TAG_LEN + 4,
                 mac_start: 1 + ISSUER_TAG_LEN + 4 + HASH_LEN,
+                mac_end: SIGNATURE_RAW_LEN,
             },
         );
     }
@@ -362,7 +421,8 @@ fn classify_signature(signature: &str, thinking_ordinal: u32, thinking: &str) ->
     if raw.len() == AWS_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN
         && raw.starts_with(&AWS_SHAPED_SYNTHETIC_SIGNATURE_PREFIX)
     {
-        let issuer_start = AWS_SHAPED_SYNTHETIC_SIGNATURE_PREFIX.len();
+        let issuer_start = AWS_SHAPED_SYNTHETIC_SELF_OFFSET;
+        let mac_start = issuer_start + ISSUER_TAG_LEN + 4 + HASH_LEN;
         return classify_own_signature(
             signature,
             &raw,
@@ -372,7 +432,8 @@ fn classify_signature(signature: &str, thinking_ordinal: u32, thinking: &str) ->
                 issuer_start,
                 ordinal_start: issuer_start + ISSUER_TAG_LEN,
                 hash_start: issuer_start + ISSUER_TAG_LEN + 4,
-                mac_start: raw.len() - HMAC_LEN,
+                mac_start,
+                mac_end: mac_start + HMAC_LEN,
             },
         );
     }
@@ -386,6 +447,7 @@ struct OwnSignatureLayout {
     ordinal_start: usize,
     hash_start: usize,
     mac_start: usize,
+    mac_end: usize,
 }
 
 fn classify_own_signature(
@@ -427,8 +489,9 @@ fn classify_own_signature(
     }
 
     let mac_start = layout.mac_start;
+    let mac_end = layout.mac_end;
     let expected_mac = signature_mac(&key, &raw[..mac_start]);
-    if raw[mac_start..].ct_eq(&expected_mac).unwrap_u8() != 1 {
+    if raw[mac_start..mac_end].ct_eq(&expected_mac).unwrap_u8() != 1 {
         return SignatureClass::InvalidOwn(invalid_own_signature_detail(
             signature,
             raw,
@@ -567,6 +630,58 @@ fn signature_mac(key: &[u8; 32], body: &[u8]) -> [u8; HMAC_LEN] {
     payload.extend_from_slice(b"anthropic-thinking-signature-body\n");
     payload.extend_from_slice(body);
     hmac_sha256(key, &payload)
+}
+
+fn aws_shaped_synthetic_header() -> Vec<u8> {
+    let mut header = Vec::with_capacity(99);
+    header.extend_from_slice(&[0x08, 0x0d, 0x18, 0x02, 0x2a, 0x40]);
+    header.extend_from_slice(&AWS_SHAPED_SYNTHETIC_HEADER_RANDOM_TEMPLATE);
+    push_protobuf_len_field(&mut header, 6, b"claude-opus-4-7");
+    header.extend_from_slice(&[0x38, 0x00]);
+    push_protobuf_len_field(&mut header, 8, b"thinking");
+    debug_assert_eq!(header.len(), 99);
+    header
+}
+
+fn synthetic_signature_chunk(
+    key: &[u8; 32],
+    domain: &[u8],
+    nonce: &[u8; HASH_LEN],
+    len: usize,
+) -> Vec<u8> {
+    let mut chunk = Vec::with_capacity(len);
+    let mut counter = 0u32;
+    while chunk.len() < len {
+        let mut payload = Vec::with_capacity(
+            b"anthropic-thinking-signature-synthetic-chunk\n".len()
+                + domain.len()
+                + nonce.len()
+                + 4,
+        );
+        payload.extend_from_slice(b"anthropic-thinking-signature-synthetic-chunk\n");
+        payload.extend_from_slice(domain);
+        payload.extend_from_slice(nonce);
+        payload.extend_from_slice(&counter.to_be_bytes());
+        let block = hmac_sha256(key, &payload);
+        let remaining = len - chunk.len();
+        chunk.extend_from_slice(&block[..block.len().min(remaining)]);
+        counter = counter.wrapping_add(1);
+    }
+    chunk
+}
+
+fn push_protobuf_len_field(out: &mut Vec<u8>, field_number: u64, value: &[u8]) {
+    push_varint(out, (field_number << 3) | 2);
+    push_varint(out, value.len() as u64);
+    out.extend_from_slice(value);
+}
+
+fn push_varint(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        out.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
 }
 
 fn synthetic_signature_nonce(nonce_material: &[u8]) -> [u8; HASH_LEN] {
@@ -763,10 +878,13 @@ mod tests {
         let signature_b = sign_synthetic_hidden_thinking_block(0, "", b"response-b");
 
         assert_ne!(signature_a, signature_b);
-        assert_eq!(signature_a.len(), 4332);
+        assert_eq!(signature_a.len(), 3284);
         let raw = decode_signature(&signature_a).expect("signature should decode");
         assert_eq!(raw.len(), AWS_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN);
         assert!(raw.starts_with(&AWS_SHAPED_SYNTHETIC_SIGNATURE_PREFIX));
+        assert_eq!(&raw[77..92], b"claude-opus-4-7");
+        assert_eq!(&raw[96..104], b"thinking");
+        assert_eq!(&raw[raw.len() - 2..], &[0x18, 0x01]);
         assert_eq!(
             classify_signature(&signature_a, 0, ""),
             SignatureClass::ValidOwn

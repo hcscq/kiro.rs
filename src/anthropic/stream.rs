@@ -2084,7 +2084,7 @@ mod tests {
         );
 
         let signature = collect_first_signature(&all).expect("signature should exist");
-        assert_eq!(signature.len(), 4332);
+        assert_eq!(signature.len(), 3284);
         let req = request_with_stream_thinking(String::new(), signature);
         validate_thinking_signatures(&req).expect("synthetic hidden signature should validate");
         assert_eq!(
@@ -2107,7 +2107,7 @@ mod tests {
             collect_first_signature(&all).expect("real thinking signature should exist");
         assert_ne!(
             signature.len(),
-            4332,
+            3284,
             "real thinking should keep compact native signature"
         );
         let req = request_with_stream_thinking("abc".to_string(), signature);
