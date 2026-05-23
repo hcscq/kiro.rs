@@ -791,6 +791,11 @@ impl KiroProvider {
         self.token_manager.thinking_signature_validation_mode()
     }
 
+    pub fn response_thinking_signature_compat_enabled(&self) -> bool {
+        self.token_manager
+            .response_thinking_signature_compat_enabled()
+    }
+
     pub fn supports_model(&self, model: &str) -> bool {
         self.token_manager.supports_model(model)
     }

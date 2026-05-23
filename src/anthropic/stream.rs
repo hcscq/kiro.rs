@@ -9,7 +9,9 @@ use uuid::Uuid;
 
 use crate::kiro::model::events::Event;
 
-use super::thinking_compat::{canonicalize_thinking_for_signature, sign_thinking_block};
+use super::thinking_compat::{
+    canonicalize_thinking_for_signature, sign_synthetic_hidden_thinking_block, sign_thinking_block,
+};
 
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
@@ -491,6 +493,10 @@ pub struct StreamContext {
     strip_thinking_leading_newline: bool,
     /// 已发送给客户端的 thinking 内容，用于生成不透明 signature
     thinking_signature_source: String,
+    /// 是否在上游未返回 thinking 内容时补齐隐藏 synthetic thinking signature
+    synthesize_hidden_thinking_signature: bool,
+    /// 是否已经补齐过隐藏 synthetic thinking block
+    synthetic_hidden_thinking_emitted: bool,
 }
 
 impl StreamContext {
@@ -518,7 +524,14 @@ impl StreamContext {
             text_block_index: None,
             strip_thinking_leading_newline: false,
             thinking_signature_source: String::new(),
+            synthesize_hidden_thinking_signature: false,
+            synthetic_hidden_thinking_emitted: false,
         }
+    }
+
+    pub fn with_synthetic_hidden_thinking_signature(mut self, enabled: bool) -> Self {
+        self.synthesize_hidden_thinking_signature = enabled;
+        self
     }
 
     /// 生成 message_start 事件
@@ -768,6 +781,74 @@ impl StreamContext {
         events
     }
 
+    fn should_synthesize_hidden_thinking_block(&self) -> bool {
+        self.thinking_enabled
+            && self.synthesize_hidden_thinking_signature
+            && !self.synthetic_hidden_thinking_emitted
+            && self.thinking_block_index.is_none()
+            && !self.in_thinking_block
+    }
+
+    fn synthetic_hidden_signature_seed(&self) -> Vec<u8> {
+        format!(
+            "{}\n{}\n{}\n{}",
+            self.message_id,
+            self.model,
+            self.input_tokens,
+            self.context_input_tokens.unwrap_or_default()
+        )
+        .into_bytes()
+    }
+
+    /// 在首个非 thinking 内容块前补齐隐藏 thinking block。
+    fn synthesize_hidden_thinking_block_events(&mut self) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        if !self.should_synthesize_hidden_thinking_block() {
+            return events;
+        }
+
+        let thinking_index = self.state_manager.next_block_index();
+        self.thinking_block_index = Some(thinking_index);
+        self.thinking_extracted = true;
+        self.synthetic_hidden_thinking_emitted = true;
+        self.thinking_signature_source.clear();
+
+        let start_events = self.state_manager.handle_content_block_start(
+            thinking_index,
+            "thinking",
+            json!({
+                "type": "content_block_start",
+                "index": thinking_index,
+                "content_block": {
+                    "type": "thinking",
+                    "thinking": "",
+                    "signature": ""
+                }
+            }),
+        );
+        events.extend(start_events);
+
+        let signature =
+            sign_synthetic_hidden_thinking_block(0, "", &self.synthetic_hidden_signature_seed());
+        if let Some(signature_event) =
+            self.create_signature_delta_event_with_signature(thinking_index, signature)
+        {
+            events.push(signature_event);
+        }
+        if let Some(stop_event) = self.state_manager.handle_content_block_stop(thinking_index) {
+            events.push(stop_event);
+        }
+
+        tracing::debug!(
+            model = %self.model,
+            message_id = %self.message_id,
+            thinking_index,
+            "已补齐隐藏 synthetic thinking signature"
+        );
+
+        events
+    }
+
     /// 创建 text_delta 事件
     ///
     /// 如果文本块尚未创建，会先创建文本块。
@@ -776,6 +857,7 @@ impl StreamContext {
     /// 返回值包含可能的 content_block_start 事件和 content_block_delta 事件。
     fn create_text_delta_events(&mut self, text: &str) -> Vec<SseEvent> {
         let mut events = Vec::new();
+        events.extend(self.synthesize_hidden_thinking_block_events());
 
         // 如果当前 text_block_index 指向的块已经被关闭（例如 tool_use 开始时自动 stop），
         // 则丢弃该索引并创建新的文本块继续输出，避免 delta 被状态机拒绝导致“吞字”。
@@ -858,6 +940,14 @@ impl StreamContext {
             return None;
         }
         let signature = sign_thinking_block(0, thinking);
+        self.create_signature_delta_event_with_signature(index, signature)
+    }
+
+    fn create_signature_delta_event_with_signature(
+        &self,
+        index: i32,
+        signature: String,
+    ) -> Option<SseEvent> {
         Some(SseEvent::new(
             "content_block_delta",
             json!({
@@ -938,6 +1028,8 @@ impl StreamContext {
             let buffered = std::mem::take(&mut self.thinking_buffer);
             events.extend(self.create_text_delta_events(&buffered));
         }
+
+        events.extend(self.synthesize_hidden_thinking_block_events());
 
         // 获取或分配块索引
         let block_index = if let Some(&idx) = self.tool_block_indices.get(&tool_use.tool_use_id) {
@@ -1147,6 +1239,11 @@ impl BufferedStreamContext {
             estimated_input_tokens,
             initial_events_generated: false,
         }
+    }
+
+    pub fn with_synthetic_hidden_thinking_signature(mut self, enabled: bool) -> Self {
+        self.inner = self.inner.with_synthetic_hidden_thinking_signature(enabled);
+        self
     }
 
     /// 处理 Kiro 事件并缓冲结果
@@ -1934,6 +2031,87 @@ mod tests {
             output_config: None,
             metadata: None,
         }
+    }
+
+    #[test]
+    fn test_synthetic_hidden_thinking_signature_precedes_first_text_block() {
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-4-7", 1, true, HashMap::new())
+            .with_synthetic_hidden_thinking_signature(true);
+        let mut all = ctx.generate_initial_events();
+
+        all.extend(ctx.process_assistant_response("这是一段没有 thinking 标签的上游文本。"));
+        all.extend(ctx.generate_final_events());
+
+        let thinking_start = all
+            .iter()
+            .position(|e| {
+                e.event == "content_block_start"
+                    && e.data["index"].as_i64() == Some(0)
+                    && e.data["content_block"]["type"] == "thinking"
+                    && e.data["content_block"]["thinking"] == ""
+                    && e.data["content_block"]["signature"] == ""
+            })
+            .expect("hidden thinking block should start at index 0");
+        let signature_pos = all
+            .iter()
+            .position(|e| {
+                e.event == "content_block_delta"
+                    && e.data["index"].as_i64() == Some(0)
+                    && e.data["delta"]["type"] == "signature_delta"
+            })
+            .expect("signature_delta should be emitted for hidden thinking");
+        let thinking_stop = all
+            .iter()
+            .position(|e| e.event == "content_block_stop" && e.data["index"].as_i64() == Some(0))
+            .expect("hidden thinking block should stop");
+        let text_start = all
+            .iter()
+            .position(|e| {
+                e.event == "content_block_start"
+                    && e.data["index"].as_i64() == Some(1)
+                    && e.data["content_block"]["type"] == "text"
+            })
+            .expect("text block should be shifted to index 1");
+
+        assert!(thinking_start < signature_pos);
+        assert!(signature_pos < thinking_stop);
+        assert!(thinking_stop < text_start);
+        assert!(
+            all.iter().all(|e| {
+                !(e.event == "content_block_delta" && e.data["delta"]["type"] == "thinking_delta")
+            }),
+            "hidden synthetic thinking must not expose thinking_delta content"
+        );
+
+        let signature = collect_first_signature(&all).expect("signature should exist");
+        assert_eq!(signature.len(), 4332);
+        let req = request_with_stream_thinking(String::new(), signature);
+        validate_thinking_signatures(&req).expect("synthetic hidden signature should validate");
+        assert_eq!(
+            collect_text_content(&all),
+            "这是一段没有 thinking 标签的上游文本。"
+        );
+    }
+
+    #[test]
+    fn test_synthetic_hidden_thinking_signature_is_not_used_for_real_thinking() {
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-4-7", 1, true, HashMap::new())
+            .with_synthetic_hidden_thinking_signature(true);
+        let mut all = ctx.generate_initial_events();
+
+        all.extend(ctx.process_assistant_response("<thinking>\nabc</thinking>\n\n你好"));
+        all.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_thinking_content(&all), "abc");
+        let signature =
+            collect_first_signature(&all).expect("real thinking signature should exist");
+        assert_ne!(
+            signature.len(),
+            4332,
+            "real thinking should keep compact native signature"
+        );
+        let req = request_with_stream_thinking("abc".to_string(), signature);
+        validate_thinking_signatures(&req).expect("real thinking signature should validate");
     }
 
     #[test]

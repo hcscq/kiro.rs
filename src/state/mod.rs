@@ -847,6 +847,8 @@ pub struct PersistedDispatchConfig {
     pub request_weighting: RequestWeightingConfig,
     #[serde(default)]
     pub thinking_signature_validation_mode: ThinkingSignatureValidationMode,
+    #[serde(default)]
+    pub response_thinking_signature_compat_enabled: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub account_type_policies: BTreeMap<String, ModelSupportPolicy>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -948,6 +950,8 @@ impl PersistedDispatchConfig {
             rate_limit_refill_backoff_factor: config.rate_limit_refill_backoff_factor,
             request_weighting: config.request_weighting.clone(),
             thinking_signature_validation_mode: config.thinking_signature_validation_mode,
+            response_thinking_signature_compat_enabled: config
+                .response_thinking_signature_compat_enabled,
             account_type_policies,
             account_type_dispatch_policies,
         }
@@ -985,6 +989,8 @@ impl PersistedDispatchConfig {
         config.rate_limit_refill_backoff_factor = self.rate_limit_refill_backoff_factor;
         config.request_weighting = self.request_weighting.clone();
         config.thinking_signature_validation_mode = self.thinking_signature_validation_mode;
+        config.response_thinking_signature_compat_enabled =
+            self.response_thinking_signature_compat_enabled;
         config.account_type_policies = self.account_type_policies.clone();
         config.account_type_dispatch_policies = self.account_type_dispatch_policies.clone();
     }
@@ -3534,6 +3540,7 @@ mod tests {
                 ..RequestWeightingConfig::default()
             },
             thinking_signature_validation_mode: ThinkingSignatureValidationMode::StripInvalid,
+            response_thinking_signature_compat_enabled: true,
             account_type_policies: BTreeMap::new(),
             account_type_dispatch_policies: BTreeMap::new(),
         };

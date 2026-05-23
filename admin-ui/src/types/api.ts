@@ -223,6 +223,7 @@ export interface LoadBalancingConfigResponse {
   rateLimitRefillBackoffFactor: number
   requestWeighting: RequestWeightingConfig
   thinkingSignatureValidationMode: ThinkingSignatureValidationMode
+  responseThinkingSignatureCompatEnabled: boolean
   waitingRequests: number
 }
 
@@ -251,6 +252,7 @@ export interface UpdateLoadBalancingConfigRequest {
   rateLimitRefillBackoffFactor?: number
   requestWeighting?: RequestWeightingConfig
   thinkingSignatureValidationMode?: ThinkingSignatureValidationMode
+  responseThinkingSignatureCompatEnabled?: boolean
 }
 
 export interface ModelCapabilitiesConfigResponse {

@@ -404,6 +404,8 @@ pub struct LoadBalancingModeResponse {
     pub request_weighting: RequestWeightingConfig,
     /// 历史 thinking signature 的本地校验策略
     pub thinking_signature_validation_mode: ThinkingSignatureValidationMode,
+    /// 响应侧隐藏 thinking signature 兼容补齐开关
+    pub response_thinking_signature_compat_enabled: bool,
     /// 当前正在排队的请求数
     pub waiting_requests: usize,
 }
@@ -460,6 +462,8 @@ pub struct SetLoadBalancingModeRequest {
     pub request_weighting: Option<RequestWeightingConfig>,
     /// 历史 thinking signature 的本地校验策略
     pub thinking_signature_validation_mode: Option<ThinkingSignatureValidationMode>,
+    /// 响应侧隐藏 thinking signature 兼容补齐开关
+    pub response_thinking_signature_compat_enabled: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]

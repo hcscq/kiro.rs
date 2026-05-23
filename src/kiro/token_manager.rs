@@ -874,6 +874,7 @@ pub struct LoadBalancingConfigSnapshot {
     pub rate_limit_refill_backoff_factor: f64,
     pub request_weighting: RequestWeightingConfig,
     pub thinking_signature_validation_mode: ThinkingSignatureValidationMode,
+    pub response_thinking_signature_compat_enabled: bool,
     pub waiting_requests: usize,
 }
 
@@ -910,6 +911,7 @@ struct DispatchConfig {
     rate_limit_refill_backoff_factor: f64,
     request_weighting: RequestWeightingConfig,
     thinking_signature_validation_mode: ThinkingSignatureValidationMode,
+    response_thinking_signature_compat_enabled: bool,
     account_type_policies: BTreeMap<String, ModelSupportPolicy>,
     account_type_dispatch_policies: BTreeMap<String, AccountTypeDispatchPolicy>,
 }
@@ -979,6 +981,8 @@ impl DispatchConfig {
             ),
             request_weighting: config.request_weighting.clone(),
             thinking_signature_validation_mode: config.thinking_signature_validation_mode,
+            response_thinking_signature_compat_enabled: config
+                .response_thinking_signature_compat_enabled,
             account_type_policies,
             account_type_dispatch_policies,
         }
@@ -6821,6 +6825,8 @@ impl MultiTokenManager {
             rate_limit_refill_backoff_factor: dispatch.rate_limit_refill_backoff_factor,
             request_weighting: dispatch.request_weighting.clone(),
             thinking_signature_validation_mode: dispatch.thinking_signature_validation_mode,
+            response_thinking_signature_compat_enabled: dispatch
+                .response_thinking_signature_compat_enabled,
             waiting_requests: self.queue_depth(),
         }
     }
@@ -6851,6 +6857,11 @@ impl MultiTokenManager {
 
     pub fn thinking_signature_validation_mode(&self) -> ThinkingSignatureValidationMode {
         self.dispatch_config().thinking_signature_validation_mode
+    }
+
+    pub fn response_thinking_signature_compat_enabled(&self) -> bool {
+        self.dispatch_config()
+            .response_thinking_signature_compat_enabled
     }
 
     /// 获取负载均衡模式（Admin API）
@@ -6893,6 +6904,8 @@ impl MultiTokenManager {
                 rate_limit_refill_backoff_factor: dispatch.rate_limit_refill_backoff_factor,
                 request_weighting: dispatch.request_weighting.clone(),
                 thinking_signature_validation_mode: dispatch.thinking_signature_validation_mode,
+                response_thinking_signature_compat_enabled: dispatch
+                    .response_thinking_signature_compat_enabled,
                 account_type_policies: dispatch.account_type_policies.clone(),
                 account_type_dispatch_policies: dispatch.account_type_dispatch_policies.clone(),
             })?;
@@ -6904,6 +6917,7 @@ impl MultiTokenManager {
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
         self.set_load_balancing_config(
             Some(mode),
+            None,
             None,
             None,
             None,
@@ -7009,6 +7023,7 @@ impl MultiTokenManager {
         request_weighting: Option<RequestWeightingConfig>,
         session_affinity_enabled: Option<bool>,
         thinking_signature_validation_mode: Option<ThinkingSignatureValidationMode>,
+        response_thinking_signature_compat_enabled: Option<bool>,
     ) -> anyhow::Result<()> {
         let previous = self.dispatch_config();
         let mut next = previous.clone();
@@ -7111,6 +7126,12 @@ impl MultiTokenManager {
         if let Some(thinking_signature_validation_mode) = thinking_signature_validation_mode {
             next.thinking_signature_validation_mode = thinking_signature_validation_mode;
         }
+        if let Some(response_thinking_signature_compat_enabled) =
+            response_thinking_signature_compat_enabled
+        {
+            next.response_thinking_signature_compat_enabled =
+                response_thinking_signature_compat_enabled;
+        }
 
         if next.suspicious_activity_auto_disable_enabled
             && next.suspicious_activity_auto_disable_threshold == 0
@@ -7176,7 +7197,7 @@ impl MultiTokenManager {
 
         self.availability_notify.notify_waiters();
         tracing::info!(
-            "调度配置已更新: mode={}, sessionAffinityEnabled={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, rateLimitCooldownEnabled={}, suspiciousActivityCooldownMs={}, suspiciousActivityCooldownEnabled={}, suspiciousActivityAutoClearEnabled={}, suspiciousActivityAutoClearSuccessThreshold={}, suspiciousActivityAutoClearAfterMs={}, modelCooldownEnabled={}, defaultMaxConcurrency={:?}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}, requestWeightingEnabled={}, requestWeightingBaseWeight={}, requestWeightingMaxWeight={}, thinkingSignatureValidationMode={}",
+            "调度配置已更新: mode={}, sessionAffinityEnabled={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, rateLimitCooldownEnabled={}, suspiciousActivityCooldownMs={}, suspiciousActivityCooldownEnabled={}, suspiciousActivityAutoClearEnabled={}, suspiciousActivityAutoClearSuccessThreshold={}, suspiciousActivityAutoClearAfterMs={}, modelCooldownEnabled={}, defaultMaxConcurrency={:?}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}, requestWeightingEnabled={}, requestWeightingBaseWeight={}, requestWeightingMaxWeight={}, thinkingSignatureValidationMode={}, responseThinkingSignatureCompatEnabled={}",
             next.mode,
             next.session_affinity_enabled,
             next.queue_max_size,
@@ -7198,7 +7219,8 @@ impl MultiTokenManager {
             next.request_weighting.enabled,
             next.request_weighting.base_weight,
             next.request_weighting.max_weight,
-            next.thinking_signature_validation_mode.as_str()
+            next.thinking_signature_validation_mode.as_str(),
+            next.response_thinking_signature_compat_enabled
         );
         Ok(())
     }
@@ -9106,6 +9128,7 @@ mod tests {
                 ..RequestWeightingConfig::default()
             },
             thinking_signature_validation_mode: ThinkingSignatureValidationMode::WarnOnly,
+            response_thinking_signature_compat_enabled: true,
             account_type_policies: BTreeMap::new(),
             account_type_dispatch_policies: BTreeMap::new(),
         };
@@ -9150,6 +9173,7 @@ mod tests {
             snapshot.thinking_signature_validation_mode,
             ThinkingSignatureValidationMode::WarnOnly
         );
+        assert!(snapshot.response_thinking_signature_compat_enabled);
 
         assert!(!manager.apply_dispatch_config_from_state(&persisted));
     }
@@ -9275,6 +9299,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap_err()
             .to_string();
@@ -9331,6 +9356,7 @@ mod tests {
                 }),
                 Some(true),
                 Some(ThinkingSignatureValidationMode::StripInvalid),
+                Some(true),
             )
             .unwrap();
 
@@ -9369,10 +9395,12 @@ mod tests {
             persisted.thinking_signature_validation_mode,
             ThinkingSignatureValidationMode::StripInvalid
         );
+        assert!(persisted.response_thinking_signature_compat_enabled);
         assert_eq!(
             manager.thinking_signature_validation_mode(),
             ThinkingSignatureValidationMode::StripInvalid
         );
+        assert!(manager.response_thinking_signature_compat_enabled());
         assert_eq!(manager.get_load_balancing_mode(), "balanced");
 
         std::fs::remove_file(&config_path).unwrap();
@@ -9419,6 +9447,7 @@ mod tests {
                 None,
                 None,
                 Some(false),
+                None,
                 None,
                 None,
                 None,

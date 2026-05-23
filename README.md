@@ -234,6 +234,7 @@ GitHub Actions 镜像构建：
 | `rateLimitRefillBackoffFactor` | number | `0.75` | 遭遇 `429` 时当前回填速率的衰减系数，范围 `[0.05, 1]` |
 | `requestWeighting` | object | 默认开启 | 轻/重请求加权配置。默认值已按单号/少号场景收敛：重请求会多消耗 bucket，但不会像旧参数那样过快把桶打空 |
 | `thinkingSignatureValidationMode` | string | `strict` | 历史 thinking signature 校验模式：`strict` 拒绝无效自签名，`warn_only` 只告警放行，`disabled` 跳过校验，`strip_invalid` 移除无效自签名后放行；也可在 Admin UI 的“调度与并发配置”页面热更新 |
+| `responseThinkingSignatureCompatEnabled` | boolean | `false` | 响应侧 thinking signature 兼容补齐；启用后，thinking 流式请求若上游先返回普通内容，会在首个非 thinking 内容块前补齐隐藏 thinking block 和动态 AWS-shaped `signature_delta` |
 
 完整配置示例：
 
@@ -307,7 +308,8 @@ GitHub Actions 镜像构建：
       "heavyThinkingBudgetThreshold": 24000,
       "heavyThinkingBudgetBonus": 0.35
    },
-   "thinkingSignatureValidationMode": "strict"
+   "thinkingSignatureValidationMode": "strict",
+   "responseThinkingSignatureCompatEnabled": false
 }
 ```
 
@@ -673,7 +675,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 - **Admin UI**
   - `GET /admin` - 访问管理页面（需要在编译前构建 `admin-ui/dist`）
-  - “调度与并发配置”页面支持修改 `thinkingSignatureValidationMode`
+  - “调度与并发配置”页面支持修改 `thinkingSignatureValidationMode` 和 `responseThinkingSignatureCompatEnabled`
 
 ## 注意事项
 

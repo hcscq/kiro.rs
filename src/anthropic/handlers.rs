@@ -957,6 +957,8 @@ pub async fn post_messages(
 
     // 检查是否启用了thinking
     let thinking_enabled = request_thinking_enabled(&payload);
+    let synthesize_hidden_thinking_signature =
+        thinking_enabled && provider.response_thinking_signature_compat_enabled();
     let request_weighting = provider.request_weighting_config();
 
     // 调度使用本地估算，返回给下游的 usage 使用远端计数优先。
@@ -1051,6 +1053,7 @@ pub async fn post_messages(
             &payload.model,
             billing_input_tokens,
             thinking_enabled,
+            synthesize_hidden_thinking_signature,
             tool_name_map,
             RequestOptions {
                 omit_agent_mode_header: probe.omit_agent_mode_header,
@@ -1093,6 +1096,7 @@ async fn handle_stream_request(
     model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
+    synthesize_hidden_thinking_signature: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     request_options: RequestOptions,
 ) -> Response {
@@ -1109,7 +1113,8 @@ async fn handle_stream_request(
     // 创建流处理上下文。普通 /v1 流式路径也延迟 message_start，
     // 以便 Kiro 的 contextUsageEvent 能修正首包 usage.input_tokens。
     let ctx =
-        StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+        StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map)
+            .with_synthetic_hidden_thinking_signature(synthesize_hidden_thinking_signature);
 
     // 创建 SSE 流
     let stream = create_sse_stream(response, ctx, request_id);
@@ -2330,6 +2335,8 @@ pub async fn post_messages_cc(
 
     // 检查是否启用了thinking
     let thinking_enabled = request_thinking_enabled(&payload);
+    let synthesize_hidden_thinking_signature =
+        thinking_enabled && provider.response_thinking_signature_compat_enabled();
     let request_weighting = provider.request_weighting_config();
 
     // 调度使用本地估算，返回给下游的 usage 使用远端计数优先。
@@ -2424,6 +2431,7 @@ pub async fn post_messages_cc(
             &payload.model,
             billing_input_tokens,
             thinking_enabled,
+            synthesize_hidden_thinking_signature,
             tool_name_map,
             RequestOptions {
                 omit_agent_mode_header: probe.omit_agent_mode_header,
@@ -2469,6 +2477,7 @@ async fn handle_stream_request_buffered(
     model: &str,
     estimated_input_tokens: i32,
     thinking_enabled: bool,
+    synthesize_hidden_thinking_signature: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     request_options: RequestOptions,
 ) -> Response {
@@ -2487,7 +2496,8 @@ async fn handle_stream_request_buffered(
         estimated_input_tokens,
         thinking_enabled,
         tool_name_map,
-    );
+    )
+    .with_synthetic_hidden_thinking_signature(synthesize_hidden_thinking_signature);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx);

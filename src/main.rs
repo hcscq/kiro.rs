@@ -993,6 +993,7 @@ mod tests {
                 ..RequestWeightingConfig::default()
             },
             thinking_signature_validation_mode: ThinkingSignatureValidationMode::WarnOnly,
+            response_thinking_signature_compat_enabled: true,
             account_type_policies: std::collections::BTreeMap::new(),
             account_type_dispatch_policies: std::collections::BTreeMap::new(),
         };
@@ -1037,5 +1038,6 @@ mod tests {
             rollback.thinking_signature_validation_mode,
             ThinkingSignatureValidationMode::WarnOnly
         );
+        assert!(rollback.response_thinking_signature_compat_enabled);
     }
 }

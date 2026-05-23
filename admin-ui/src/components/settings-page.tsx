@@ -307,6 +307,8 @@ export function SettingsPage() {
   )
   const [thinkingSignatureValidationMode, setThinkingSignatureValidationMode] =
     useState<ThinkingSignatureValidationMode>('strict')
+  const [responseThinkingSignatureCompatEnabled, setResponseThinkingSignatureCompatEnabled] =
+    useState(false)
 
   useEffect(() => {
     if (!loadBalancingData) {
@@ -337,6 +339,7 @@ export function SettingsPage() {
     setRequestWeightingEnabled(requestWeighting.enabled)
     setRequestWeightingInputs(createRequestWeightingInputs(requestWeighting))
     setThinkingSignatureValidationMode(loadBalancingData.thinkingSignatureValidationMode ?? 'strict')
+    setResponseThinkingSignatureCompatEnabled(loadBalancingData.responseThinkingSignatureCompatEnabled ?? false)
   }, [loadBalancingData])
 
   const handleRequestWeightingInputChange = (
@@ -500,6 +503,7 @@ export function SettingsPage() {
         rateLimitRefillBackoffFactor: parsedRateLimitRefillBackoffFactor,
         requestWeighting: parsedRequestWeighting,
         thinkingSignatureValidationMode,
+        responseThinkingSignatureCompatEnabled,
       },
       {
         onSuccess: () => {
@@ -932,6 +936,19 @@ export function SettingsPage() {
                     </span>
                   </Button>
                 ))}
+              </div>
+
+              <div className="flex flex-col gap-3 rounded-lg border bg-background/70 p-4 md:flex-row md:items-center md:justify-between">
+                <div className="space-y-1">
+                  <div className="text-sm font-medium">响应侧隐藏 thinking signature 补齐</div>
+                  <p className="text-sm text-muted-foreground">
+                    thinking 流式请求先返回普通内容时，补齐隐藏 thinking block 和动态 AWS-shaped signature_delta。
+                  </p>
+                </div>
+                <Switch
+                  checked={responseThinkingSignatureCompatEnabled}
+                  onCheckedChange={setResponseThinkingSignatureCompatEnabled}
+                />
               </div>
             </div>
           </div>

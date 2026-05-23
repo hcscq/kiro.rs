@@ -477,6 +477,8 @@ impl AdminService {
             rate_limit_refill_backoff_factor: snapshot.rate_limit_refill_backoff_factor,
             request_weighting: snapshot.request_weighting,
             thinking_signature_validation_mode: snapshot.thinking_signature_validation_mode,
+            response_thinking_signature_compat_enabled: snapshot
+                .response_thinking_signature_compat_enabled,
             waiting_requests: snapshot.waiting_requests,
         })
     }
@@ -554,6 +556,7 @@ impl AdminService {
             && req.rate_limit_refill_backoff_factor.is_none()
             && req.request_weighting.is_none()
             && req.thinking_signature_validation_mode.is_none()
+            && req.response_thinking_signature_compat_enabled.is_none()
         {
             return self.get_load_balancing_mode();
         }
@@ -591,6 +594,7 @@ impl AdminService {
                 req.request_weighting,
                 req.session_affinity_enabled,
                 req.thinking_signature_validation_mode,
+                req.response_thinking_signature_compat_enabled,
             )
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 

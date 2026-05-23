@@ -402,6 +402,11 @@ pub struct Config {
     #[serde(default, alias = "thinking_signature_validation_mode")]
     pub thinking_signature_validation_mode: ThinkingSignatureValidationMode,
 
+    /// 响应侧 thinking signature 兼容模式：当 thinking 请求的上游流先返回文本/工具块时，
+    /// 补齐隐藏 thinking block 和动态 signature_delta。默认关闭。
+    #[serde(default, alias = "response_thinking_signature_compat_enabled")]
+    pub response_thinking_signature_compat_enabled: bool,
+
     /// 账号类型默认模型策略
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub account_type_policies: BTreeMap<String, ModelSupportPolicy>,
@@ -650,6 +655,7 @@ impl Default for Config {
             rate_limit_refill_backoff_factor: default_rate_limit_refill_backoff_factor(),
             request_weighting: RequestWeightingConfig::default(),
             thinking_signature_validation_mode: ThinkingSignatureValidationMode::default(),
+            response_thinking_signature_compat_enabled: false,
             account_type_policies: BTreeMap::new(),
             account_type_dispatch_policies: BTreeMap::new(),
             config_path: None,
@@ -929,6 +935,7 @@ mod tests {
             config.thinking_signature_validation_mode,
             ThinkingSignatureValidationMode::Strict
         );
+        assert!(!config.response_thinking_signature_compat_enabled);
         assert!(!config.rate_limit_cooldown_enabled);
         assert!(config.suspicious_activity_cooldown_enabled);
         assert_eq!(config.suspicious_activity_cooldown_ms, 7_200_000);
@@ -969,5 +976,16 @@ mod tests {
             snake.thinking_signature_validation_mode,
             ThinkingSignatureValidationMode::StripInvalid
         );
+    }
+
+    #[test]
+    fn response_thinking_signature_compat_enabled_deserializes_alias() {
+        let camel: Config =
+            serde_json::from_str(r#"{"responseThinkingSignatureCompatEnabled":true}"#).unwrap();
+        let snake: Config =
+            serde_json::from_str(r#"{"response_thinking_signature_compat_enabled":true}"#).unwrap();
+
+        assert!(camel.response_thinking_signature_compat_enabled);
+        assert!(snake.response_thinking_signature_compat_enabled);
     }
 }

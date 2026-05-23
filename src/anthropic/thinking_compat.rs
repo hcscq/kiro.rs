@@ -19,6 +19,11 @@ const ISSUER_TAG_LEN: usize = 16;
 const HMAC_LEN: usize = 32;
 const HASH_LEN: usize = 32;
 const SIGNATURE_RAW_LEN: usize = 1 + ISSUER_TAG_LEN + 4 + HASH_LEN + HMAC_LEN;
+const AWS_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN: usize = 3249;
+const AWS_SHAPED_SYNTHETIC_SIGNATURE_PREFIX: [u8; 24] = [
+    0x12, 0x9a, 0x13, 0x0a, 0x63, 0x08, 0x0d, 0x18, 0x02, 0x2a, 0x40, 0x0b, 0xea, 0x3f, 0x40, 0xd2,
+    0x98, 0x2a, 0xdb, 0xce, 0x9e, 0x7e, 0xca, 0xf6,
+];
 
 static SIGNING_KEY: OnceLock<[u8; 32]> = OnceLock::new();
 static VALIDATION_KEYS: OnceLock<Vec<[u8; 32]>> = OnceLock::new();
@@ -182,6 +187,40 @@ pub(crate) fn sign_thinking_block(thinking_ordinal: u32, thinking: &str) -> Stri
     STANDARD_NO_PAD.encode(raw)
 }
 
+/// 签发用于隐藏 synthetic thinking block 的动态 AWS-shaped signature。
+///
+/// Kiro 上游有时不会返回可见 thinking 内容；为了响应侧仍符合 Claude thinking
+/// SSE 形状，这里签发一个可由本服务后续校验的空 thinking signature。签名长度和
+/// 前缀按 AWS Claude 常见形态组织，但主体中包含本服务 issuer、thinking hash、
+/// nonce 和 MAC，因此不是固定捕获值。
+pub(crate) fn sign_synthetic_hidden_thinking_block(
+    thinking_ordinal: u32,
+    thinking: &str,
+    nonce_material: &[u8],
+) -> String {
+    let key = signing_key();
+    let issuer = issuer_tag(&key);
+    let thinking = canonicalize_thinking_for_signature(thinking);
+    let thinking_hash = sha256_bytes(thinking.as_bytes());
+    let nonce = synthetic_signature_nonce(nonce_material);
+
+    let mut body = Vec::with_capacity(AWS_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN - HMAC_LEN);
+    body.extend_from_slice(&AWS_SHAPED_SYNTHETIC_SIGNATURE_PREFIX);
+    body.extend_from_slice(&issuer);
+    body.extend_from_slice(&thinking_ordinal.to_be_bytes());
+    body.extend_from_slice(&thinking_hash);
+    body.extend_from_slice(&nonce);
+
+    let filler_len = AWS_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN - HMAC_LEN - body.len();
+    body.extend_from_slice(&synthetic_signature_filler(&key, &body, filler_len));
+
+    let mac = signature_mac(&key, &body);
+    let mut raw = body;
+    raw.extend_from_slice(&mac);
+
+    STANDARD_NO_PAD.encode(raw)
+}
+
 pub(crate) fn validate_thinking_signatures(
     req: &MessagesRequest,
 ) -> Result<ThinkingSignatureValidationStats, ThinkingSignatureValidationError> {
@@ -304,11 +343,59 @@ fn classify_signature(signature: &str, thinking_ordinal: u32, thinking: &str) ->
     let Some(raw) = decode_signature(signature) else {
         return SignatureClass::Foreign;
     };
-    if raw.len() != SIGNATURE_RAW_LEN || raw[0] != SIGNATURE_VERSION {
-        return SignatureClass::Foreign;
+
+    if raw.len() == SIGNATURE_RAW_LEN && raw[0] == SIGNATURE_VERSION {
+        return classify_own_signature(
+            signature,
+            &raw,
+            thinking_ordinal,
+            thinking,
+            OwnSignatureLayout {
+                issuer_start: 1,
+                ordinal_start: 1 + ISSUER_TAG_LEN,
+                hash_start: 1 + ISSUER_TAG_LEN + 4,
+                mac_start: 1 + ISSUER_TAG_LEN + 4 + HASH_LEN,
+            },
+        );
     }
 
-    let issuer_start = 1;
+    if raw.len() == AWS_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN
+        && raw.starts_with(&AWS_SHAPED_SYNTHETIC_SIGNATURE_PREFIX)
+    {
+        let issuer_start = AWS_SHAPED_SYNTHETIC_SIGNATURE_PREFIX.len();
+        return classify_own_signature(
+            signature,
+            &raw,
+            thinking_ordinal,
+            thinking,
+            OwnSignatureLayout {
+                issuer_start,
+                ordinal_start: issuer_start + ISSUER_TAG_LEN,
+                hash_start: issuer_start + ISSUER_TAG_LEN + 4,
+                mac_start: raw.len() - HMAC_LEN,
+            },
+        );
+    }
+
+    SignatureClass::Foreign
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OwnSignatureLayout {
+    issuer_start: usize,
+    ordinal_start: usize,
+    hash_start: usize,
+    mac_start: usize,
+}
+
+fn classify_own_signature(
+    signature: &str,
+    raw: &[u8],
+    thinking_ordinal: u32,
+    thinking: &str,
+    layout: OwnSignatureLayout,
+) -> SignatureClass {
+    let issuer_start = layout.issuer_start;
     let issuer_end = issuer_start + ISSUER_TAG_LEN;
     let Some(key) = validation_keys().iter().find(|key| {
         raw[issuer_start..issuer_end]
@@ -319,36 +406,36 @@ fn classify_signature(signature: &str, thinking_ordinal: u32, thinking: &str) ->
         return SignatureClass::Foreign;
     };
 
-    let ordinal_start = issuer_end;
-    let ordinal_end = ordinal_start + 4;
+    let ordinal_start = layout.ordinal_start;
     let signed_ordinal = u32::from_be_bytes([
         raw[ordinal_start],
         raw[ordinal_start + 1],
         raw[ordinal_start + 2],
         raw[ordinal_start + 3],
     ]);
+    let hash_start = layout.hash_start;
+    let hash_end = hash_start + HASH_LEN;
     if signed_ordinal != thinking_ordinal {
         return SignatureClass::InvalidOwn(invalid_own_signature_detail(
             signature,
-            &raw,
+            raw,
             signed_ordinal,
             ThinkingSignatureInvalidReason::OrdinalMismatch,
             thinking,
+            &raw[hash_start..hash_end],
         ));
     }
 
-    let hash_start = ordinal_end;
-    let hash_end = hash_start + HASH_LEN;
-    let body_end = hash_end;
-    let mac_start = body_end;
-    let expected_mac = signature_mac(&key, &raw[..body_end]);
+    let mac_start = layout.mac_start;
+    let expected_mac = signature_mac(&key, &raw[..mac_start]);
     if raw[mac_start..].ct_eq(&expected_mac).unwrap_u8() != 1 {
         return SignatureClass::InvalidOwn(invalid_own_signature_detail(
             signature,
-            &raw,
+            raw,
             signed_ordinal,
             ThinkingSignatureInvalidReason::MacMismatch,
             thinking,
+            &raw[hash_start..hash_end],
         ));
     }
 
@@ -357,10 +444,11 @@ fn classify_signature(signature: &str, thinking_ordinal: u32, thinking: &str) ->
     } else {
         SignatureClass::InvalidOwn(invalid_own_signature_detail(
             signature,
-            &raw,
+            raw,
             signed_ordinal,
             ThinkingSignatureInvalidReason::ThinkingHashMismatch,
             thinking,
+            &raw[hash_start..hash_end],
         ))
     }
 }
@@ -371,9 +459,8 @@ fn invalid_own_signature_detail(
     signed_ordinal: u32,
     reason: ThinkingSignatureInvalidReason,
     thinking: &str,
+    signed_thinking_hash: &[u8],
 ) -> InvalidOwnSignatureDetail {
-    let hash_start = 1 + ISSUER_TAG_LEN + 4;
-    let hash_end = hash_start + HASH_LEN;
     let canonical = canonicalize_thinking_for_signature(thinking);
     let computed_thinking_hash = sha256_bytes(canonical.as_bytes());
     let signature_hash = sha256_bytes(signature.as_bytes());
@@ -384,10 +471,7 @@ fn invalid_own_signature_detail(
         raw_signature_len: raw.len(),
         signature_sha256_prefix: hex_prefix(&signature_hash),
         canonical_thinking_len: canonical.len(),
-        signed_thinking_hash_prefix: raw
-            .get(hash_start..hash_end)
-            .map(hex_prefix)
-            .unwrap_or_default(),
+        signed_thinking_hash_prefix: hex_prefix(signed_thinking_hash),
         computed_thinking_hash_prefix: hex_prefix(&computed_thinking_hash),
     }
 }
@@ -485,6 +569,31 @@ fn signature_mac(key: &[u8; 32], body: &[u8]) -> [u8; HMAC_LEN] {
     hmac_sha256(key, &payload)
 }
 
+fn synthetic_signature_nonce(nonce_material: &[u8]) -> [u8; HASH_LEN] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"anthropic-thinking-signature-synthetic-nonce\n");
+    hasher.update(nonce_material);
+    hasher.finalize().into()
+}
+
+fn synthetic_signature_filler(key: &[u8; 32], body_prefix: &[u8], len: usize) -> Vec<u8> {
+    let mut filler = Vec::with_capacity(len);
+    let mut counter = 0u32;
+    while filler.len() < len {
+        let mut payload = Vec::with_capacity(
+            b"anthropic-thinking-signature-synthetic-filler\n".len() + body_prefix.len() + 4,
+        );
+        payload.extend_from_slice(b"anthropic-thinking-signature-synthetic-filler\n");
+        payload.extend_from_slice(body_prefix);
+        payload.extend_from_slice(&counter.to_be_bytes());
+        let block = hmac_sha256(key, &payload);
+        let remaining = len - filler.len();
+        filler.extend_from_slice(&block[..block.len().min(remaining)]);
+        counter = counter.wrapping_add(1);
+    }
+    filler
+}
+
 fn sha256_bytes(input: &[u8]) -> [u8; HASH_LEN] {
     let mut hasher = Sha256::new();
     hasher.update(input);
@@ -547,11 +656,12 @@ pub(crate) fn canonicalize_thinking_for_signature(thinking: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        HASH_LEN, HMAC_LEN, ISSUER_TAG_LEN, SIGNATURE_RAW_LEN, SIGNATURE_VERSION, STANDARD_NO_PAD,
+        AWS_SHAPED_SYNTHETIC_SIGNATURE_PREFIX, AWS_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN, HASH_LEN,
+        HMAC_LEN, ISSUER_TAG_LEN, SIGNATURE_RAW_LEN, SIGNATURE_VERSION, STANDARD_NO_PAD,
         SignatureClass, ThinkingSignatureInvalidReason, classify_signature, decode_signature,
         extract_thinking_and_text, hmac_sha256, inspect_thinking_signatures, issuer_tag,
-        sha256_bytes, sign_thinking_block, signature_mac, signing_key,
-        strip_invalid_own_thinking_signatures, validate_thinking_signatures,
+        sha256_bytes, sign_synthetic_hidden_thinking_block, sign_thinking_block, signature_mac,
+        signing_key, strip_invalid_own_thinking_signatures, validate_thinking_signatures,
         validation_keys_for_material,
     };
     use crate::anthropic::types::{Message, MessagesRequest};
@@ -645,6 +755,27 @@ mod tests {
             classify_signature(&signature, 0, "\nstep 1\n"),
             SignatureClass::ValidOwn
         );
+    }
+
+    #[test]
+    fn test_sign_synthetic_hidden_thinking_block_is_dynamic_and_verifiable() {
+        let signature_a = sign_synthetic_hidden_thinking_block(0, "", b"response-a");
+        let signature_b = sign_synthetic_hidden_thinking_block(0, "", b"response-b");
+
+        assert_ne!(signature_a, signature_b);
+        assert_eq!(signature_a.len(), 4332);
+        let raw = decode_signature(&signature_a).expect("signature should decode");
+        assert_eq!(raw.len(), AWS_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN);
+        assert!(raw.starts_with(&AWS_SHAPED_SYNTHETIC_SIGNATURE_PREFIX));
+        assert_eq!(
+            classify_signature(&signature_a, 0, ""),
+            SignatureClass::ValidOwn
+        );
+        assert!(matches!(
+            classify_signature(&signature_a, 0, "non-empty"),
+            SignatureClass::InvalidOwn(detail)
+                if detail.reason == ThinkingSignatureInvalidReason::ThinkingHashMismatch
+        ));
     }
 
     #[test]
