@@ -44,6 +44,8 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
         });
     };
 
+    normalize_schema_object_for_kiro(&mut obj);
+
     // type（必须是字符串）
     if !obj
         .get("type")
@@ -90,6 +92,322 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     }
 
     serde_json::Value::Object(obj)
+}
+
+fn normalize_schema_value_for_kiro(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(obj) => normalize_schema_object_for_kiro(obj),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                normalize_schema_value_for_kiro(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_schema_object_for_kiro(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    for key in ["allOf", "anyOf", "oneOf"] {
+        normalize_schema_union_for_kiro(obj, key);
+    }
+
+    if let Some(serde_json::Value::Object(properties)) = obj.get_mut("properties") {
+        for schema in properties.values_mut() {
+            normalize_schema_value_for_kiro(schema);
+        }
+    }
+
+    for key in [
+        "$defs",
+        "definitions",
+        "patternProperties",
+        "dependentSchemas",
+    ] {
+        if let Some(serde_json::Value::Object(children)) = obj.get_mut(key) {
+            for schema in children.values_mut() {
+                normalize_schema_value_for_kiro(schema);
+            }
+        }
+    }
+
+    for key in [
+        "items",
+        "additionalProperties",
+        "unevaluatedProperties",
+        "propertyNames",
+        "contains",
+        "not",
+        "if",
+        "then",
+        "else",
+    ] {
+        if let Some(child) = obj.get_mut(key) {
+            normalize_schema_value_for_kiro(child);
+        }
+    }
+}
+
+fn normalize_schema_union_for_kiro(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) {
+    let Some(raw) = obj.remove(key) else {
+        return;
+    };
+    let serde_json::Value::Array(branches) = raw else {
+        add_schema_description_hint(
+            obj,
+            "Original schema union was simplified for compatibility.",
+        );
+        ensure_fallback_schema_type(obj);
+        return;
+    };
+
+    let mut nullable = false;
+    let mut non_null_branches = Vec::with_capacity(branches.len());
+    for mut branch in branches {
+        normalize_schema_value_for_kiro(&mut branch);
+        if is_null_schema_branch(&branch) {
+            nullable = true;
+            continue;
+        }
+        non_null_branches.push(branch);
+    }
+
+    if non_null_branches.is_empty() {
+        obj.insert(
+            "type".to_string(),
+            serde_json::Value::String("string".to_string()),
+        );
+        if nullable {
+            add_schema_description_hint(obj, "Nullable: null is also accepted.");
+        }
+        return;
+    }
+
+    if non_null_branches.len() == 1 {
+        merge_schema_branch_for_kiro(obj, &non_null_branches[0]);
+        if nullable {
+            add_schema_description_hint(obj, "Nullable: null is also accepted.");
+        }
+        normalize_schema_object_for_kiro(obj);
+        return;
+    }
+
+    if collapse_scalar_union_for_kiro(obj, &non_null_branches, nullable) {
+        return;
+    }
+    if collapse_object_union_for_kiro(obj, &non_null_branches, nullable) {
+        normalize_schema_object_for_kiro(obj);
+        return;
+    }
+
+    add_schema_description_hint(obj, "Original schema accepted one of multiple shapes.");
+    ensure_fallback_schema_type(obj);
+    if nullable {
+        add_schema_description_hint(obj, "Nullable: null is also accepted.");
+    }
+}
+
+fn is_null_schema_branch(branch: &serde_json::Value) -> bool {
+    match branch {
+        serde_json::Value::Null => true,
+        serde_json::Value::Object(obj) => match obj.get("type") {
+            Some(serde_json::Value::String(value)) => value == "null",
+            Some(serde_json::Value::Array(values)) => values
+                .iter()
+                .all(|value| value.as_str().is_some_and(|type_name| type_name == "null")),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn merge_schema_branch_for_kiro(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    branch: &serde_json::Value,
+) {
+    let serde_json::Value::Object(branch_obj) = branch else {
+        ensure_fallback_schema_type(target);
+        return;
+    };
+
+    for (key, value) in branch_obj {
+        if key == "description" {
+            if let Some(text) = value.as_str() {
+                add_schema_description_hint(target, text);
+            }
+            continue;
+        }
+        target.insert(key.clone(), value.clone());
+    }
+}
+
+fn collapse_scalar_union_for_kiro(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    branches: &[serde_json::Value],
+    nullable: bool,
+) -> bool {
+    let mut scalar_type = String::new();
+    let mut enum_values = Vec::new();
+    let mut has_open_branch = false;
+
+    for branch in branches {
+        let Some((branch_type, values)) = scalar_schema_branch_for_kiro(branch) else {
+            return false;
+        };
+        if scalar_type.is_empty() {
+            scalar_type = branch_type;
+        } else if scalar_type != branch_type {
+            target.insert(
+                "type".to_string(),
+                serde_json::Value::String("string".to_string()),
+            );
+            add_schema_description_hint(
+                target,
+                "Compatible scalar types were simplified to string.",
+            );
+            if nullable {
+                add_schema_description_hint(target, "Nullable: null is also accepted.");
+            }
+            return true;
+        }
+
+        if values.is_empty() {
+            has_open_branch = true;
+            continue;
+        }
+        for value in values {
+            if !enum_values.contains(&value) {
+                enum_values.push(value);
+            }
+        }
+    }
+
+    if scalar_type.is_empty() {
+        return false;
+    }
+
+    target.insert("type".to_string(), serde_json::Value::String(scalar_type));
+    if !has_open_branch && !enum_values.is_empty() {
+        target.insert("enum".to_string(), serde_json::Value::Array(enum_values));
+    }
+    if nullable {
+        add_schema_description_hint(target, "Nullable: null is also accepted.");
+    }
+    true
+}
+
+fn scalar_schema_branch_for_kiro(
+    branch: &serde_json::Value,
+) -> Option<(String, Vec<serde_json::Value>)> {
+    let serde_json::Value::Object(obj) = branch else {
+        return None;
+    };
+
+    let scalar_type = obj
+        .get("type")
+        .and_then(|value| value.as_str())
+        .filter(|value| matches!(*value, "string" | "number" | "integer" | "boolean"))?
+        .to_string();
+
+    let mut values = Vec::new();
+    if let Some(serde_json::Value::Array(enum_values)) = obj.get("enum") {
+        values.extend(enum_values.iter().cloned());
+    }
+    if let Some(value) = obj.get("const") {
+        values.push(value.clone());
+    }
+    Some((scalar_type, values))
+}
+
+fn collapse_object_union_for_kiro(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    branches: &[serde_json::Value],
+    nullable: bool,
+) -> bool {
+    let mut merged_properties = serde_json::Map::new();
+    let mut saw_object_branch = false;
+
+    for branch in branches {
+        let serde_json::Value::Object(obj) = branch else {
+            return false;
+        };
+        if obj
+            .get("type")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value != "object")
+        {
+            return false;
+        }
+        saw_object_branch = true;
+        if let Some(serde_json::Value::Object(properties)) = obj.get("properties") {
+            for (name, schema) in properties {
+                merged_properties
+                    .entry(name.clone())
+                    .or_insert_with(|| schema.clone());
+            }
+        }
+    }
+
+    if !saw_object_branch {
+        return false;
+    }
+
+    target.insert(
+        "type".to_string(),
+        serde_json::Value::String("object".to_string()),
+    );
+    target.insert(
+        "properties".to_string(),
+        serde_json::Value::Object(merged_properties),
+    );
+    add_schema_description_hint(target, "Alternative object shapes are accepted.");
+    if nullable {
+        add_schema_description_hint(target, "Nullable: null is also accepted.");
+    }
+    true
+}
+
+fn ensure_fallback_schema_type(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    if obj.get("type").and_then(|value| value.as_str()).is_some() {
+        return;
+    }
+    let fallback_type = if obj.get("properties").is_some() {
+        "object"
+    } else {
+        "string"
+    };
+    obj.insert(
+        "type".to_string(),
+        serde_json::Value::String(fallback_type.to_string()),
+    );
+}
+
+fn add_schema_description_hint(obj: &mut serde_json::Map<String, serde_json::Value>, hint: &str) {
+    let hint = hint.trim();
+    if hint.is_empty() {
+        return;
+    }
+
+    let existing = obj
+        .get("description")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim();
+    if existing.contains(hint) {
+        return;
+    }
+
+    let description = if existing.is_empty() {
+        hint.to_string()
+    } else {
+        format!("{existing}\n{hint}")
+    };
+    obj.insert(
+        "description".to_string(),
+        serde_json::Value::String(description),
+    );
 }
 
 /// 追加到 Write 工具 description 末尾的内容
@@ -2697,6 +3015,77 @@ mod tests {
             "first declaration"
         );
         assert_eq!(converted[1].tool_specification.name, "mcp__read__file");
+    }
+
+    #[test]
+    fn test_convert_tools_normalizes_nested_nullable_enum_anyof_schema() {
+        let tools = Some(vec![super::super::types::Tool {
+            tool_type: None,
+            name: "TaskUpdate".to_string(),
+            description: "Update task status".to_string(),
+            input_schema: HashMap::from([
+                ("type".to_string(), serde_json::json!("object")),
+                (
+                    "properties".to_string(),
+                    serde_json::json!({
+                        "status": {
+                            "anyOf": [
+                                {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "completed"]
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ]
+                        }
+                    }),
+                ),
+                ("required".to_string(), serde_json::json!(["status"])),
+            ]),
+            max_uses: None,
+            ..super::super::types::Tool::default()
+        }]);
+
+        let converted = convert_tools(&tools, &mut HashMap::new());
+
+        let schema = &converted[0].tool_specification.input_schema.json;
+        assert!(
+            !schema_contains_key(schema, "anyOf"),
+            "normalized schema must not retain anyOf: {schema}"
+        );
+        let status = schema
+            .pointer("/properties/status")
+            .expect("status property should exist");
+        assert_eq!(
+            status.get("type").and_then(|value| value.as_str()),
+            Some("string")
+        );
+        assert_eq!(
+            status
+                .get("enum")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(3)
+        );
+        assert!(
+            status
+                .get("description")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| value.contains("Nullable"))
+        );
+    }
+
+    fn schema_contains_key(value: &serde_json::Value, target: &str) -> bool {
+        match value {
+            serde_json::Value::Object(obj) => obj
+                .iter()
+                .any(|(key, value)| key == target || schema_contains_key(value, target)),
+            serde_json::Value::Array(items) => {
+                items.iter().any(|value| schema_contains_key(value, target))
+            }
+            _ => false,
+        }
     }
 
     #[test]
