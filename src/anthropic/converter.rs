@@ -1989,11 +1989,35 @@ fn merge_user_message_parts(
         tool_results.extend(msg_tool_results);
     }
 
+    let tool_results = dedupe_tool_results_by_id(tool_results);
+
     Ok(MergedUserMessageParts {
         content: content_parts.join("\n"),
         images,
         tool_results,
     })
+}
+
+fn dedupe_tool_results_by_id(tool_results: Vec<ToolResult>) -> Vec<ToolResult> {
+    if tool_results.len() <= 1 {
+        return tool_results;
+    }
+
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::with_capacity(tool_results.len());
+
+    for result in tool_results {
+        if seen.insert(result.tool_use_id.clone()) {
+            deduped.push(result);
+        } else {
+            tracing::warn!(
+                tool_use_id = %result.tool_use_id,
+                "跳过同一 user turn 内重复的 tool_result，避免 Bedrock TOOL_DUPLICATE"
+            );
+        }
+    }
+
+    deduped
 }
 
 fn build_history_user_message_from_parts(
@@ -2003,6 +2027,7 @@ fn build_history_user_message_from_parts(
     tool_results: Vec<ToolResult>,
 ) -> HistoryUserMessage {
     let mut user_msg = UserMessage::new(content, model_id);
+    let tool_results = dedupe_tool_results_by_id(tool_results);
 
     if !images.is_empty() {
         user_msg = user_msg.with_images(images);
@@ -4017,6 +4042,161 @@ mod tests {
                 assert_eq!(tool_uses.len(), 2);
             }
             other => panic!("history[1] 应为 assistant，got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_convert_request_deduplicates_current_tool_results_by_id() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-opus-4-6".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Run the tool"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "text", "text": "Calling it now."},
+                        {
+                            "type": "tool_use",
+                            "id": "call_dup",
+                            "name": "read_file",
+                            "input": {"path": "/tmp/a.txt"}
+                        }
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_dup",
+                            "content": "first result"
+                        },
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_dup",
+                            "content": "duplicate result"
+                        },
+                        {
+                            "type": "text",
+                            "text": "Use the result."
+                        }
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let state = convert_request(&req)
+            .expect("duplicate current tool_result ids should be deduplicated")
+            .conversation_state;
+        let tool_results = &state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tool_results;
+
+        assert_eq!(tool_results.len(), 1);
+        assert_eq!(tool_results[0].tool_use_id, "call_dup");
+        assert_eq!(
+            tool_results[0].content[0]
+                .get("text")
+                .and_then(|v| v.as_str()),
+            Some("first result")
+        );
+    }
+
+    #[test]
+    fn test_convert_request_deduplicates_history_tool_results_by_id() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-opus-4-6".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Run the tool"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "text", "text": "Calling it now."},
+                        {
+                            "type": "tool_use",
+                            "id": "call_dup",
+                            "name": "read_file",
+                            "input": {"path": "/tmp/a.txt"}
+                        }
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_dup",
+                            "content": "first history result"
+                        },
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_dup",
+                            "content": "duplicate history result"
+                        }
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("Done."),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Continue."),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let state = convert_request(&req)
+            .expect("duplicate historical tool_result ids should be deduplicated")
+            .conversation_state;
+
+        match &state.history[2] {
+            Message::User(user) => {
+                let tool_results = &user
+                    .user_input_message
+                    .user_input_message_context
+                    .tool_results;
+                assert_eq!(tool_results.len(), 1);
+                assert_eq!(tool_results[0].tool_use_id, "call_dup");
+                assert_eq!(
+                    tool_results[0].content[0]
+                        .get("text")
+                        .and_then(|v| v.as_str()),
+                    Some("first history result")
+                );
+            }
+            other => panic!(
+                "history[2] should be duplicate tool_result user, got {:?}",
+                other
+            ),
         }
     }
 
