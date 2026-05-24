@@ -764,6 +764,62 @@ enum StreamContentStartPrefetch {
     },
 }
 
+#[derive(Debug, Default, PartialEq)]
+struct KiroRequestBodyDiagnostics {
+    body_bytes: usize,
+    profile_arn_present: bool,
+    conversation_id_present: bool,
+    agent_task_type_present: bool,
+    chat_trigger_type: Option<String>,
+    current_model_id: Option<String>,
+    current_origin: Option<String>,
+    current_content_bytes: usize,
+    current_image_count: usize,
+    current_tool_count: usize,
+    current_tool_result_count: usize,
+    current_tool_result_error_count: usize,
+    history_count: usize,
+    history_user_count: usize,
+    history_assistant_count: usize,
+    history_user_image_count: usize,
+    history_tool_result_count: usize,
+    history_tool_use_count: usize,
+    tail_history_roles: Vec<String>,
+}
+
+const KIRO_REQUEST_DIAGNOSTICS_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+fn append_bounded_tail(mut values: Vec<String>, value: &str, limit: usize) -> Vec<String> {
+    if limit == 0 {
+        return values;
+    }
+    values.push(truncate_log_string(value.trim(), 64));
+    if values.len() > limit {
+        let drain_count = values.len() - limit;
+        values.drain(0..drain_count);
+    }
+    values
+}
+
+fn truncate_log_string(value: &str, limit: usize) -> String {
+    if limit == 0 || value.len() <= limit {
+        return value.to_string();
+    }
+    if limit <= 3 {
+        let mut end = limit;
+        while end > 0 && !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        return value[..end].to_string();
+    }
+
+    let mut end = limit - 3;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &value[..end])
+}
+
 impl KiroProvider {
     /// 创建带代理配置的 KiroProvider 实例
     pub fn with_proxy(token_manager: Arc<MultiTokenManager>, proxy: Option<ProxyConfig>) -> Self {
@@ -864,6 +920,110 @@ impl KiroProvider {
             .get("modelId")?
             .as_str()
             .map(|s| s.to_string())
+    }
+
+    fn summarize_kiro_request_body_for_log(
+        request_body: &str,
+    ) -> Option<KiroRequestBodyDiagnostics> {
+        if request_body.len() > KIRO_REQUEST_DIAGNOSTICS_MAX_BODY_BYTES {
+            return None;
+        }
+
+        let json: serde_json::Value = serde_json::from_str(request_body).ok()?;
+        let conversation = json.get("conversationState")?;
+        let current = conversation
+            .get("currentMessage")?
+            .get("userInputMessage")?;
+        let current_context = current.get("userInputMessageContext");
+
+        let mut diagnostics = KiroRequestBodyDiagnostics {
+            body_bytes: request_body.len(),
+            profile_arn_present: json.get("profileArn").is_some(),
+            conversation_id_present: conversation
+                .get("conversationId")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| !value.trim().is_empty()),
+            agent_task_type_present: conversation
+                .get("agentTaskType")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| !value.trim().is_empty()),
+            chat_trigger_type: Self::bounded_json_string(conversation.get("chatTriggerType"), 32),
+            current_model_id: Self::bounded_json_string(current.get("modelId"), 96),
+            current_origin: Self::bounded_json_string(current.get("origin"), 64),
+            current_content_bytes: current
+                .get("content")
+                .and_then(|value| value.as_str())
+                .map(str::len)
+                .unwrap_or_default(),
+            current_image_count: Self::json_array_len(current.get("images")),
+            current_tool_count: Self::json_array_len(
+                current_context.and_then(|ctx| ctx.get("tools")),
+            ),
+            current_tool_result_count: Self::json_array_len(
+                current_context.and_then(|ctx| ctx.get("toolResults")),
+            ),
+            ..Default::default()
+        };
+
+        if let Some(tool_results) = current_context
+            .and_then(|ctx| ctx.get("toolResults"))
+            .and_then(|value| value.as_array())
+        {
+            diagnostics.current_tool_result_error_count = tool_results
+                .iter()
+                .filter(|result| {
+                    result
+                        .get("isError")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false)
+                })
+                .count();
+        }
+
+        if let Some(history) = conversation
+            .get("history")
+            .and_then(|value| value.as_array())
+        {
+            diagnostics.history_count = history.len();
+            for entry in history {
+                if let Some(user) = entry.get("userInputMessage") {
+                    diagnostics.history_user_count += 1;
+                    diagnostics.tail_history_roles =
+                        append_bounded_tail(diagnostics.tail_history_roles, "user", 16);
+                    diagnostics.history_user_image_count +=
+                        Self::json_array_len(user.get("images"));
+                    if let Some(ctx) = user.get("userInputMessageContext") {
+                        diagnostics.history_tool_result_count +=
+                            Self::json_array_len(ctx.get("toolResults"));
+                    }
+                    continue;
+                }
+                if let Some(assistant) = entry.get("assistantResponseMessage") {
+                    diagnostics.history_assistant_count += 1;
+                    diagnostics.tail_history_roles =
+                        append_bounded_tail(diagnostics.tail_history_roles, "assistant", 16);
+                    diagnostics.history_tool_use_count +=
+                        Self::json_array_len(assistant.get("toolUses"));
+                    continue;
+                }
+                diagnostics.tail_history_roles =
+                    append_bounded_tail(diagnostics.tail_history_roles, "unknown", 16);
+            }
+        }
+
+        Some(diagnostics)
+    }
+
+    fn json_array_len(value: Option<&serde_json::Value>) -> usize {
+        value.and_then(|value| value.as_array()).map_or(0, Vec::len)
+    }
+
+    fn bounded_json_string(value: Option<&serde_json::Value>, limit: usize) -> Option<String> {
+        let value = value?.as_str()?.trim();
+        if value.is_empty() {
+            return None;
+        }
+        Some(truncate_log_string(value, limit))
     }
 
     /// 将凭据的 profile_arn 注入到请求体 JSON 中。
@@ -2424,6 +2584,79 @@ impl KiroProvider {
                     );
                 }
 
+                if request_body.len() > KIRO_REQUEST_DIAGNOSTICS_MAX_BODY_BYTES {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        api_type,
+                        model = model.as_deref().unwrap_or("unknown"),
+                        credential_id = ctx_id,
+                        attempt = attempt + 1,
+                        max_retries,
+                        region = %region,
+                        stream = is_stream,
+                        request_body_bytes,
+                        status_code = status.as_u16(),
+                        error_summary = %error_summary,
+                        kiro_body_bytes = request_body.len(),
+                        kiro_diagnostic_body_limit_bytes = KIRO_REQUEST_DIAGNOSTICS_MAX_BODY_BYTES,
+                        total_elapsed_ms = overall_started_at.elapsed().as_millis(),
+                        "API 请求失败（上游 400，诊断摘要跳过：请求体超过诊断上限）"
+                    );
+                } else if let Some(diagnostics) =
+                    Self::summarize_kiro_request_body_for_log(request_body)
+                {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        api_type,
+                        model = model.as_deref().unwrap_or("unknown"),
+                        credential_id = ctx_id,
+                        attempt = attempt + 1,
+                        max_retries,
+                        region = %region,
+                        stream = is_stream,
+                        request_body_bytes,
+                        status_code = status.as_u16(),
+                        error_summary = %error_summary,
+                        kiro_body_bytes = diagnostics.body_bytes,
+                        kiro_profile_arn_present = diagnostics.profile_arn_present,
+                        kiro_conversation_id_present = diagnostics.conversation_id_present,
+                        kiro_agent_task_type_present = diagnostics.agent_task_type_present,
+                        kiro_chat_trigger_type = diagnostics.chat_trigger_type.as_deref().unwrap_or(""),
+                        kiro_current_model_id = diagnostics.current_model_id.as_deref().unwrap_or(""),
+                        kiro_current_origin = diagnostics.current_origin.as_deref().unwrap_or(""),
+                        kiro_current_content_bytes = diagnostics.current_content_bytes,
+                        kiro_current_image_count = diagnostics.current_image_count,
+                        kiro_current_tool_count = diagnostics.current_tool_count,
+                        kiro_current_tool_result_count = diagnostics.current_tool_result_count,
+                        kiro_current_tool_result_error_count = diagnostics.current_tool_result_error_count,
+                        kiro_history_count = diagnostics.history_count,
+                        kiro_history_user_count = diagnostics.history_user_count,
+                        kiro_history_assistant_count = diagnostics.history_assistant_count,
+                        kiro_history_user_image_count = diagnostics.history_user_image_count,
+                        kiro_history_tool_result_count = diagnostics.history_tool_result_count,
+                        kiro_history_tool_use_count = diagnostics.history_tool_use_count,
+                        kiro_tail_history_roles = ?diagnostics.tail_history_roles,
+                        total_elapsed_ms = overall_started_at.elapsed().as_millis(),
+                        "API 请求失败（上游 400 诊断摘要）"
+                    );
+                } else {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        api_type,
+                        model = model.as_deref().unwrap_or("unknown"),
+                        credential_id = ctx_id,
+                        attempt = attempt + 1,
+                        max_retries,
+                        region = %region,
+                        stream = is_stream,
+                        request_body_bytes,
+                        status_code = status.as_u16(),
+                        error_summary = %error_summary,
+                        total_elapsed_ms = overall_started_at.elapsed().as_millis(),
+                        "API 请求失败（上游 400，诊断摘要解析失败）"
+                    );
+                }
+
                 let log_message = format!("{} API 请求失败: {}", api_type, error_summary);
                 let public_error = if Self::is_context_length_exceeded_body(&body) {
                     PublicProviderError::context_length_exceeded(400, log_message)
@@ -3092,6 +3325,72 @@ mod tests {
             "",
             "body_excerpt=\"Invalid thinking signature at messages[315] thinking block 0\""
         ));
+    }
+
+    #[test]
+    fn test_summarize_kiro_request_body_for_log_is_bounded_shape_only() {
+        let body = r#"{
+            "profileArn":"arn:test",
+            "conversationState":{
+                "conversationId":"conv-1",
+                "agentTaskType":"vibe",
+                "chatTriggerType":"MANUAL",
+                "currentMessage":{"userInputMessage":{
+                    "modelId":"claude-opus-4.6",
+                    "origin":"AI_EDITOR",
+                    "content":"secret current text",
+                    "images":[{"format":"png","source":{"bytes":"AA=="}}],
+                    "userInputMessageContext":{
+                        "tools":[{"toolSpecification":{"name":"Read","description":"read","inputSchema":{"json":{"type":"object"}}}}],
+                        "toolResults":[
+                            {"toolUseId":"toolu_1","content":[{"text":"hidden"}],"status":"success"},
+                            {"toolUseId":"toolu_2","content":[{"text":"hidden"}],"status":"error","isError":true}
+                        ]
+                    }
+                }},
+                "history":[
+                    {"userInputMessage":{"content":"old","modelId":"m","images":[{"format":"png","source":{"bytes":"AA=="}}],"userInputMessageContext":{"toolResults":[{"toolUseId":"toolu_old","content":[{"text":"hidden"}]}]}}},
+                    {"assistantResponseMessage":{"content":"old","toolUses":[{"toolUseId":"toolu_old","name":"Read","input":{"path":"secret"}}]}},
+                    {"unknownMessage":{}}
+                ]
+            }
+        }"#;
+
+        let diagnostics =
+            KiroProvider::summarize_kiro_request_body_for_log(body).expect("expected diagnostics");
+
+        assert_eq!(diagnostics.body_bytes, body.len());
+        assert!(diagnostics.profile_arn_present);
+        assert!(diagnostics.conversation_id_present);
+        assert!(diagnostics.agent_task_type_present);
+        assert_eq!(diagnostics.chat_trigger_type.as_deref(), Some("MANUAL"));
+        assert_eq!(
+            diagnostics.current_model_id.as_deref(),
+            Some("claude-opus-4.6")
+        );
+        assert_eq!(diagnostics.current_origin.as_deref(), Some("AI_EDITOR"));
+        assert_eq!(
+            diagnostics.current_content_bytes,
+            "secret current text".len()
+        );
+        assert_eq!(diagnostics.current_image_count, 1);
+        assert_eq!(diagnostics.current_tool_count, 1);
+        assert_eq!(diagnostics.current_tool_result_count, 2);
+        assert_eq!(diagnostics.current_tool_result_error_count, 1);
+        assert_eq!(diagnostics.history_count, 3);
+        assert_eq!(diagnostics.history_user_count, 1);
+        assert_eq!(diagnostics.history_assistant_count, 1);
+        assert_eq!(diagnostics.history_user_image_count, 1);
+        assert_eq!(diagnostics.history_tool_result_count, 1);
+        assert_eq!(diagnostics.history_tool_use_count, 1);
+        assert_eq!(
+            diagnostics.tail_history_roles,
+            vec![
+                "user".to_string(),
+                "assistant".to_string(),
+                "unknown".to_string()
+            ]
+        );
     }
 
     #[test]
