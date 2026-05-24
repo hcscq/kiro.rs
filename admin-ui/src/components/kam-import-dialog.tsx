@@ -23,6 +23,7 @@ interface KamAccount {
   email?: string
   userId?: string | null
   nickname?: string
+  profileArn?: string
   accountType?: string
   maxConcurrency?: number
   rateLimitBucketCapacity?: number
@@ -32,6 +33,7 @@ interface KamAccount {
     clientId?: string
     clientSecret?: string
     region?: string
+    profileArn?: string
     authMethod?: string
     startUrl?: string
   }
@@ -67,6 +69,7 @@ function normalizeKamAccount(item: unknown): unknown {
         : typeof obj.label === 'string'
           ? (obj.label as string)
           : undefined
+    const profileArn = typeof obj.profileArn === 'string' ? obj.profileArn : undefined
     const accountType = typeof obj.accountType === 'string' ? obj.accountType : undefined
     const maxConcurrency =
       typeof obj.maxConcurrency === 'number' ? obj.maxConcurrency : undefined
@@ -88,6 +91,7 @@ function normalizeKamAccount(item: unknown): unknown {
       email,
       userId,
       nickname,
+      profileArn,
       accountType,
       maxConcurrency,
       rateLimitBucketCapacity,
@@ -99,6 +103,7 @@ function normalizeKamAccount(item: unknown): unknown {
         clientId,
         clientSecret,
         region,
+        profileArn,
         authMethod,
         startUrl,
       },
@@ -285,6 +290,9 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           const clientId = cred.clientId?.trim() || undefined
           const clientSecret = cred.clientSecret?.trim() || undefined
           const authMethod = clientId && clientSecret ? 'idc' : 'social'
+          const kamRegion = cred.region?.trim() || undefined
+          const profileArn =
+            account.profileArn?.trim() || cred.profileArn?.trim() || undefined
 
           // idc 模式下必须同时提供 clientId 和 clientSecret
           if (authMethod === 'social' && (clientId || clientSecret)) {
@@ -316,7 +324,10 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             refreshToken: token,
             email: account.email?.trim() || undefined,
             authMethod,
-            authRegion: cred.region?.trim() || undefined,
+            region: kamRegion,
+            authRegion: kamRegion,
+            apiRegion: kamRegion,
+            profileArn,
             clientId,
             clientSecret,
             startUrl: cred.startUrl?.trim() || undefined,
@@ -338,17 +349,29 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
 
           await new Promise(resolve => setTimeout(resolve, 1000))
 
-          const balance = await getCredentialBalance(addedCred.credentialId)
+          let usage: string | undefined
+          let balanceError: string | undefined
+          try {
+            const balance = await getCredentialBalance(addedCred.credentialId)
+            usage = `${balance.currentUsage}/${balance.usageLimit}`
+          } catch (error) {
+            balanceError = `获取额度失败: ${extractErrorMessage(error)}`
+          }
 
           successCount++
           existingTokenHashes.add(tokenHash)
-          setCurrentProcessing(`验活成功: ${addedCred.email || account.email || `账号 ${i + 1}`}`)
+          setCurrentProcessing(
+            balanceError
+              ? `导入成功，额度获取失败: ${addedCred.email || account.email || `账号 ${i + 1}`}`
+              : `验活成功: ${addedCred.email || account.email || `账号 ${i + 1}`}`,
+          )
           setResults(prev => {
             const next = [...prev]
             next[i] = {
               ...next[i],
               status: 'verified',
-              usage: `${balance.currentUsage}/${balance.usageLimit}`,
+              usage,
+              error: balanceError,
               email: addedCred.email || account.email,
               credentialId: addedCred.credentialId,
             }

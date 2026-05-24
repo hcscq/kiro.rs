@@ -148,6 +148,7 @@ export interface SetCredentialModelPolicyRequest {
 export interface AddCredentialRequest {
   refreshToken: string
   authMethod?: 'social' | 'idc'
+  profileArn?: string
   clientId?: string
   clientSecret?: string
   priority?: number

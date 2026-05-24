@@ -20,6 +20,9 @@ use crate::model::model_policy::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
+pub const KIRO_BUILDER_ID_PROFILE_ARN: &str =
+    "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolvedAccountTypeSource {
     Explicit,
@@ -450,6 +453,25 @@ impl KiroCredentials {
         }
 
         Some("idc".to_string())
+    }
+
+    pub fn effective_profile_arn_for_kiro_requests(&self) -> Option<&str> {
+        if let Some(profile_arn) = self.profile_arn.as_deref() {
+            let trimmed = profile_arn.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed);
+            }
+        }
+
+        if self
+            .detected_auth_account_type()
+            .as_deref()
+            .is_some_and(|account_type| account_type == "builder-id")
+        {
+            return Some(KIRO_BUILDER_ID_PROFILE_ARN);
+        }
+
+        None
     }
 
     pub fn canonicalize_auth_method(&mut self) {
@@ -1005,6 +1027,53 @@ mod tests {
         assert_eq!(
             builder.detected_auth_account_type().as_deref(),
             Some("enterprise")
+        );
+    }
+
+    #[test]
+    fn test_effective_profile_arn_defaults_only_for_builder_id() {
+        let builder = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            client_id: Some("client".to_string()),
+            client_secret: Some("secret".to_string()),
+            start_url: Some("https://view.awsapps.com/start/".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            builder.effective_profile_arn_for_kiro_requests(),
+            Some(KIRO_BUILDER_ID_PROFILE_ARN)
+        );
+
+        let enterprise = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            client_id: Some("client".to_string()),
+            client_secret: Some("secret".to_string()),
+            start_url: Some("https://example.awsapps.com/start".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(enterprise.effective_profile_arn_for_kiro_requests(), None);
+
+        let social = KiroCredentials {
+            auth_method: Some("social".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(social.effective_profile_arn_for_kiro_requests(), None);
+    }
+
+    #[test]
+    fn test_effective_profile_arn_prefers_explicit_value() {
+        let credentials = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            client_id: Some("client".to_string()),
+            client_secret: Some("secret".to_string()),
+            start_url: Some("https://view.awsapps.com/start/".to_string()),
+            profile_arn: Some(" arn:aws:test ".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            credentials.effective_profile_arn_for_kiro_requests(),
+            Some("arn:aws:test")
         );
     }
 

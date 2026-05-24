@@ -1420,8 +1420,8 @@ impl KiroProvider {
                 .body(request_body.to_string())
                 .header("content-type", "application/json");
 
-            // MCP 请求需要携带 profile ARN（如果凭据中存在）
-            if let Some(ref arn) = credentials.profile_arn {
+            // MCP 请求需要携带 profile ARN；BuilderID 缺省时使用 Kiro 默认值。
+            if let Some(arn) = credentials.effective_profile_arn_for_kiro_requests() {
                 request = request.header("x-amzn-kiro-profile-arn", arn);
             }
 
@@ -1793,12 +1793,15 @@ impl KiroProvider {
             let acquire_context_ms = attempt_started_at.elapsed().as_millis();
             let invocation_id = Uuid::new_v4().to_string();
 
-            // 注入实际凭据的 profile_arn 到请求体
+            // BuilderID 缺省时使用 Kiro 默认 profileArn，Enterprise 仍保持不注入。
             let body_inject_started_at = Instant::now();
+            let effective_profile_arn = credentials
+                .effective_profile_arn_for_kiro_requests()
+                .map(str::to_string);
             let body = Self::request_body_for_profile_arn(
                 request_body,
                 &mut original_request_body,
-                &credentials.profile_arn,
+                &effective_profile_arn,
             );
             let body_inject_ms = body_inject_started_at.elapsed().as_millis();
             let request_body_bytes = body.len();
@@ -1813,7 +1816,7 @@ impl KiroProvider {
                     attempt = attempt + 1,
                     request_body_bytes,
                     body_inject_ms,
-                    profile_arn_present = credentials.profile_arn.is_some(),
+                    profile_arn_present = effective_profile_arn.is_some(),
                     "Kiro provider request body prepared"
                 );
             }

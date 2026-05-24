@@ -243,6 +243,9 @@ pub struct AddCredentialRequest {
     #[serde(default = "default_auth_method")]
     pub auth_method: String,
 
+    /// Profile ARN（可选；BuilderID 缺省时后端会使用默认 BuilderID profile）
+    pub profile_arn: Option<String>,
+
     /// OIDC Client ID（IdC 认证需要）
     pub client_id: Option<String>,
 

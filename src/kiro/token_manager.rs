@@ -423,8 +423,8 @@ pub(crate) async fn get_usage_limits(
         management_endpoint
     );
 
-    // profileArn 是可选的
-    if let Some(profile_arn) = &credentials.profile_arn {
+    // BuilderID 账号在 Kiro/KAM 中会使用固定 profileArn；Enterprise 不补默认值。
+    if let Some(profile_arn) = credentials.effective_profile_arn_for_kiro_requests() {
         url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
     }
 
