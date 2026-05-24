@@ -21,10 +21,12 @@ use bytes::Bytes;
 use futures::{Stream, stream};
 use regex::Regex;
 use reqwest::redirect::Policy;
+use serde::Serialize;
 use serde_json::{Value, json};
 use url::Url;
 use uuid::Uuid;
 
+use crate::common::logging::summarize_text_for_log;
 use crate::token;
 
 use super::handlers::execute_non_stream_round;
@@ -46,6 +48,7 @@ const WEB_FETCH_REQUEST_TIMEOUT_SECS: u64 = 20;
 const WEB_FETCH_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const WEB_FETCH_MAX_URL_LEN: usize = 250;
 const WEB_FETCH_HARD_MAX_USES: usize = 16;
+const WEB_TOOL_LOOP_RECENT_ATTEMPTS_LIMIT: usize = 5;
 const WEB_FETCH_DEFAULT_MAX_CONTENT_TOKENS: i32 = 100_000;
 const TEXT_CHUNK_SIZE: usize = 120;
 
@@ -107,6 +110,14 @@ struct ServerWebToolRun {
     total_output_tokens: i32,
     web_fetch_requests: i32,
     web_search_requests: i32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ServerWebToolAttemptLog {
+    round_idx: usize,
+    tool_name: String,
+    input: String,
+    error_code: Option<String>,
 }
 
 pub fn has_web_fetch_tool(req: &MessagesRequest) -> bool {
@@ -177,6 +188,7 @@ async fn execute_server_web_tool_loop(
     let mut total_output_tokens = 0;
     let mut web_fetch_requests = 0;
     let mut web_search_requests = 0;
+    let mut recent_attempts: Vec<ServerWebToolAttemptLog> = Vec::new();
 
     for round_idx in 0..WEB_FETCH_HARD_MAX_USES {
         let round_request_id = format!("{request_id}-webtool-{round_idx}");
@@ -212,6 +224,10 @@ async fn execute_server_web_tool_loop(
                 };
                 web_fetch_requests += execution.web_fetch_requests;
                 web_search_requests += execution.web_search_requests;
+                push_recent_server_web_tool_attempt(
+                    &mut recent_attempts,
+                    summarize_server_web_tool_attempt(round_idx, &execution),
+                );
                 outward_content.push(execution.server_tool_use_block);
                 outward_content.push(execution.result_block);
                 tool_result_blocks.push(execution.internal_tool_result);
@@ -228,6 +244,10 @@ async fn execute_server_web_tool_loop(
                 .await;
                 web_fetch_requests += execution.web_fetch_requests;
                 web_search_requests += execution.web_search_requests;
+                push_recent_server_web_tool_attempt(
+                    &mut recent_attempts,
+                    summarize_server_web_tool_attempt(round_idx, &execution),
+                );
                 outward_content.push(execution.server_tool_use_block);
                 outward_content.push(execution.result_block);
                 tool_result_blocks.push(execution.internal_tool_result);
@@ -266,6 +286,25 @@ async fn execute_server_web_tool_loop(
         });
     }
 
+    let last_error_code = recent_attempts
+        .iter()
+        .rev()
+        .find_map(|attempt| attempt.error_code.as_deref())
+        .unwrap_or("none");
+    let recent_attempts_json =
+        serde_json::to_string(&recent_attempts).unwrap_or_else(|_| "[]".to_string());
+    tracing::error!(
+        request_id = %request_id,
+        max_rounds = WEB_FETCH_HARD_MAX_USES,
+        total_input_tokens,
+        total_output_tokens,
+        web_fetch_requests,
+        web_search_requests,
+        recent_attempts = %recent_attempts_json,
+        last_error_code,
+        "Server-side web tool loop exceeded internal safety limit"
+    );
+
     Err((
         StatusCode::BAD_GATEWAY,
         Json(ErrorResponse::new(
@@ -274,6 +313,68 @@ async fn execute_server_web_tool_loop(
         )),
     )
         .into_response())
+}
+
+fn push_recent_server_web_tool_attempt(
+    recent_attempts: &mut Vec<ServerWebToolAttemptLog>,
+    attempt: ServerWebToolAttemptLog,
+) {
+    if recent_attempts.len() >= WEB_TOOL_LOOP_RECENT_ATTEMPTS_LIMIT {
+        recent_attempts.remove(0);
+    }
+    recent_attempts.push(attempt);
+}
+
+fn summarize_server_web_tool_attempt(
+    round_idx: usize,
+    execution: &ServerToolExecution,
+) -> ServerWebToolAttemptLog {
+    let tool_name = execution
+        .server_tool_use_block
+        .get("name")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let input = execution
+        .server_tool_use_block
+        .get("input")
+        .map(summarize_server_web_tool_input)
+        .unwrap_or_else(|| "<missing>".to_string());
+    let error_code = execution
+        .result_block
+        .get("content")
+        .and_then(|content| content.get("error_code"))
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned);
+
+    ServerWebToolAttemptLog {
+        round_idx,
+        tool_name,
+        input,
+        error_code,
+    }
+}
+
+fn summarize_server_web_tool_input(input: &Value) -> String {
+    let input_json = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
+    let input_summary = summarize_text_for_log(&input_json, 240);
+
+    if let Some(url) = input.get("url").and_then(|value| value.as_str()) {
+        return format!(
+            "url={} json={}",
+            summarize_text_for_log(url, 160),
+            input_summary
+        );
+    }
+    if let Some(query) = input.get("query").and_then(|value| value.as_str()) {
+        return format!(
+            "query={} json={}",
+            summarize_text_for_log(query, 160),
+            input_summary
+        );
+    }
+
+    input_summary
 }
 
 fn validate_server_web_tools(payload: &MessagesRequest) -> Result<ServerWebToolConfig, Response> {
@@ -2128,6 +2229,50 @@ mod tests {
             sample_request_with_tools(vec![sample_web_search_tool(), sample_web_search_tool()]);
 
         assert!(validate_server_web_tools(&req).is_err());
+    }
+
+    #[test]
+    fn test_server_web_tool_attempt_log_summarizes_recent_inputs_and_errors() {
+        let execution = ServerToolExecution {
+            server_tool_use_block: json!({
+                "type": "server_tool_use",
+                "id": "srvtoolu_test",
+                "name": "web_fetch",
+                "input": {
+                    "url": "https://example.com/article",
+                    "extra": "x".repeat(400)
+                }
+            }),
+            result_block: json!({
+                "type": "web_fetch_tool_result",
+                "tool_use_id": "srvtoolu_test",
+                "content": {
+                    "type": "web_fetch_tool_error",
+                    "error_code": "max_uses_exceeded"
+                }
+            }),
+            internal_tool_result: json!({}),
+            web_fetch_requests: 0,
+            web_search_requests: 0,
+        };
+
+        let attempt = summarize_server_web_tool_attempt(3, &execution);
+        assert_eq!(attempt.round_idx, 3);
+        assert_eq!(attempt.tool_name, "web_fetch");
+        assert_eq!(attempt.error_code.as_deref(), Some("max_uses_exceeded"));
+        assert!(attempt.input.contains("https://example.com/article"));
+        assert!(attempt.input.ends_with('…'));
+
+        let mut recent_attempts = Vec::new();
+        for round_idx in 0..(WEB_TOOL_LOOP_RECENT_ATTEMPTS_LIMIT + 2) {
+            push_recent_server_web_tool_attempt(
+                &mut recent_attempts,
+                summarize_server_web_tool_attempt(round_idx, &execution),
+            );
+        }
+
+        assert_eq!(recent_attempts.len(), WEB_TOOL_LOOP_RECENT_ATTEMPTS_LIMIT);
+        assert_eq!(recent_attempts[0].round_idx, 2);
     }
 
     #[test]
