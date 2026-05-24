@@ -349,7 +349,7 @@ pub struct Tool {
     #[serde(default)]
     pub description: String,
     /// 输入参数 schema（普通工具必需，WebSearch 工具无此字段）
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_input_schema")]
     pub input_schema: HashMap<String, serde_json::Value>,
     /// 最大使用次数（仅 WebSearch 工具）
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -366,6 +366,18 @@ pub struct Tool {
     /// WebFetch 抓取内容的最大 token 数
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_content_tokens: Option<i32>,
+}
+
+fn deserialize_input_schema<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(
+        Option::<HashMap<String, serde_json::Value>>::deserialize(deserializer)?
+            .unwrap_or_default(),
+    )
 }
 
 /// 内容块
@@ -451,6 +463,28 @@ mod tests {
             output_config: None,
             metadata: None,
         }
+    }
+
+    #[test]
+    fn test_tool_input_schema_null_deserializes_as_empty_map() {
+        let request: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4.5",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": "hello"}
+            ],
+            "tools": [
+                {
+                    "name": "example_tool",
+                    "description": "example",
+                    "input_schema": null
+                }
+            ]
+        }))
+        .expect("null input_schema should be accepted for compatibility");
+
+        let tools = request.tools.expect("tools should deserialize");
+        assert!(tools[0].input_schema.is_empty());
     }
 
     #[test]
