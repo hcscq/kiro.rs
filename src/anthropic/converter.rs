@@ -445,6 +445,8 @@ const DOCUMENT_RENDER_LINE_PX: u32 = 10 * DOCUMENT_RENDER_SCALE;
 const MAX_TOOL_RESULT_TEXT_CHARS: usize = 120_000;
 const TOOL_RESULT_HEAD_CHARS: usize = 80_000;
 const TOOL_RESULT_TAIL_CHARS: usize = 40_000;
+const MAX_STRUCTURED_HISTORY_TOOL_PAIRS: usize = 48;
+const COLLAPSED_HISTORY_TOOL_TEXT_CHARS: usize = 16_000;
 const KIRO_REENCODE_IMAGE_BYTES: usize = 200_000;
 const KIRO_IMAGE_JPEG_QUALITY: u8 = 85;
 const KIRO_GIF_MAX_OUTPUT_FRAMES: usize = 5;
@@ -714,6 +716,11 @@ pub fn convert_request_with_probe(
     inject_current_tool_result_fallback_text(
         &mut merged_current,
         !validated_tool_results.is_empty() || moved_tool_results_to_history > 0,
+    );
+    collapse_old_structured_history_tool_pairs_for_kiro(
+        &mut history,
+        &validated_tool_results,
+        MAX_STRUCTURED_HISTORY_TOOL_PAIRS,
     );
 
     // 10. 收集历史中使用的工具名称，为缺失的工具生成占位符定义
@@ -2320,6 +2327,240 @@ fn move_current_extra_images_to_history_for_image_compat(
     merged_current.images = current_images;
 }
 
+#[derive(Debug, Clone)]
+struct HistoryToolUseRef {
+    tool_use_id: String,
+    assistant_index: usize,
+    user_result_index: Option<usize>,
+}
+
+fn collapse_old_structured_history_tool_pairs_for_kiro(
+    history: &mut [Message],
+    protected_current_tool_results: &[ToolResult],
+    max_structured_pairs: usize,
+) -> usize {
+    if max_structured_pairs == 0 {
+        return 0;
+    }
+
+    let tool_refs = collect_history_tool_use_refs(history);
+    if tool_refs.len() <= max_structured_pairs {
+        return 0;
+    }
+
+    let protected_ids: HashSet<String> = protected_current_tool_results
+        .iter()
+        .map(|result| result.tool_use_id.clone())
+        .collect();
+    let mut structured_count = tool_refs.len();
+    let mut collapsed_count = 0usize;
+
+    for tool_ref in tool_refs {
+        if structured_count <= max_structured_pairs {
+            break;
+        }
+        if protected_ids.contains(&tool_ref.tool_use_id) {
+            continue;
+        }
+        if collapse_history_tool_pair(history, &tool_ref) {
+            structured_count = structured_count.saturating_sub(1);
+            collapsed_count += 1;
+        }
+    }
+
+    if collapsed_count > 0 {
+        tracing::info!(
+            collapsed_tool_pairs = collapsed_count,
+            remaining_structured_tool_pairs = structured_count,
+            max_structured_tool_pairs = max_structured_pairs,
+            "将较旧的 history tool_use/tool_result 对降级为普通文本，规避 Kiro 上游结构化工具历史上限"
+        );
+    }
+
+    collapsed_count
+}
+
+fn collect_history_tool_use_refs(history: &[Message]) -> Vec<HistoryToolUseRef> {
+    let mut result_indices: HashMap<String, usize> = HashMap::new();
+    for (index, msg) in history.iter().enumerate() {
+        let Message::User(user_msg) = msg else {
+            continue;
+        };
+        for result in &user_msg
+            .user_input_message
+            .user_input_message_context
+            .tool_results
+        {
+            result_indices
+                .entry(result.tool_use_id.clone())
+                .or_insert(index);
+        }
+    }
+
+    let mut refs = Vec::new();
+    for (index, msg) in history.iter().enumerate() {
+        let Message::Assistant(assistant_msg) = msg else {
+            continue;
+        };
+        let Some(tool_uses) = assistant_msg.assistant_response_message.tool_uses.as_ref() else {
+            continue;
+        };
+        for tool_use in tool_uses {
+            refs.push(HistoryToolUseRef {
+                tool_use_id: tool_use.tool_use_id.clone(),
+                assistant_index: index,
+                user_result_index: result_indices.get(&tool_use.tool_use_id).copied(),
+            });
+        }
+    }
+    refs
+}
+
+fn collapse_history_tool_pair(history: &mut [Message], tool_ref: &HistoryToolUseRef) -> bool {
+    let Some(tool_use) =
+        remove_history_tool_use(history, tool_ref.assistant_index, &tool_ref.tool_use_id)
+    else {
+        return false;
+    };
+
+    if let Message::Assistant(assistant_msg) = &mut history[tool_ref.assistant_index] {
+        append_history_text(
+            &mut assistant_msg.assistant_response_message.content,
+            &collapsed_tool_use_text(&tool_use),
+        );
+    }
+
+    if let Some(user_index) = tool_ref.user_result_index {
+        if let Some(tool_result) =
+            remove_history_tool_result(history, user_index, &tool_ref.tool_use_id)
+            && let Message::User(user_msg) = &mut history[user_index]
+        {
+            append_history_text(
+                &mut user_msg.user_input_message.content,
+                &collapsed_tool_result_text(&tool_result),
+            );
+        }
+    }
+
+    true
+}
+
+fn remove_history_tool_use(
+    history: &mut [Message],
+    assistant_index: usize,
+    tool_use_id: &str,
+) -> Option<ToolUseEntry> {
+    let Some(Message::Assistant(assistant_msg)) = history.get_mut(assistant_index) else {
+        return None;
+    };
+    let Some(tool_uses) = assistant_msg.assistant_response_message.tool_uses.as_mut() else {
+        return None;
+    };
+    let position = tool_uses
+        .iter()
+        .position(|tool_use| tool_use.tool_use_id == tool_use_id)?;
+    let tool_use = tool_uses.remove(position);
+    if tool_uses.is_empty() {
+        assistant_msg.assistant_response_message.tool_uses = None;
+    }
+    Some(tool_use)
+}
+
+fn remove_history_tool_result(
+    history: &mut [Message],
+    user_index: usize,
+    tool_use_id: &str,
+) -> Option<ToolResult> {
+    let Some(Message::User(user_msg)) = history.get_mut(user_index) else {
+        return None;
+    };
+    let tool_results = &mut user_msg
+        .user_input_message
+        .user_input_message_context
+        .tool_results;
+    let position = tool_results
+        .iter()
+        .position(|result| result.tool_use_id == tool_use_id)?;
+    Some(tool_results.remove(position))
+}
+
+fn append_history_text(content: &mut String, addition: &str) {
+    let addition = addition.trim();
+    if addition.is_empty() {
+        return;
+    }
+
+    if content.trim().is_empty() {
+        *content = addition.to_string();
+        return;
+    }
+
+    content.push_str("\n\n");
+    content.push_str(addition);
+}
+
+fn collapsed_tool_use_text(tool_use: &ToolUseEntry) -> String {
+    let input = serde_json::to_string(&tool_use.input)
+        .unwrap_or_else(|_| "[unserializable input]".to_string());
+    format!(
+        "Previous tool call:\nTool: {}\nInput: {}",
+        tool_use.name,
+        clip_history_tool_text(&input)
+    )
+}
+
+fn collapsed_tool_result_text(result: &ToolResult) -> String {
+    let status =
+        result
+            .status
+            .as_deref()
+            .unwrap_or(if result.is_error { "error" } else { "success" });
+    let content = tool_result_content_to_plain_text(result);
+    format!(
+        "Previous tool result:\nTool use ID: {}\nStatus: {}\nContent:\n{}",
+        result.tool_use_id,
+        status,
+        clip_history_tool_text(&content)
+    )
+}
+
+fn tool_result_content_to_plain_text(result: &ToolResult) -> String {
+    let mut parts = Vec::new();
+    for item in &result.content {
+        if let Some(text) = item.get("text").and_then(|value| value.as_str()) {
+            parts.push(text.to_string());
+        } else {
+            parts.push(serde_json::Value::Object(item.clone()).to_string());
+        }
+    }
+    parts.join("\n")
+}
+
+fn clip_history_tool_text(text: &str) -> String {
+    if text.chars().count() <= COLLAPSED_HISTORY_TOOL_TEXT_CHARS {
+        return text.to_string();
+    }
+
+    let keep_each_side = COLLAPSED_HISTORY_TOOL_TEXT_CHARS / 2;
+    let head: String = text.chars().take(keep_each_side).collect();
+    let tail: String = text
+        .chars()
+        .rev()
+        .take(keep_each_side)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let omitted = text
+        .chars()
+        .count()
+        .saturating_sub(keep_each_side.saturating_mul(2));
+    format!(
+        "{}\n...[compacted historical tool text, {} chars omitted]...\n{}",
+        head, omitted, tail
+    )
+}
+
 /// 转换 assistant 消息
 fn convert_assistant_message(
     msg: &super::types::Message,
@@ -2459,6 +2700,68 @@ mod tests {
 
     fn repeated_png_image_blocks(count: usize) -> Vec<serde_json::Value> {
         (0..count).map(|_| png_image_block()).collect()
+    }
+
+    fn history_structured_tool_counts(history: &[Message]) -> (usize, usize) {
+        let mut tool_uses = 0usize;
+        let mut tool_results = 0usize;
+        for msg in history {
+            match msg {
+                Message::Assistant(assistant_msg) => {
+                    tool_uses += assistant_msg
+                        .assistant_response_message
+                        .tool_uses
+                        .as_ref()
+                        .map_or(0, Vec::len);
+                }
+                Message::User(user_msg) => {
+                    tool_results += user_msg
+                        .user_input_message
+                        .user_input_message_context
+                        .tool_results
+                        .len();
+                }
+            }
+        }
+        (tool_uses, tool_results)
+    }
+
+    fn tool_pair_messages(count: usize) -> Vec<super::super::types::Message> {
+        let mut messages = vec![super::super::types::Message {
+            role: "user".to_string(),
+            content: serde_json::json!("start"),
+        }];
+        for index in 0..count {
+            let tool_use_id = format!("toolu_{index:02}");
+            messages.push(super::super::types::Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {"type": "tool_use", "id": tool_use_id, "name": "read_file", "input": {"path": format!("/tmp/{index}.txt")}}
+                ]),
+            });
+            messages.push(super::super::types::Message {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "tool_result", "tool_use_id": tool_use_id, "content": format!("file content {index}")}
+                ]),
+            });
+        }
+        messages
+    }
+
+    fn request_from_messages(messages: Vec<super::super::types::Message>) -> MessagesRequest {
+        MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages,
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        }
     }
 
     fn oversized_jpeg_block(width: u32, height: u32) -> serde_json::Value {
@@ -2973,6 +3276,101 @@ mod tests {
         // 验证 JSON 序列化正确
         let json = serde_json::to_string(&tool).unwrap();
         assert!(json.contains("\"name\":\"my_custom_tool\""));
+    }
+
+    #[test]
+    fn test_convert_request_collapses_old_history_tool_pairs_over_kiro_limit() {
+        let mut messages = tool_pair_messages(MAX_STRUCTURED_HISTORY_TOOL_PAIRS + 3);
+        messages.push(super::super::types::Message {
+            role: "user".to_string(),
+            content: serde_json::json!("continue"),
+        });
+        let req = request_from_messages(messages);
+
+        let result = convert_request(&req).expect("conversion should succeed");
+        let state = result.conversation_state;
+        let history = &state.history;
+        let (tool_uses, tool_results) = history_structured_tool_counts(history);
+        let current_tool_results = state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tool_results
+            .len();
+
+        assert_eq!(tool_uses, MAX_STRUCTURED_HISTORY_TOOL_PAIRS);
+        assert_eq!(
+            tool_results + current_tool_results,
+            MAX_STRUCTURED_HISTORY_TOOL_PAIRS
+        );
+        assert!(
+            history.iter().any(|msg| matches!(
+                msg,
+                Message::Assistant(assistant_msg)
+                    if assistant_msg
+                        .assistant_response_message
+                        .content
+                        .contains("Previous tool call:")
+            )),
+            "oldest structured tool_use entries should be represented as text"
+        );
+        assert!(
+            history.iter().any(|msg| matches!(
+                msg,
+                Message::User(user_msg)
+                    if user_msg
+                        .user_input_message
+                        .content
+                        .contains("Previous tool result:")
+            )),
+            "oldest structured tool_result entries should be represented as text"
+        );
+    }
+
+    #[test]
+    fn test_convert_request_keeps_pending_current_tool_result_pair_when_collapsing() {
+        let mut messages = tool_pair_messages(MAX_STRUCTURED_HISTORY_TOOL_PAIRS + 2);
+        messages.push(super::super::types::Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {"type": "tool_use", "id": "toolu_pending", "name": "read_file", "input": {"path": "/tmp/pending.txt"}}
+            ]),
+        });
+        messages.push(super::super::types::Message {
+            role: "user".to_string(),
+            content: serde_json::json!([
+                {"type": "tool_result", "tool_use_id": "toolu_pending", "content": "pending result"}
+            ]),
+        });
+        let req = request_from_messages(messages);
+
+        let result = convert_request(&req).expect("conversion should succeed");
+        let state = result.conversation_state;
+        let (tool_uses, history_tool_results) = history_structured_tool_counts(&state.history);
+        let current_tool_results = &state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tool_results;
+
+        assert_eq!(tool_uses, MAX_STRUCTURED_HISTORY_TOOL_PAIRS);
+        assert_eq!(history_tool_results, MAX_STRUCTURED_HISTORY_TOOL_PAIRS - 1);
+        assert_eq!(current_tool_results.len(), 1);
+        assert_eq!(current_tool_results[0].tool_use_id, "toolu_pending");
+        assert!(
+            state.history.iter().any(|msg| matches!(
+                msg,
+                Message::Assistant(assistant_msg)
+                    if assistant_msg
+                        .assistant_response_message
+                        .tool_uses
+                        .as_ref()
+                        .is_some_and(|tool_uses| tool_uses
+                            .iter()
+                            .any(|tool_use| tool_use.tool_use_id == "toolu_pending"))
+            )),
+            "pending tool_use needed by current tool_result must remain structured"
+        );
     }
 
     #[test]
