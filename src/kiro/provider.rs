@@ -1515,10 +1515,12 @@ impl KiroProvider {
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
             let empty_model_unsupported = HashSet::new();
             let empty_slow_first_content = HashSet::new();
+            let empty_body = HashSet::new();
             let request_scoped_excluded_credentials = Self::combined_request_exclusions(
                 &empty_model_unsupported,
                 &request_scoped_rate_limited_credentials,
                 &empty_slow_first_content,
+                &empty_body,
                 &request_scoped_transient_error_credentials,
             );
             let ctx = match self
@@ -1728,6 +1730,7 @@ impl KiroProvider {
                     request_scoped_rate_limited_credentials.insert(ctx_id);
                     let empty_model_unsupported = HashSet::new();
                     let empty_slow_first_content = HashSet::new();
+                    let empty_body = HashSet::new();
                     Self::maybe_spill_rate_limited_priority(
                         &self.token_manager,
                         None,
@@ -1736,6 +1739,7 @@ impl KiroProvider {
                         &empty_model_unsupported,
                         &mut request_scoped_rate_limited_credentials,
                         &empty_slow_first_content,
+                        &empty_body,
                         &request_scoped_transient_error_credentials,
                     );
                     let supported_candidate_count =
@@ -1808,6 +1812,7 @@ impl KiroProvider {
         let mut request_scoped_model_unsupported_credentials: HashSet<u64> = HashSet::new();
         let mut request_scoped_rate_limited_credentials: HashSet<u64> = HashSet::new();
         let mut request_scoped_slow_first_content_credentials: HashSet<u64> = HashSet::new();
+        let mut request_scoped_empty_body_credentials: HashSet<u64> = HashSet::new();
         let mut request_scoped_transient_error_credentials: HashSet<u64> = HashSet::new();
         let mut priority_rate_limit_hits: HashMap<u32, usize> = HashMap::new();
         let mut slow_first_content_failovers = 0usize;
@@ -1851,7 +1856,8 @@ impl KiroProvider {
                 .enabled_supported_credential_count(model.as_deref());
             let retryable_candidate_count = Self::request_retryable_candidate_count(
                 supported_candidate_count,
-                request_scoped_model_unsupported_credentials.len(),
+                &request_scoped_model_unsupported_credentials,
+                &request_scoped_empty_body_credentials,
             );
             let retryable_exclusion_count = Self::request_scoped_retryable_exclusion_count(
                 &request_scoped_rate_limited_credentials,
@@ -1875,6 +1881,7 @@ impl KiroProvider {
                 &request_scoped_model_unsupported_credentials,
                 &request_scoped_rate_limited_credentials,
                 &request_scoped_slow_first_content_credentials,
+                &request_scoped_empty_body_credentials,
                 &request_scoped_transient_error_credentials,
             );
             let acquire_context = || {
@@ -1915,6 +1922,7 @@ impl KiroProvider {
                         continue;
                     }
                     if (!request_scoped_rate_limited_credentials.is_empty()
+                        || !request_scoped_empty_body_credentials.is_empty()
                         || !request_scoped_transient_error_credentials.is_empty())
                         && last_error.is_some()
                     {
@@ -1926,6 +1934,8 @@ impl KiroProvider {
                             max_retries,
                             rate_limited_credentials =
                                 request_scoped_rate_limited_credentials.len(),
+                            empty_body_credentials =
+                                request_scoped_empty_body_credentials.len(),
                             transient_error_credentials =
                                 request_scoped_transient_error_credentials.len(),
                             error = %err,
@@ -2247,6 +2257,51 @@ impl KiroProvider {
                             continue;
                         }
                     };
+                    if body_bytes.is_empty() {
+                        request_scoped_empty_body_credentials.insert(ctx_id);
+                        let retryable_candidate_count_after_empty =
+                            Self::request_retryable_candidate_count(
+                                supported_candidate_count,
+                                &request_scoped_model_unsupported_credentials,
+                                &request_scoped_empty_body_credentials,
+                            );
+                        let will_retry_with_alternate_credential =
+                            attempt + 1 < max_retries && retryable_candidate_count_after_empty > 0;
+                        tracing::warn!(
+                            request_id = %request_id,
+                            api_type,
+                            model = model.as_deref().unwrap_or("unknown"),
+                            credential_id = ctx_id,
+                            attempt = attempt + 1,
+                            max_retries,
+                            region = %region,
+                            request_body_bytes,
+                            status_code = status.as_u16(),
+                            body_len = 0usize,
+                            empty_body_credentials =
+                                request_scoped_empty_body_credentials.len(),
+                            supported_candidate_count,
+                            retryable_candidate_count_after_empty,
+                            will_retry_with_alternate_credential,
+                            total_elapsed_ms = overall_started_at.elapsed().as_millis(),
+                            "非流式上游成功响应体为空，当前请求排除该凭据"
+                        );
+                        last_error = Some(anyhow::Error::new(PublicProviderError::bad_gateway(
+                            format!(
+                                "{} API 上游成功响应体为空: request_id={} credential_id={} attempt={} status={} body_len=0 empty_body_credentials={} retryable_candidate_count_after_empty={} total_elapsed_ms={}",
+                                api_type,
+                                request_id,
+                                ctx_id,
+                                attempt + 1,
+                                status.as_u16(),
+                                request_scoped_empty_body_credentials.len(),
+                                retryable_candidate_count_after_empty,
+                                overall_started_at.elapsed().as_millis()
+                            ),
+                            "Upstream returned an empty response body for this request. Retry later.",
+                        )));
+                        continue;
+                    }
 
                     self.token_manager.record_session_affinity(
                         model.as_deref(),
@@ -2797,6 +2852,7 @@ impl KiroProvider {
                         &request_scoped_model_unsupported_credentials,
                         &mut request_scoped_rate_limited_credentials,
                         &request_scoped_slow_first_content_credentials,
+                        &request_scoped_empty_body_credentials,
                         &request_scoped_transient_error_credentials,
                     );
                     let supported_candidate_count = self
@@ -2999,9 +3055,19 @@ impl KiroProvider {
 
     fn request_retryable_candidate_count(
         supported_candidate_count: usize,
-        request_scoped_model_unsupported_count: usize,
+        model_unsupported_credentials: &HashSet<u64>,
+        empty_body_credentials: &HashSet<u64>,
     ) -> usize {
-        supported_candidate_count.saturating_sub(request_scoped_model_unsupported_count)
+        if model_unsupported_credentials.is_empty() {
+            return supported_candidate_count.saturating_sub(empty_body_credentials.len());
+        }
+        if empty_body_credentials.is_empty() {
+            return supported_candidate_count.saturating_sub(model_unsupported_credentials.len());
+        }
+
+        let mut excluded = model_unsupported_credentials.clone();
+        excluded.extend(empty_body_credentials.iter().copied());
+        supported_candidate_count.saturating_sub(excluded.len())
     }
 
     fn should_reset_retryable_exclusions_for_next_pass(
@@ -3020,11 +3086,13 @@ impl KiroProvider {
         model_unsupported_credentials: &HashSet<u64>,
         rate_limited_credentials: &HashSet<u64>,
         slow_first_content_credentials: &HashSet<u64>,
+        empty_body_credentials: &HashSet<u64>,
         transient_error_credentials: &HashSet<u64>,
     ) -> HashSet<u64> {
         let mut excluded = model_unsupported_credentials.clone();
         excluded.extend(rate_limited_credentials.iter().copied());
         excluded.extend(slow_first_content_credentials.iter().copied());
+        excluded.extend(empty_body_credentials.iter().copied());
         excluded.extend(transient_error_credentials.iter().copied());
         excluded
     }
@@ -3053,6 +3121,7 @@ impl KiroProvider {
         request_scoped_model_unsupported_credentials: &HashSet<u64>,
         request_scoped_rate_limited_credentials: &mut HashSet<u64>,
         request_scoped_slow_first_content_credentials: &HashSet<u64>,
+        request_scoped_empty_body_credentials: &HashSet<u64>,
         request_scoped_transient_error_credentials: &HashSet<u64>,
     ) {
         let hits = priority_rate_limit_hits
@@ -3068,6 +3137,7 @@ impl KiroProvider {
             request_scoped_model_unsupported_credentials,
             request_scoped_rate_limited_credentials,
             request_scoped_slow_first_content_credentials,
+            request_scoped_empty_body_credentials,
             request_scoped_transient_error_credentials,
         );
         if !token_manager.has_enabled_supported_credential_below_priority(
@@ -3581,6 +3651,53 @@ mod tests {
         assert!(KiroProvider::should_reset_retryable_exclusions_for_next_pass(2, 2, 2, 6));
         assert!(!KiroProvider::should_reset_retryable_exclusions_for_next_pass(2, 2, 6, 6));
         assert!(!KiroProvider::should_reset_retryable_exclusions_for_next_pass(1, 2, 1, 6));
+    }
+
+    #[test]
+    fn test_retryable_candidate_count_excludes_empty_body_credentials() {
+        let mut model_unsupported = HashSet::new();
+        model_unsupported.insert(1);
+        model_unsupported.insert(2);
+
+        let mut empty_body = HashSet::new();
+        empty_body.insert(2);
+        empty_body.insert(3);
+
+        assert_eq!(
+            KiroProvider::request_retryable_candidate_count(5, &model_unsupported, &empty_body),
+            2
+        );
+    }
+
+    #[test]
+    fn test_combined_request_exclusions_includes_empty_body_credentials() {
+        let mut model_unsupported = HashSet::new();
+        model_unsupported.insert(1);
+
+        let mut rate_limited = HashSet::new();
+        rate_limited.insert(2);
+
+        let mut slow_first_content = HashSet::new();
+        slow_first_content.insert(3);
+
+        let mut empty_body = HashSet::new();
+        empty_body.insert(4);
+
+        let mut transient_errors = HashSet::new();
+        transient_errors.insert(5);
+
+        let excluded = KiroProvider::combined_request_exclusions(
+            &model_unsupported,
+            &rate_limited,
+            &slow_first_content,
+            &empty_body,
+            &transient_errors,
+        );
+
+        assert_eq!(excluded.len(), 5);
+        for credential_id in 1..=5 {
+            assert!(excluded.contains(&credential_id));
+        }
     }
 
     #[test]
