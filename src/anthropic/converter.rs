@@ -431,6 +431,11 @@ Complete all chunked operations without commentary.";
 /// 文本可以稳定恢复正常生成，同时尽量不改变原始语义。
 const CURRENT_TOOL_RESULT_FALLBACK_TEXT: &str = "Please continue based on the tool result.";
 
+/// Some compacted historical transcripts contain tool_use blocks with an id
+/// and input but no name. Kiro/Bedrock still requires a tool name, so use a
+/// stable placeholder instead of dropping the structured call/result pair.
+const MISSING_TOOL_USE_NAME_PLACEHOLDER: &str = "historical_tool";
+
 /// 避免把异常大的文档直接加载到 Kiro 转换层里。
 const MAX_DOCUMENT_EXTRACT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_INLINE_DOCUMENT_TEXT_CHARS: usize = 40_000;
@@ -677,6 +682,8 @@ pub fn convert_request_with_probe(
         &mut tool_name_map,
         &probe,
     )?;
+
+    repair_history_tool_result_pairing_for_kiro(&mut history, &merged_current.tool_results);
 
     // 8. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
@@ -2196,6 +2203,153 @@ fn previous_assistant_available_tool_use_ids(history: &[Message]) -> HashSet<Str
         .unwrap_or_default()
 }
 
+fn previous_assistant_tool_use_ids_at(history: &[Message], user_index: usize) -> HashSet<String> {
+    if user_index == 0 {
+        return HashSet::new();
+    }
+
+    let Some(Message::Assistant(assistant_msg)) = history.get(user_index - 1) else {
+        return HashSet::new();
+    };
+
+    assistant_msg
+        .assistant_response_message
+        .tool_uses
+        .as_ref()
+        .map(|tool_uses| {
+            tool_uses
+                .iter()
+                .map(|tool_use| tool_use.tool_use_id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn collect_adjacent_history_tool_result_ids(history: &[Message]) -> HashSet<String> {
+    let mut ids = HashSet::new();
+
+    for (index, msg) in history.iter().enumerate() {
+        let Message::User(user_msg) = msg else {
+            continue;
+        };
+        let previous_ids = previous_assistant_tool_use_ids_at(history, index);
+        if previous_ids.is_empty() {
+            continue;
+        }
+
+        for result in &user_msg
+            .user_input_message
+            .user_input_message_context
+            .tool_results
+        {
+            if previous_ids.contains(&result.tool_use_id) {
+                ids.insert(result.tool_use_id.clone());
+            }
+        }
+    }
+
+    ids
+}
+
+fn collapse_history_tool_use_only(
+    history: &mut [Message],
+    assistant_index: usize,
+    tool_use_id: &str,
+) -> bool {
+    let Some(tool_use) = remove_history_tool_use(history, assistant_index, tool_use_id) else {
+        return false;
+    };
+
+    if let Message::Assistant(assistant_msg) = &mut history[assistant_index] {
+        append_history_text(
+            &mut assistant_msg.assistant_response_message.content,
+            &collapsed_tool_use_text(&tool_use),
+        );
+    }
+
+    true
+}
+
+fn repair_history_tool_result_pairing_for_kiro(
+    history: &mut [Message],
+    protected_current_tool_results: &[ToolResult],
+) -> usize {
+    let valid_history_result_ids = collect_adjacent_history_tool_result_ids(history);
+    let protected_ids: HashSet<String> = protected_current_tool_results
+        .iter()
+        .map(|result| result.tool_use_id.clone())
+        .collect();
+    let mut collapsed_tool_use_ids = HashSet::new();
+    let mut converted_results = 0usize;
+
+    for index in 0..history.len() {
+        let allowed_ids = previous_assistant_tool_use_ids_at(history, index);
+        let invalid_results = {
+            let Message::User(user_msg) = &mut history[index] else {
+                continue;
+            };
+
+            let tool_results = &mut user_msg
+                .user_input_message
+                .user_input_message_context
+                .tool_results;
+            if tool_results.is_empty() {
+                Vec::new()
+            } else {
+                let mut kept = Vec::with_capacity(tool_results.len());
+                let mut invalid = Vec::new();
+
+                for result in std::mem::take(tool_results) {
+                    if allowed_ids.contains(&result.tool_use_id) {
+                        kept.push(result);
+                    } else {
+                        invalid.push(result);
+                    }
+                }
+
+                *tool_results = kept;
+                if !invalid.is_empty() {
+                    for result in &invalid {
+                        append_history_text(
+                            &mut user_msg.user_input_message.content,
+                            &collapsed_tool_result_text(result),
+                        );
+                    }
+                }
+
+                invalid
+            }
+        };
+
+        for result in invalid_results {
+            converted_results += 1;
+            if valid_history_result_ids.contains(&result.tool_use_id)
+                || protected_ids.contains(&result.tool_use_id)
+                || collapsed_tool_use_ids.contains(&result.tool_use_id)
+            {
+                continue;
+            }
+
+            if let Some(assistant_index) =
+                find_history_assistant_for_tool_use(history, &result.tool_use_id)
+                && collapse_history_tool_use_only(history, assistant_index, &result.tool_use_id)
+            {
+                collapsed_tool_use_ids.insert(result.tool_use_id.clone());
+            }
+        }
+    }
+
+    if converted_results > 0 {
+        tracing::info!(
+            converted_history_tool_results = converted_results,
+            collapsed_history_tool_uses = collapsed_tool_use_ids.len(),
+            "将不满足紧邻配对规则的 history tool_result 降级为文本，保留内容并规避 Bedrock TOOL_USE_RESULT_MISMATCH"
+        );
+    }
+
+    converted_results
+}
+
 fn find_history_assistant_for_tool_use(history: &[Message], tool_use_id: &str) -> Option<usize> {
     history.iter().enumerate().rev().find_map(|(index, msg)| {
         let Message::Assistant(assistant_msg) = msg else {
@@ -2589,7 +2743,18 @@ fn convert_assistant_message(
                             }
                         }
                         "tool_use" => {
-                            if let (Some(id), Some(name)) = (block.id, block.name) {
+                            if let Some(id) = block.id {
+                                let name = block.name.unwrap_or_default();
+                                let name = if name.trim().is_empty() {
+                                    tracing::info!(
+                                        tool_use_id = %id,
+                                        placeholder_tool_name = MISSING_TOOL_USE_NAME_PLACEHOLDER,
+                                        "为缺少 name 的历史 tool_use 填充稳定占位工具名，保留结构化 tool_result 配对"
+                                    );
+                                    MISSING_TOOL_USE_NAME_PLACEHOLDER.to_string()
+                                } else {
+                                    name
+                                };
                                 let input = block.input.unwrap_or(serde_json::json!({}));
                                 let mapped_name = map_tool_name(&name, tool_name_map);
                                 tool_uses
@@ -3276,6 +3441,221 @@ mod tests {
         // 验证 JSON 序列化正确
         let json = serde_json::to_string(&tool).unwrap();
         assert!(json.contains("\"name\":\"my_custom_tool\""));
+    }
+
+    #[test]
+    fn test_convert_request_fills_missing_history_tool_use_names() {
+        let req = request_from_messages(vec![
+            super::super::types::Message {
+                role: "user".to_string(),
+                content: serde_json::json!("search weather"),
+            },
+            super::super::types::Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {"type": "text", "text": "Searching."},
+                    {"type": "tool_use", "id": "call_weather_cn", "input": {"query": "芜湖天气"}},
+                    {"type": "tool_use", "id": "call_weather_en", "input": {"query": "Wuhu weather"}}
+                ]),
+            },
+            super::super::types::Message {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "tool_result", "tool_use_id": "call_weather_cn", "content": "阴 22C"},
+                    {"type": "tool_result", "tool_use_id": "call_weather_en", "content": "overcast 22C"}
+                ]),
+            },
+            super::super::types::Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!("Weather answered."),
+            },
+            super::super::types::Message {
+                role: "user".to_string(),
+                content: serde_json::json!("continue"),
+            },
+        ]);
+
+        let state = convert_request(&req)
+            .expect("nameless historical tool_use blocks should be repaired")
+            .conversation_state;
+
+        match &state.history[1] {
+            Message::Assistant(assistant) => {
+                let tool_uses = assistant
+                    .assistant_response_message
+                    .tool_uses
+                    .as_ref()
+                    .expect("tool_uses should be preserved");
+                assert_eq!(tool_uses.len(), 2);
+                assert!(
+                    tool_uses
+                        .iter()
+                        .all(|tool_use| tool_use.name == MISSING_TOOL_USE_NAME_PLACEHOLDER)
+                );
+            }
+            other => panic!("history[1] should be assistant, got {:?}", other),
+        }
+
+        match &state.history[2] {
+            Message::User(user) => {
+                assert_eq!(
+                    user.user_input_message
+                        .user_input_message_context
+                        .tool_results
+                        .len(),
+                    2
+                );
+                assert!(
+                    user.user_input_message.content.trim().is_empty(),
+                    "valid adjacent tool_results should not be downgraded to text"
+                );
+            }
+            other => panic!("history[2] should be user, got {:?}", other),
+        }
+
+        let tools = &state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools;
+        assert!(
+            tools
+                .iter()
+                .any(|tool| { tool.tool_specification.name == MISSING_TOOL_USE_NAME_PLACEHOLDER })
+        );
+    }
+
+    #[test]
+    fn test_convert_request_downgrades_extra_history_tool_result_to_text() {
+        let req = request_from_messages(vec![
+            super::super::types::Message {
+                role: "user".to_string(),
+                content: serde_json::json!("read one file"),
+            },
+            super::super::types::Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {"type": "tool_use", "id": "toolu_one", "name": "read_file", "input": {"path": "/tmp/one.txt"}}
+                ]),
+            },
+            super::super::types::Message {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "tool_result", "tool_use_id": "toolu_one", "content": "one"},
+                    {"type": "tool_result", "tool_use_id": "toolu_extra", "content": "extra"}
+                ]),
+            },
+            super::super::types::Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!("Done."),
+            },
+            super::super::types::Message {
+                role: "user".to_string(),
+                content: serde_json::json!("continue"),
+            },
+        ]);
+
+        let state = convert_request(&req)
+            .expect("extra historical tool_result should be text-downgraded")
+            .conversation_state;
+
+        match &state.history[2] {
+            Message::User(user) => {
+                let tool_results = &user
+                    .user_input_message
+                    .user_input_message_context
+                    .tool_results;
+                assert_eq!(tool_results.len(), 1);
+                assert_eq!(tool_results[0].tool_use_id, "toolu_one");
+                assert!(
+                    user.user_input_message
+                        .content
+                        .contains("Previous tool result:")
+                );
+                assert!(user.user_input_message.content.contains("toolu_extra"));
+                assert!(user.user_input_message.content.contains("extra"));
+            }
+            other => panic!("history[2] should be user, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_convert_request_downgrades_non_adjacent_history_tool_pair_to_text() {
+        let req = request_from_messages(vec![
+            super::super::types::Message {
+                role: "user".to_string(),
+                content: serde_json::json!("read old file"),
+            },
+            super::super::types::Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {"type": "tool_use", "id": "toolu_old", "name": "read_file", "input": {"path": "/tmp/old.txt"}}
+                ]),
+            },
+            super::super::types::Message {
+                role: "user".to_string(),
+                content: serde_json::json!("not the result yet"),
+            },
+            super::super::types::Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!("Waiting."),
+            },
+            super::super::types::Message {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "tool_result", "tool_use_id": "toolu_old", "content": "old content"}
+                ]),
+            },
+            super::super::types::Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!("Done."),
+            },
+            super::super::types::Message {
+                role: "user".to_string(),
+                content: serde_json::json!("continue"),
+            },
+        ]);
+
+        let state = convert_request(&req)
+            .expect("non-adjacent historical tool pair should be text-downgraded")
+            .conversation_state;
+
+        match &state.history[1] {
+            Message::Assistant(assistant) => {
+                assert!(assistant.assistant_response_message.tool_uses.is_none());
+                assert!(
+                    assistant
+                        .assistant_response_message
+                        .content
+                        .contains("Previous tool call:")
+                );
+                assert!(
+                    assistant
+                        .assistant_response_message
+                        .content
+                        .contains("/tmp/old.txt")
+                );
+            }
+            other => panic!("history[1] should be assistant, got {:?}", other),
+        }
+
+        match &state.history[4] {
+            Message::User(user) => {
+                assert!(
+                    user.user_input_message
+                        .user_input_message_context
+                        .tool_results
+                        .is_empty()
+                );
+                assert!(
+                    user.user_input_message
+                        .content
+                        .contains("Previous tool result:")
+                );
+                assert!(user.user_input_message.content.contains("old content"));
+            }
+            other => panic!("history[4] should be user, got {:?}", other),
+        }
     }
 
     #[test]

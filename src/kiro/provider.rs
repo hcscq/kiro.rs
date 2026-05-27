@@ -1093,6 +1093,13 @@ impl KiroProvider {
         if body.contains("Input is too long") {
             return "Input is too long. Reduce the size of your messages.".to_string();
         }
+        if body.contains("TOOL_USE_RESULT_MISMATCH")
+            || body.contains("toolResult blocks")
+            || body.contains("toolUse blocks of previous turn")
+        {
+            return "Upstream rejected mismatched tool history. Ensure each tool_result immediately follows the assistant tool_use it answers."
+                .to_string();
+        }
         if body.contains("Improperly formed request") {
             return "Upstream rejected the request as malformed. Review message ordering, tool payloads, and oversized inputs.".to_string();
         }
@@ -3301,6 +3308,17 @@ mod tests {
         assert_eq!(
             message,
             "Upstream rejected the request as malformed. Review message ordering, tool payloads, and oversized inputs."
+        );
+    }
+
+    #[test]
+    fn test_invalid_request_public_message_special_cases_tool_mismatch() {
+        let message = KiroProvider::invalid_request_public_message(
+            r#"{"reason":"TOOL_USE_RESULT_MISMATCH","message":"Bedrock error message: The number of toolResult blocks at messages.4.content exceeds the number of toolUse blocks of previous turn."}"#,
+        );
+        assert_eq!(
+            message,
+            "Upstream rejected mismatched tool history. Ensure each tool_result immediately follows the assistant tool_use it answers."
         );
     }
 
