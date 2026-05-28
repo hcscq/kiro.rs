@@ -1609,6 +1609,18 @@ where
     }
 }
 
+fn drop_away_from_tokio_runtime<T>(value: T)
+where
+    T: Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => std::thread::spawn(move || drop(value))
+            .join()
+            .expect("state blocking drop thread panicked"),
+        Err(_) => drop(value),
+    }
+}
+
 fn apply_refreshed_credential_compare_and_swap(
     credentials: &mut [KiroCredentials],
     id: u64,
@@ -1842,8 +1854,37 @@ impl StateBackend for FileStateBackend {
     }
 }
 
+struct BlockingPostgresClient {
+    client: Mutex<Option<Client>>,
+}
+
+impl BlockingPostgresClient {
+    fn new(client: Client) -> Self {
+        Self {
+            client: Mutex::new(Some(client)),
+        }
+    }
+
+    fn with_client<R>(
+        &self,
+        operation: impl FnOnce(&mut Client) -> anyhow::Result<R>,
+    ) -> anyhow::Result<R> {
+        let mut guard = self.client.lock();
+        let client = guard.as_mut().context("PostgreSQL 状态存储客户端已关闭")?;
+        operation(client)
+    }
+}
+
+impl Drop for BlockingPostgresClient {
+    fn drop(&mut self) {
+        if let Some(client) = self.client.get_mut().take() {
+            drop_away_from_tokio_runtime(client);
+        }
+    }
+}
+
 struct PostgresStateBackend {
-    client: Arc<Mutex<Client>>,
+    client: Arc<BlockingPostgresClient>,
 }
 
 impl std::fmt::Debug for PostgresStateBackend {
@@ -1875,7 +1916,7 @@ impl PostgresStateBackend {
             Ok(client)
         })?;
         Ok(Self {
-            client: Arc::new(Mutex::new(client)),
+            client: Arc::new(BlockingPostgresClient::new(client)),
         })
     }
 
@@ -1889,20 +1930,21 @@ impl PostgresStateBackend {
         let label = label.to_string();
 
         run_blocking_state_op(move || {
-            let mut client = client.lock();
-            let row = client
-                .query_opt(
-                    "SELECT value FROM kiro_state_store WHERE namespace = $1 AND key = $2",
-                    &[&POSTGRES_NAMESPACE, &key],
-                )
-                .with_context(|| format!("从 PostgreSQL 读取{label}失败"))?;
+            client.with_client(|client| {
+                let row = client
+                    .query_opt(
+                        "SELECT value FROM kiro_state_store WHERE namespace = $1 AND key = $2",
+                        &[&POSTGRES_NAMESPACE, &key],
+                    )
+                    .with_context(|| format!("从 PostgreSQL 读取{label}失败"))?;
 
-            row.map(|row| {
-                let payload: String = row.get(0);
-                serde_json::from_str(&payload)
-                    .with_context(|| format!("解析 PostgreSQL {label}失败"))
+                row.map(|row| {
+                    let payload: String = row.get(0);
+                    serde_json::from_str(&payload)
+                        .with_context(|| format!("解析 PostgreSQL {label}失败"))
+                })
+                .transpose()
             })
-            .transpose()
         })
     }
 
@@ -1913,19 +1955,20 @@ impl PostgresStateBackend {
         let label = label.to_string();
 
         run_blocking_state_op(move || {
-            let mut client = client.lock();
-            client
-                .execute(
-                    r#"
+            client.with_client(|client| {
+                client
+                    .execute(
+                        r#"
                     INSERT INTO kiro_state_store (namespace, key, value, updated_at)
                     VALUES ($1, $2, $3, NOW())
                     ON CONFLICT (namespace, key)
                     DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
                     "#,
-                    &[&POSTGRES_NAMESPACE, &key, &payload],
-                )
-                .with_context(|| format!("保存{label}到 PostgreSQL 失败"))?;
-            Ok(())
+                        &[&POSTGRES_NAMESPACE, &key, &payload],
+                    )
+                    .with_context(|| format!("保存{label}到 PostgreSQL 失败"))?;
+                Ok(())
+            })
         })
     }
 }
@@ -1966,55 +2009,56 @@ impl StateBackend for PostgresStateBackend {
         let patch = patch.clone();
 
         run_blocking_state_op(move || {
-            let mut client = client.lock();
-            let mut transaction = client
+            client.with_client(|client| {
+                let mut transaction = client
                 .transaction()
                 .context("开启 PostgreSQL 凭据健康状态事务失败")?;
-            let row = transaction
-                .query_opt(
-                    "SELECT value FROM kiro_state_store WHERE namespace = $1 AND key = $2 FOR UPDATE",
-                    &[&POSTGRES_NAMESPACE, &POSTGRES_CREDENTIALS_KEY],
-                )
-                .context("锁定 PostgreSQL 凭据列表失败")?;
+                let row = transaction
+                    .query_opt(
+                        "SELECT value FROM kiro_state_store WHERE namespace = $1 AND key = $2 FOR UPDATE",
+                        &[&POSTGRES_NAMESPACE, &POSTGRES_CREDENTIALS_KEY],
+                    )
+                    .context("锁定 PostgreSQL 凭据列表失败")?;
 
-            let Some(row) = row else {
+                let Some(row) = row else {
+                    transaction
+                        .commit()
+                        .context("提交空 PostgreSQL 凭据健康状态事务失败")?;
+                    anyhow::bail!("凭据不存在: {}", id);
+                };
+
+                let payload: String = row.get(0);
+                let mut credentials: Vec<KiroCredentials> =
+                    serde_json::from_str(&payload).context("解析 PostgreSQL 凭据列表失败")?;
+                let Some(credential) = credentials
+                    .iter_mut()
+                    .find(|credential| credential.id == Some(id))
+                else {
+                    transaction
+                        .commit()
+                        .context("提交未命中 PostgreSQL 凭据健康状态事务失败")?;
+                    anyhow::bail!("凭据不存在: {}", id);
+                };
+
+                patch.apply_to(credential);
+                let payload =
+                    serde_json::to_string(&credentials).context("序列化 PostgreSQL 凭据列表失败")?;
+                transaction
+                    .execute(
+                        r#"
+                        UPDATE kiro_state_store
+                        SET value = $3, updated_at = NOW()
+                        WHERE namespace = $1 AND key = $2
+                        "#,
+                        &[&POSTGRES_NAMESPACE, &POSTGRES_CREDENTIALS_KEY, &payload],
+                    )
+                    .context("更新 PostgreSQL 凭据健康状态失败")?;
+
                 transaction
                     .commit()
-                    .context("提交空 PostgreSQL 凭据健康状态事务失败")?;
-                anyhow::bail!("凭据不存在: {}", id);
-            };
-
-            let payload: String = row.get(0);
-            let mut credentials: Vec<KiroCredentials> =
-                serde_json::from_str(&payload).context("解析 PostgreSQL 凭据列表失败")?;
-            let Some(credential) = credentials
-                .iter_mut()
-                .find(|credential| credential.id == Some(id))
-            else {
-                transaction
-                    .commit()
-                    .context("提交未命中 PostgreSQL 凭据健康状态事务失败")?;
-                anyhow::bail!("凭据不存在: {}", id);
-            };
-
-            patch.apply_to(credential);
-            let payload =
-                serde_json::to_string(&credentials).context("序列化 PostgreSQL 凭据列表失败")?;
-            transaction
-                .execute(
-                    r#"
-                    UPDATE kiro_state_store
-                    SET value = $3, updated_at = NOW()
-                    WHERE namespace = $1 AND key = $2
-                    "#,
-                    &[&POSTGRES_NAMESPACE, &POSTGRES_CREDENTIALS_KEY, &payload],
-                )
-                .context("更新 PostgreSQL 凭据健康状态失败")?;
-
-            transaction
-                .commit()
-                .context("提交 PostgreSQL 凭据健康状态事务失败")?;
-            Ok(true)
+                    .context("提交 PostgreSQL 凭据健康状态事务失败")?;
+                Ok(true)
+            })
         })
     }
 
@@ -2032,53 +2076,54 @@ impl StateBackend for PostgresStateBackend {
         next_credential.normalize_model_capabilities();
 
         run_blocking_state_op(move || {
-            let mut client = client.lock();
-            let mut transaction = client
+            client.with_client(|client| {
+                let mut transaction = client
                 .transaction()
                 .context("开启 PostgreSQL 凭据 compare-and-swap 事务失败")?;
-            let row = transaction
-                .query_opt(
-                    "SELECT value FROM kiro_state_store WHERE namespace = $1 AND key = $2 FOR UPDATE",
-                    &[&POSTGRES_NAMESPACE, &POSTGRES_CREDENTIALS_KEY],
-                )
-                .context("锁定 PostgreSQL 凭据列表失败")?;
+                let row = transaction
+                    .query_opt(
+                        "SELECT value FROM kiro_state_store WHERE namespace = $1 AND key = $2 FOR UPDATE",
+                        &[&POSTGRES_NAMESPACE, &POSTGRES_CREDENTIALS_KEY],
+                    )
+                    .context("锁定 PostgreSQL 凭据列表失败")?;
 
-            let Some(row) = row else {
+                let Some(row) = row else {
+                    transaction
+                        .commit()
+                        .context("提交空 PostgreSQL 凭据 compare-and-swap 事务失败")?;
+                    return Ok(CredentialCompareAndSwapResult::Missing);
+                };
+
+                let payload: String = row.get(0);
+                let mut credentials: Vec<KiroCredentials> =
+                    serde_json::from_str(&payload).context("解析 PostgreSQL 凭据列表失败")?;
+                let result = apply_refreshed_credential_compare_and_swap(
+                    &mut credentials,
+                    id,
+                    expected_refresh_token.as_deref(),
+                    &next_credential,
+                );
+
+                if matches!(result, CredentialCompareAndSwapResult::Applied) {
+                    let payload = serde_json::to_string(&credentials)
+                        .context("序列化 PostgreSQL 凭据列表失败")?;
+                    transaction
+                        .execute(
+                            r#"
+                            UPDATE kiro_state_store
+                            SET value = $3, updated_at = NOW()
+                            WHERE namespace = $1 AND key = $2
+                            "#,
+                            &[&POSTGRES_NAMESPACE, &POSTGRES_CREDENTIALS_KEY, &payload],
+                        )
+                        .context("更新 PostgreSQL 凭据列表失败")?;
+                }
+
                 transaction
                     .commit()
-                    .context("提交空 PostgreSQL 凭据 compare-and-swap 事务失败")?;
-                return Ok(CredentialCompareAndSwapResult::Missing);
-            };
-
-            let payload: String = row.get(0);
-            let mut credentials: Vec<KiroCredentials> =
-                serde_json::from_str(&payload).context("解析 PostgreSQL 凭据列表失败")?;
-            let result = apply_refreshed_credential_compare_and_swap(
-                &mut credentials,
-                id,
-                expected_refresh_token.as_deref(),
-                &next_credential,
-            );
-
-            if matches!(result, CredentialCompareAndSwapResult::Applied) {
-                let payload = serde_json::to_string(&credentials)
-                    .context("序列化 PostgreSQL 凭据列表失败")?;
-                transaction
-                    .execute(
-                        r#"
-                        UPDATE kiro_state_store
-                        SET value = $3, updated_at = NOW()
-                        WHERE namespace = $1 AND key = $2
-                        "#,
-                        &[&POSTGRES_NAMESPACE, &POSTGRES_CREDENTIALS_KEY, &payload],
-                    )
-                    .context("更新 PostgreSQL 凭据列表失败")?;
-            }
-
-            transaction
-                .commit()
-                .context("提交 PostgreSQL 凭据 compare-and-swap 事务失败")?;
-            Ok(result)
+                    .context("提交 PostgreSQL 凭据 compare-and-swap 事务失败")?;
+                Ok(result)
+            })
         })
     }
 
@@ -2100,51 +2145,52 @@ impl StateBackend for PostgresStateBackend {
         let updates = updates.clone();
 
         run_blocking_state_op(move || {
-            let mut client = client.lock();
-            let mut transaction = client
+            client.with_client(|client| {
+                let mut transaction = client
                 .transaction()
                 .context("开启 PostgreSQL 统计事务失败")?;
-            let empty_payload = "{}".to_string();
+                let empty_payload = "{}".to_string();
 
-            transaction
-                .execute(
-                    r#"
-                    INSERT INTO kiro_state_store (namespace, key, value, updated_at)
-                    VALUES ($1, $2, $3, NOW())
-                    ON CONFLICT (namespace, key) DO NOTHING
-                    "#,
-                    &[&POSTGRES_NAMESPACE, &POSTGRES_STATS_KEY, &empty_payload],
-                )
-                .context("初始化 PostgreSQL 统计缓存行失败")?;
+                transaction
+                    .execute(
+                        r#"
+                        INSERT INTO kiro_state_store (namespace, key, value, updated_at)
+                        VALUES ($1, $2, $3, NOW())
+                        ON CONFLICT (namespace, key) DO NOTHING
+                        "#,
+                        &[&POSTGRES_NAMESPACE, &POSTGRES_STATS_KEY, &empty_payload],
+                    )
+                    .context("初始化 PostgreSQL 统计缓存行失败")?;
 
-            let row = transaction
-                .query_one(
-                    "SELECT value FROM kiro_state_store WHERE namespace = $1 AND key = $2 FOR UPDATE",
-                    &[&POSTGRES_NAMESPACE, &POSTGRES_STATS_KEY],
-                )
-                .context("锁定 PostgreSQL 统计缓存失败")?;
-            let payload: String = row.get(0);
-            let stats: HashMap<String, StatsEntryRecord> =
-                serde_json::from_str(&payload).context("解析 PostgreSQL 统计缓存失败")?;
-            let merged = merge_stats_records(stats, &updates);
-            let merged_payload =
-                serde_json::to_string(&merged).context("序列化 PostgreSQL 合并统计失败")?;
+                let row = transaction
+                    .query_one(
+                        "SELECT value FROM kiro_state_store WHERE namespace = $1 AND key = $2 FOR UPDATE",
+                        &[&POSTGRES_NAMESPACE, &POSTGRES_STATS_KEY],
+                    )
+                    .context("锁定 PostgreSQL 统计缓存失败")?;
+                let payload: String = row.get(0);
+                let stats: HashMap<String, StatsEntryRecord> =
+                    serde_json::from_str(&payload).context("解析 PostgreSQL 统计缓存失败")?;
+                let merged = merge_stats_records(stats, &updates);
+                let merged_payload =
+                    serde_json::to_string(&merged).context("序列化 PostgreSQL 合并统计失败")?;
 
-            transaction
-                .execute(
-                    r#"
-                    UPDATE kiro_state_store
-                    SET value = $3, updated_at = NOW()
-                    WHERE namespace = $1 AND key = $2
-                    "#,
-                    &[&POSTGRES_NAMESPACE, &POSTGRES_STATS_KEY, &merged_payload],
-                )
-                .context("写回 PostgreSQL 合并统计失败")?;
+                transaction
+                    .execute(
+                        r#"
+                        UPDATE kiro_state_store
+                        SET value = $3, updated_at = NOW()
+                        WHERE namespace = $1 AND key = $2
+                        "#,
+                        &[&POSTGRES_NAMESPACE, &POSTGRES_STATS_KEY, &merged_payload],
+                    )
+                    .context("写回 PostgreSQL 合并统计失败")?;
 
-            transaction
-                .commit()
-                .context("提交 PostgreSQL 统计事务失败")?;
-            Ok(merged)
+                transaction
+                    .commit()
+                    .context("提交 PostgreSQL 统计事务失败")?;
+                Ok(merged)
+            })
         })
     }
 
@@ -3309,6 +3355,31 @@ mod tests {
         });
 
         assert_ne!(operation_thread_id, caller_thread_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drop_away_from_tokio_runtime_allows_nested_runtime_drop() {
+        struct RuntimeDroppingProbe(Arc<Mutex<Option<std::thread::ThreadId>>>);
+
+        impl Drop for RuntimeDroppingProbe {
+            fn drop(&mut self) {
+                let drop_thread_id = std::thread::current().id();
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async { 1 + 1 });
+                *self.0.lock() = Some(drop_thread_id);
+            }
+        }
+
+        let caller_thread_id = std::thread::current().id();
+        let drop_thread_id = Arc::new(Mutex::new(None));
+
+        drop_away_from_tokio_runtime(RuntimeDroppingProbe(Arc::clone(&drop_thread_id)));
+
+        let drop_thread_id = drop_thread_id.lock().expect("probe should be dropped");
+        assert_ne!(drop_thread_id, caller_thread_id);
     }
 
     #[test]
