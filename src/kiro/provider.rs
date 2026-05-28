@@ -698,6 +698,8 @@ async fn read_response_body_with_trace(
     Ok(bytes)
 }
 
+const THINKING_START_TAG: &str = "<thinking>";
+
 struct StreamContentStartProbe {
     thinking_enabled: bool,
     buffer: String,
@@ -728,27 +730,28 @@ impl StreamContentStartProbe {
         }
 
         self.buffer.push_str(content);
-        if self.buffer.contains("<thinking>") {
+        if self.buffer.contains(THINKING_START_TAG) {
             return true;
         }
 
-        let safe_len = self
-            .buffer
-            .len()
-            .saturating_sub("<thinking>".len())
-            .min(self.buffer.len());
-        let safe_prefix = match self.buffer.get(..safe_len) {
-            Some(prefix) => prefix,
-            None => {
-                let mut boundary = safe_len;
-                while boundary > 0 && !self.buffer.is_char_boundary(boundary) {
-                    boundary -= 1;
-                }
-                &self.buffer[..boundary]
-            }
-        };
-        !safe_prefix.trim().is_empty()
+        let safe_len = stream_content_probe_safe_prefix_len(&self.buffer);
+        let safe_prefix = &self.buffer[..safe_len];
+        if !safe_prefix.trim().is_empty() {
+            return true;
+        }
+        if safe_len > 0 {
+            self.buffer.drain(..safe_len);
+        }
+        false
     }
+}
+
+fn stream_content_probe_safe_prefix_len(buffer: &str) -> usize {
+    let mut boundary = buffer.len().saturating_sub(THINKING_START_TAG.len());
+    while boundary > 0 && !buffer.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    boundary
 }
 
 enum StreamContentStartPrefetch {
@@ -3781,6 +3784,15 @@ mod tests {
         assert!(!probe.observe_assistant_content("\n\n<th"));
         assert!(!probe.observe_assistant_content("inking"));
         assert!(probe.observe_assistant_content(">step 1"));
+    }
+
+    #[test]
+    fn test_stream_content_start_probe_thinking_bounds_whitespace_buffer() {
+        let mut probe = StreamContentStartProbe::new(true);
+        assert!(!probe.observe_assistant_content(&" ".repeat(256)));
+        assert!(probe.buffer.len() <= THINKING_START_TAG.len());
+        assert!(!probe.observe_assistant_content("<think"));
+        assert!(probe.observe_assistant_content("ing>step 1"));
     }
 
     #[test]

@@ -1026,7 +1026,7 @@ fn render_document_text_as_kiro_images(text: &str) -> Vec<KiroImage> {
         }
     }
 
-    if text.chars().count() > MAX_RENDERED_DOCUMENT_TEXT_CHARS
+    if document_text_exceeds_chars(text, MAX_RENDERED_DOCUMENT_TEXT_CHARS)
         || lines.len() > max_lines_per_page * MAX_RENDERED_DOCUMENT_IMAGES
     {
         tracing::info!(
@@ -1056,15 +1056,18 @@ fn wrap_document_text_for_rendering(text: &str) -> Vec<String> {
 
     for raw_line in text.replace("\r\n", "\n").replace('\r', "\n").lines() {
         let mut current = String::new();
+        let mut current_cols = 0usize;
         for ch in raw_line.chars() {
             let ch = if ch == '\t' { ' ' } else { ch };
             if ch.is_control() {
                 continue;
             }
-            if current.chars().count() >= max_cols {
+            if current_cols >= max_cols {
                 lines.push(std::mem::take(&mut current));
+                current_cols = 0;
             }
             current.push(ch);
+            current_cols += 1;
         }
         lines.push(current);
     }
@@ -1160,10 +1163,14 @@ fn normalize_document_text(text: &str) -> String {
 }
 
 fn clip_document_text(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
+    match text.char_indices().nth(max_chars) {
+        Some((index, _)) => text[..index].to_string(),
+        None => text.to_string(),
     }
-    text.chars().take(max_chars).collect::<String>()
+}
+
+fn document_text_exceeds_chars(text: &str, max_chars: usize) -> bool {
+    text.chars().nth(max_chars).is_some()
 }
 
 /// 从 media_type 获取图片格式
@@ -2967,6 +2974,20 @@ mod tests {
                 "data": "data:text/plain;base64,U0tRRFlHREY="
             }
         })
+    }
+
+    #[test]
+    fn test_clip_document_text_preserves_char_boundaries() {
+        assert_eq!(clip_document_text("ab成cd", 3), "ab成");
+        assert_eq!(clip_document_text("ab成cd", 10), "ab成cd");
+        assert_eq!(clip_document_text("ab成cd", 0), "");
+    }
+
+    #[test]
+    fn test_wrap_document_text_for_rendering_normalizes_line_endings() {
+        let lines = wrap_document_text_for_rendering("ab\tcd\r\nef\r\n\r\n");
+
+        assert_eq!(lines, vec!["ab cd".to_string(), "ef".to_string()]);
     }
 
     #[test]
