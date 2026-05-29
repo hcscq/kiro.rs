@@ -453,8 +453,8 @@ async fn ready_handler(
     let snapshot = health.readiness_snapshot();
     let draining = health.is_draining() || drain_file_present();
     let conversion = conversion_runtime.stats();
-    let conversion_overloaded = conversion.is_saturated();
-    let ready = !draining && snapshot.total > 0 && !conversion_overloaded;
+    let conversion_saturated = conversion.is_saturated();
+    let ready = !draining && snapshot.total > 0;
     let status = if ready {
         StatusCode::OK
     } else {
@@ -464,8 +464,6 @@ async fn ready_handler(
         "draining"
     } else if snapshot.total == 0 {
         "no_credentials"
-    } else if conversion_overloaded {
-        "overloaded"
     } else {
         "not_ready"
     };
@@ -482,6 +480,7 @@ async fn ready_handler(
             "conversion_waiting": conversion.waiting,
             "conversion_max_queue": conversion.max_queue,
             "conversion_queue_wait_ms": conversion.queue_wait_ms,
+            "conversion_status": if conversion_saturated { "saturated" } else { "available" },
             "readiness_source": "cached",
         })),
     )

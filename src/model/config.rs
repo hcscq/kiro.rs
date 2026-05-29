@@ -802,15 +802,15 @@ fn default_stream_pre_sse_min_remaining_ms() -> u64 {
 }
 
 fn default_conversion_max_concurrent() -> usize {
-    2
+    4
 }
 
 fn default_conversion_max_queue() -> usize {
-    8
+    32
 }
 
 fn default_conversion_queue_wait_ms() -> u64 {
-    10_000
+    60_000
 }
 
 impl Default for Config {
@@ -1220,6 +1220,9 @@ mod tests {
         assert!((config.rate_limit_refill_backoff_factor - 0.75).abs() < f64::EPSILON);
         assert!((config.request_weighting.max_weight - 2.5).abs() < f64::EPSILON);
         assert!((config.request_weighting.tools_bonus - 0.4).abs() < f64::EPSILON);
+        assert_eq!(config.conversion_runtime.max_concurrent, 4);
+        assert_eq!(config.conversion_runtime.max_queue, 32);
+        assert_eq!(config.conversion_runtime.queue_wait_ms, 60_000);
     }
 
     #[test]
