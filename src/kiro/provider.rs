@@ -48,6 +48,7 @@ const STREAM_TOTAL_WALL_CLOCK_BUDGET: Duration = Duration::from_secs(540);
 const STREAM_FIRST_CONTENT_FAILOVER_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(60);
 const STREAM_FIRST_CONTENT_FAILOVER_TOTAL_BUDGET: Duration = Duration::from_secs(165);
 const STREAM_FIRST_CONTENT_FAILOVER_COOLDOWN: Duration = Duration::from_secs(15);
+const STREAM_CONTENT_START_ACTIVITY_READY_BYTES: usize = 8 * 1024;
 const INSUFFICIENT_CAPACITY_COOLDOWN: Duration = Duration::from_secs(10);
 const MAX_SLOW_FIRST_CONTENT_FAILOVERS: usize = 2;
 const MIN_STREAM_FIRST_CONTENT_FAILOVER_REMAINING: Duration = Duration::from_secs(15);
@@ -703,6 +704,12 @@ const THINKING_START_TAG: &str = "<thinking>";
 struct StreamContentStartProbe {
     thinking_enabled: bool,
     buffer: String,
+    observed_events: usize,
+    non_error_events: usize,
+    assistant_events: usize,
+    assistant_content_bytes: usize,
+    tool_use_events: usize,
+    error_events: usize,
 }
 
 impl StreamContentStartProbe {
@@ -710,14 +717,39 @@ impl StreamContentStartProbe {
         Self {
             thinking_enabled,
             buffer: String::new(),
+            observed_events: 0,
+            non_error_events: 0,
+            assistant_events: 0,
+            assistant_content_bytes: 0,
+            tool_use_events: 0,
+            error_events: 0,
         }
     }
 
     fn observe(&mut self, event: &Event) -> bool {
+        self.observed_events = self.observed_events.saturating_add(1);
         match event {
-            Event::ToolUse(_) => true,
-            Event::AssistantResponse(resp) => self.observe_assistant_content(&resp.content),
-            _ => false,
+            Event::ToolUse(_) => {
+                self.non_error_events = self.non_error_events.saturating_add(1);
+                self.tool_use_events = self.tool_use_events.saturating_add(1);
+                true
+            }
+            Event::AssistantResponse(resp) => {
+                self.non_error_events = self.non_error_events.saturating_add(1);
+                self.assistant_events = self.assistant_events.saturating_add(1);
+                self.assistant_content_bytes = self
+                    .assistant_content_bytes
+                    .saturating_add(resp.content.len());
+                self.observe_assistant_content(&resp.content)
+            }
+            Event::Error { .. } | Event::Exception { .. } => {
+                self.error_events = self.error_events.saturating_add(1);
+                false
+            }
+            _ => {
+                self.non_error_events = self.non_error_events.saturating_add(1);
+                false
+            }
         }
     }
 
@@ -744,6 +776,24 @@ impl StreamContentStartProbe {
         }
         false
     }
+
+    fn should_release_after_stream_activity(&self, prefetched_bytes: usize) -> bool {
+        self.thinking_enabled
+            && prefetched_bytes >= STREAM_CONTENT_START_ACTIVITY_READY_BYTES
+            && self.non_error_events > 0
+            && self.error_events == 0
+    }
+
+    fn diagnostics(&self) -> StreamContentStartProbeDiagnostics {
+        StreamContentStartProbeDiagnostics {
+            observed_events: self.observed_events,
+            non_error_events: self.non_error_events,
+            assistant_events: self.assistant_events,
+            assistant_content_bytes: self.assistant_content_bytes,
+            tool_use_events: self.tool_use_events,
+            error_events: self.error_events,
+        }
+    }
 }
 
 fn stream_content_probe_safe_prefix_len(buffer: &str) -> usize {
@@ -754,16 +804,29 @@ fn stream_content_probe_safe_prefix_len(buffer: &str) -> usize {
     boundary
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct StreamContentStartProbeDiagnostics {
+    observed_events: usize,
+    non_error_events: usize,
+    assistant_events: usize,
+    assistant_content_bytes: usize,
+    tool_use_events: usize,
+    error_events: usize,
+}
+
 enum StreamContentStartPrefetch {
     Ready {
         stream: BoxStream<'static, Result<Bytes, reqwest::Error>>,
         first_chunk_logged: bool,
         prefetched_bytes: usize,
         elapsed: Duration,
+        ready_reason: &'static str,
+        probe_diagnostics: StreamContentStartProbeDiagnostics,
     },
     TimedOut {
         elapsed: Duration,
         prefetched_bytes: usize,
+        probe_diagnostics: StreamContentStartProbeDiagnostics,
     },
 }
 
@@ -1262,17 +1325,45 @@ impl KiroProvider {
 
         loop {
             let Some(remaining) = timeout_budget.checked_sub(started_at.elapsed()) else {
+                if probe.should_release_after_stream_activity(prefetched_bytes) {
+                    let probe_diagnostics = probe.diagnostics();
+                    let prefetched_stream = stream::iter(prefetched.into_iter().map(Ok));
+                    let stream = prefetched_stream.chain(body_stream).boxed();
+                    return Ok(StreamContentStartPrefetch::Ready {
+                        stream,
+                        first_chunk_logged,
+                        prefetched_bytes,
+                        elapsed: started_at.elapsed(),
+                        ready_reason: "stream_activity_without_content_start",
+                        probe_diagnostics,
+                    });
+                }
                 return Ok(StreamContentStartPrefetch::TimedOut {
                     elapsed: started_at.elapsed(),
                     prefetched_bytes,
+                    probe_diagnostics: probe.diagnostics(),
                 });
             };
 
             match timeout(remaining, body_stream.next()).await {
                 Err(_) => {
+                    if probe.should_release_after_stream_activity(prefetched_bytes) {
+                        let probe_diagnostics = probe.diagnostics();
+                        let prefetched_stream = stream::iter(prefetched.into_iter().map(Ok));
+                        let stream = prefetched_stream.chain(body_stream).boxed();
+                        return Ok(StreamContentStartPrefetch::Ready {
+                            stream,
+                            first_chunk_logged,
+                            prefetched_bytes,
+                            elapsed: started_at.elapsed(),
+                            ready_reason: "stream_activity_without_content_start",
+                            probe_diagnostics,
+                        });
+                    }
                     return Ok(StreamContentStartPrefetch::TimedOut {
                         elapsed: started_at.elapsed(),
                         prefetched_bytes,
+                        probe_diagnostics: probe.diagnostics(),
                     });
                 }
                 Ok(Some(Ok(chunk))) => {
@@ -1312,6 +1403,7 @@ impl KiroProvider {
                                 match Event::from_frame(frame) {
                                     Ok(event) => {
                                         if probe.observe(&event) {
+                                            let probe_diagnostics = probe.diagnostics();
                                             let prefetched_stream =
                                                 stream::iter(prefetched.into_iter().map(Ok));
                                             let stream =
@@ -1321,6 +1413,8 @@ impl KiroProvider {
                                                 first_chunk_logged,
                                                 prefetched_bytes,
                                                 elapsed: started_at.elapsed(),
+                                                ready_reason: "content_start_observed",
+                                                probe_diagnostics,
                                             });
                                         }
                                     }
@@ -1357,6 +1451,7 @@ impl KiroProvider {
                 }
                 Ok(Some(Err(err))) => return Err(err.into()),
                 Ok(None) => {
+                    let probe_diagnostics = probe.diagnostics();
                     let prefetched_stream = stream::iter(prefetched.into_iter().map(Ok));
                     let stream = prefetched_stream.chain(body_stream).boxed();
                     return Ok(StreamContentStartPrefetch::Ready {
@@ -1364,6 +1459,8 @@ impl KiroProvider {
                         first_chunk_logged,
                         prefetched_bytes,
                         elapsed: started_at.elapsed(),
+                        ready_reason: "upstream_stream_ended",
+                        probe_diagnostics,
                     });
                 }
             }
@@ -2356,6 +2453,8 @@ impl KiroProvider {
                             first_chunk_logged,
                             prefetched_bytes,
                             elapsed,
+                            ready_reason,
+                            probe_diagnostics,
                         }) => {
                             tracing::info!(
                                 request_id = %request_id,
@@ -2368,6 +2467,14 @@ impl KiroProvider {
                                 request_body_bytes,
                                 prefetched_bytes,
                                 prefetch_elapsed_ms = elapsed.as_millis(),
+                                content_start_ready_reason = ready_reason,
+                                prefetch_observed_events = probe_diagnostics.observed_events,
+                                prefetch_non_error_events = probe_diagnostics.non_error_events,
+                                prefetch_assistant_events = probe_diagnostics.assistant_events,
+                                prefetch_assistant_content_bytes =
+                                    probe_diagnostics.assistant_content_bytes,
+                                prefetch_tool_use_events = probe_diagnostics.tool_use_events,
+                                prefetch_error_events = probe_diagnostics.error_events,
                                 slow_first_content_failovers,
                                 max_slow_first_content_failovers = MAX_SLOW_FIRST_CONTENT_FAILOVERS,
                                 "上游流预读已满足首内容块调度条件"
@@ -2388,6 +2495,7 @@ impl KiroProvider {
                         Ok(StreamContentStartPrefetch::TimedOut {
                             elapsed,
                             prefetched_bytes,
+                            probe_diagnostics,
                         }) => {
                             let remaining_after_prefetch =
                                 Self::remaining_stream_first_content_failover_budget(
@@ -2448,6 +2556,13 @@ impl KiroProvider {
                                 request_body_bytes,
                                 prefetched_bytes,
                                 prefetch_elapsed_ms = elapsed.as_millis(),
+                                prefetch_observed_events = probe_diagnostics.observed_events,
+                                prefetch_non_error_events = probe_diagnostics.non_error_events,
+                                prefetch_assistant_events = probe_diagnostics.assistant_events,
+                                prefetch_assistant_content_bytes =
+                                    probe_diagnostics.assistant_content_bytes,
+                                prefetch_tool_use_events = probe_diagnostics.tool_use_events,
+                                prefetch_error_events = probe_diagnostics.error_events,
                                 slow_first_content_failovers,
                                 max_slow_first_content_failovers = MAX_SLOW_FIRST_CONTENT_FAILOVERS,
                                 scoped_candidate_count,
@@ -3824,5 +3939,43 @@ mod tests {
     fn test_stream_content_start_probe_thinking_accepts_multibyte_plain_text_prefix() {
         let mut probe = StreamContentStartProbe::new(true);
         assert!(probe.observe_assistant_content("commit 成功了，"));
+    }
+
+    #[test]
+    fn test_stream_content_start_probe_releases_active_thinking_stream() {
+        let mut probe = StreamContentStartProbe::new(true);
+        assert!(
+            !probe.should_release_after_stream_activity(STREAM_CONTENT_START_ACTIVITY_READY_BYTES)
+        );
+
+        assert!(!probe.observe(&Event::Metering(())));
+        assert!(
+            !probe.should_release_after_stream_activity(
+                STREAM_CONTENT_START_ACTIVITY_READY_BYTES - 1
+            )
+        );
+        assert!(
+            probe.should_release_after_stream_activity(STREAM_CONTENT_START_ACTIVITY_READY_BYTES)
+        );
+    }
+
+    #[test]
+    fn test_stream_content_start_probe_does_not_release_errors_or_non_thinking() {
+        let mut errored_probe = StreamContentStartProbe::new(true);
+        assert!(!errored_probe.observe(&Event::Error {
+            error_code: "Bad".to_string(),
+            error_message: "bad".to_string(),
+        }));
+        assert!(
+            !errored_probe
+                .should_release_after_stream_activity(STREAM_CONTENT_START_ACTIVITY_READY_BYTES)
+        );
+
+        let mut non_thinking_probe = StreamContentStartProbe::new(false);
+        assert!(!non_thinking_probe.observe(&Event::Metering(())));
+        assert!(
+            !non_thinking_probe
+                .should_release_after_stream_activity(STREAM_CONTENT_START_ACTIVITY_READY_BYTES)
+        );
     }
 }
