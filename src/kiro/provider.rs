@@ -1201,6 +1201,8 @@ impl KiroProvider {
     fn is_insufficient_model_capacity(body: &str, error_summary: &str) -> bool {
         body.contains("INSUFFICIENT_MODEL_CAPACITY")
             || error_summary.contains("reason=INSUFFICIENT_MODEL_CAPACITY")
+            || body.contains("MODEL_TEMPORARILY_UNAVAILABLE")
+            || error_summary.contains("reason=MODEL_TEMPORARILY_UNAVAILABLE")
     }
 
     fn insufficient_model_capacity_public_message() -> &'static str {
@@ -2022,7 +2024,7 @@ impl KiroProvider {
         let mut priority_rate_limit_hits: HashMap<u32, usize> = HashMap::new();
         let mut slow_first_content_failovers = 0usize;
         let mut pre_sse_fast_failovers = 0usize;
-        let mut capacity_429_count = 0usize;
+        let mut capacity_unavailable_count = 0usize;
         let api_type = if is_stream { "流式" } else { "非流式" };
         let request_id = options
             .request_id
@@ -3152,17 +3154,26 @@ impl KiroProvider {
             // 429/408/5xx - 瞬态上游错误：重试但不禁用凭据，并在当前请求内切换候选。
             // 429 会额外进入短冷却/桶退避。
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
-                let insufficient_capacity = status.as_u16() == 429
-                    && Self::is_insufficient_model_capacity(&body, &error_summary);
-                if status.as_u16() == 429 {
-                    if insufficient_capacity {
-                        capacity_429_count = capacity_429_count.saturating_add(1);
-                        self.token_manager.defer_capacity_limited_credential(
-                            ctx_id,
-                            model.as_deref().unwrap_or("unknown"),
-                            INSUFFICIENT_CAPACITY_COOLDOWN,
-                        );
-                    } else if Self::is_suspicious_activity_limited(&body, &error_summary) {
+                let insufficient_capacity =
+                    Self::is_insufficient_model_capacity(&body, &error_summary);
+                if insufficient_capacity {
+                    capacity_unavailable_count = capacity_unavailable_count.saturating_add(1);
+                    self.token_manager.defer_capacity_limited_credential(
+                        ctx_id,
+                        model.as_deref().unwrap_or("unknown"),
+                        INSUFFICIENT_CAPACITY_COOLDOWN,
+                    );
+                    request_scoped_rate_limited_credentials.insert(ctx_id);
+                    let supported_candidate_count = self
+                        .token_manager
+                        .enabled_supported_credential_count(model.as_deref());
+                    max_retries = max_retries.max(Self::rate_limit_retry_cap(
+                        total_credentials,
+                        supported_candidate_count,
+                        model.as_deref(),
+                    ));
+                } else if status.as_u16() == 429 {
+                    if Self::is_suspicious_activity_limited(&body, &error_summary) {
                         self.token_manager
                             .report_suspicious_activity_limited(ctx_id, Some(&error_summary));
                     } else {
@@ -3180,14 +3191,6 @@ impl KiroProvider {
                         &request_scoped_empty_body_credentials,
                         &request_scoped_transient_error_credentials,
                     );
-                    let supported_candidate_count = self
-                        .token_manager
-                        .enabled_supported_credential_count(model.as_deref());
-                    max_retries = max_retries.max(Self::rate_limit_retry_cap(
-                        total_credentials,
-                        supported_candidate_count,
-                        model.as_deref(),
-                    ));
                 } else {
                     request_scoped_transient_error_credentials.insert(ctx_id);
                 }
@@ -3204,7 +3207,7 @@ impl KiroProvider {
                     status_code = status.as_u16(),
                     error_summary = %error_summary,
                     insufficient_capacity,
-                    capacity_429_count,
+                    capacity_unavailable_count,
                     effective_retry_cap = max_retries,
                     total_elapsed_ms = overall_started_at.elapsed().as_millis(),
                     "API 请求失败（上游瞬态错误）"
@@ -3947,6 +3950,14 @@ mod tests {
         assert!(KiroProvider::is_insufficient_model_capacity(
             "{}",
             "status=429 body_len=110 reason=INSUFFICIENT_MODEL_CAPACITY"
+        ));
+        assert!(KiroProvider::is_insufficient_model_capacity(
+            r#"{"reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#,
+            "status=500 body_len=136"
+        ));
+        assert!(KiroProvider::is_insufficient_model_capacity(
+            "{}",
+            "status=500 body_len=136 reason=MODEL_TEMPORARILY_UNAVAILABLE"
         ));
         assert!(!KiroProvider::is_insufficient_model_capacity(
             r#"{"reason":"RATE_LIMIT"}"#,
