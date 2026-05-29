@@ -305,14 +305,64 @@ async fn execute_server_web_tool_loop(
         "Server-side web tool loop exceeded internal safety limit"
     );
 
-    Err((
-        StatusCode::BAD_GATEWAY,
-        Json(ErrorResponse::new(
-            "api_error",
-            "server-side web tool loop exceeded the internal safety limit",
-        )),
+    let synthesis_payload =
+        build_server_web_tool_final_synthesis_payload(payload, &outward_content, &recent_attempts);
+    let synthesis_request_id = format!("{request_id}-webtool-final-synthesis");
+    tracing::warn!(
+        request_id = %request_id,
+        synthesis_request_id = %synthesis_request_id,
+        max_rounds = WEB_FETCH_HARD_MAX_USES,
+        web_fetch_requests,
+        web_search_requests,
+        "Server-side web tool loop exhausted; attempting final synthesis without tools"
+    );
+
+    let synthesis = match execute_non_stream_round(
+        provider,
+        &synthesis_payload,
+        probe,
+        Some(synthesis_request_id.clone()),
     )
-        .into_response())
+    .await
+    {
+        Ok(result) => result,
+        Err(response) => {
+            tracing::error!(
+                request_id = %request_id,
+                synthesis_request_id = %synthesis_request_id,
+                "Server-side web tool final synthesis failed"
+            );
+            return Err(response);
+        }
+    };
+
+    total_input_tokens += synthesis.input_tokens.max(0);
+    total_output_tokens += synthesis.output_tokens.max(0);
+
+    let final_blocks = final_synthesis_content(synthesis.content);
+    let final_block_count = final_blocks.len();
+    outward_content.extend(final_blocks);
+
+    tracing::info!(
+        request_id = %request_id,
+        synthesis_request_id = %synthesis_request_id,
+        final_block_count,
+        total_input_tokens,
+        total_output_tokens,
+        web_fetch_requests,
+        web_search_requests,
+        "Server-side web tool final synthesis completed"
+    );
+
+    Ok(ServerWebToolRun {
+        content: outward_content,
+        stop_reason: "end_turn".to_string(),
+        fallback_input_tokens: input_tokens,
+        total_input_tokens,
+        total_output_tokens,
+        web_fetch_requests,
+        web_search_requests,
+    })
 }
 
 fn push_recent_server_web_tool_attempt(
@@ -375,6 +425,53 @@ fn summarize_server_web_tool_input(input: &Value) -> String {
     }
 
     input_summary
+}
+
+fn build_server_web_tool_final_synthesis_payload(
+    payload: &MessagesRequest,
+    content: &[Value],
+    recent_attempts: &[ServerWebToolAttemptLog],
+) -> MessagesRequest {
+    let mut synthesis = payload.clone();
+    synthesis.stream = false;
+    synthesis.tools = None;
+    synthesis.tool_choice = None;
+
+    let trace = server_web_tool_trace_for_repair(content);
+    let previous_text = truncate_chars(&structured_outputs::collect_text_content(content), 8_000);
+    let recent_attempts_json =
+        serde_json::to_string(recent_attempts).unwrap_or_else(|_| "[]".to_string());
+    synthesis.messages.push(Message {
+        role: "user".to_string(),
+        content: Value::String(format!(
+            "Server-side web tools have already been executed for this request, \
+             but the internal web tool safety limit was reached before a final answer. \
+             Do not ask to call tools and do not repeat any web search or fetch. \
+             Use only the original conversation, the web tool trace, and any partial answer below. \
+             If the available evidence is insufficient, say so directly and answer with the available context.\n\
+             <server_side_web_tool_trace>\n{trace}\n</server_side_web_tool_trace>\n\
+             <recent_web_tool_attempts>{recent_attempts_json}</recent_web_tool_attempts>\n\
+             <partial_answer>\n{previous_text}\n</partial_answer>\n\
+             Return the best final answer now."
+        )),
+    });
+    synthesis
+}
+
+fn final_synthesis_content(content: Vec<Value>) -> Vec<Value> {
+    let mut final_content: Vec<Value> = content
+        .into_iter()
+        .filter(|block| !is_client_tool_use(block) && !is_server_web_trace_block(block))
+        .collect();
+
+    if final_content.is_empty() {
+        final_content.push(json!({
+            "type": "text",
+            "text": "I could not produce a final answer after the available server-side web tool results."
+        }));
+    }
+
+    final_content
 }
 
 fn validate_server_web_tools(payload: &MessagesRequest) -> Result<ServerWebToolConfig, Response> {
@@ -2383,6 +2480,84 @@ mod tests {
         assert!(last.contains("Do not ask to call tools"));
         assert!(last.contains("Fetched page text"));
         assert!(last.contains("JSON Schema"));
+    }
+
+    #[test]
+    fn test_final_synthesis_payload_removes_tools_and_embeds_web_trace() {
+        let mut req = sample_request_with_tools(vec![sample_tool(), sample_web_search_tool()]);
+        req.stream = true;
+        let content = vec![
+            json!({
+                "type":"server_tool_use",
+                "id":"srvtoolu_test",
+                "name":"web_search",
+                "input":{"query":"rust release"}
+            }),
+            json!({
+                "type":"web_search_tool_result",
+                "content":[{
+                    "type":"web_search_result",
+                    "title":"Rust",
+                    "url":"https://example.com/rust",
+                    "encrypted_content":"Rust result"
+                }]
+            }),
+            json!({"type":"text","text":"Partial answer"}),
+        ];
+        let recent_attempts = vec![ServerWebToolAttemptLog {
+            round_idx: 15,
+            tool_name: "web_search".to_string(),
+            input: "query=rust release".to_string(),
+            error_code: None,
+        }];
+
+        let synthesis =
+            build_server_web_tool_final_synthesis_payload(&req, &content, &recent_attempts);
+
+        assert!(!synthesis.stream);
+        assert!(synthesis.tools.is_none());
+        assert!(synthesis.tool_choice.is_none());
+        let last = synthesis.messages.last().unwrap().content.as_str().unwrap();
+        assert!(last.contains("Do not ask to call tools"));
+        assert!(last.contains("rust release"));
+        assert!(last.contains("Partial answer"));
+        assert!(last.contains("\"round_idx\":15"));
+    }
+
+    #[test]
+    fn test_final_synthesis_content_drops_tool_and_trace_blocks() {
+        let content = final_synthesis_content(vec![
+            json!({
+                "type":"server_tool_use",
+                "id":"srvtoolu_test",
+                "name":"web_search",
+                "input":{"query":"rust"}
+            }),
+            json!({
+                "type":"web_search_tool_result",
+                "content":[]
+            }),
+            json!({
+                "type":"tool_use",
+                "id":"toolu_repeat",
+                "name":"web_search",
+                "input":{"query":"rust again"}
+            }),
+            json!({"type":"text","text":"Final answer"}),
+        ]);
+
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "Final answer");
+
+        let fallback = final_synthesis_content(vec![json!({
+            "type":"tool_use",
+            "id":"toolu_repeat",
+            "name":"web_search",
+            "input":{"query":"rust again"}
+        })]);
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0]["type"], "text");
     }
 
     #[test]
