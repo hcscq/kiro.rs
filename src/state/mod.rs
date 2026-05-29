@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use crate::admin::types::BalanceResponse;
 use crate::kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use crate::model::config::{
-    Config, RequestWeightingConfig, StateBackendKind, ThinkingSignatureValidationMode,
+    Config, RequestWeightingConfig, StateBackendKind, StreamPreSseFailoverConfig,
+    ThinkingSignatureValidationMode,
 };
 use crate::model::model_policy::{
     AccountTypeDispatchPolicy, ModelSupportPolicy, normalize_account_type_dispatch_policies,
@@ -846,6 +847,8 @@ pub struct PersistedDispatchConfig {
     #[serde(default)]
     pub request_weighting: RequestWeightingConfig,
     #[serde(default)]
+    pub stream_pre_sse_failover: StreamPreSseFailoverConfig,
+    #[serde(default)]
     pub thinking_signature_validation_mode: ThinkingSignatureValidationMode,
     #[serde(default)]
     pub response_thinking_signature_compat_enabled: bool,
@@ -949,6 +952,7 @@ impl PersistedDispatchConfig {
                 .rate_limit_refill_recovery_step_per_success,
             rate_limit_refill_backoff_factor: config.rate_limit_refill_backoff_factor,
             request_weighting: config.request_weighting.clone(),
+            stream_pre_sse_failover: config.stream_pre_sse_failover.clone(),
             thinking_signature_validation_mode: config.thinking_signature_validation_mode,
             response_thinking_signature_compat_enabled: config
                 .response_thinking_signature_compat_enabled,
@@ -988,6 +992,7 @@ impl PersistedDispatchConfig {
             self.rate_limit_refill_recovery_step_per_success;
         config.rate_limit_refill_backoff_factor = self.rate_limit_refill_backoff_factor;
         config.request_weighting = self.request_weighting.clone();
+        config.stream_pre_sse_failover = self.stream_pre_sse_failover.clone();
         config.thinking_signature_validation_mode = self.thinking_signature_validation_mode;
         config.response_thinking_signature_compat_enabled =
             self.response_thinking_signature_compat_enabled;
@@ -3610,6 +3615,7 @@ mod tests {
                 tools_bonus: 1.0,
                 ..RequestWeightingConfig::default()
             },
+            stream_pre_sse_failover: StreamPreSseFailoverConfig::default(),
             thinking_signature_validation_mode: ThinkingSignatureValidationMode::StripInvalid,
             response_thinking_signature_compat_enabled: true,
             account_type_policies: BTreeMap::new(),
@@ -3663,6 +3669,7 @@ mod tests {
         );
         assert!(dispatch.model_cooldown_enabled);
         assert!(dispatch.request_weighting.enabled);
+        assert!(dispatch.stream_pre_sse_failover.enabled);
         assert_eq!(
             dispatch.thinking_signature_validation_mode,
             ThinkingSignatureValidationMode::Strict

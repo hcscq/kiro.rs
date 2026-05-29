@@ -25,7 +25,9 @@ use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
-use crate::model::config::{Config, RequestWeightingConfig, ThinkingSignatureValidationMode};
+use crate::model::config::{
+    Config, RequestWeightingConfig, StreamPreSseFailoverConfig, ThinkingSignatureValidationMode,
+};
 use crate::model::model_policy::{
     AccountTypeDispatchPolicy, ModelSupportPolicy, normalize_account_type_dispatch_policies,
     normalize_account_type_policies, normalize_model_selector,
@@ -873,6 +875,7 @@ pub struct LoadBalancingConfigSnapshot {
     pub rate_limit_refill_recovery_step_per_success: f64,
     pub rate_limit_refill_backoff_factor: f64,
     pub request_weighting: RequestWeightingConfig,
+    pub stream_pre_sse_failover: StreamPreSseFailoverConfig,
     pub thinking_signature_validation_mode: ThinkingSignatureValidationMode,
     pub response_thinking_signature_compat_enabled: bool,
     pub waiting_requests: usize,
@@ -910,6 +913,7 @@ struct DispatchConfig {
     rate_limit_refill_recovery_step_per_success: f64,
     rate_limit_refill_backoff_factor: f64,
     request_weighting: RequestWeightingConfig,
+    stream_pre_sse_failover: StreamPreSseFailoverConfig,
     thinking_signature_validation_mode: ThinkingSignatureValidationMode,
     response_thinking_signature_compat_enabled: bool,
     account_type_policies: BTreeMap<String, ModelSupportPolicy>,
@@ -980,6 +984,7 @@ impl DispatchConfig {
                 config.rate_limit_refill_backoff_factor,
             ),
             request_weighting: config.request_weighting.clone(),
+            stream_pre_sse_failover: config.stream_pre_sse_failover.clone(),
             thinking_signature_validation_mode: config.thinking_signature_validation_mode,
             response_thinking_signature_compat_enabled: config
                 .response_thinking_signature_compat_enabled,
@@ -6828,6 +6833,7 @@ impl MultiTokenManager {
                 .rate_limit_refill_recovery_step_per_success,
             rate_limit_refill_backoff_factor: dispatch.rate_limit_refill_backoff_factor,
             request_weighting: dispatch.request_weighting.clone(),
+            stream_pre_sse_failover: dispatch.stream_pre_sse_failover.clone(),
             thinking_signature_validation_mode: dispatch.thinking_signature_validation_mode,
             response_thinking_signature_compat_enabled: dispatch
                 .response_thinking_signature_compat_enabled,
@@ -6857,6 +6863,10 @@ impl MultiTokenManager {
 
     pub fn request_weighting_config_snapshot(&self) -> RequestWeightingConfig {
         self.dispatch_config().request_weighting
+    }
+
+    pub fn stream_pre_sse_failover_config_snapshot(&self) -> StreamPreSseFailoverConfig {
+        self.dispatch_config().stream_pre_sse_failover
     }
 
     pub fn thinking_signature_validation_mode(&self) -> ThinkingSignatureValidationMode {
@@ -6907,6 +6917,7 @@ impl MultiTokenManager {
                     .rate_limit_refill_recovery_step_per_success,
                 rate_limit_refill_backoff_factor: dispatch.rate_limit_refill_backoff_factor,
                 request_weighting: dispatch.request_weighting.clone(),
+                stream_pre_sse_failover: dispatch.stream_pre_sse_failover.clone(),
                 thinking_signature_validation_mode: dispatch.thinking_signature_validation_mode,
                 response_thinking_signature_compat_enabled: dispatch
                     .response_thinking_signature_compat_enabled,
@@ -6921,6 +6932,7 @@ impl MultiTokenManager {
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
         self.set_load_balancing_config(
             Some(mode),
+            None,
             None,
             None,
             None,
@@ -7025,6 +7037,7 @@ impl MultiTokenManager {
         rate_limit_refill_recovery_step_per_success: Option<f64>,
         rate_limit_refill_backoff_factor: Option<f64>,
         request_weighting: Option<RequestWeightingConfig>,
+        stream_pre_sse_failover: Option<StreamPreSseFailoverConfig>,
         session_affinity_enabled: Option<bool>,
         thinking_signature_validation_mode: Option<ThinkingSignatureValidationMode>,
         response_thinking_signature_compat_enabled: Option<bool>,
@@ -7124,6 +7137,9 @@ impl MultiTokenManager {
         if let Some(request_weighting) = request_weighting {
             next.request_weighting = request_weighting;
         }
+        if let Some(stream_pre_sse_failover) = stream_pre_sse_failover {
+            next.stream_pre_sse_failover = stream_pre_sse_failover;
+        }
         if let Some(session_affinity_enabled) = session_affinity_enabled {
             next.session_affinity_enabled = session_affinity_enabled;
         }
@@ -7154,6 +7170,7 @@ impl MultiTokenManager {
         }
 
         Self::validate_dispatch_rate_limit_config(&next)?;
+        next.stream_pre_sse_failover.validate()?;
 
         if previous == next {
             return Ok(());
@@ -7201,7 +7218,7 @@ impl MultiTokenManager {
 
         self.availability_notify.notify_waiters();
         tracing::info!(
-            "调度配置已更新: mode={}, sessionAffinityEnabled={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, rateLimitCooldownEnabled={}, suspiciousActivityCooldownMs={}, suspiciousActivityCooldownEnabled={}, suspiciousActivityAutoClearEnabled={}, suspiciousActivityAutoClearSuccessThreshold={}, suspiciousActivityAutoClearAfterMs={}, modelCooldownEnabled={}, defaultMaxConcurrency={:?}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}, requestWeightingEnabled={}, requestWeightingBaseWeight={}, requestWeightingMaxWeight={}, thinkingSignatureValidationMode={}, responseThinkingSignatureCompatEnabled={}",
+            "调度配置已更新: mode={}, sessionAffinityEnabled={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, rateLimitCooldownEnabled={}, suspiciousActivityCooldownMs={}, suspiciousActivityCooldownEnabled={}, suspiciousActivityAutoClearEnabled={}, suspiciousActivityAutoClearSuccessThreshold={}, suspiciousActivityAutoClearAfterMs={}, modelCooldownEnabled={}, defaultMaxConcurrency={:?}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}, requestWeightingEnabled={}, requestWeightingBaseWeight={}, requestWeightingMaxWeight={}, streamPreSseFailoverEnabled={}, streamPreSseTotalBudgetMs={}, streamPreSseMaxFastFailovers={}, thinkingSignatureValidationMode={}, responseThinkingSignatureCompatEnabled={}",
             next.mode,
             next.session_affinity_enabled,
             next.queue_max_size,
@@ -7223,6 +7240,9 @@ impl MultiTokenManager {
             next.request_weighting.enabled,
             next.request_weighting.base_weight,
             next.request_weighting.max_weight,
+            next.stream_pre_sse_failover.enabled,
+            next.stream_pre_sse_failover.total_budget_ms,
+            next.stream_pre_sse_failover.max_fast_failovers,
             next.thinking_signature_validation_mode.as_str(),
             next.response_thinking_signature_compat_enabled
         );
@@ -9166,6 +9186,7 @@ mod tests {
                 tools_bonus: 1.0,
                 ..RequestWeightingConfig::default()
             },
+            stream_pre_sse_failover: StreamPreSseFailoverConfig::default(),
             thinking_signature_validation_mode: ThinkingSignatureValidationMode::WarnOnly,
             response_thinking_signature_compat_enabled: true,
             account_type_policies: BTreeMap::new(),
@@ -9208,6 +9229,7 @@ mod tests {
         assert_eq!(snapshot.rate_limit_refill_backoff_factor, 0.6);
         assert_eq!(snapshot.request_weighting.max_weight, 4.0);
         assert_eq!(snapshot.request_weighting.tools_bonus, 1.0);
+        assert!(snapshot.stream_pre_sse_failover.enabled);
         assert_eq!(
             snapshot.thinking_signature_validation_mode,
             ThinkingSignatureValidationMode::WarnOnly
@@ -9339,6 +9361,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap_err()
             .to_string();
@@ -9393,6 +9416,7 @@ mod tests {
                     tools_bonus: 1.0,
                     ..RequestWeightingConfig::default()
                 }),
+                Some(StreamPreSseFailoverConfig::default()),
                 Some(true),
                 Some(ThinkingSignatureValidationMode::StripInvalid),
                 Some(true),
@@ -9486,6 +9510,7 @@ mod tests {
                 None,
                 None,
                 Some(false),
+                None,
                 None,
                 None,
                 None,

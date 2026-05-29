@@ -17,11 +17,17 @@ import {
 } from '@/hooks/use-credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import { Save, AlertCircle, Info } from 'lucide-react'
-import type { RequestWeightingConfig, ThinkingSignatureValidationMode } from '@/types/api'
+import type {
+  RequestWeightingConfig,
+  StreamPreSseFailoverConfig,
+  ThinkingSignatureValidationMode,
+} from '@/types/api'
 
 type RequestWeightingNumericField = Exclude<keyof RequestWeightingConfig, 'enabled'>
+type StreamPreSseFailoverNumericField = Exclude<keyof StreamPreSseFailoverConfig, 'enabled'>
 
 type RequestWeightingInputState = Record<RequestWeightingNumericField, string>
+type StreamPreSseFailoverInputState = Record<StreamPreSseFailoverNumericField, string>
 
 const DEFAULT_REQUEST_WEIGHTING: RequestWeightingConfig = {
   enabled: true,
@@ -37,6 +43,21 @@ const DEFAULT_REQUEST_WEIGHTING: RequestWeightingConfig = {
   thinkingBonus: 0.35,
   heavyThinkingBudgetThreshold: 24000,
   heavyThinkingBudgetBonus: 0.35,
+}
+
+const DEFAULT_STREAM_PRE_SSE_FAILOVER: StreamPreSseFailoverConfig = {
+  enabled: true,
+  totalBudgetMs: 170000,
+  smallRequestThresholdBytes: 128 * 1024,
+  mediumRequestThresholdBytes: 1024 * 1024,
+  largeRequestThresholdBytes: 5 * 1024 * 1024,
+  smallRequestTimeoutMs: 30000,
+  mediumRequestTimeoutMs: 60000,
+  largeRequestTimeoutMs: 120000,
+  hugeRequestTimeoutMs: 0,
+  slowModelMinTimeoutMs: 60000,
+  maxFastFailovers: 2,
+  minRemainingMs: 15000,
 }
 
 const THINKING_SIGNATURE_VALIDATION_OPTIONS: Array<{
@@ -194,6 +215,104 @@ const REQUEST_WEIGHTING_FIELD_SECTIONS: Array<{
   },
 ]
 
+const STREAM_PRE_SSE_FAILOVER_FIELDS: Array<{
+  key: StreamPreSseFailoverNumericField
+  label: string
+  step: string
+  min: string
+  placeholder: string
+  hint: string
+}> = [
+  {
+    key: 'totalBudgetMs',
+    label: '总等待预算 (毫秒)',
+    step: '1000',
+    min: '1',
+    placeholder: '默认 170000',
+    hint: '整个流式请求在收到上游响应头前最多等待的总时长。',
+  },
+  {
+    key: 'smallRequestThresholdBytes',
+    label: '小请求阈值 (bytes)',
+    step: '1024',
+    min: '1',
+    placeholder: '默认 131072',
+    hint: '请求体不超过该值时使用小请求超时。',
+  },
+  {
+    key: 'mediumRequestThresholdBytes',
+    label: '中请求阈值 (bytes)',
+    step: '1024',
+    min: '1',
+    placeholder: '默认 1048576',
+    hint: '请求体不超过该值时使用中请求超时。',
+  },
+  {
+    key: 'largeRequestThresholdBytes',
+    label: '大请求阈值 (bytes)',
+    step: '1024',
+    min: '1',
+    placeholder: '默认 5242880',
+    hint: '请求体不超过该值时使用大请求超时，超过后进入超大请求档。',
+  },
+  {
+    key: 'smallRequestTimeoutMs',
+    label: '小请求单次等待 (毫秒)',
+    step: '1000',
+    min: '1',
+    placeholder: '默认 30000',
+    hint: '小请求单个凭据等待响应头的时间。',
+  },
+  {
+    key: 'mediumRequestTimeoutMs',
+    label: '中请求单次等待 (毫秒)',
+    step: '1000',
+    min: '1',
+    placeholder: '默认 60000',
+    hint: '中请求单个凭据等待响应头的时间。',
+  },
+  {
+    key: 'largeRequestTimeoutMs',
+    label: '大请求单次等待 (毫秒)',
+    step: '1000',
+    min: '1',
+    placeholder: '默认 120000',
+    hint: '大请求单个凭据等待响应头的时间。',
+  },
+  {
+    key: 'hugeRequestTimeoutMs',
+    label: '超大请求单次等待 (毫秒)',
+    step: '1000',
+    min: '0',
+    placeholder: '0 表示使用剩余总预算',
+    hint: '设为 0 时超大请求不做快速故障转移。',
+  },
+  {
+    key: 'slowModelMinTimeoutMs',
+    label: '高阶 Opus 最小等待 (毫秒)',
+    step: '1000',
+    min: '1',
+    placeholder: '默认 60000',
+    hint: '真实 Opus 4.7/4.8 请求的单次等待不会低于该值。',
+  },
+  {
+    key: 'maxFastFailovers',
+    label: '最大快速切换次数',
+    step: '1',
+    min: '0',
+    placeholder: '默认 2',
+    hint: '超过该次数后，最后一次尝试会使用剩余总预算。',
+  },
+  {
+    key: 'minRemainingMs',
+    label: '保留剩余预算 (毫秒)',
+    step: '1000',
+    min: '1',
+    placeholder: '默认 15000',
+    hint: '只有预计切换后仍保留该预算时，才会提前切换凭据。',
+  },
+]
+
 function createRequestWeightingInputs(config: RequestWeightingConfig): RequestWeightingInputState {
   return {
     baseWeight: String(config.baseWeight),
@@ -208,6 +327,24 @@ function createRequestWeightingInputs(config: RequestWeightingConfig): RequestWe
     thinkingBonus: String(config.thinkingBonus),
     heavyThinkingBudgetThreshold: String(config.heavyThinkingBudgetThreshold),
     heavyThinkingBudgetBonus: String(config.heavyThinkingBudgetBonus),
+  }
+}
+
+function createStreamPreSseFailoverInputs(
+  config: StreamPreSseFailoverConfig
+): StreamPreSseFailoverInputState {
+  return {
+    totalBudgetMs: String(config.totalBudgetMs),
+    smallRequestThresholdBytes: String(config.smallRequestThresholdBytes),
+    mediumRequestThresholdBytes: String(config.mediumRequestThresholdBytes),
+    largeRequestThresholdBytes: String(config.largeRequestThresholdBytes),
+    smallRequestTimeoutMs: String(config.smallRequestTimeoutMs),
+    mediumRequestTimeoutMs: String(config.mediumRequestTimeoutMs),
+    largeRequestTimeoutMs: String(config.largeRequestTimeoutMs),
+    hugeRequestTimeoutMs: String(config.hugeRequestTimeoutMs),
+    slowModelMinTimeoutMs: String(config.slowModelMinTimeoutMs),
+    maxFastFailovers: String(config.maxFastFailovers),
+    minRemainingMs: String(config.minRemainingMs),
   }
 }
 
@@ -305,6 +442,12 @@ export function SettingsPage() {
   const [requestWeightingInputs, setRequestWeightingInputs] = useState<RequestWeightingInputState>(
     () => createRequestWeightingInputs(DEFAULT_REQUEST_WEIGHTING)
   )
+  const [streamPreSseFailoverEnabled, setStreamPreSseFailoverEnabled] =
+    useState(DEFAULT_STREAM_PRE_SSE_FAILOVER.enabled)
+  const [streamPreSseFailoverInputs, setStreamPreSseFailoverInputs] =
+    useState<StreamPreSseFailoverInputState>(
+      () => createStreamPreSseFailoverInputs(DEFAULT_STREAM_PRE_SSE_FAILOVER)
+    )
   const [thinkingSignatureValidationMode, setThinkingSignatureValidationMode] =
     useState<ThinkingSignatureValidationMode>('strict')
   const [responseThinkingSignatureCompatEnabled, setResponseThinkingSignatureCompatEnabled] =
@@ -338,6 +481,10 @@ export function SettingsPage() {
     const requestWeighting = loadBalancingData.requestWeighting ?? DEFAULT_REQUEST_WEIGHTING
     setRequestWeightingEnabled(requestWeighting.enabled)
     setRequestWeightingInputs(createRequestWeightingInputs(requestWeighting))
+    const streamPreSseFailover =
+      loadBalancingData.streamPreSseFailover ?? DEFAULT_STREAM_PRE_SSE_FAILOVER
+    setStreamPreSseFailoverEnabled(streamPreSseFailover.enabled)
+    setStreamPreSseFailoverInputs(createStreamPreSseFailoverInputs(streamPreSseFailover))
     setThinkingSignatureValidationMode(loadBalancingData.thinkingSignatureValidationMode ?? 'strict')
     setResponseThinkingSignatureCompatEnabled(loadBalancingData.responseThinkingSignatureCompatEnabled ?? false)
   }, [loadBalancingData])
@@ -347,6 +494,16 @@ export function SettingsPage() {
     value: string
   ) => {
     setRequestWeightingInputs((prev) => ({
+      ...prev,
+      [key]: value,
+    }))
+  }
+
+  const handleStreamPreSseFailoverInputChange = (
+    key: StreamPreSseFailoverNumericField,
+    value: string
+  ) => {
+    setStreamPreSseFailoverInputs((prev) => ({
       ...prev,
       [key]: value,
     }))
@@ -381,6 +538,20 @@ export function SettingsPage() {
       thinkingBonus: requestWeightingInputs.thinkingBonus.trim() === '' ? 0 : Number.parseFloat(requestWeightingInputs.thinkingBonus),
       heavyThinkingBudgetThreshold: requestWeightingInputs.heavyThinkingBudgetThreshold.trim() === '' ? 0 : parseInt(requestWeightingInputs.heavyThinkingBudgetThreshold, 10),
       heavyThinkingBudgetBonus: requestWeightingInputs.heavyThinkingBudgetBonus.trim() === '' ? 0 : Number.parseFloat(requestWeightingInputs.heavyThinkingBudgetBonus),
+    }
+    const parsedStreamPreSseFailover: StreamPreSseFailoverConfig = {
+      enabled: streamPreSseFailoverEnabled,
+      totalBudgetMs: streamPreSseFailoverInputs.totalBudgetMs.trim() === '' ? 0 : parseInt(streamPreSseFailoverInputs.totalBudgetMs, 10),
+      smallRequestThresholdBytes: streamPreSseFailoverInputs.smallRequestThresholdBytes.trim() === '' ? 0 : parseInt(streamPreSseFailoverInputs.smallRequestThresholdBytes, 10),
+      mediumRequestThresholdBytes: streamPreSseFailoverInputs.mediumRequestThresholdBytes.trim() === '' ? 0 : parseInt(streamPreSseFailoverInputs.mediumRequestThresholdBytes, 10),
+      largeRequestThresholdBytes: streamPreSseFailoverInputs.largeRequestThresholdBytes.trim() === '' ? 0 : parseInt(streamPreSseFailoverInputs.largeRequestThresholdBytes, 10),
+      smallRequestTimeoutMs: streamPreSseFailoverInputs.smallRequestTimeoutMs.trim() === '' ? 0 : parseInt(streamPreSseFailoverInputs.smallRequestTimeoutMs, 10),
+      mediumRequestTimeoutMs: streamPreSseFailoverInputs.mediumRequestTimeoutMs.trim() === '' ? 0 : parseInt(streamPreSseFailoverInputs.mediumRequestTimeoutMs, 10),
+      largeRequestTimeoutMs: streamPreSseFailoverInputs.largeRequestTimeoutMs.trim() === '' ? 0 : parseInt(streamPreSseFailoverInputs.largeRequestTimeoutMs, 10),
+      hugeRequestTimeoutMs: streamPreSseFailoverInputs.hugeRequestTimeoutMs.trim() === '' ? 0 : parseInt(streamPreSseFailoverInputs.hugeRequestTimeoutMs, 10),
+      slowModelMinTimeoutMs: streamPreSseFailoverInputs.slowModelMinTimeoutMs.trim() === '' ? 0 : parseInt(streamPreSseFailoverInputs.slowModelMinTimeoutMs, 10),
+      maxFastFailovers: streamPreSseFailoverInputs.maxFastFailovers.trim() === '' ? 0 : parseInt(streamPreSseFailoverInputs.maxFastFailovers, 10),
+      minRemainingMs: streamPreSseFailoverInputs.minRemainingMs.trim() === '' ? 0 : parseInt(streamPreSseFailoverInputs.minRemainingMs, 10),
     }
 
     if (
@@ -478,6 +649,55 @@ export function SettingsPage() {
       return
     }
 
+    const streamPreSseFailoverValues = [
+      parsedStreamPreSseFailover.totalBudgetMs,
+      parsedStreamPreSseFailover.smallRequestThresholdBytes,
+      parsedStreamPreSseFailover.mediumRequestThresholdBytes,
+      parsedStreamPreSseFailover.largeRequestThresholdBytes,
+      parsedStreamPreSseFailover.smallRequestTimeoutMs,
+      parsedStreamPreSseFailover.mediumRequestTimeoutMs,
+      parsedStreamPreSseFailover.largeRequestTimeoutMs,
+      parsedStreamPreSseFailover.hugeRequestTimeoutMs,
+      parsedStreamPreSseFailover.slowModelMinTimeoutMs,
+      parsedStreamPreSseFailover.maxFastFailovers,
+      parsedStreamPreSseFailover.minRemainingMs,
+    ]
+
+    if (
+      streamPreSseFailoverValues.some((value) => Number.isNaN(value) || value < 0)
+    ) {
+      toast.error('流式响应头故障转移参数必须是大于等于 0 的整数')
+      return
+    }
+
+    if (
+      parsedStreamPreSseFailover.totalBudgetMs <= 0 ||
+      parsedStreamPreSseFailover.smallRequestThresholdBytes <= 0 ||
+      parsedStreamPreSseFailover.smallRequestTimeoutMs <= 0 ||
+      parsedStreamPreSseFailover.mediumRequestTimeoutMs <= 0 ||
+      parsedStreamPreSseFailover.largeRequestTimeoutMs <= 0 ||
+      parsedStreamPreSseFailover.slowModelMinTimeoutMs <= 0 ||
+      parsedStreamPreSseFailover.minRemainingMs <= 0
+    ) {
+      toast.error('流式响应头故障转移参数除超大请求等待和最大切换次数外必须大于 0')
+      return
+    }
+
+    if (
+      parsedStreamPreSseFailover.mediumRequestThresholdBytes <
+        parsedStreamPreSseFailover.smallRequestThresholdBytes ||
+      parsedStreamPreSseFailover.largeRequestThresholdBytes <
+        parsedStreamPreSseFailover.mediumRequestThresholdBytes
+    ) {
+      toast.error('请求体阈值必须按小、中、大递增')
+      return
+    }
+
+    if (parsedStreamPreSseFailover.maxFastFailovers > 8) {
+      toast.error('最大快速切换次数不能大于 8')
+      return
+    }
+
     setLoadBalancingMode(
       {
         queueMaxSize: parsedQueueMaxSize,
@@ -502,6 +722,7 @@ export function SettingsPage() {
         rateLimitRefillRecoveryStepPerSuccess: parsedRateLimitRefillRecoveryStep,
         rateLimitRefillBackoffFactor: parsedRateLimitRefillBackoffFactor,
         requestWeighting: parsedRequestWeighting,
+        streamPreSseFailover: parsedStreamPreSseFailover,
         thinkingSignatureValidationMode,
         responseThinkingSignatureCompatEnabled,
       },
@@ -903,6 +1124,45 @@ export function SettingsPage() {
                   </div>
                 </div>
               ))}
+            </div>
+          </div>
+
+          <div className="space-y-4">
+            <h3 className="text-sm font-semibold flex items-center text-primary">流式响应头故障转移</h3>
+            <div className="space-y-4 rounded-lg bg-muted/30 p-4">
+              <SwitchSettingCard
+                title="启用自适应 pre-SSE 快速切换"
+                checked={streamPreSseFailoverEnabled}
+                onCheckedChange={setStreamPreSseFailoverEnabled}
+                ariaLabel="切换自适应 pre-SSE 快速切换"
+                disabledLabel="仅使用总预算"
+                description={
+                  <>
+                    <p>流式请求在上游长期不返回响应头时，按请求大小和模型给单个凭据设置等待上限。</p>
+                    <p>超过快速切换次数后，最后一次尝试使用剩余总预算，避免大请求被频繁打断。</p>
+                  </>
+                }
+              />
+
+              <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+                {STREAM_PRE_SSE_FAILOVER_FIELDS.map((field) => (
+                  <div key={field.key} className="space-y-2">
+                    <label className="text-sm font-medium" htmlFor={`streamPreSse-${field.key}`}>
+                      {field.label}
+                    </label>
+                    <Input
+                      id={`streamPreSse-${field.key}`}
+                      type="number"
+                      min={field.min}
+                      step={field.step}
+                      value={streamPreSseFailoverInputs[field.key]}
+                      onChange={(e) => handleStreamPreSseFailoverInputChange(field.key, e.target.value)}
+                      placeholder={field.placeholder}
+                    />
+                    <p className="text-xs text-muted-foreground">{field.hint}</p>
+                  </div>
+                ))}
+              </div>
             </div>
           </div>
 

@@ -197,6 +197,21 @@ export interface RequestWeightingConfig {
   heavyThinkingBudgetBonus: number
 }
 
+export interface StreamPreSseFailoverConfig {
+  enabled: boolean
+  totalBudgetMs: number
+  smallRequestThresholdBytes: number
+  mediumRequestThresholdBytes: number
+  largeRequestThresholdBytes: number
+  smallRequestTimeoutMs: number
+  mediumRequestTimeoutMs: number
+  largeRequestTimeoutMs: number
+  hugeRequestTimeoutMs: number
+  slowModelMinTimeoutMs: number
+  maxFastFailovers: number
+  minRemainingMs: number
+}
+
 export type ThinkingSignatureValidationMode = 'strict' | 'warn_only' | 'disabled' | 'strip_invalid'
 
 export interface LoadBalancingConfigResponse {
@@ -223,6 +238,7 @@ export interface LoadBalancingConfigResponse {
   rateLimitRefillRecoveryStepPerSuccess: number
   rateLimitRefillBackoffFactor: number
   requestWeighting: RequestWeightingConfig
+  streamPreSseFailover: StreamPreSseFailoverConfig
   thinkingSignatureValidationMode: ThinkingSignatureValidationMode
   responseThinkingSignatureCompatEnabled: boolean
   waitingRequests: number
@@ -252,6 +268,7 @@ export interface UpdateLoadBalancingConfigRequest {
   rateLimitRefillRecoveryStepPerSuccess?: number
   rateLimitRefillBackoffFactor?: number
   requestWeighting?: RequestWeightingConfig
+  streamPreSseFailover?: StreamPreSseFailoverConfig
   thinkingSignatureValidationMode?: ThinkingSignatureValidationMode
   responseThinkingSignatureCompatEnabled?: boolean
 }

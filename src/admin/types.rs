@@ -2,7 +2,9 @@
 
 use std::collections::BTreeMap;
 
-use crate::model::config::{RequestWeightingConfig, ThinkingSignatureValidationMode};
+use crate::model::config::{
+    RequestWeightingConfig, StreamPreSseFailoverConfig, ThinkingSignatureValidationMode,
+};
 use crate::model::model_policy::{
     AccountTypeDispatchPolicy, ModelSupportPolicy, RuntimeModelRestriction,
 };
@@ -405,6 +407,8 @@ pub struct LoadBalancingModeResponse {
     pub rate_limit_refill_backoff_factor: f64,
     /// 轻/重请求的本地令牌消耗权重规则
     pub request_weighting: RequestWeightingConfig,
+    /// 流式请求上游响应头前的自适应故障转移策略
+    pub stream_pre_sse_failover: StreamPreSseFailoverConfig,
     /// 历史 thinking signature 的本地校验策略
     pub thinking_signature_validation_mode: ThinkingSignatureValidationMode,
     /// 响应侧隐藏 thinking signature 兼容补齐开关
@@ -463,6 +467,8 @@ pub struct SetLoadBalancingModeRequest {
     pub rate_limit_refill_backoff_factor: Option<f64>,
     /// 轻/重请求的本地令牌消耗权重规则
     pub request_weighting: Option<RequestWeightingConfig>,
+    /// 流式请求上游响应头前的自适应故障转移策略
+    pub stream_pre_sse_failover: Option<StreamPreSseFailoverConfig>,
     /// 历史 thinking signature 的本地校验策略
     pub thinking_signature_validation_mode: Option<ThinkingSignatureValidationMode>,
     /// 响应侧隐藏 thinking signature 兼容补齐开关

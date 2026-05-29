@@ -476,6 +476,7 @@ impl AdminService {
                 .rate_limit_refill_recovery_step_per_success,
             rate_limit_refill_backoff_factor: snapshot.rate_limit_refill_backoff_factor,
             request_weighting: snapshot.request_weighting,
+            stream_pre_sse_failover: snapshot.stream_pre_sse_failover,
             thinking_signature_validation_mode: snapshot.thinking_signature_validation_mode,
             response_thinking_signature_compat_enabled: snapshot
                 .response_thinking_signature_compat_enabled,
@@ -555,6 +556,7 @@ impl AdminService {
             && req.rate_limit_refill_recovery_step_per_success.is_none()
             && req.rate_limit_refill_backoff_factor.is_none()
             && req.request_weighting.is_none()
+            && req.stream_pre_sse_failover.is_none()
             && req.thinking_signature_validation_mode.is_none()
             && req.response_thinking_signature_compat_enabled.is_none()
         {
@@ -592,6 +594,7 @@ impl AdminService {
                 req.rate_limit_refill_recovery_step_per_success,
                 req.rate_limit_refill_backoff_factor,
                 req.request_weighting,
+                req.stream_pre_sse_failover,
                 req.session_affinity_enabled,
                 req.thinking_signature_validation_mode,
                 req.response_thinking_signature_compat_enabled,

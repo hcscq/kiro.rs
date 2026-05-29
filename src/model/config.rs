@@ -138,6 +138,120 @@ impl RequestWeightingConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamPreSseFailoverConfig {
+    #[serde(default = "default_stream_pre_sse_failover_enabled")]
+    pub enabled: bool,
+
+    /// 流式请求在收到上游 SSE/响应头之前的总等待预算。
+    #[serde(default = "default_stream_pre_sse_total_budget_ms")]
+    pub total_budget_ms: u64,
+
+    #[serde(default = "default_stream_pre_sse_small_request_threshold_bytes")]
+    pub small_request_threshold_bytes: usize,
+
+    #[serde(default = "default_stream_pre_sse_medium_request_threshold_bytes")]
+    pub medium_request_threshold_bytes: usize,
+
+    #[serde(default = "default_stream_pre_sse_large_request_threshold_bytes")]
+    pub large_request_threshold_bytes: usize,
+
+    #[serde(default = "default_stream_pre_sse_small_request_timeout_ms")]
+    pub small_request_timeout_ms: u64,
+
+    #[serde(default = "default_stream_pre_sse_medium_request_timeout_ms")]
+    pub medium_request_timeout_ms: u64,
+
+    #[serde(default = "default_stream_pre_sse_large_request_timeout_ms")]
+    pub large_request_timeout_ms: u64,
+
+    /// 0 表示超大请求使用剩余总预算，不做快速故障转移。
+    #[serde(default)]
+    pub huge_request_timeout_ms: u64,
+
+    /// 真实高阶 Opus 模型的最小单次响应头等待时间。
+    #[serde(default = "default_stream_pre_sse_slow_model_min_timeout_ms")]
+    pub slow_model_min_timeout_ms: u64,
+
+    #[serde(default = "default_stream_pre_sse_max_fast_failovers")]
+    pub max_fast_failovers: usize,
+
+    #[serde(default = "default_stream_pre_sse_min_remaining_ms")]
+    pub min_remaining_ms: u64,
+}
+
+impl Default for StreamPreSseFailoverConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_stream_pre_sse_failover_enabled(),
+            total_budget_ms: default_stream_pre_sse_total_budget_ms(),
+            small_request_threshold_bytes: default_stream_pre_sse_small_request_threshold_bytes(),
+            medium_request_threshold_bytes: default_stream_pre_sse_medium_request_threshold_bytes(),
+            large_request_threshold_bytes: default_stream_pre_sse_large_request_threshold_bytes(),
+            small_request_timeout_ms: default_stream_pre_sse_small_request_timeout_ms(),
+            medium_request_timeout_ms: default_stream_pre_sse_medium_request_timeout_ms(),
+            large_request_timeout_ms: default_stream_pre_sse_large_request_timeout_ms(),
+            huge_request_timeout_ms: 0,
+            slow_model_min_timeout_ms: default_stream_pre_sse_slow_model_min_timeout_ms(),
+            max_fast_failovers: default_stream_pre_sse_max_fast_failovers(),
+            min_remaining_ms: default_stream_pre_sse_min_remaining_ms(),
+        }
+    }
+}
+
+impl StreamPreSseFailoverConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.total_budget_ms == 0 {
+            anyhow::bail!("streamPreSseFailover.totalBudgetMs 必须大于 0");
+        }
+
+        if self.small_request_threshold_bytes == 0 {
+            anyhow::bail!("streamPreSseFailover.smallRequestThresholdBytes 必须大于 0");
+        }
+        if self.medium_request_threshold_bytes < self.small_request_threshold_bytes {
+            anyhow::bail!(
+                "streamPreSseFailover.mediumRequestThresholdBytes 不能小于 smallRequestThresholdBytes"
+            );
+        }
+        if self.large_request_threshold_bytes < self.medium_request_threshold_bytes {
+            anyhow::bail!(
+                "streamPreSseFailover.largeRequestThresholdBytes 不能小于 mediumRequestThresholdBytes"
+            );
+        }
+
+        for (name, value) in [
+            (
+                "streamPreSseFailover.smallRequestTimeoutMs",
+                self.small_request_timeout_ms,
+            ),
+            (
+                "streamPreSseFailover.mediumRequestTimeoutMs",
+                self.medium_request_timeout_ms,
+            ),
+            (
+                "streamPreSseFailover.largeRequestTimeoutMs",
+                self.large_request_timeout_ms,
+            ),
+            (
+                "streamPreSseFailover.slowModelMinTimeoutMs",
+                self.slow_model_min_timeout_ms,
+            ),
+            ("streamPreSseFailover.minRemainingMs", self.min_remaining_ms),
+        ] {
+            if value == 0 {
+                anyhow::bail!("{name} 必须大于 0");
+            }
+        }
+
+        if self.max_fast_failovers > 8 {
+            anyhow::bail!("streamPreSseFailover.maxFastFailovers 不能大于 8");
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum TlsBackend {
@@ -397,6 +511,10 @@ pub struct Config {
     #[serde(default)]
     pub request_weighting: RequestWeightingConfig,
 
+    /// 流式请求在收到上游响应头前的自适应故障转移策略。
+    #[serde(default)]
+    pub stream_pre_sse_failover: StreamPreSseFailoverConfig,
+
     /// 历史 thinking signature 校验模式。
     /// 支持 strict、warn_only、disabled、strip_invalid；默认 strict。
     #[serde(default, alias = "thinking_signature_validation_mode")]
@@ -593,6 +711,50 @@ fn default_request_weighting_heavy_thinking_budget_bonus() -> f64 {
     0.35
 }
 
+fn default_stream_pre_sse_failover_enabled() -> bool {
+    true
+}
+
+fn default_stream_pre_sse_total_budget_ms() -> u64 {
+    170_000
+}
+
+fn default_stream_pre_sse_small_request_threshold_bytes() -> usize {
+    128 * 1024
+}
+
+fn default_stream_pre_sse_medium_request_threshold_bytes() -> usize {
+    1024 * 1024
+}
+
+fn default_stream_pre_sse_large_request_threshold_bytes() -> usize {
+    5 * 1024 * 1024
+}
+
+fn default_stream_pre_sse_small_request_timeout_ms() -> u64 {
+    30_000
+}
+
+fn default_stream_pre_sse_medium_request_timeout_ms() -> u64 {
+    60_000
+}
+
+fn default_stream_pre_sse_large_request_timeout_ms() -> u64 {
+    120_000
+}
+
+fn default_stream_pre_sse_slow_model_min_timeout_ms() -> u64 {
+    60_000
+}
+
+fn default_stream_pre_sse_max_fast_failovers() -> usize {
+    2
+}
+
+fn default_stream_pre_sse_min_remaining_ms() -> u64 {
+    15_000
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -654,6 +816,7 @@ impl Default for Config {
                 default_rate_limit_refill_recovery_step_per_success(),
             rate_limit_refill_backoff_factor: default_rate_limit_refill_backoff_factor(),
             request_weighting: RequestWeightingConfig::default(),
+            stream_pre_sse_failover: StreamPreSseFailoverConfig::default(),
             thinking_signature_validation_mode: ThinkingSignatureValidationMode::default(),
             response_thinking_signature_compat_enabled: false,
             account_type_policies: BTreeMap::new(),
@@ -780,6 +943,7 @@ impl Config {
         }
 
         self.request_weighting.validate()?;
+        self.stream_pre_sse_failover.validate()?;
 
         Ok(())
     }

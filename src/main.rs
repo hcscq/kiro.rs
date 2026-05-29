@@ -951,7 +951,9 @@ fn log_runtime_coordination_status(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::config::{RequestWeightingConfig, ThinkingSignatureValidationMode};
+    use crate::model::config::{
+        RequestWeightingConfig, StreamPreSseFailoverConfig, ThinkingSignatureValidationMode,
+    };
 
     #[test]
     fn build_file_rollback_config_switches_to_file_backend() {
@@ -992,6 +994,7 @@ mod tests {
                 tools_bonus: 1.0,
                 ..RequestWeightingConfig::default()
             },
+            stream_pre_sse_failover: StreamPreSseFailoverConfig::default(),
             thinking_signature_validation_mode: ThinkingSignatureValidationMode::WarnOnly,
             response_thinking_signature_compat_enabled: true,
             account_type_policies: std::collections::BTreeMap::new(),
@@ -1034,6 +1037,7 @@ mod tests {
         assert_eq!(rollback.rate_limit_refill_backoff_factor, 0.4);
         assert_eq!(rollback.request_weighting.max_weight, 4.0);
         assert_eq!(rollback.request_weighting.tools_bonus, 1.0);
+        assert!(rollback.stream_pre_sse_failover.enabled);
         assert_eq!(
             rollback.thinking_signature_validation_mode,
             ThinkingSignatureValidationMode::WarnOnly

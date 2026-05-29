@@ -27,7 +27,8 @@ use crate::kiro::token_manager::{
     RuntimeRefreshLeaseBusyError,
 };
 use crate::model::config::{
-    Config, RequestWeightingConfig, ThinkingSignatureValidationMode, TlsBackend,
+    Config, RequestWeightingConfig, StreamPreSseFailoverConfig, ThinkingSignatureValidationMode,
+    TlsBackend,
 };
 use parking_lot::Mutex;
 
@@ -125,6 +126,13 @@ impl RequestOptions {
             1.0
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StreamPreSseAttemptTimeout {
+    timeout: Duration,
+    fast_failover: bool,
+    configured_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1275,13 +1283,27 @@ impl KiroProvider {
         api_type: &str,
         request_id: &str,
     ) -> anyhow::Error {
+        Self::stream_pre_sse_timeout_error_with_budget(
+            overall_started_at,
+            api_type,
+            request_id,
+            STREAM_PRE_SSE_RESPONSE_BUDGET,
+        )
+    }
+
+    fn stream_pre_sse_timeout_error_with_budget(
+        overall_started_at: Instant,
+        api_type: &str,
+        request_id: &str,
+        budget: Duration,
+    ) -> anyhow::Error {
         anyhow::Error::new(PublicProviderError::gateway_timeout(
             format!(
                 "{} API 请求超时: request_id={} total_elapsed_ms={} exceeded pre-SSE stream budget {}ms",
                 api_type,
                 request_id,
                 overall_started_at.elapsed().as_millis(),
-                STREAM_PRE_SSE_RESPONSE_BUDGET.as_millis()
+                budget.as_millis()
             ),
             Self::stream_pre_sse_timeout_public_message(),
         ))
@@ -1297,6 +1319,89 @@ impl KiroProvider {
             .ok_or_else(|| {
                 Self::stream_pre_sse_timeout_error(overall_started_at, api_type, request_id)
             })
+    }
+
+    fn remaining_stream_pre_sse_response_budget_with_config(
+        overall_started_at: Instant,
+        api_type: &str,
+        request_id: &str,
+        config: &StreamPreSseFailoverConfig,
+    ) -> anyhow::Result<Duration> {
+        let budget = Duration::from_millis(config.total_budget_ms.max(1));
+        budget
+            .checked_sub(overall_started_at.elapsed())
+            .ok_or_else(|| {
+                Self::stream_pre_sse_timeout_error_with_budget(
+                    overall_started_at,
+                    api_type,
+                    request_id,
+                    budget,
+                )
+            })
+    }
+
+    fn stream_pre_sse_configured_timeout_ms(
+        config: &StreamPreSseFailoverConfig,
+        request_body_bytes: usize,
+        model: Option<&str>,
+    ) -> u64 {
+        let mut timeout_ms = if request_body_bytes <= config.small_request_threshold_bytes {
+            config.small_request_timeout_ms
+        } else if request_body_bytes <= config.medium_request_threshold_bytes {
+            config.medium_request_timeout_ms
+        } else if request_body_bytes <= config.large_request_threshold_bytes {
+            config.large_request_timeout_ms
+        } else {
+            config.huge_request_timeout_ms
+        };
+
+        if timeout_ms > 0 && Self::is_real_opus_4_7_model(model) {
+            timeout_ms = timeout_ms.max(config.slow_model_min_timeout_ms);
+        }
+
+        timeout_ms
+    }
+
+    fn stream_pre_sse_attempt_timeout(
+        config: &StreamPreSseFailoverConfig,
+        request_body_bytes: usize,
+        model: Option<&str>,
+        fast_failovers_used: usize,
+        attempts_remaining: bool,
+        retryable_candidates_after_current: usize,
+        remaining_budget: Duration,
+    ) -> StreamPreSseAttemptTimeout {
+        let remaining_ms = remaining_budget.as_millis().min(u128::from(u64::MAX)) as u64;
+        let configured_timeout_ms =
+            Self::stream_pre_sse_configured_timeout_ms(config, request_body_bytes, model);
+        if !config.enabled
+            || configured_timeout_ms == 0
+            || fast_failovers_used >= config.max_fast_failovers
+            || !attempts_remaining
+            || retryable_candidates_after_current == 0
+            || remaining_ms <= config.min_remaining_ms
+        {
+            return StreamPreSseAttemptTimeout {
+                timeout: remaining_budget,
+                fast_failover: false,
+                configured_timeout_ms,
+            };
+        }
+
+        let reserved_final_budget = config.min_remaining_ms;
+        if configured_timeout_ms.saturating_add(reserved_final_budget) >= remaining_ms {
+            return StreamPreSseAttemptTimeout {
+                timeout: remaining_budget,
+                fast_failover: false,
+                configured_timeout_ms,
+            };
+        }
+
+        StreamPreSseAttemptTimeout {
+            timeout: Duration::from_millis(configured_timeout_ms),
+            fast_failover: true,
+            configured_timeout_ms,
+        }
     }
 
     fn remaining_stream_first_content_failover_budget(
@@ -1916,6 +2021,7 @@ impl KiroProvider {
         let mut request_scoped_transient_error_credentials: HashSet<u64> = HashSet::new();
         let mut priority_rate_limit_hits: HashMap<u32, usize> = HashMap::new();
         let mut slow_first_content_failovers = 0usize;
+        let mut pre_sse_fast_failovers = 0usize;
         let mut capacity_429_count = 0usize;
         let api_type = if is_stream { "流式" } else { "非流式" };
         let request_id = options
@@ -1925,6 +2031,8 @@ impl KiroProvider {
         let request_weight = options.normalized_request_weight();
         let overall_started_at = Instant::now();
         let mut original_request_body: Option<Bytes> = None;
+        let stream_pre_sse_failover_config =
+            self.token_manager.stream_pre_sse_failover_config_snapshot();
 
         // Anthropic handlers already know the mapped Kiro model. Fall back to JSON extraction for
         // direct provider callers so large requests avoid an extra full-body parse on the hot path.
@@ -1993,18 +2101,20 @@ impl KiroProvider {
                 )
             };
             let acquire_result = if is_stream {
-                let remaining = Self::remaining_stream_pre_sse_response_budget(
+                let remaining = Self::remaining_stream_pre_sse_response_budget_with_config(
                     overall_started_at,
                     api_type,
                     &request_id,
+                    &stream_pre_sse_failover_config,
                 )?;
                 match timeout(remaining, acquire_context()).await {
                     Ok(result) => result,
                     Err(_) => {
-                        return Err(Self::stream_pre_sse_timeout_error(
+                        return Err(Self::stream_pre_sse_timeout_error_with_budget(
                             overall_started_at,
                             api_type,
                             &request_id,
+                            Duration::from_millis(stream_pre_sse_failover_config.total_budget_ms),
                         ));
                     }
                 }
@@ -2125,14 +2235,39 @@ impl KiroProvider {
                 None
             };
             let stream_pre_sse_budget_remaining = if is_stream {
-                Some(Self::remaining_stream_pre_sse_response_budget(
+                Some(Self::remaining_stream_pre_sse_response_budget_with_config(
                     overall_started_at,
                     api_type,
                     &request_id,
+                    &stream_pre_sse_failover_config,
                 )?)
             } else {
                 None
             };
+            let stream_pre_sse_retryable_candidates_after_current = if is_stream {
+                let mut transient_after_current =
+                    request_scoped_transient_error_credentials.clone();
+                transient_after_current.insert(ctx_id);
+                let retryable_exclusions_after_current =
+                    Self::request_scoped_retryable_exclusion_count(
+                        &request_scoped_rate_limited_credentials,
+                        &transient_after_current,
+                    );
+                retryable_candidate_count.saturating_sub(retryable_exclusions_after_current)
+            } else {
+                0
+            };
+            let stream_pre_sse_attempt_timeout = stream_pre_sse_budget_remaining.map(|remaining| {
+                Self::stream_pre_sse_attempt_timeout(
+                    &stream_pre_sse_failover_config,
+                    request_body_bytes,
+                    model.as_deref(),
+                    pre_sse_fast_failovers,
+                    attempt + 1 < max_retries,
+                    stream_pre_sse_retryable_candidates_after_current,
+                    remaining,
+                )
+            });
             tracing::info!(
                 request_id = %request_id,
                 api_type,
@@ -2153,6 +2288,21 @@ impl KiroProvider {
                 stream_pre_sse_budget_remaining_ms = stream_pre_sse_budget_remaining
                     .map(|value| value.as_millis())
                     .unwrap_or(0),
+                stream_pre_sse_failover_enabled = stream_pre_sse_failover_config.enabled,
+                stream_pre_sse_configured_timeout_ms = stream_pre_sse_attempt_timeout
+                    .map(|value| value.configured_timeout_ms)
+                    .unwrap_or(0),
+                stream_pre_sse_attempt_timeout_ms = stream_pre_sse_attempt_timeout
+                    .map(|value| value.timeout.as_millis())
+                    .unwrap_or(0),
+                stream_pre_sse_fast_failover = stream_pre_sse_attempt_timeout
+                    .map(|value| value.fast_failover)
+                    .unwrap_or(false),
+                stream_pre_sse_fast_failovers_used = pre_sse_fast_failovers,
+                stream_pre_sse_max_fast_failovers =
+                    stream_pre_sse_failover_config.max_fast_failovers,
+                stream_pre_sse_retryable_candidates_after_current =
+                    stream_pre_sse_retryable_candidates_after_current,
                 stream_request_timeout_override_ms = 0u64,
                 upstream_client_timeout_ms = u128::from(DEFAULT_UPSTREAM_TIMEOUT_SECS) * 1000,
                 omit_agent_mode_header = options.omit_agent_mode_header,
@@ -2161,14 +2311,71 @@ impl KiroProvider {
             );
 
             let upstream_request_started_at = Instant::now();
-            let send_result = if let Some(pre_sse_budget) = stream_pre_sse_budget_remaining {
-                match timeout(pre_sse_budget, request.send()).await {
+            let send_result = if let Some(pre_sse_attempt_timeout) = stream_pre_sse_attempt_timeout
+            {
+                match timeout(pre_sse_attempt_timeout.timeout, request.send()).await {
                     Ok(result) => result,
                     Err(_) => {
-                        return Err(Self::stream_pre_sse_timeout_error(
+                        let will_retry = pre_sse_attempt_timeout.fast_failover;
+                        tracing::warn!(
+                            request_id = %request_id,
+                            api_type,
+                            model = model.as_deref().unwrap_or("unknown"),
+                            credential_id = ctx_id,
+                            attempt = attempt + 1,
+                            max_retries,
+                            region = %region,
+                            request_body_bytes,
+                            request_weight,
+                            acquire_context_ms,
+                            upstream_wait_ms = upstream_request_started_at.elapsed().as_millis(),
+                            total_elapsed_ms = overall_started_at.elapsed().as_millis(),
+                            stream_pre_sse_total_budget_ms =
+                                stream_pre_sse_failover_config.total_budget_ms,
+                            stream_pre_sse_budget_remaining_ms = stream_pre_sse_budget_remaining
+                                .map(|value| value.as_millis())
+                                .unwrap_or(0),
+                            stream_pre_sse_configured_timeout_ms =
+                                pre_sse_attempt_timeout.configured_timeout_ms,
+                            stream_pre_sse_attempt_timeout_ms =
+                                pre_sse_attempt_timeout.timeout.as_millis(),
+                            stream_pre_sse_fast_failover = pre_sse_attempt_timeout.fast_failover,
+                            stream_pre_sse_fast_failovers_used = pre_sse_fast_failovers,
+                            stream_pre_sse_max_fast_failovers =
+                                stream_pre_sse_failover_config.max_fast_failovers,
+                            stream_pre_sse_retryable_candidates_after_current =
+                                stream_pre_sse_retryable_candidates_after_current,
+                            will_retry,
+                            "等待上游响应头超时"
+                        );
+                        if will_retry {
+                            pre_sse_fast_failovers = pre_sse_fast_failovers.saturating_add(1);
+                            last_error = Some(anyhow::Error::new(
+                                PublicProviderError::gateway_timeout(
+                                    format!(
+                                        "{} API 响应头等待超时: request_id={} attempt={} total_elapsed_ms={} upstream_wait_ms={} timeout_ms={}",
+                                        api_type,
+                                        request_id,
+                                        attempt + 1,
+                                        overall_started_at.elapsed().as_millis(),
+                                        upstream_request_started_at.elapsed().as_millis(),
+                                        pre_sse_attempt_timeout.timeout.as_millis()
+                                    ),
+                                    Self::stream_pre_sse_timeout_public_message(),
+                                ),
+                            ));
+                            request_scoped_transient_error_credentials.insert(ctx_id);
+                            if attempt + 1 < max_retries {
+                                sleep(Self::retry_delay(attempt)).await;
+                            }
+                            continue;
+                        }
+
+                        return Err(Self::stream_pre_sse_timeout_error_with_budget(
                             overall_started_at,
                             api_type,
                             &request_id,
+                            Duration::from_millis(stream_pre_sse_failover_config.total_budget_ms),
                         ));
                     }
                 }
@@ -3904,6 +4111,76 @@ mod tests {
             public.public_message(),
             "Upstream stream did not produce a usable response before the retry budget was exhausted."
         );
+    }
+
+    #[test]
+    fn test_stream_pre_sse_attempt_timeout_uses_small_request_fast_failover() {
+        let config = StreamPreSseFailoverConfig::default();
+        let timeout = KiroProvider::stream_pre_sse_attempt_timeout(
+            &config,
+            64 * 1024,
+            Some("claude-sonnet-4.5"),
+            0,
+            true,
+            1,
+            Duration::from_millis(config.total_budget_ms),
+        );
+
+        assert_eq!(timeout.timeout, Duration::from_millis(30_000));
+        assert!(timeout.fast_failover);
+    }
+
+    #[test]
+    fn test_stream_pre_sse_attempt_timeout_respects_opus_minimum() {
+        let config = StreamPreSseFailoverConfig::default();
+        let timeout = KiroProvider::stream_pre_sse_attempt_timeout(
+            &config,
+            64 * 1024,
+            Some("claude-opus-4-8"),
+            0,
+            true,
+            1,
+            Duration::from_millis(config.total_budget_ms),
+        );
+
+        assert_eq!(timeout.timeout, Duration::from_millis(60_000));
+        assert!(timeout.fast_failover);
+    }
+
+    #[test]
+    fn test_stream_pre_sse_attempt_timeout_uses_remaining_for_huge_request() {
+        let config = StreamPreSseFailoverConfig::default();
+        let remaining = Duration::from_millis(config.total_budget_ms);
+        let timeout = KiroProvider::stream_pre_sse_attempt_timeout(
+            &config,
+            config.large_request_threshold_bytes + 1,
+            Some("claude-opus-4-8"),
+            0,
+            true,
+            1,
+            remaining,
+        );
+
+        assert_eq!(timeout.timeout, remaining);
+        assert!(!timeout.fast_failover);
+    }
+
+    #[test]
+    fn test_stream_pre_sse_attempt_timeout_uses_remaining_after_fast_failover_cap() {
+        let config = StreamPreSseFailoverConfig::default();
+        let remaining = Duration::from_millis(config.total_budget_ms);
+        let timeout = KiroProvider::stream_pre_sse_attempt_timeout(
+            &config,
+            64 * 1024,
+            Some("claude-sonnet-4.5"),
+            config.max_fast_failovers,
+            true,
+            1,
+            remaining,
+        );
+
+        assert_eq!(timeout.timeout, remaining);
+        assert!(!timeout.fast_failover);
     }
 
     #[test]
