@@ -252,6 +252,43 @@ impl StreamPreSseFailoverConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversionRuntimeConfig {
+    #[serde(default = "default_conversion_max_concurrent")]
+    pub max_concurrent: usize,
+
+    #[serde(default = "default_conversion_max_queue")]
+    pub max_queue: usize,
+
+    #[serde(default = "default_conversion_queue_wait_ms")]
+    pub queue_wait_ms: u64,
+}
+
+impl Default for ConversionRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent: default_conversion_max_concurrent(),
+            max_queue: default_conversion_max_queue(),
+            queue_wait_ms: default_conversion_queue_wait_ms(),
+        }
+    }
+}
+
+impl ConversionRuntimeConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.max_concurrent == 0 {
+            anyhow::bail!("conversionRuntime.maxConcurrent 必须大于 0");
+        }
+        if self.max_queue > 0 && self.queue_wait_ms == 0 {
+            anyhow::bail!(
+                "conversionRuntime.queueWaitMs 必须大于 0，或将 conversionRuntime.maxQueue 设为 0"
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum TlsBackend {
@@ -315,6 +352,11 @@ pub struct Config {
 
     #[serde(default = "default_port")]
     pub port: u16,
+
+    /// 独立健康检查端口。未配置时使用 port + 1；port=65535 时不额外监听。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_port: Option<u16>,
 
     #[serde(default = "default_region")]
     pub region: String,
@@ -514,6 +556,10 @@ pub struct Config {
     /// 流式请求在收到上游响应头前的自适应故障转移策略。
     #[serde(default)]
     pub stream_pre_sse_failover: StreamPreSseFailoverConfig,
+
+    /// Anthropic -> Kiro 转换与图片处理的本地 blocking 运行池。
+    #[serde(default)]
+    pub conversion_runtime: ConversionRuntimeConfig,
 
     /// 历史 thinking signature 校验模式。
     /// 支持 strict、warn_only、disabled、strip_invalid；默认 strict。
@@ -755,11 +801,24 @@ fn default_stream_pre_sse_min_remaining_ms() -> u64 {
     15_000
 }
 
+fn default_conversion_max_concurrent() -> usize {
+    2
+}
+
+fn default_conversion_max_queue() -> usize {
+    8
+}
+
+fn default_conversion_queue_wait_ms() -> u64 {
+    10_000
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             host: default_host(),
             port: default_port(),
+            health_port: None,
             region: default_region(),
             auth_region: None,
             api_region: None,
@@ -817,6 +876,7 @@ impl Default for Config {
             rate_limit_refill_backoff_factor: default_rate_limit_refill_backoff_factor(),
             request_weighting: RequestWeightingConfig::default(),
             stream_pre_sse_failover: StreamPreSseFailoverConfig::default(),
+            conversion_runtime: ConversionRuntimeConfig::default(),
             thinking_signature_validation_mode: ThinkingSignatureValidationMode::default(),
             response_thinking_signature_compat_enabled: false,
             account_type_policies: BTreeMap::new(),
@@ -925,6 +985,14 @@ impl Config {
             anyhow::bail!("stateRedisHeartbeatIntervalSecs 必须小于 stateRedisLeaderLeaseTtlSecs");
         }
 
+        if self.health_port.is_some_and(|port| port == 0) {
+            anyhow::bail!("healthPort 不能为 0");
+        }
+
+        if self.health_port.is_some_and(|port| port == self.port) {
+            anyhow::bail!("healthPort 不能与 port 相同");
+        }
+
         if self.suspicious_activity_auto_disable_enabled
             && self.suspicious_activity_auto_disable_threshold == 0
         {
@@ -944,6 +1012,7 @@ impl Config {
 
         self.request_weighting.validate()?;
         self.stream_pre_sse_failover.validate()?;
+        self.conversion_runtime.validate()?;
 
         Ok(())
     }
@@ -1000,6 +1069,10 @@ impl Config {
         Some(format!("http://{advertise_host}:{}", self.port))
     }
 
+    pub fn resolved_health_port(&self) -> Option<u16> {
+        self.health_port.or_else(|| self.port.checked_add(1))
+    }
+
     /// 将当前配置写回原始配置文件
     pub fn save(&self) -> anyhow::Result<()> {
         let path = self
@@ -1016,7 +1089,9 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, RequestWeightingConfig, ThinkingSignatureValidationMode};
+    use super::{
+        Config, ConversionRuntimeConfig, RequestWeightingConfig, ThinkingSignatureValidationMode,
+    };
 
     #[test]
     fn validate_rejects_invalid_redis_runtime_coordination_timing() {
@@ -1035,6 +1110,29 @@ mod tests {
         config.instance_id = Some("kiro-a".to_string());
 
         assert_eq!(config.resolved_instance_id(), "kiro-a");
+    }
+
+    #[test]
+    fn resolved_health_port_defaults_to_next_port() {
+        let config = Config {
+            port: 8990,
+            ..Config::default()
+        };
+
+        assert_eq!(config.resolved_health_port(), Some(8991));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_conversion_runtime() {
+        let mut config = Config::default();
+        config.conversion_runtime = ConversionRuntimeConfig {
+            max_concurrent: 0,
+            ..ConversionRuntimeConfig::default()
+        };
+
+        let err = config.validate().unwrap_err().to_string();
+
+        assert!(err.contains("conversionRuntime.maxConcurrent"));
     }
 
     #[test]

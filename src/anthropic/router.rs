@@ -1,5 +1,7 @@
 //! Anthropic API 路由配置
 
+use std::sync::Arc;
+
 use axum::{
     Router,
     extract::DefaultBodyLimit,
@@ -10,6 +12,7 @@ use axum::{
 use crate::kiro::provider::KiroProvider;
 
 use super::{
+    conversion_runtime::ConversionRuntime,
     extractor::MAX_ANTHROPIC_BODY_SIZE_BYTES,
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
     middleware::{AppState, auth_middleware, cors_layer, message_routing_middleware},
@@ -35,8 +38,9 @@ use super::{
 pub fn create_router_with_provider(
     api_key: impl Into<String>,
     kiro_provider: Option<KiroProvider>,
+    conversion_runtime: Arc<ConversionRuntime>,
 ) -> Router {
-    let mut state = AppState::new(api_key);
+    let mut state = AppState::new(api_key).with_conversion_runtime(conversion_runtime);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }

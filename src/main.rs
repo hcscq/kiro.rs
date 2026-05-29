@@ -446,10 +446,15 @@ async fn live_handler() -> (StatusCode, Json<serde_json::Value>) {
     (StatusCode::OK, Json(json!({ "status": "ok" })))
 }
 
-async fn ready_handler(health: Arc<RuntimeHealth>) -> (StatusCode, Json<serde_json::Value>) {
+async fn ready_handler(
+    health: Arc<RuntimeHealth>,
+    conversion_runtime: Arc<anthropic::ConversionRuntime>,
+) -> (StatusCode, Json<serde_json::Value>) {
     let snapshot = health.readiness_snapshot();
     let draining = health.is_draining() || drain_file_present();
-    let ready = !draining && snapshot.total > 0;
+    let conversion = conversion_runtime.stats();
+    let conversion_overloaded = conversion.is_saturated();
+    let ready = !draining && snapshot.total > 0 && !conversion_overloaded;
     let status = if ready {
         StatusCode::OK
     } else {
@@ -459,6 +464,8 @@ async fn ready_handler(health: Arc<RuntimeHealth>) -> (StatusCode, Json<serde_js
         "draining"
     } else if snapshot.total == 0 {
         "no_credentials"
+    } else if conversion_overloaded {
+        "overloaded"
     } else {
         "not_ready"
     };
@@ -470,15 +477,54 @@ async fn ready_handler(health: Arc<RuntimeHealth>) -> (StatusCode, Json<serde_js
             "credentials_total": snapshot.total,
             "credentials_available": snapshot.available,
             "credentials_dispatchable": snapshot.dispatchable,
+            "conversion_available_permits": conversion.available_permits,
+            "conversion_max_concurrent": conversion.max_concurrent,
+            "conversion_waiting": conversion.waiting,
+            "conversion_max_queue": conversion.max_queue,
+            "conversion_queue_wait_ms": conversion.queue_wait_ms,
             "readiness_source": "cached",
         })),
     )
+}
+
+fn health_router(
+    runtime_health: Arc<RuntimeHealth>,
+    conversion_runtime: Arc<anthropic::ConversionRuntime>,
+) -> Router {
+    Router::new()
+        .route("/health", get(live_handler))
+        .route("/healthz", get(live_handler))
+        .route("/livez", get(live_handler))
+        .route(
+            "/readyz",
+            get({
+                let runtime_health = runtime_health.clone();
+                let conversion_runtime = conversion_runtime.clone();
+                move || {
+                    let runtime_health = runtime_health.clone();
+                    let conversion_runtime = conversion_runtime.clone();
+                    async move { ready_handler(runtime_health, conversion_runtime).await }
+                }
+            }),
+        )
+}
+
+async fn server_shutdown_signal(mut shutdown: watch::Receiver<bool>) {
+    loop {
+        if *shutdown.borrow_and_update() {
+            break;
+        }
+        if shutdown.changed().await.is_err() {
+            break;
+        }
+    }
 }
 
 async fn shutdown_signal(
     health: Arc<RuntimeHealth>,
     state_store: StateStore,
     background_tasks: BackgroundTasks,
+    shutdown_tx: watch::Sender<bool>,
 ) {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
@@ -527,6 +573,7 @@ async fn shutdown_signal(
         Err(err) => tracing::warn!("shutdown drain: 释放运行时协调状态失败: {}", err),
     }
     sleep(SHUTDOWN_DRAIN_DELAY).await;
+    let _ = shutdown_tx.send(true);
 }
 
 #[tokio::main]
@@ -635,6 +682,16 @@ async fn main() {
     let runtime_health = Arc::new(RuntimeHealth::default());
     let background_tasks = BackgroundTasks::new();
     let advertise_http_base_url = config.resolved_advertise_http_base_url();
+    let conversion_runtime = Arc::new(anthropic::ConversionRuntime::new(
+        config.conversion_runtime.clone(),
+    ));
+    let conversion_stats = conversion_runtime.stats();
+    tracing::info!(
+        max_concurrent = conversion_stats.max_concurrent,
+        max_queue = conversion_stats.max_queue,
+        queue_wait_ms = conversion_stats.queue_wait_ms,
+        "已启用 Anthropic 请求转换 blocking 运行池"
+    );
 
     if state_store.runtime_coordination_enabled() {
         let initial_status = state_store
@@ -817,7 +874,11 @@ async fn main() {
         thinking_signature_validation_mode = config.thinking_signature_validation_mode.as_str(),
         "Anthropic thinking signature validation mode configured"
     );
-    let anthropic_app = anthropic::create_router_with_provider(&api_key, Some(kiro_provider));
+    let anthropic_app = anthropic::create_router_with_provider(
+        &api_key,
+        Some(kiro_provider),
+        conversion_runtime.clone(),
+    );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
     // 安全检查：空字符串被视为未配置，防止空 key 绕过认证
@@ -869,25 +930,25 @@ async fn main() {
         anthropic_app
     };
 
-    let health_app = Router::new()
-        .route("/health", get(live_handler))
-        .route("/healthz", get(live_handler))
-        .route("/livez", get(live_handler))
-        .route(
-            "/readyz",
-            get({
-                let runtime_health = runtime_health.clone();
-                move || {
-                    let runtime_health = runtime_health.clone();
-                    async move { ready_handler(runtime_health).await }
-                }
-            }),
-        );
-    let app = health_app.merge(base_app);
+    let health_app = health_router(runtime_health.clone(), conversion_runtime.clone());
+    let app = health_app.clone().merge(base_app);
 
     // 启动服务器
     let addr = format!("{}:{}", config.host, config.port);
     tracing::info!("启动 Anthropic API 端点: {}", addr);
+    let health_listener = if let Some(health_port) = config.resolved_health_port() {
+        let health_addr = format!("{}:{}", config.host, health_port);
+        tracing::info!("启动独立健康检查端点: {}", health_addr);
+        Some((
+            health_addr,
+            tokio::net::TcpListener::bind(format!("{}:{}", config.host, health_port))
+                .await
+                .unwrap(),
+        ))
+    } else {
+        tracing::warn!("port=65535 且未配置 healthPort，未启动独立健康检查端点");
+        None
+    };
     tracing::info!("API Key: {}***", &api_key[..(api_key.len() / 2)]);
     tracing::info!("可用 API:");
     tracing::info!("  GET  /v1/models");
@@ -905,14 +966,41 @@ async fn main() {
     }
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let shutdown_task = tokio::spawn(shutdown_signal(
+        runtime_health,
+        state_store,
+        background_tasks,
+        shutdown_tx,
+    ));
+    let health_server = health_listener.map(|(health_addr, health_listener)| {
+        let shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let result = axum::serve(health_listener, health_app)
+                .with_graceful_shutdown(server_shutdown_signal(shutdown_rx))
+                .await;
+            if let Err(err) = &result {
+                tracing::error!(address = %health_addr, error = %err, "独立健康检查端点退出异常");
+            }
+            result
+        })
+    });
+
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(
-            runtime_health,
-            state_store,
-            background_tasks,
-        ))
+        .with_graceful_shutdown(server_shutdown_signal(shutdown_rx))
         .await
         .unwrap();
+
+    if let Some(health_server) = health_server {
+        match health_server.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => tracing::error!("独立健康检查端点停止失败: {}", err),
+            Err(err) => tracing::error!("独立健康检查任务失败: {}", err),
+        }
+    }
+    if let Err(err) = shutdown_task.await {
+        tracing::error!("shutdown 任务失败: {}", err);
+    }
 }
 
 fn log_runtime_coordination_status(

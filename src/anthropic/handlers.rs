@@ -1,6 +1,6 @@
 //! Anthropic API Handler 函数
 
-use std::convert::Infallible;
+use std::{convert::Infallible, sync::Arc};
 
 use crate::common::logging::summarize_text_for_log;
 use crate::kiro::model::events::Event;
@@ -26,7 +26,8 @@ use std::time::Duration;
 use tokio::time::{Instant, interval_at};
 use uuid::Uuid;
 
-use super::converter::{ConversionError, convert_request_with_probe};
+use super::conversion_runtime::{ConversionRuntime, ConversionRuntimeError};
+use super::converter::{ConversionError, ConversionResult};
 use super::extractor::AnthropicJson;
 use super::middleware::{ANTHROPIC_RUNTIME_LEADER_REQUIRED_HEADER, AppState};
 use super::multimodal;
@@ -110,6 +111,135 @@ fn json_schema_output_or_response(
         "Structured output JSON Schema accepted"
     );
     Ok(Some(output))
+}
+
+async fn convert_request_on_runtime(
+    conversion_runtime: Arc<ConversionRuntime>,
+    payload: &MessagesRequest,
+    probe: UpstreamProbe,
+    request_id: Option<&str>,
+    route: &str,
+) -> Result<ConversionResult, Response> {
+    match conversion_runtime.convert(payload, probe).await {
+        Ok(result) => Ok(result),
+        Err(err) => Err(conversion_runtime_error_response(err, request_id, route)),
+    }
+}
+
+fn conversion_runtime_error_response(
+    err: ConversionRuntimeError,
+    request_id: Option<&str>,
+    route: &str,
+) -> Response {
+    match err {
+        ConversionRuntimeError::Conversion(e) => {
+            let (error_type, message) = match &e {
+                ConversionError::UnsupportedModel(model) => {
+                    ("invalid_request_error", format!("模型不支持: {}", model))
+                }
+                ConversionError::EmptyMessages => {
+                    ("invalid_request_error", "消息列表为空".to_string())
+                }
+            };
+            if let Some(request_id) = request_id {
+                tracing::warn!(request_id = %request_id, route, error = %e, "请求转换失败");
+            } else {
+                tracing::warn!(route, error = %e, "请求转换失败");
+            }
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(error_type, message)),
+            )
+                .into_response()
+        }
+        ConversionRuntimeError::QueueFull(stats) => {
+            if let Some(request_id) = request_id {
+                tracing::warn!(
+                    request_id = %request_id,
+                    route,
+                    max_concurrent = stats.max_concurrent,
+                    available_permits = stats.available_permits,
+                    waiting = stats.waiting,
+                    max_queue = stats.max_queue,
+                    queue_wait_ms = stats.queue_wait_ms,
+                    "转换运行池队列已满，拒绝请求并要求客户端重试"
+                );
+            } else {
+                tracing::warn!(
+                    route,
+                    max_concurrent = stats.max_concurrent,
+                    available_permits = stats.available_permits,
+                    waiting = stats.waiting,
+                    max_queue = stats.max_queue,
+                    queue_wait_ms = stats.queue_wait_ms,
+                    "转换运行池队列已满，拒绝请求并要求客户端重试"
+                );
+            }
+            conversion_overloaded_response("conversion_queue_full")
+        }
+        ConversionRuntimeError::WaitTimeout(stats) => {
+            if let Some(request_id) = request_id {
+                tracing::warn!(
+                    request_id = %request_id,
+                    route,
+                    max_concurrent = stats.max_concurrent,
+                    available_permits = stats.available_permits,
+                    waiting = stats.waiting,
+                    max_queue = stats.max_queue,
+                    queue_wait_ms = stats.queue_wait_ms,
+                    "转换运行池等待超时，拒绝请求并要求客户端重试"
+                );
+            } else {
+                tracing::warn!(
+                    route,
+                    max_concurrent = stats.max_concurrent,
+                    available_permits = stats.available_permits,
+                    waiting = stats.waiting,
+                    max_queue = stats.max_queue,
+                    queue_wait_ms = stats.queue_wait_ms,
+                    "转换运行池等待超时，拒绝请求并要求客户端重试"
+                );
+            }
+            conversion_overloaded_response("conversion_queue_timeout")
+        }
+        ConversionRuntimeError::WorkerClosed => {
+            tracing::error!(route, request_id = ?request_id, "转换运行池已关闭");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "internal_error",
+                    "conversion worker closed",
+                )),
+            )
+                .into_response()
+        }
+        ConversionRuntimeError::WorkerJoin(message) => {
+            tracing::error!(route, request_id = ?request_id, error = %message, "转换 blocking worker 失败");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "internal_error",
+                    "conversion worker failed",
+                )),
+            )
+                .into_response()
+        }
+    }
+}
+
+fn conversion_overloaded_response(reason: &'static str) -> Response {
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorResponse::new(
+            "service_overloaded",
+            format!("conversion runtime overloaded: {reason}"),
+        )),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    response
 }
 
 fn built_in_models() -> Vec<Model> {
@@ -851,6 +981,7 @@ pub async fn post_messages(
             provider,
             &payload,
             input_tokens,
+            state.conversion_runtime.clone(),
             probe.clone(),
             &request_id,
             structured_output,
@@ -863,6 +994,7 @@ pub async fn post_messages(
             return handle_structured_stream_request(
                 provider,
                 payload,
+                state.conversion_runtime.clone(),
                 probe.clone(),
                 request_id.clone(),
                 output,
@@ -873,6 +1005,7 @@ pub async fn post_messages(
         return handle_structured_non_stream_request(
             provider,
             &payload,
+            state.conversion_runtime.clone(),
             probe.clone(),
             request_id,
             output,
@@ -883,26 +1016,21 @@ pub async fn post_messages(
     // 转换请求
     pre_upstream_trace.mark_stage_started("convert_request");
     let convert_started_at = Instant::now();
-    let conversion_result = match convert_request_with_probe(&payload, probe.clone()) {
+    let conversion_result = match convert_request_on_runtime(
+        state.conversion_runtime.clone(),
+        &payload,
+        probe.clone(),
+        Some(&request_id),
+        "messages",
+    )
+    .await
+    {
         Ok(result) => result,
-        Err(e) => {
+        Err(response) => {
             pre_upstream_trace
                 .mark_stage_completed("convert_request", convert_started_at.elapsed().as_millis());
             pre_upstream_trace.mark_terminal("convert_request_failed");
-            let (error_type, message) = match &e {
-                ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
-                }
-                ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "消息列表为空".to_string())
-                }
-            };
-            tracing::warn!(request_id = %request_id, error = %e, "请求转换失败");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(error_type, message)),
-            )
-                .into_response();
+            return response;
         }
     };
     let convert_ms = convert_started_at.elapsed().as_millis();
@@ -1377,34 +1505,20 @@ fn finalize_stream_events(ctx: &mut StreamContext, message_started: &mut bool) -
 use super::converter::get_context_window_size;
 
 pub(crate) async fn execute_non_stream_round(
-    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    provider: Arc<crate::kiro::provider::KiroProvider>,
     payload: &MessagesRequest,
+    conversion_runtime: Arc<ConversionRuntime>,
     probe: UpstreamProbe,
     request_id: Option<String>,
 ) -> Result<NonStreamMessageResponse, Response> {
-    let conversion_result = match convert_request_with_probe(payload, probe.clone()) {
-        Ok(result) => result,
-        Err(e) => {
-            let (error_type, message) = match &e {
-                ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
-                }
-                ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "消息列表为空".to_string())
-                }
-            };
-            if let Some(request_id) = request_id.as_deref() {
-                tracing::warn!(request_id = %request_id, error = %e, "请求转换失败");
-            } else {
-                tracing::warn!(error = %e, "请求转换失败");
-            }
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(error_type, message)),
-            )
-                .into_response());
-        }
-    };
+    let conversion_result = convert_request_on_runtime(
+        conversion_runtime,
+        payload,
+        probe.clone(),
+        request_id.as_deref(),
+        "non_stream_round",
+    )
+    .await?;
 
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
@@ -1495,26 +1609,46 @@ async fn count_billing_input_tokens_with_structured_instruction(payload: &Messag
 }
 
 async fn handle_structured_non_stream_request(
-    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    provider: Arc<crate::kiro::provider::KiroProvider>,
     payload: &MessagesRequest,
+    conversion_runtime: Arc<ConversionRuntime>,
     probe: UpstreamProbe,
     request_id: String,
     output: JsonSchemaOutput,
 ) -> Response {
-    match execute_structured_non_stream(provider, payload, probe, request_id, output).await {
+    match execute_structured_non_stream(
+        provider,
+        payload,
+        conversion_runtime,
+        probe,
+        request_id,
+        output,
+    )
+    .await
+    {
         Ok(result) => (StatusCode::OK, Json(result.body)).into_response(),
         Err(response) => response,
     }
 }
 
 async fn handle_structured_stream_request(
-    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    provider: Arc<crate::kiro::provider::KiroProvider>,
     payload: MessagesRequest,
+    conversion_runtime: Arc<ConversionRuntime>,
     probe: UpstreamProbe,
     request_id: String,
     output: JsonSchemaOutput,
 ) -> Response {
-    match execute_structured_non_stream(provider, &payload, probe, request_id, output).await {
+    match execute_structured_non_stream(
+        provider,
+        &payload,
+        conversion_runtime,
+        probe,
+        request_id,
+        output,
+    )
+    .await
+    {
         Ok(result) => {
             let events = structured_non_stream_to_sse_events(result);
             let stream = stream::iter(
@@ -1535,8 +1669,9 @@ async fn handle_structured_stream_request(
 }
 
 async fn execute_structured_non_stream(
-    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    provider: Arc<crate::kiro::provider::KiroProvider>,
     payload: &MessagesRequest,
+    conversion_runtime: Arc<ConversionRuntime>,
     probe: UpstreamProbe,
     request_id: String,
     output: JsonSchemaOutput,
@@ -1559,6 +1694,7 @@ async fn execute_structured_non_stream(
         let result = execute_non_stream_round(
             provider.clone(),
             &attempt_payload,
+            conversion_runtime.clone(),
             probe.clone(),
             Some(request_id.clone()),
         )
@@ -2321,6 +2457,7 @@ pub async fn post_messages_cc(
             provider,
             &payload,
             input_tokens,
+            state.conversion_runtime.clone(),
             probe.clone(),
             &request_id,
             structured_output,
@@ -2333,6 +2470,7 @@ pub async fn post_messages_cc(
             return handle_structured_stream_request(
                 provider,
                 payload,
+                state.conversion_runtime.clone(),
                 probe.clone(),
                 request_id.clone(),
                 output,
@@ -2343,6 +2481,7 @@ pub async fn post_messages_cc(
         return handle_structured_non_stream_request(
             provider,
             &payload,
+            state.conversion_runtime.clone(),
             probe.clone(),
             request_id,
             output,
@@ -2353,26 +2492,21 @@ pub async fn post_messages_cc(
     // 转换请求
     pre_upstream_trace.mark_stage_started("convert_request");
     let convert_started_at = Instant::now();
-    let conversion_result = match convert_request_with_probe(&payload, probe.clone()) {
+    let conversion_result = match convert_request_on_runtime(
+        state.conversion_runtime.clone(),
+        &payload,
+        probe.clone(),
+        Some(&request_id),
+        "cc_messages",
+    )
+    .await
+    {
         Ok(result) => result,
-        Err(e) => {
+        Err(response) => {
             pre_upstream_trace
                 .mark_stage_completed("convert_request", convert_started_at.elapsed().as_millis());
             pre_upstream_trace.mark_terminal("convert_request_failed");
-            let (error_type, message) = match &e {
-                ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
-                }
-                ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "消息列表为空".to_string())
-                }
-            };
-            tracing::warn!(request_id = %request_id, error = %e, "请求转换失败");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(error_type, message)),
-            )
-                .into_response();
+            return response;
         }
     };
     let convert_ms = convert_started_at.elapsed().as_millis();

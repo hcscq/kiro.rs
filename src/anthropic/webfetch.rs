@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 use std::convert::Infallible;
 use std::io::Cursor;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use axum::{
@@ -29,6 +29,7 @@ use uuid::Uuid;
 use crate::common::logging::summarize_text_for_log;
 use crate::token;
 
+use super::conversion_runtime::ConversionRuntime;
 use super::handlers::execute_non_stream_round;
 use super::probe::UpstreamProbe;
 use super::stream::SseEvent;
@@ -135,9 +136,10 @@ pub fn has_server_web_tool(req: &MessagesRequest) -> bool {
 }
 
 pub async fn handle_server_web_tool_request(
-    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    provider: Arc<crate::kiro::provider::KiroProvider>,
     payload: &MessagesRequest,
     input_tokens: i32,
+    conversion_runtime: Arc<ConversionRuntime>,
     probe: UpstreamProbe,
     request_id: &str,
     structured_output: Option<JsonSchemaOutput>,
@@ -146,6 +148,7 @@ pub async fn handle_server_web_tool_request(
         provider.clone(),
         payload,
         input_tokens,
+        conversion_runtime.clone(),
         probe.clone(),
         request_id,
     )
@@ -157,7 +160,13 @@ pub async fn handle_server_web_tool_request(
 
     if let Some(output) = structured_output {
         return finalize_structured_server_web_tool_response(
-            provider, payload, run, probe, request_id, output,
+            provider,
+            payload,
+            run,
+            conversion_runtime,
+            probe,
+            request_id,
+            output,
         )
         .await;
     }
@@ -175,9 +184,10 @@ pub async fn handle_server_web_tool_request(
 }
 
 async fn execute_server_web_tool_loop(
-    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    provider: Arc<crate::kiro::provider::KiroProvider>,
     payload: &MessagesRequest,
     input_tokens: i32,
+    conversion_runtime: Arc<ConversionRuntime>,
     probe: UpstreamProbe,
     request_id: &str,
 ) -> Result<ServerWebToolRun, Response> {
@@ -195,6 +205,7 @@ async fn execute_server_web_tool_loop(
         let round = execute_non_stream_round(
             provider.clone(),
             &internal_payload,
+            conversion_runtime.clone(),
             probe.clone(),
             Some(round_request_id),
         )
@@ -320,6 +331,7 @@ async fn execute_server_web_tool_loop(
     let synthesis = match execute_non_stream_round(
         provider,
         &synthesis_payload,
+        conversion_runtime,
         probe,
         Some(synthesis_request_id.clone()),
     )
@@ -1165,9 +1177,10 @@ fn build_internal_tool_result_text(url: &str, title: Option<&str>, text: &str) -
 }
 
 async fn finalize_structured_server_web_tool_response(
-    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    provider: Arc<crate::kiro::provider::KiroProvider>,
     payload: &MessagesRequest,
     mut run: ServerWebToolRun,
+    conversion_runtime: Arc<ConversionRuntime>,
     probe: UpstreamProbe,
     request_id: &str,
     output: JsonSchemaOutput,
@@ -1238,6 +1251,7 @@ async fn finalize_structured_server_web_tool_response(
                 let repair_result = match execute_non_stream_round(
                     provider.clone(),
                     &repair_payload,
+                    conversion_runtime.clone(),
                     probe.clone(),
                     Some(repair_request_id),
                 )

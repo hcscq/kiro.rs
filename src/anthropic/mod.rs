@@ -23,6 +23,7 @@
 //! ```
 
 mod body_budget;
+mod conversion_runtime;
 mod converter;
 mod extractor;
 mod handlers;
@@ -37,4 +38,5 @@ pub mod types;
 mod webfetch;
 mod websearch;
 
+pub(crate) use conversion_runtime::ConversionRuntime;
 pub use router::create_router_with_provider;

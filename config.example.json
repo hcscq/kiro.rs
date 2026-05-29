@@ -1,6 +1,7 @@
 {
   "host": "127.0.0.1",
   "port": 8990,
+  "healthPort": 8991,
   "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
   "tlsBackend": "rustls",
   "region": "us-east-1",
@@ -48,6 +49,11 @@
     "thinkingBonus": 0.35,
     "heavyThinkingBudgetThreshold": 24000,
     "heavyThinkingBudgetBonus": 0.35
+  },
+  "conversionRuntime": {
+    "maxConcurrent": 2,
+    "maxQueue": 8,
+    "queueWaitMs": 10000
   },
   "thinkingSignatureValidationMode": "strict",
   "responseThinkingSignatureCompatEnabled": false,

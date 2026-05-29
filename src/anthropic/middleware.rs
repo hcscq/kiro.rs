@@ -26,6 +26,7 @@ use super::{
         InflightBodyBudget, InflightBodyBudgetPermit, load_budget_from_env,
         request_body_budget_exhausted_response, request_body_budget_reservation_bytes,
     },
+    conversion_runtime::ConversionRuntime,
     extractor::{
         BufferedAnthropicBody, MAX_ANTHROPIC_BODY_SIZE_BYTES, content_length_header_value,
         request_body_too_large_response,
@@ -107,6 +108,7 @@ pub struct AppState {
     /// Kiro Provider（可选，用于实际 API 调用）
     /// 内部使用 MultiTokenManager，已支持线程安全的多凭据管理
     pub kiro_provider: Option<Arc<KiroProvider>>,
+    pub conversion_runtime: Arc<ConversionRuntime>,
     client: Client,
     request_body_budget: Option<Arc<InflightBodyBudget>>,
 }
@@ -119,6 +121,7 @@ impl AppState {
         Self {
             api_key,
             kiro_provider: None,
+            conversion_runtime: Arc::new(ConversionRuntime::default()),
             client: Client::builder()
                 .connect_timeout(Duration::from_secs(5))
                 .timeout(Duration::from_secs(600))
@@ -131,6 +134,11 @@ impl AppState {
     /// 设置 KiroProvider
     pub fn with_kiro_provider(mut self, provider: KiroProvider) -> Self {
         self.kiro_provider = Some(Arc::new(provider));
+        self
+    }
+
+    pub fn with_conversion_runtime(mut self, conversion_runtime: Arc<ConversionRuntime>) -> Self {
+        self.conversion_runtime = conversion_runtime;
         self
     }
 
