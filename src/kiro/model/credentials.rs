@@ -668,7 +668,7 @@ impl KiroCredentials {
             .unwrap_or(true)
     }
 
-    /// 检查凭据是否适合作为真实 Opus 4.7 的候选账号
+    /// 检查凭据是否适合作为真实 Opus 4.7/4.8 的候选账号
     ///
     /// 在上游正式全量开放前，所有非 FREE 档位都保留为候选，
     /// 交由运行时根据 `INVALID_MODEL_ID` 动态探测。
@@ -678,7 +678,7 @@ impl KiroCredentials {
             .unwrap_or(true)
     }
 
-    /// 返回真实 Opus 4.7 的调度偏好，数值越小越优先。
+    /// 返回真实 Opus 4.7/4.8 的调度偏好，数值越小越优先。
     pub fn opus_4_7_preference_rank(&self) -> u8 {
         match self.standard_subscription_account_type() {
             Some("max" | "ultra" | "pro-plus") => 0,

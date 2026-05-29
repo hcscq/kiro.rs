@@ -210,6 +210,7 @@ pub(crate) fn sign_thinking_block(thinking_ordinal: u32, thinking: &str) -> Stri
 pub(crate) fn sign_synthetic_hidden_thinking_block(
     thinking_ordinal: u32,
     thinking: &str,
+    model: &str,
     nonce_material: &[u8],
 ) -> String {
     let key = signing_key();
@@ -219,7 +220,7 @@ pub(crate) fn sign_synthetic_hidden_thinking_block(
     let nonce = synthetic_signature_nonce(nonce_material);
 
     let mut inner = Vec::with_capacity(AWS_SHAPED_SYNTHETIC_OUTER_PAYLOAD_LEN);
-    let header = aws_shaped_synthetic_header();
+    let header = aws_shaped_synthetic_header(model);
     push_protobuf_len_field(&mut inner, 1, &header);
     push_protobuf_len_field(
         &mut inner,
@@ -632,15 +633,25 @@ fn signature_mac(key: &[u8; 32], body: &[u8]) -> [u8; HMAC_LEN] {
     hmac_sha256(key, &payload)
 }
 
-fn aws_shaped_synthetic_header() -> Vec<u8> {
+fn aws_shaped_synthetic_header(model: &str) -> Vec<u8> {
+    let synthetic_model = synthetic_signature_model_id(model);
     let mut header = Vec::with_capacity(99);
     header.extend_from_slice(&[0x08, 0x0d, 0x18, 0x02, 0x2a, 0x40]);
     header.extend_from_slice(&AWS_SHAPED_SYNTHETIC_HEADER_RANDOM_TEMPLATE);
-    push_protobuf_len_field(&mut header, 6, b"claude-opus-4-7");
+    push_protobuf_len_field(&mut header, 6, synthetic_model.as_bytes());
     header.extend_from_slice(&[0x38, 0x00]);
     push_protobuf_len_field(&mut header, 8, b"thinking");
     debug_assert_eq!(header.len(), 99);
     header
+}
+
+fn synthetic_signature_model_id(model: &str) -> &'static str {
+    let lower = model.to_ascii_lowercase();
+    if lower.contains("claude-opus-4.8") || lower.contains("claude-opus-4-8") {
+        "claude-opus-4-8"
+    } else {
+        "claude-opus-4-7"
+    }
 }
 
 fn synthetic_signature_chunk(
@@ -874,8 +885,10 @@ mod tests {
 
     #[test]
     fn test_sign_synthetic_hidden_thinking_block_is_dynamic_and_verifiable() {
-        let signature_a = sign_synthetic_hidden_thinking_block(0, "", b"response-a");
-        let signature_b = sign_synthetic_hidden_thinking_block(0, "", b"response-b");
+        let signature_a =
+            sign_synthetic_hidden_thinking_block(0, "", "claude-opus-4-7", b"response-a");
+        let signature_b =
+            sign_synthetic_hidden_thinking_block(0, "", "claude-opus-4-7", b"response-b");
 
         assert_ne!(signature_a, signature_b);
         assert_eq!(signature_a.len(), 3284);
@@ -894,6 +907,18 @@ mod tests {
             SignatureClass::InvalidOwn(detail)
                 if detail.reason == ThinkingSignatureInvalidReason::ThinkingHashMismatch
         ));
+    }
+
+    #[test]
+    fn test_synthetic_hidden_thinking_block_uses_opus_4_8_model_when_requested() {
+        let signature =
+            sign_synthetic_hidden_thinking_block(0, "", "claude-opus-4.8", b"response-a");
+        let raw = decode_signature(&signature).expect("signature should decode");
+        assert_eq!(&raw[77..92], b"claude-opus-4-8");
+        assert_eq!(
+            classify_signature(&signature, 0, ""),
+            SignatureClass::ValidOwn
+        );
     }
 
     #[test]

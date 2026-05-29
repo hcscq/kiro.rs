@@ -50,6 +50,7 @@ const BUILT_IN_ACCOUNT_TYPE_PRESETS: [BuiltInAccountTypePreset; 6] = [
         subscription_title_examples: &["KIRO FREE"],
         recommended_allowed_models: &[],
         recommended_blocked_models: &[
+            "claude-opus-4.8",
             "claude-opus-4.7",
             "claude-opus-4.6",
             "claude-opus-4.5-20251101",
@@ -61,10 +62,10 @@ const BUILT_IN_ACCOUNT_TYPE_PRESETS: [BuiltInAccountTypePreset; 6] = [
     BuiltInAccountTypePreset {
         id: "pro",
         display_name: "KIRO Pro",
-        description: "标准付费档位的保守基线。建议默认不要承接 Opus 4.7，必要时再派生灰度类型。",
+        description: "标准付费档位的保守基线。建议默认不要承接最新 Opus 高阶模型，必要时再派生灰度类型。",
         subscription_title_examples: &["KIRO PRO"],
         recommended_allowed_models: &[],
-        recommended_blocked_models: &["claude-opus-4.7"],
+        recommended_blocked_models: &["claude-opus-4.8", "claude-opus-4.7"],
         recommended_max_concurrency: None,
         recommended_rate_limit_bucket_capacity: None,
         recommended_rate_limit_refill_per_second: None,
@@ -75,7 +76,7 @@ const BUILT_IN_ACCOUNT_TYPE_PRESETS: [BuiltInAccountTypePreset; 6] = [
         description: "Power 档位实测单卡可稳定承接更高并发。建议保留 Opus 4.6 及以下，并用账号类型调度策略关闭本地 bucket 覆盖、并发上限提升到 32。",
         subscription_title_examples: &["KIRO POWER"],
         recommended_allowed_models: &[],
-        recommended_blocked_models: &["claude-opus-4.7"],
+        recommended_blocked_models: &["claude-opus-4.8", "claude-opus-4.7"],
         recommended_max_concurrency: Some(32),
         recommended_rate_limit_bucket_capacity: Some(0.0),
         recommended_rate_limit_refill_per_second: Some(0.0),
@@ -83,7 +84,7 @@ const BUILT_IN_ACCOUNT_TYPE_PRESETS: [BuiltInAccountTypePreset; 6] = [
     BuiltInAccountTypePreset {
         id: "pro-plus",
         display_name: "KIRO Pro+",
-        description: "高价值标准档位。通常适合作为 Opus 4.7 主力池，建议保持空白基线，仅在衍生类型中做金丝雀限制。",
+        description: "高价值标准档位。通常适合作为最新 Opus 高阶模型主力池，建议保持空白基线，仅在衍生类型中做金丝雀限制。",
         subscription_title_examples: &["KIRO PRO+"],
         recommended_allowed_models: &[],
         recommended_blocked_models: &[],

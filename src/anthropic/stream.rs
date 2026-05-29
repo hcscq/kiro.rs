@@ -828,8 +828,12 @@ impl StreamContext {
         );
         events.extend(start_events);
 
-        let signature =
-            sign_synthetic_hidden_thinking_block(0, "", &self.synthetic_hidden_signature_seed());
+        let signature = sign_synthetic_hidden_thinking_block(
+            0,
+            "",
+            &self.model,
+            &self.synthetic_hidden_signature_seed(),
+        );
         if let Some(signature_event) =
             self.create_signature_delta_event_with_signature(thinking_index, signature)
         {

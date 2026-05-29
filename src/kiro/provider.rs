@@ -38,7 +38,7 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 const MAX_TOTAL_RETRIES: usize = 9;
 /// 429/容量不足时最多探测的候选凭据数量，避免上游容量抖动时把全池扫穿。
 const MAX_RATE_LIMIT_RETRY_CANDIDATES: usize = 24;
-/// 真实 Opus 4.7 模型也只做有限扇出探测，避免大凭据池下单请求长期占用本地资源。
+/// 真实 Opus 4.7/4.8 模型也只做有限扇出探测，避免大凭据池下单请求长期占用本地资源。
 const MAX_OPUS_4_7_RETRY_CANDIDATES: usize = 24;
 /// 同一请求内，同一优先级连续触发多少个 429 后开始下探低优先级兜底账号。
 const MAX_RATE_LIMITS_PER_PRIORITY_BEFORE_SPILL: usize = 3;
@@ -1801,7 +1801,7 @@ impl KiroProvider {
     /// 重试策略：
     /// - 每个凭据最多重试 MAX_RETRIES_PER_CREDENTIAL 次
     /// - 默认总重试次数 = min(凭据数量 × 每凭据重试次数, MAX_TOTAL_RETRIES)
-    /// - 真实 Opus 4.7 做有限候选探测，避免大池下单请求长期占用本地资源
+    /// - 真实 Opus 4.7/4.8 做有限候选探测，避免大池下单请求长期占用本地资源
     /// - 429 会在有界范围内扩展候选，并在请求内排除已 429 的凭据
     async fn call_api_with_retry(
         &self,
@@ -2195,7 +2195,7 @@ impl KiroProvider {
                         upstream_headers_ms,
                         slow_model_cooldown_threshold_ms = OPUS_4_7_SLOW_MODEL_HEADERS_MS,
                         slow_model_cooldown_ms = OPUS_4_7_SLOW_MODEL_COOLDOWN.as_millis(),
-                        "真实 Opus 4.7 响应头过慢，已触发模型级冷却"
+                        "真实高阶 Opus 响应头过慢，已触发模型级冷却"
                     );
                 }
                 let trace = ResponseTrace {
@@ -3165,7 +3165,10 @@ impl KiroProvider {
     fn is_real_opus_4_7_model(model: Option<&str>) -> bool {
         model.is_some_and(|model| {
             let lower = model.to_ascii_lowercase();
-            lower.contains("claude-opus-4.7") || lower.contains("claude-opus-4-7")
+            lower.contains("claude-opus-4.8")
+                || lower.contains("claude-opus-4-8")
+                || lower.contains("claude-opus-4.7")
+                || lower.contains("claude-opus-4-7")
         })
     }
 
@@ -3320,6 +3323,14 @@ mod tests {
         ));
         assert!(KiroProvider::should_failover_model_unsupported(
             Some("claude-opus-4-7"),
+            body
+        ));
+        assert!(KiroProvider::should_failover_model_unsupported(
+            Some("claude-opus-4.8"),
+            body
+        ));
+        assert!(KiroProvider::should_failover_model_unsupported(
+            Some("claude-opus-4-8"),
             body
         ));
         assert!(KiroProvider::should_failover_model_unsupported(
@@ -3579,12 +3590,20 @@ mod tests {
             KiroProvider::rate_limit_retry_cap(164, 164, Some("claude-opus-4.7")),
             24
         );
+        assert_eq!(
+            KiroProvider::rate_limit_retry_cap(164, 164, Some("claude-opus-4.8")),
+            24
+        );
     }
 
     #[test]
     fn test_initial_opus_retry_cap_is_bounded_for_large_pools() {
         assert_eq!(
             KiroProvider::initial_api_retry_cap(25, Some("claude-opus-4.7")),
+            24
+        );
+        assert_eq!(
+            KiroProvider::initial_api_retry_cap(25, Some("claude-opus-4.8")),
             24
         );
         assert_eq!(

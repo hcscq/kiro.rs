@@ -212,6 +212,7 @@ fn normalize_non_negative_finite(value: Option<f64>) -> Option<f64> {
 
 fn normalize_known_model_alias(model: &str) -> String {
     model
+        .replace("claude-opus-4-8", "claude-opus-4.8")
         .replace("claude-opus-4-7", "claude-opus-4.7")
         .replace("claude-opus-4-6", "claude-opus-4.6")
         .replace("claude-opus-4-5", "claude-opus-4.5")
@@ -233,6 +234,10 @@ mod tests {
 
     #[test]
     fn normalize_model_token_keeps_known_aliases_consistent() {
+        assert_eq!(
+            normalize_model_token("claude-opus-4-8-thinking"),
+            Some("claude-opus-4.8-thinking".to_string())
+        );
         assert_eq!(
             normalize_model_token("claude-opus-4-6"),
             Some("claude-opus-4.6".to_string())

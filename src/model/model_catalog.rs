@@ -7,7 +7,21 @@ pub struct BuiltInModelCatalogItem {
     pub max_tokens: i32,
 }
 
-const BUILT_IN_MODEL_CATALOG: [BuiltInModelCatalogItem; 12] = [
+const BUILT_IN_MODEL_CATALOG: [BuiltInModelCatalogItem; 14] = [
+    BuiltInModelCatalogItem {
+        api_id: "claude-opus-4-8",
+        policy_id: "claude-opus-4.8",
+        display_name: "Claude Opus 4.8",
+        created: 1780012800,
+        max_tokens: 64000,
+    },
+    BuiltInModelCatalogItem {
+        api_id: "claude-opus-4-8-thinking",
+        policy_id: "claude-opus-4.8-thinking",
+        display_name: "Claude Opus 4.8 (Thinking)",
+        created: 1780012800,
+        max_tokens: 64000,
+    },
     BuiltInModelCatalogItem {
         api_id: "claude-opus-4-7",
         policy_id: "claude-opus-4.7",

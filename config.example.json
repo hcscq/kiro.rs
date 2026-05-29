@@ -58,11 +58,13 @@
         "claude-sonnet-4.6"
       ],
       "blockedModels": [
+        "claude-opus-4.8",
         "claude-opus-4.7"
       ]
     },
     "pro-plus": {
       "allowedModels": [
+        "claude-opus-4.8",
         "claude-opus-4.7"
       ]
     }

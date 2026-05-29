@@ -1973,7 +1973,7 @@ fn decode_non_stream_message(
 
 /// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
 ///
-/// - Opus 4.7：覆写为 adaptive 类型，并默认显示 summarized thinking
+/// - Opus 4.7/4.8：覆写为 adaptive 类型，并默认显示 summarized thinking
 /// - 其他模型：覆写为 enabled 类型
 /// - budget_tokens 固定为 20000
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
@@ -1982,9 +1982,13 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         return;
     }
 
-    let is_opus_4_7 = is_opus_4_7_model(&payload.model);
+    let is_adaptive_opus = is_adaptive_opus_model(&payload.model);
 
-    let thinking_type = if is_opus_4_7 { "adaptive" } else { "enabled" };
+    let thinking_type = if is_adaptive_opus {
+        "adaptive"
+    } else {
+        "enabled"
+    };
 
     tracing::info!(
         model = %payload.model,
@@ -1994,7 +1998,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
 
     payload.thinking = Some(Thinking {
         thinking_type: thinking_type.to_string(),
-        display: if is_opus_4_7 {
+        display: if is_adaptive_opus {
             Some("summarized".to_string())
         } else {
             None
@@ -2002,7 +2006,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         budget_tokens: 20000,
     });
 
-    if is_opus_4_7 {
+    if is_adaptive_opus {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
             format: None,
@@ -2010,9 +2014,13 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     }
 }
 
-fn is_opus_4_7_model(model: &str) -> bool {
+fn is_adaptive_opus_model(model: &str) -> bool {
     let model_lower = model.to_lowercase();
-    model_lower.contains("opus") && (model_lower.contains("4-7") || model_lower.contains("4.7"))
+    model_lower.contains("opus")
+        && (model_lower.contains("4-8")
+            || model_lower.contains("4.8")
+            || model_lower.contains("4-7")
+            || model_lower.contains("4.7"))
 }
 
 fn system_contains_thinking_tags(system: Option<&Vec<super::types::SystemMessage>>) -> bool {
@@ -2696,7 +2704,7 @@ mod tests {
     use super::{
         ANTHROPIC_RUNTIME_LEADER_REQUIRED_HEADER, NonStreamMessageResponse,
         coerce_structured_response, decode_non_stream_message, finalize_stream_events,
-        is_opus_4_7_model, map_provider_error, override_thinking_from_model_name,
+        is_adaptive_opus_model, map_provider_error, override_thinking_from_model_name,
         prepare_stream_events_for_emit, request_thinking_enabled,
         should_synthesize_hidden_thinking_signature_for_request,
         validate_thinking_signature_payload,
@@ -2924,15 +2932,17 @@ mod tests {
     }
 
     #[test]
-    fn test_is_opus_4_7_model_accepts_direct_and_bedrock_ids() {
-        assert!(is_opus_4_7_model("claude-opus-4-7"));
-        assert!(is_opus_4_7_model("us.anthropic.claude-opus-4-7-v1"));
-        assert!(!is_opus_4_7_model("claude-opus-4-6"));
+    fn test_is_adaptive_opus_model_accepts_direct_and_bedrock_ids() {
+        assert!(is_adaptive_opus_model("claude-opus-4-7"));
+        assert!(is_adaptive_opus_model("us.anthropic.claude-opus-4-7-v1"));
+        assert!(is_adaptive_opus_model("claude-opus-4-8"));
+        assert!(is_adaptive_opus_model("us.anthropic.claude-opus-4-8-v1"));
+        assert!(!is_adaptive_opus_model("claude-opus-4-6"));
     }
 
     #[test]
-    fn test_override_thinking_from_model_name_uses_adaptive_for_opus_4_7() {
-        let mut payload = base_request("claude-opus-4-7-thinking");
+    fn test_override_thinking_from_model_name_uses_adaptive_for_opus_4_8() {
+        let mut payload = base_request("claude-opus-4-8-thinking");
 
         override_thinking_from_model_name(&mut payload);
 

@@ -720,7 +720,7 @@ export function ModelPoliciesPage() {
                 onChange={(e) => setModelCapabilitiesJson(e.target.value)}
                 spellCheck={false}
                 className="flex min-h-[280px] w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
-                placeholder={`{\n  "power": {\n    "allowedModels": ["claude-opus-4.6"],\n    "blockedModels": ["claude-opus-4.7"]\n  }\n}`}
+                placeholder={`{\n  "power": {\n    "allowedModels": ["claude-opus-4.6"],\n    "blockedModels": ["claude-opus-4.8", "claude-opus-4.7"]\n  }\n}`}
               />
               <p className="text-xs text-muted-foreground">
                 适合批量粘贴或紧急修正；保存成功后，可视化表单会自动同步最新结果。

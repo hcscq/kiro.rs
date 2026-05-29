@@ -1622,7 +1622,11 @@ impl MultiTokenManager {
             return ModelRequirement::Any;
         };
 
-        if model.contains("claude-opus-4.7") || model.contains("claude-opus-4-7") {
+        if model.contains("claude-opus-4.8")
+            || model.contains("claude-opus-4-8")
+            || model.contains("claude-opus-4.7")
+            || model.contains("claude-opus-4-7")
+        {
             ModelRequirement::RealOpus47
         } else if model.contains("opus") {
             ModelRequirement::PaidOpus
@@ -5248,10 +5252,10 @@ impl MultiTokenManager {
         result
     }
 
-    /// 当真实 Opus 4.7 在某个凭据上出现明确慢启动时，仅对该模型族做短暂运行时限制。
+    /// 当真实 Opus 4.7/4.8 在某个凭据上出现明确慢启动时，仅对该模型族做短暂运行时限制。
     ///
     /// 该路径不会设置账号级限流冷却；并且写入前必须确认目标凭据以外仍有至少一个
-    /// 已启用且当前支持该模型的候选，避免特殊情况下把整个 4.7 候选池全部打入冷却。
+    /// 已启用且当前支持该模型的候选，避免特殊情况下把整个高阶 Opus 候选池全部打入冷却。
     pub fn defer_slow_model_credential(
         &self,
         id: u64,
@@ -5327,7 +5331,7 @@ impl MultiTokenManager {
                     model = %model_label,
                     reason,
                     cooldown_ms,
-                    "跳过慢模型运行时限制：没有其他可用 4.7 候选，避免全池冷却"
+                    "跳过慢模型运行时限制：没有其他可用高阶 Opus 候选，避免全池冷却"
                 );
                 return false;
             };
@@ -5359,7 +5363,7 @@ impl MultiTokenManager {
                     reason,
                     cooldown_ms,
                     restriction_changed,
-                    "凭据触发慢模型运行时限制，已切换到其他 4.7 候选"
+                    "凭据触发慢模型运行时限制，已切换到其他高阶 Opus 候选"
                 );
             } else {
                 tracing::warn!(
@@ -7872,6 +7876,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_real_opus_4_8_uses_high_tier_opus_candidate_policy() {
+        let config = Config::default();
+        let mut power = available_credential(0);
+        power.subscription_title = Some("KIRO POWER".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![power], None, None, false).unwrap();
+
+        let ctx = manager
+            .acquire_context(Some("claude-opus-4.8"))
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 1);
+    }
+
+    #[tokio::test]
     async fn test_model_unsupported_restriction_does_not_cool_down_account_for_other_models() {
         let mut config = Config::default();
         config.model_cooldown_enabled = true;
@@ -7904,6 +7923,26 @@ mod tests {
             .await
             .expect("其他合法模型不应被前一个 INVALID_MODEL_ID 拖住");
         assert_eq!(ctx.id, 1);
+    }
+
+    #[tokio::test]
+    async fn test_model_unsupported_restriction_for_opus_4_8_is_model_family_scoped() {
+        let mut config = Config::default();
+        config.model_cooldown_enabled = true;
+        let mut cred = available_credential(0);
+        cred.subscription_title = Some("KIRO PRO+".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        assert!(!manager.defer_model_unsupported_credential(1, "claude-opus-4.8"));
+        assert!(
+            !manager.supports_model("claude-opus-4-8"),
+            "被上游拒绝的 4.8 模型族应被运行时屏蔽"
+        );
+        assert!(
+            manager.supports_model("claude-opus-4-7"),
+            "4.8 运行时限制不应影响 4.7 模型族"
+        );
     }
 
     #[tokio::test]

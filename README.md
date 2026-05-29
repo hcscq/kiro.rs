@@ -641,6 +641,8 @@ RUST_LOG=debug ./target/release/kiro-rs
 |----------------|-----------|
 | `*sonnet*` | `claude-sonnet-4.5` |
 | `*opus*`（含 4.5/4-5） | `claude-opus-4.5` |
+| `*opus*`（含 4.8/4-8） | `claude-opus-4.8` |
+| `*opus*`（含 4.7/4-7） | `claude-opus-4.7` |
 | `*opus*`（其他） | `claude-opus-4.6` |
 | `*haiku*` | `claude-haiku-4.5` |
 
