@@ -1247,11 +1247,18 @@ fn create_sse_stream(
                             }
 
                             let mut events = Vec::new();
+                            let mut observed_non_error_event = false;
                             loop {
                                 match decoder.decode() {
                                     Ok(Some(frame)) => {
                                         match Event::from_frame(frame.clone()) {
                                             Ok(event) => {
+                                                if !matches!(
+                                                    &event,
+                                                    Event::Error { .. } | Event::Exception { .. }
+                                                ) {
+                                                    observed_non_error_event = true;
+                                                }
                                                 let sse_events = ctx.process_kiro_event(&event);
                                                 events.extend(sse_events);
                                             }
@@ -1286,9 +1293,13 @@ fn create_sse_stream(
                                 &mut ctx,
                                 &mut message_started,
                                 events,
+                                observed_non_error_event,
                             );
                             let next_can_ping = can_ping
-                                || events.iter().any(|event| event.event == "content_block_start");
+                                || events.iter().any(|event| {
+                                    event.event == "message_start"
+                                        || event.event == "content_block_start"
+                                });
 
                             // 转换为 SSE 字节流
                             let bytes: Vec<Result<Bytes, Infallible>> = events
@@ -1336,9 +1347,10 @@ fn prepare_stream_events_for_emit(
     ctx: &mut StreamContext,
     message_started: &mut bool,
     mut events: Vec<SseEvent>,
+    observed_non_error_event: bool,
 ) -> Vec<SseEvent> {
-    let should_start_message =
-        !*message_started && (ctx.context_input_tokens.is_some() || !events.is_empty());
+    let should_start_message = !*message_started
+        && (ctx.context_input_tokens.is_some() || !events.is_empty() || observed_non_error_event);
     if !*message_started && !should_start_message {
         return Vec::new();
     }
@@ -2771,7 +2783,7 @@ mod tests {
             context_usage_percentage: 82.5,
         }));
         let emitted =
-            prepare_stream_events_for_emit(&mut ctx, &mut message_started, context_events);
+            prepare_stream_events_for_emit(&mut ctx, &mut message_started, context_events, true);
 
         assert!(message_started);
         assert_eq!(emitted.len(), 1);
@@ -2790,13 +2802,41 @@ mod tests {
         )];
 
         let emitted =
-            prepare_stream_events_for_emit(&mut ctx, &mut message_started, content_events);
+            prepare_stream_events_for_emit(&mut ctx, &mut message_started, content_events, false);
 
         assert!(message_started);
         assert_eq!(emitted.len(), 2);
         assert_eq!(emitted[0].event, "message_start");
         assert_eq!(emitted[1].event, "content_block_start");
         assert_eq!(emitted[0].data["message"]["usage"]["input_tokens"], 123);
+    }
+
+    #[test]
+    fn delayed_stream_start_flushes_for_metadata_only_activity() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-7", 123, true, HashMap::new());
+        let mut message_started = false;
+
+        let emitted =
+            prepare_stream_events_for_emit(&mut ctx, &mut message_started, Vec::new(), true);
+
+        assert!(message_started);
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].event, "message_start");
+        assert_eq!(emitted[0].data["message"]["usage"]["input_tokens"], 123);
+    }
+
+    #[test]
+    fn delayed_stream_start_still_waits_without_upstream_activity() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-7", 123, true, HashMap::new());
+        let mut message_started = false;
+
+        let emitted =
+            prepare_stream_events_for_emit(&mut ctx, &mut message_started, Vec::new(), false);
+
+        assert!(!message_started);
+        assert!(emitted.is_empty());
     }
 
     #[test]
