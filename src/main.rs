@@ -453,6 +453,9 @@ async fn ready_handler(
     let snapshot = health.readiness_snapshot();
     let draining = health.is_draining() || drain_file_present();
     let conversion = conversion_runtime.stats();
+    let conversion_metrics = conversion.metrics;
+    let conversion_wait_ms = conversion_metrics.wait_ms;
+    let conversion_convert_ms = conversion_metrics.convert_ms;
     let conversion_saturated = conversion.is_saturated();
     let ready = !draining && snapshot.total > 0;
     let status = if ready {
@@ -475,12 +478,46 @@ async fn ready_handler(
             "credentials_total": snapshot.total,
             "credentials_available": snapshot.available,
             "credentials_dispatchable": snapshot.dispatchable,
+            "conversion_max_permits": conversion.max_concurrent,
             "conversion_available_permits": conversion.available_permits,
+            "conversion_used_permits": conversion.used_permits,
             "conversion_max_concurrent": conversion.max_concurrent,
+            "conversion_in_flight": conversion.in_flight,
+            "conversion_in_flight_weight": conversion.in_flight_weight,
             "conversion_waiting": conversion.waiting,
+            "conversion_waiting_weight": conversion.waiting_weight,
             "conversion_max_queue": conversion.max_queue,
+            "conversion_max_queue_weight": conversion.max_queue_weight,
             "conversion_queue_wait_ms": conversion.queue_wait_ms,
+            "conversion_max_request_weight": conversion.max_request_weight,
             "conversion_status": if conversion_saturated { "saturated" } else { "available" },
+            "conversion_metrics": {
+                "accepted_total": conversion_metrics.accepted_total,
+                "completed_total": conversion_metrics.completed_total,
+                "queue_full_total": conversion_metrics.queue_full_total,
+                "wait_timeout_total": conversion_metrics.wait_timeout_total,
+                "worker_join_error_total": conversion_metrics.worker_join_error_total,
+                "conversion_error_total": conversion_metrics.conversion_error_total,
+                "max_observed_waiting": conversion_metrics.max_observed_waiting,
+                "max_observed_waiting_weight": conversion_metrics.max_observed_waiting_weight,
+                "max_observed_request_weight": conversion_metrics.max_observed_request_weight,
+                "wait_ms": {
+                    "le_1": conversion_wait_ms.le_1_ms,
+                    "le_10": conversion_wait_ms.le_10_ms,
+                    "le_100": conversion_wait_ms.le_100_ms,
+                    "le_1000": conversion_wait_ms.le_1000_ms,
+                    "le_5000": conversion_wait_ms.le_5000_ms,
+                    "gt_5000": conversion_wait_ms.gt_5000_ms,
+                },
+                "convert_ms": {
+                    "le_1": conversion_convert_ms.le_1_ms,
+                    "le_10": conversion_convert_ms.le_10_ms,
+                    "le_100": conversion_convert_ms.le_100_ms,
+                    "le_1000": conversion_convert_ms.le_1000_ms,
+                    "le_5000": conversion_convert_ms.le_5000_ms,
+                    "gt_5000": conversion_convert_ms.gt_5000_ms,
+                },
+            },
             "readiness_source": "cached",
         })),
     )
@@ -688,8 +725,10 @@ async fn main() {
     tracing::info!(
         max_concurrent = conversion_stats.max_concurrent,
         max_queue = conversion_stats.max_queue,
+        max_queue_weight = conversion_stats.max_queue_weight,
         queue_wait_ms = conversion_stats.queue_wait_ms,
-        "已启用 Anthropic 请求转换 blocking 运行池"
+        max_request_weight = conversion_stats.max_request_weight,
+        "已启用 Anthropic 请求转换加权 blocking 运行池"
     );
 
     if state_store.runtime_coordination_enabled() {

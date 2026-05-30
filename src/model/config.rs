@@ -261,8 +261,14 @@ pub struct ConversionRuntimeConfig {
     #[serde(default = "default_conversion_max_queue")]
     pub max_queue: usize,
 
+    #[serde(default = "default_conversion_max_queue_weight")]
+    pub max_queue_weight: usize,
+
     #[serde(default = "default_conversion_queue_wait_ms")]
     pub queue_wait_ms: u64,
+
+    #[serde(default = "default_conversion_max_request_weight")]
+    pub max_request_weight: usize,
 }
 
 impl Default for ConversionRuntimeConfig {
@@ -270,7 +276,9 @@ impl Default for ConversionRuntimeConfig {
         Self {
             max_concurrent: default_conversion_max_concurrent(),
             max_queue: default_conversion_max_queue(),
+            max_queue_weight: default_conversion_max_queue_weight(),
             queue_wait_ms: default_conversion_queue_wait_ms(),
+            max_request_weight: default_conversion_max_request_weight(),
         }
     }
 }
@@ -279,6 +287,9 @@ impl ConversionRuntimeConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.max_concurrent == 0 {
             anyhow::bail!("conversionRuntime.maxConcurrent 必须大于 0");
+        }
+        if self.max_request_weight == 0 {
+            anyhow::bail!("conversionRuntime.maxRequestWeight 必须大于 0");
         }
         if self.max_queue > 0 && self.queue_wait_ms == 0 {
             anyhow::bail!(
@@ -802,15 +813,23 @@ fn default_stream_pre_sse_min_remaining_ms() -> u64 {
 }
 
 fn default_conversion_max_concurrent() -> usize {
-    4
+    16
 }
 
 fn default_conversion_max_queue() -> usize {
-    32
+    64
+}
+
+fn default_conversion_max_queue_weight() -> usize {
+    128
 }
 
 fn default_conversion_queue_wait_ms() -> u64 {
     60_000
+}
+
+fn default_conversion_max_request_weight() -> usize {
+    8
 }
 
 impl Default for Config {
@@ -1220,9 +1239,11 @@ mod tests {
         assert!((config.rate_limit_refill_backoff_factor - 0.75).abs() < f64::EPSILON);
         assert!((config.request_weighting.max_weight - 2.5).abs() < f64::EPSILON);
         assert!((config.request_weighting.tools_bonus - 0.4).abs() < f64::EPSILON);
-        assert_eq!(config.conversion_runtime.max_concurrent, 4);
-        assert_eq!(config.conversion_runtime.max_queue, 32);
+        assert_eq!(config.conversion_runtime.max_concurrent, 16);
+        assert_eq!(config.conversion_runtime.max_queue, 64);
+        assert_eq!(config.conversion_runtime.max_queue_weight, 128);
         assert_eq!(config.conversion_runtime.queue_wait_ms, 60_000);
+        assert_eq!(config.conversion_runtime.max_request_weight, 8);
     }
 
     #[test]

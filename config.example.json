@@ -51,9 +51,11 @@
     "heavyThinkingBudgetBonus": 0.35
   },
   "conversionRuntime": {
-    "maxConcurrent": 4,
-    "maxQueue": 32,
-    "queueWaitMs": 60000
+    "maxConcurrent": 16,
+    "maxQueue": 64,
+    "maxQueueWeight": 128,
+    "queueWaitMs": 60000,
+    "maxRequestWeight": 8
   },
   "thinkingSignatureValidationMode": "strict",
   "responseThinkingSignatureCompatEnabled": false,

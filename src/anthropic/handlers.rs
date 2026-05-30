@@ -119,8 +119,9 @@ async fn convert_request_on_runtime(
     probe: UpstreamProbe,
     request_id: Option<&str>,
     route: &str,
+    body_bytes: Option<usize>,
 ) -> Result<ConversionResult, Response> {
-    match conversion_runtime.convert(payload, probe).await {
+    match conversion_runtime.convert(payload, probe, body_bytes).await {
         Ok(result) => Ok(result),
         Err(err) => Err(conversion_runtime_error_response(err, request_id, route)),
     }
@@ -152,16 +153,25 @@ fn conversion_runtime_error_response(
             )
                 .into_response()
         }
-        ConversionRuntimeError::QueueFull(stats) => {
+        ConversionRuntimeError::QueueFull { stats, workload } => {
             if let Some(request_id) = request_id {
                 tracing::warn!(
                     request_id = %request_id,
                     route,
                     max_concurrent = stats.max_concurrent,
                     available_permits = stats.available_permits,
+                    used_permits = stats.used_permits,
                     waiting = stats.waiting,
+                    waiting_weight = stats.waiting_weight,
                     max_queue = stats.max_queue,
+                    max_queue_weight = stats.max_queue_weight,
                     queue_wait_ms = stats.queue_wait_ms,
+                    request_weight = workload.weight,
+                    body_bytes = workload.body_bytes,
+                    message_count = workload.message_count,
+                    image_count = workload.image_count,
+                    document_count = workload.document_count,
+                    source_data_bytes = workload.source_data_bytes,
                     "转换运行池队列已满，拒绝请求并要求客户端重试"
                 );
             } else {
@@ -169,24 +179,42 @@ fn conversion_runtime_error_response(
                     route,
                     max_concurrent = stats.max_concurrent,
                     available_permits = stats.available_permits,
+                    used_permits = stats.used_permits,
                     waiting = stats.waiting,
+                    waiting_weight = stats.waiting_weight,
                     max_queue = stats.max_queue,
+                    max_queue_weight = stats.max_queue_weight,
                     queue_wait_ms = stats.queue_wait_ms,
+                    request_weight = workload.weight,
+                    body_bytes = workload.body_bytes,
+                    message_count = workload.message_count,
+                    image_count = workload.image_count,
+                    document_count = workload.document_count,
+                    source_data_bytes = workload.source_data_bytes,
                     "转换运行池队列已满，拒绝请求并要求客户端重试"
                 );
             }
             conversion_overloaded_response("conversion_queue_full")
         }
-        ConversionRuntimeError::WaitTimeout(stats) => {
+        ConversionRuntimeError::WaitTimeout { stats, workload } => {
             if let Some(request_id) = request_id {
                 tracing::warn!(
                     request_id = %request_id,
                     route,
                     max_concurrent = stats.max_concurrent,
                     available_permits = stats.available_permits,
+                    used_permits = stats.used_permits,
                     waiting = stats.waiting,
+                    waiting_weight = stats.waiting_weight,
                     max_queue = stats.max_queue,
+                    max_queue_weight = stats.max_queue_weight,
                     queue_wait_ms = stats.queue_wait_ms,
+                    request_weight = workload.weight,
+                    body_bytes = workload.body_bytes,
+                    message_count = workload.message_count,
+                    image_count = workload.image_count,
+                    document_count = workload.document_count,
+                    source_data_bytes = workload.source_data_bytes,
                     "转换运行池等待超时，拒绝请求并要求客户端重试"
                 );
             } else {
@@ -194,24 +222,22 @@ fn conversion_runtime_error_response(
                     route,
                     max_concurrent = stats.max_concurrent,
                     available_permits = stats.available_permits,
+                    used_permits = stats.used_permits,
                     waiting = stats.waiting,
+                    waiting_weight = stats.waiting_weight,
                     max_queue = stats.max_queue,
+                    max_queue_weight = stats.max_queue_weight,
                     queue_wait_ms = stats.queue_wait_ms,
+                    request_weight = workload.weight,
+                    body_bytes = workload.body_bytes,
+                    message_count = workload.message_count,
+                    image_count = workload.image_count,
+                    document_count = workload.document_count,
+                    source_data_bytes = workload.source_data_bytes,
                     "转换运行池等待超时，拒绝请求并要求客户端重试"
                 );
             }
             conversion_overloaded_response("conversion_queue_timeout")
-        }
-        ConversionRuntimeError::WorkerClosed => {
-            tracing::error!(route, request_id = ?request_id, "转换运行池已关闭");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    "internal_error",
-                    "conversion worker closed",
-                )),
-            )
-                .into_response()
         }
         ConversionRuntimeError::WorkerJoin(message) => {
             tracing::error!(route, request_id = ?request_id, error = %message, "转换 blocking worker 失败");
@@ -1022,6 +1048,7 @@ pub async fn post_messages(
         probe.clone(),
         Some(&request_id),
         "messages",
+        Some(body_bytes),
     )
     .await
     {
@@ -1517,6 +1544,7 @@ pub(crate) async fn execute_non_stream_round(
         probe.clone(),
         request_id.as_deref(),
         "non_stream_round",
+        None,
     )
     .await?;
 
@@ -2498,6 +2526,7 @@ pub async fn post_messages_cc(
         probe.clone(),
         Some(&request_id),
         "cc_messages",
+        Some(body_bytes),
     )
     .await
     {
