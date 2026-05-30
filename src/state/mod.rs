@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use crate::admin::types::BalanceResponse;
 use crate::kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use crate::model::config::{
-    Config, RequestWeightingConfig, StateBackendKind, StreamPreSseFailoverConfig,
-    ThinkingSignatureValidationMode,
+    Config, NonStreamBodyReadTimeoutConfig, RequestWeightingConfig, StateBackendKind,
+    StreamPreSseFailoverConfig, ThinkingSignatureValidationMode,
 };
 use crate::model::model_policy::{
     AccountTypeDispatchPolicy, ModelSupportPolicy, normalize_account_type_dispatch_policies,
@@ -849,6 +849,8 @@ pub struct PersistedDispatchConfig {
     #[serde(default)]
     pub stream_pre_sse_failover: StreamPreSseFailoverConfig,
     #[serde(default)]
+    pub non_stream_body_read_timeout: NonStreamBodyReadTimeoutConfig,
+    #[serde(default)]
     pub thinking_signature_validation_mode: ThinkingSignatureValidationMode,
     #[serde(default)]
     pub response_thinking_signature_compat_enabled: bool,
@@ -953,6 +955,7 @@ impl PersistedDispatchConfig {
             rate_limit_refill_backoff_factor: config.rate_limit_refill_backoff_factor,
             request_weighting: config.request_weighting.clone(),
             stream_pre_sse_failover: config.stream_pre_sse_failover.clone(),
+            non_stream_body_read_timeout: config.non_stream_body_read_timeout.clone(),
             thinking_signature_validation_mode: config.thinking_signature_validation_mode,
             response_thinking_signature_compat_enabled: config
                 .response_thinking_signature_compat_enabled,
@@ -993,6 +996,7 @@ impl PersistedDispatchConfig {
         config.rate_limit_refill_backoff_factor = self.rate_limit_refill_backoff_factor;
         config.request_weighting = self.request_weighting.clone();
         config.stream_pre_sse_failover = self.stream_pre_sse_failover.clone();
+        config.non_stream_body_read_timeout = self.non_stream_body_read_timeout.clone();
         config.thinking_signature_validation_mode = self.thinking_signature_validation_mode;
         config.response_thinking_signature_compat_enabled =
             self.response_thinking_signature_compat_enabled;
@@ -3616,6 +3620,7 @@ mod tests {
                 ..RequestWeightingConfig::default()
             },
             stream_pre_sse_failover: StreamPreSseFailoverConfig::default(),
+            non_stream_body_read_timeout: NonStreamBodyReadTimeoutConfig::default(),
             thinking_signature_validation_mode: ThinkingSignatureValidationMode::StripInvalid,
             response_thinking_signature_compat_enabled: true,
             account_type_policies: BTreeMap::new(),

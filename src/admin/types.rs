@@ -3,7 +3,8 @@
 use std::collections::BTreeMap;
 
 use crate::model::config::{
-    RequestWeightingConfig, StreamPreSseFailoverConfig, ThinkingSignatureValidationMode,
+    NonStreamBodyReadTimeoutConfig, RequestWeightingConfig, StreamPreSseFailoverConfig,
+    ThinkingSignatureValidationMode,
 };
 use crate::model::model_policy::{
     AccountTypeDispatchPolicy, ModelSupportPolicy, RuntimeModelRestriction,
@@ -409,6 +410,8 @@ pub struct LoadBalancingModeResponse {
     pub request_weighting: RequestWeightingConfig,
     /// 流式请求上游响应头前的自适应故障转移策略
     pub stream_pre_sse_failover: StreamPreSseFailoverConfig,
+    /// 非流式请求上游响应体读取超时策略
+    pub non_stream_body_read_timeout: NonStreamBodyReadTimeoutConfig,
     /// 历史 thinking signature 的本地校验策略
     pub thinking_signature_validation_mode: ThinkingSignatureValidationMode,
     /// 响应侧隐藏 thinking signature 兼容补齐开关
@@ -469,6 +472,8 @@ pub struct SetLoadBalancingModeRequest {
     pub request_weighting: Option<RequestWeightingConfig>,
     /// 流式请求上游响应头前的自适应故障转移策略
     pub stream_pre_sse_failover: Option<StreamPreSseFailoverConfig>,
+    /// 非流式请求上游响应体读取超时策略
+    pub non_stream_body_read_timeout: Option<NonStreamBodyReadTimeoutConfig>,
     /// 历史 thinking signature 的本地校验策略
     pub thinking_signature_validation_mode: Option<ThinkingSignatureValidationMode>,
     /// 响应侧隐藏 thinking signature 兼容补齐开关

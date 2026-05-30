@@ -1121,6 +1121,7 @@ mod tests {
                 ..RequestWeightingConfig::default()
             },
             stream_pre_sse_failover: StreamPreSseFailoverConfig::default(),
+            non_stream_body_read_timeout: Default::default(),
             thinking_signature_validation_mode: ThinkingSignatureValidationMode::WarnOnly,
             response_thinking_signature_compat_enabled: true,
             account_type_policies: std::collections::BTreeMap::new(),

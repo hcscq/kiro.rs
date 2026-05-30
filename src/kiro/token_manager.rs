@@ -26,7 +26,8 @@ use crate::kiro::model::token_refresh::{
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::{
-    Config, RequestWeightingConfig, StreamPreSseFailoverConfig, ThinkingSignatureValidationMode,
+    Config, NonStreamBodyReadTimeoutConfig, RequestWeightingConfig, StreamPreSseFailoverConfig,
+    ThinkingSignatureValidationMode,
 };
 use crate::model::model_policy::{
     AccountTypeDispatchPolicy, ModelSupportPolicy, normalize_account_type_dispatch_policies,
@@ -876,6 +877,7 @@ pub struct LoadBalancingConfigSnapshot {
     pub rate_limit_refill_backoff_factor: f64,
     pub request_weighting: RequestWeightingConfig,
     pub stream_pre_sse_failover: StreamPreSseFailoverConfig,
+    pub non_stream_body_read_timeout: NonStreamBodyReadTimeoutConfig,
     pub thinking_signature_validation_mode: ThinkingSignatureValidationMode,
     pub response_thinking_signature_compat_enabled: bool,
     pub waiting_requests: usize,
@@ -914,6 +916,7 @@ struct DispatchConfig {
     rate_limit_refill_backoff_factor: f64,
     request_weighting: RequestWeightingConfig,
     stream_pre_sse_failover: StreamPreSseFailoverConfig,
+    non_stream_body_read_timeout: NonStreamBodyReadTimeoutConfig,
     thinking_signature_validation_mode: ThinkingSignatureValidationMode,
     response_thinking_signature_compat_enabled: bool,
     account_type_policies: BTreeMap<String, ModelSupportPolicy>,
@@ -985,6 +988,7 @@ impl DispatchConfig {
             ),
             request_weighting: config.request_weighting.clone(),
             stream_pre_sse_failover: config.stream_pre_sse_failover.clone(),
+            non_stream_body_read_timeout: config.non_stream_body_read_timeout.clone(),
             thinking_signature_validation_mode: config.thinking_signature_validation_mode,
             response_thinking_signature_compat_enabled: config
                 .response_thinking_signature_compat_enabled,
@@ -6834,6 +6838,7 @@ impl MultiTokenManager {
             rate_limit_refill_backoff_factor: dispatch.rate_limit_refill_backoff_factor,
             request_weighting: dispatch.request_weighting.clone(),
             stream_pre_sse_failover: dispatch.stream_pre_sse_failover.clone(),
+            non_stream_body_read_timeout: dispatch.non_stream_body_read_timeout.clone(),
             thinking_signature_validation_mode: dispatch.thinking_signature_validation_mode,
             response_thinking_signature_compat_enabled: dispatch
                 .response_thinking_signature_compat_enabled,
@@ -6867,6 +6872,10 @@ impl MultiTokenManager {
 
     pub fn stream_pre_sse_failover_config_snapshot(&self) -> StreamPreSseFailoverConfig {
         self.dispatch_config().stream_pre_sse_failover
+    }
+
+    pub fn non_stream_body_read_timeout_config_snapshot(&self) -> NonStreamBodyReadTimeoutConfig {
+        self.dispatch_config().non_stream_body_read_timeout
     }
 
     pub fn thinking_signature_validation_mode(&self) -> ThinkingSignatureValidationMode {
@@ -6918,6 +6927,7 @@ impl MultiTokenManager {
                 rate_limit_refill_backoff_factor: dispatch.rate_limit_refill_backoff_factor,
                 request_weighting: dispatch.request_weighting.clone(),
                 stream_pre_sse_failover: dispatch.stream_pre_sse_failover.clone(),
+                non_stream_body_read_timeout: dispatch.non_stream_body_read_timeout.clone(),
                 thinking_signature_validation_mode: dispatch.thinking_signature_validation_mode,
                 response_thinking_signature_compat_enabled: dispatch
                     .response_thinking_signature_compat_enabled,
@@ -6932,6 +6942,7 @@ impl MultiTokenManager {
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
         self.set_load_balancing_config(
             Some(mode),
+            None,
             None,
             None,
             None,
@@ -7038,6 +7049,7 @@ impl MultiTokenManager {
         rate_limit_refill_backoff_factor: Option<f64>,
         request_weighting: Option<RequestWeightingConfig>,
         stream_pre_sse_failover: Option<StreamPreSseFailoverConfig>,
+        non_stream_body_read_timeout: Option<NonStreamBodyReadTimeoutConfig>,
         session_affinity_enabled: Option<bool>,
         thinking_signature_validation_mode: Option<ThinkingSignatureValidationMode>,
         response_thinking_signature_compat_enabled: Option<bool>,
@@ -7140,6 +7152,9 @@ impl MultiTokenManager {
         if let Some(stream_pre_sse_failover) = stream_pre_sse_failover {
             next.stream_pre_sse_failover = stream_pre_sse_failover;
         }
+        if let Some(non_stream_body_read_timeout) = non_stream_body_read_timeout {
+            next.non_stream_body_read_timeout = non_stream_body_read_timeout;
+        }
         if let Some(session_affinity_enabled) = session_affinity_enabled {
             next.session_affinity_enabled = session_affinity_enabled;
         }
@@ -7171,6 +7186,7 @@ impl MultiTokenManager {
 
         Self::validate_dispatch_rate_limit_config(&next)?;
         next.stream_pre_sse_failover.validate()?;
+        next.non_stream_body_read_timeout.validate()?;
 
         if previous == next {
             return Ok(());
@@ -9187,6 +9203,7 @@ mod tests {
                 ..RequestWeightingConfig::default()
             },
             stream_pre_sse_failover: StreamPreSseFailoverConfig::default(),
+            non_stream_body_read_timeout: NonStreamBodyReadTimeoutConfig::default(),
             thinking_signature_validation_mode: ThinkingSignatureValidationMode::WarnOnly,
             response_thinking_signature_compat_enabled: true,
             account_type_policies: BTreeMap::new(),
@@ -9362,6 +9379,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap_err()
             .to_string();
@@ -9417,6 +9435,11 @@ mod tests {
                     ..RequestWeightingConfig::default()
                 }),
                 Some(StreamPreSseFailoverConfig::default()),
+                Some(NonStreamBodyReadTimeoutConfig {
+                    timeout_ms: 510_000,
+                    retry_on_timeout: true,
+                    ..NonStreamBodyReadTimeoutConfig::default()
+                }),
                 Some(true),
                 Some(ThinkingSignatureValidationMode::StripInvalid),
                 Some(true),
@@ -9458,6 +9481,8 @@ mod tests {
             persisted.thinking_signature_validation_mode,
             ThinkingSignatureValidationMode::StripInvalid
         );
+        assert_eq!(persisted.non_stream_body_read_timeout.timeout_ms, 510_000);
+        assert!(persisted.non_stream_body_read_timeout.retry_on_timeout);
         assert!(persisted.response_thinking_signature_compat_enabled);
         assert_eq!(
             manager.thinking_signature_validation_mode(),
@@ -9510,6 +9535,7 @@ mod tests {
                 None,
                 None,
                 Some(false),
+                None,
                 None,
                 None,
                 None,

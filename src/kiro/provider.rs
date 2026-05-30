@@ -525,6 +525,34 @@ impl ResponseTrace {
         );
     }
 
+    fn log_body_timeout(&self, partial_body_len: usize, partial_body: &BytesMut, timeout_ms: u64) {
+        let partial_body_prefix_hex = format_body_prefix_hex(partial_body);
+        let partial_body_prefix_text = format_body_prefix_text(partial_body);
+        tracing::warn!(
+            request_id = %self.request_id,
+            api_type = self.api_type,
+            model = self.model_label(),
+            request_body_bytes = self.request_body_bytes,
+            credential_id = self.credential_id,
+            attempt = self.attempt,
+            max_retries = self.max_retries,
+            region = %self.region,
+            status_code = self.status_code,
+            response_content_type = self.response_content_type.as_deref().unwrap_or("unknown"),
+            response_content_encoding = self.response_content_encoding.as_deref().unwrap_or("unknown"),
+            response_content_length = self.response_content_length.as_deref().unwrap_or("unknown"),
+            response_transfer_encoding = self.response_transfer_encoding.as_deref().unwrap_or("unknown"),
+            partial_body_len,
+            partial_body_prefix_hex = %partial_body_prefix_hex,
+            partial_body_prefix_text = %partial_body_prefix_text,
+            total_elapsed_ms = self.overall_started_at.elapsed().as_millis(),
+            upstream_elapsed_ms = self.upstream_request_started_at.elapsed().as_millis(),
+            body_read_elapsed_ms = self.response_headers_at.elapsed().as_millis(),
+            timeout_ms,
+            "上游响应体读取超时"
+        );
+    }
+
     fn log_first_chunk(&self, chunk_len: usize) {
         let total_elapsed_ms = self.overall_started_at.elapsed().as_millis();
         let first_chunk_wait_ms = self.upstream_request_started_at.elapsed().as_millis();
@@ -705,6 +733,46 @@ async fn read_response_body_with_trace(
     let bytes = buffer.freeze();
     trace.log_body_complete(bytes.len());
     Ok(bytes)
+}
+
+enum ResponseBodyReadFailure {
+    Upstream(reqwest::Error),
+    Timeout { timeout_ms: u64 },
+}
+
+async fn read_response_body_with_trace_timeout(
+    response: reqwest::Response,
+    trace: &ResponseTrace,
+    timeout_ms: u64,
+) -> Result<Bytes, ResponseBodyReadFailure> {
+    let mut body_stream = response.bytes_stream();
+    let mut buffer = BytesMut::new();
+    let timeout_duration = Duration::from_millis(timeout_ms);
+    let started_at = Instant::now();
+
+    loop {
+        let elapsed = started_at.elapsed();
+        if elapsed >= timeout_duration {
+            trace.log_body_timeout(buffer.len(), &buffer, timeout_ms);
+            return Err(ResponseBodyReadFailure::Timeout { timeout_ms });
+        }
+        match timeout(timeout_duration - elapsed, body_stream.next()).await {
+            Ok(Some(Ok(chunk))) => buffer.extend_from_slice(&chunk),
+            Ok(Some(Err(err))) => {
+                trace.log_body_error(buffer.len(), &buffer, &err);
+                return Err(ResponseBodyReadFailure::Upstream(err));
+            }
+            Ok(None) => {
+                let bytes = buffer.freeze();
+                trace.log_body_complete(bytes.len());
+                return Ok(bytes);
+            }
+            Err(_) => {
+                trace.log_body_timeout(buffer.len(), &buffer, timeout_ms);
+                return Err(ResponseBodyReadFailure::Timeout { timeout_ms });
+            }
+        }
+    }
 }
 
 const THINKING_START_TAG: &str = "<thinking>";
@@ -2035,6 +2103,9 @@ impl KiroProvider {
         let mut original_request_body: Option<Bytes> = None;
         let stream_pre_sse_failover_config =
             self.token_manager.stream_pre_sse_failover_config_snapshot();
+        let non_stream_body_read_timeout_config = self
+            .token_manager
+            .non_stream_body_read_timeout_config_snapshot();
 
         // Anthropic handlers already know the mapped Kiro model. Fall back to JSON extraction for
         // direct provider callers so large requests avoid an extra full-body parse on the hot path.
@@ -2541,9 +2612,21 @@ impl KiroProvider {
                 };
 
                 if !is_stream {
-                    let body_bytes = match read_response_body_with_trace(response, &trace).await {
+                    let body_read_result = if non_stream_body_read_timeout_config.enabled {
+                        read_response_body_with_trace_timeout(
+                            response,
+                            &trace,
+                            non_stream_body_read_timeout_config.timeout_ms,
+                        )
+                        .await
+                    } else {
+                        read_response_body_with_trace(response, &trace)
+                            .await
+                            .map_err(ResponseBodyReadFailure::Upstream)
+                    };
+                    let body_bytes = match body_read_result {
                         Ok(bytes) => bytes,
-                        Err(err) => {
+                        Err(ResponseBodyReadFailure::Upstream(err)) => {
                             last_error = Some(anyhow::Error::new(
                                 PublicProviderError::bad_gateway(
                                     format!(
@@ -2564,6 +2647,56 @@ impl KiroProvider {
                                 sleep(Self::retry_delay(attempt)).await;
                             }
                             continue;
+                        }
+                        Err(ResponseBodyReadFailure::Timeout { timeout_ms }) => {
+                            let body_read_elapsed_ms = response_headers_at.elapsed().as_millis();
+                            let will_retry = non_stream_body_read_timeout_config.retry_on_timeout
+                                && attempt + 1 < max_retries;
+                            tracing::warn!(
+                                request_id = %request_id,
+                                api_type,
+                                model = model.as_deref().unwrap_or("unknown"),
+                                credential_id = ctx_id,
+                                attempt = attempt + 1,
+                                max_retries,
+                                region = %region,
+                                request_body_bytes,
+                                status_code = status.as_u16(),
+                                timeout_ms,
+                                body_read_elapsed_ms,
+                                total_elapsed_ms = overall_started_at.elapsed().as_millis(),
+                                retry_on_timeout =
+                                    non_stream_body_read_timeout_config.retry_on_timeout,
+                                will_retry,
+                                "非流式上游响应体读取超时"
+                            );
+                            let timeout_error = anyhow::Error::new(
+                                PublicProviderError::gateway_timeout(
+                                    format!(
+                                        "{} API 响应体读取超时: request_id={} credential_id={} attempt={} status={} timeout_ms={} body_read_elapsed_ms={} total_elapsed_ms={} retry_on_timeout={} will_retry={}",
+                                        api_type,
+                                        request_id,
+                                        ctx_id,
+                                        attempt + 1,
+                                        status.as_u16(),
+                                        timeout_ms,
+                                        body_read_elapsed_ms,
+                                        overall_started_at.elapsed().as_millis(),
+                                        non_stream_body_read_timeout_config.retry_on_timeout,
+                                        will_retry
+                                    ),
+                                    "Upstream response body timed out before a complete non-stream response was received.",
+                                ),
+                            );
+
+                            if will_retry {
+                                last_error = Some(timeout_error);
+                                request_scoped_transient_error_credentials.insert(ctx_id);
+                                sleep(Self::retry_delay(attempt)).await;
+                                continue;
+                            }
+
+                            return Err(timeout_error);
                         }
                     };
                     if body_bytes.is_empty() {

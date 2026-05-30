@@ -254,6 +254,40 @@ impl StreamPreSseFailoverConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct NonStreamBodyReadTimeoutConfig {
+    #[serde(default = "default_non_stream_body_read_timeout_enabled")]
+    pub enabled: bool,
+
+    /// 非流式请求收到上游响应头后，读取完整 body 的最长等待时间。
+    #[serde(default = "default_non_stream_body_read_timeout_ms")]
+    pub timeout_ms: u64,
+
+    /// body 读取超时后是否尝试切换到其他凭据重试。默认关闭，避免大请求被多次长时间占用。
+    #[serde(default = "default_non_stream_body_read_timeout_retry_on_timeout")]
+    pub retry_on_timeout: bool,
+}
+
+impl Default for NonStreamBodyReadTimeoutConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_non_stream_body_read_timeout_enabled(),
+            timeout_ms: default_non_stream_body_read_timeout_ms(),
+            retry_on_timeout: default_non_stream_body_read_timeout_retry_on_timeout(),
+        }
+    }
+}
+
+impl NonStreamBodyReadTimeoutConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.enabled && self.timeout_ms == 0 {
+            anyhow::bail!("nonStreamBodyReadTimeout.timeoutMs 必须大于 0，或关闭 enabled");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct ConversionRuntimeConfig {
     #[serde(default = "default_conversion_max_concurrent")]
     pub max_concurrent: usize,
@@ -568,6 +602,10 @@ pub struct Config {
     #[serde(default)]
     pub stream_pre_sse_failover: StreamPreSseFailoverConfig,
 
+    /// 非流式请求收到上游响应头后读取完整 body 的超时策略。
+    #[serde(default)]
+    pub non_stream_body_read_timeout: NonStreamBodyReadTimeoutConfig,
+
     /// Anthropic -> Kiro 转换与图片处理的本地 blocking 运行池。
     #[serde(default)]
     pub conversion_runtime: ConversionRuntimeConfig,
@@ -812,6 +850,18 @@ fn default_stream_pre_sse_min_remaining_ms() -> u64 {
     15_000
 }
 
+fn default_non_stream_body_read_timeout_enabled() -> bool {
+    true
+}
+
+fn default_non_stream_body_read_timeout_ms() -> u64 {
+    540_000
+}
+
+fn default_non_stream_body_read_timeout_retry_on_timeout() -> bool {
+    false
+}
+
 fn default_conversion_max_concurrent() -> usize {
     16
 }
@@ -895,6 +945,7 @@ impl Default for Config {
             rate_limit_refill_backoff_factor: default_rate_limit_refill_backoff_factor(),
             request_weighting: RequestWeightingConfig::default(),
             stream_pre_sse_failover: StreamPreSseFailoverConfig::default(),
+            non_stream_body_read_timeout: NonStreamBodyReadTimeoutConfig::default(),
             conversion_runtime: ConversionRuntimeConfig::default(),
             thinking_signature_validation_mode: ThinkingSignatureValidationMode::default(),
             response_thinking_signature_compat_enabled: false,
@@ -1031,6 +1082,7 @@ impl Config {
 
         self.request_weighting.validate()?;
         self.stream_pre_sse_failover.validate()?;
+        self.non_stream_body_read_timeout.validate()?;
         self.conversion_runtime.validate()?;
 
         Ok(())
@@ -1244,6 +1296,26 @@ mod tests {
         assert_eq!(config.conversion_runtime.max_queue_weight, 128);
         assert_eq!(config.conversion_runtime.queue_wait_ms, 60_000);
         assert_eq!(config.conversion_runtime.max_request_weight, 8);
+    }
+
+    #[test]
+    fn non_stream_body_read_timeout_defaults_to_guarded_no_retry() {
+        let config = Config::default();
+
+        assert!(config.non_stream_body_read_timeout.enabled);
+        assert_eq!(config.non_stream_body_read_timeout.timeout_ms, 540_000);
+        assert!(!config.non_stream_body_read_timeout.retry_on_timeout);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_enabled_non_stream_body_read_timeout_zero() {
+        let mut config = Config::default();
+        config.non_stream_body_read_timeout.timeout_ms = 0;
+
+        let err = config.validate().unwrap_err().to_string();
+
+        assert!(err.contains("nonStreamBodyReadTimeout.timeoutMs"));
     }
 
     #[test]

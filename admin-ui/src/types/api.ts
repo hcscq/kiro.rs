@@ -212,6 +212,12 @@ export interface StreamPreSseFailoverConfig {
   minRemainingMs: number
 }
 
+export interface NonStreamBodyReadTimeoutConfig {
+  enabled: boolean
+  timeoutMs: number
+  retryOnTimeout: boolean
+}
+
 export type ThinkingSignatureValidationMode = 'strict' | 'warn_only' | 'disabled' | 'strip_invalid'
 
 export interface LoadBalancingConfigResponse {
@@ -239,6 +245,7 @@ export interface LoadBalancingConfigResponse {
   rateLimitRefillBackoffFactor: number
   requestWeighting: RequestWeightingConfig
   streamPreSseFailover: StreamPreSseFailoverConfig
+  nonStreamBodyReadTimeout: NonStreamBodyReadTimeoutConfig
   thinkingSignatureValidationMode: ThinkingSignatureValidationMode
   responseThinkingSignatureCompatEnabled: boolean
   waitingRequests: number
@@ -269,6 +276,7 @@ export interface UpdateLoadBalancingConfigRequest {
   rateLimitRefillBackoffFactor?: number
   requestWeighting?: RequestWeightingConfig
   streamPreSseFailover?: StreamPreSseFailoverConfig
+  nonStreamBodyReadTimeout?: NonStreamBodyReadTimeoutConfig
   thinkingSignatureValidationMode?: ThinkingSignatureValidationMode
   responseThinkingSignatureCompatEnabled?: boolean
 }
