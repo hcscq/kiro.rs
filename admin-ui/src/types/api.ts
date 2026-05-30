@@ -215,7 +215,9 @@ export interface StreamPreSseFailoverConfig {
 export interface NonStreamBodyReadTimeoutConfig {
   enabled: boolean
   timeoutMs: number
+  eventstreamIdleTimeoutMs: number
   retryOnTimeout: boolean
+  eventstreamSafeRetryOnStall: boolean
 }
 
 export type ThinkingSignatureValidationMode = 'strict' | 'warn_only' | 'disabled' | 'strip_invalid'

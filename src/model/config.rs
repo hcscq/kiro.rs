@@ -262,9 +262,17 @@ pub struct NonStreamBodyReadTimeoutConfig {
     #[serde(default = "default_non_stream_body_read_timeout_ms")]
     pub timeout_ms: u64,
 
+    /// 非流式上游返回 Amazon EventStream 后，连续无 body chunk 的最长等待时间。
+    #[serde(default = "default_non_stream_eventstream_idle_timeout_ms")]
+    pub eventstream_idle_timeout_ms: u64,
+
     /// body 读取超时后是否尝试切换到其他凭据重试。默认关闭，避免大请求被多次长时间占用。
     #[serde(default = "default_non_stream_body_read_timeout_retry_on_timeout")]
     pub retry_on_timeout: bool,
+
+    /// EventStream 已开始但尚未产生可用输出时，卡住后允许一次保守切凭据重试。
+    #[serde(default = "default_non_stream_eventstream_safe_retry_on_stall")]
+    pub eventstream_safe_retry_on_stall: bool,
 }
 
 impl Default for NonStreamBodyReadTimeoutConfig {
@@ -272,7 +280,9 @@ impl Default for NonStreamBodyReadTimeoutConfig {
         Self {
             enabled: default_non_stream_body_read_timeout_enabled(),
             timeout_ms: default_non_stream_body_read_timeout_ms(),
+            eventstream_idle_timeout_ms: default_non_stream_eventstream_idle_timeout_ms(),
             retry_on_timeout: default_non_stream_body_read_timeout_retry_on_timeout(),
+            eventstream_safe_retry_on_stall: default_non_stream_eventstream_safe_retry_on_stall(),
         }
     }
 }
@@ -281,6 +291,11 @@ impl NonStreamBodyReadTimeoutConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.enabled && self.timeout_ms == 0 {
             anyhow::bail!("nonStreamBodyReadTimeout.timeoutMs 必须大于 0，或关闭 enabled");
+        }
+        if self.enabled && self.eventstream_idle_timeout_ms == 0 {
+            anyhow::bail!(
+                "nonStreamBodyReadTimeout.eventstreamIdleTimeoutMs 必须大于 0，或关闭 enabled"
+            );
         }
         Ok(())
     }
@@ -858,8 +873,16 @@ fn default_non_stream_body_read_timeout_ms() -> u64 {
     540_000
 }
 
+fn default_non_stream_eventstream_idle_timeout_ms() -> u64 {
+    120_000
+}
+
 fn default_non_stream_body_read_timeout_retry_on_timeout() -> bool {
     false
+}
+
+fn default_non_stream_eventstream_safe_retry_on_stall() -> bool {
+    true
 }
 
 fn default_conversion_max_concurrent() -> usize {
@@ -1304,7 +1327,18 @@ mod tests {
 
         assert!(config.non_stream_body_read_timeout.enabled);
         assert_eq!(config.non_stream_body_read_timeout.timeout_ms, 540_000);
+        assert_eq!(
+            config
+                .non_stream_body_read_timeout
+                .eventstream_idle_timeout_ms,
+            120_000
+        );
         assert!(!config.non_stream_body_read_timeout.retry_on_timeout);
+        assert!(
+            config
+                .non_stream_body_read_timeout
+                .eventstream_safe_retry_on_stall
+        );
         config.validate().unwrap();
     }
 

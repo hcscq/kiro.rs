@@ -62,6 +62,8 @@ const SLOW_FIRST_CHUNK_MS: u128 = 3_000;
 const SLOW_HEADERS_TO_FIRST_CHUNK_MS: u128 = 1_000;
 const ERROR_BODY_EXCERPT_CHARS: usize = 240;
 const LARGE_PROVIDER_REQUEST_WARN_THRESHOLD_BYTES: usize = 16 * 1024 * 1024;
+const AMAZON_EVENTSTREAM_CONTENT_TYPE: &str = "application/vnd.amazon.eventstream";
+const MAX_NON_STREAM_EVENTSTREAM_STALL_FAILOVERS: usize = 1;
 const CONTEXT_LENGTH_EXCEEDED_CODE: &str = "context_length_exceeded";
 const CONTEXT_LENGTH_EXCEEDED_PUBLIC_MESSAGE: &str = "prompt is too long: context window is full. Reduce conversation history, system prompt, or tools.";
 
@@ -735,41 +737,268 @@ async fn read_response_body_with_trace(
     Ok(bytes)
 }
 
+#[derive(Debug)]
 enum ResponseBodyReadFailure {
     Upstream(reqwest::Error),
-    Timeout { timeout_ms: u64 },
+    Timeout {
+        timeout_ms: u64,
+        reason: &'static str,
+        eventstream_diagnostics: Option<NonStreamEventStreamReadDiagnostics>,
+    },
+}
+
+#[derive(Clone, Debug, Default)]
+struct NonStreamEventStreamReadDiagnostics {
+    observed_frames: usize,
+    event_frames: usize,
+    assistant_events: usize,
+    assistant_content_bytes: usize,
+    tool_use_events: usize,
+    tool_use_stop_events: usize,
+    metering_events: usize,
+    context_usage_events: usize,
+    unknown_events: usize,
+    error_events: usize,
+    exception_events: usize,
+    payload_parse_errors: usize,
+    decoder_errors: usize,
+    last_message_type: String,
+    last_event_type: String,
+}
+
+impl NonStreamEventStreamReadDiagnostics {
+    fn observe_frame(&mut self, frame: crate::kiro::parser::frame::Frame) {
+        self.observed_frames = self.observed_frames.saturating_add(1);
+        self.last_message_type = frame.message_type().unwrap_or("unknown").to_string();
+        self.last_event_type = frame.event_type().unwrap_or("unknown").to_string();
+        if frame.message_type() == Some("event") {
+            self.event_frames = self.event_frames.saturating_add(1);
+        }
+
+        match Event::from_frame(frame) {
+            Ok(Event::AssistantResponse(resp)) => {
+                self.assistant_events = self.assistant_events.saturating_add(1);
+                self.assistant_content_bytes = self
+                    .assistant_content_bytes
+                    .saturating_add(resp.content.len());
+            }
+            Ok(Event::ToolUse(tool_use)) => {
+                self.tool_use_events = self.tool_use_events.saturating_add(1);
+                if tool_use.stop {
+                    self.tool_use_stop_events = self.tool_use_stop_events.saturating_add(1);
+                }
+            }
+            Ok(Event::Metering(())) => {
+                self.metering_events = self.metering_events.saturating_add(1);
+            }
+            Ok(Event::ContextUsage(_)) => {
+                self.context_usage_events = self.context_usage_events.saturating_add(1);
+            }
+            Ok(Event::Unknown {}) => {
+                self.unknown_events = self.unknown_events.saturating_add(1);
+            }
+            Ok(Event::Error { .. }) => {
+                self.error_events = self.error_events.saturating_add(1);
+            }
+            Ok(Event::Exception { .. }) => {
+                self.exception_events = self.exception_events.saturating_add(1);
+            }
+            Err(_) => {
+                self.payload_parse_errors = self.payload_parse_errors.saturating_add(1);
+            }
+        }
+    }
+
+    fn record_decoder_error(&mut self) {
+        self.decoder_errors = self.decoder_errors.saturating_add(1);
+    }
+
+    fn has_usable_output(&self) -> bool {
+        self.assistant_content_bytes > 0 || self.tool_use_events > 0
+    }
+
+    fn safe_to_retry_stall(&self) -> bool {
+        self.observed_frames > 0
+            && !self.has_usable_output()
+            && self.error_events == 0
+            && self.exception_events == 0
+            && self.payload_parse_errors == 0
+            && self.decoder_errors == 0
+    }
+}
+
+fn is_amazon_eventstream_content_type(content_type: Option<&str>) -> bool {
+    content_type
+        .map(|value| {
+            value
+                .to_ascii_lowercase()
+                .contains(AMAZON_EVENTSTREAM_CONTENT_TYPE)
+        })
+        .unwrap_or(false)
 }
 
 async fn read_response_body_with_trace_timeout(
     response: reqwest::Response,
     trace: &ResponseTrace,
     timeout_ms: u64,
+    eventstream_idle_timeout_ms: u64,
 ) -> Result<Bytes, ResponseBodyReadFailure> {
     let mut body_stream = response.bytes_stream();
     let mut buffer = BytesMut::new();
     let timeout_duration = Duration::from_millis(timeout_ms);
+    let eventstream_idle_timeout = Duration::from_millis(eventstream_idle_timeout_ms);
+    let eventstream_response =
+        is_amazon_eventstream_content_type(trace.response_content_type.as_deref());
+    let mut eventstream_decoder = eventstream_response.then(EventStreamDecoder::new);
+    let mut eventstream_diagnostics =
+        eventstream_response.then(NonStreamEventStreamReadDiagnostics::default);
+    let mut last_eventstream_chunk_at: Option<Instant> = None;
     let started_at = Instant::now();
 
     loop {
         let elapsed = started_at.elapsed();
         if elapsed >= timeout_duration {
             trace.log_body_timeout(buffer.len(), &buffer, timeout_ms);
-            return Err(ResponseBodyReadFailure::Timeout { timeout_ms });
+            return Err(ResponseBodyReadFailure::Timeout {
+                timeout_ms,
+                reason: "total_body_read_timeout",
+                eventstream_diagnostics,
+            });
         }
-        match timeout(timeout_duration - elapsed, body_stream.next()).await {
-            Ok(Some(Ok(chunk))) => buffer.extend_from_slice(&chunk),
+        let mut wait_for_next_chunk = timeout_duration - elapsed;
+        let mut timeout_reason = "total_body_read_timeout";
+        let mut reported_timeout_ms = timeout_ms;
+        if eventstream_response {
+            if let Some(last_chunk_at) = last_eventstream_chunk_at {
+                let idle_elapsed = last_chunk_at.elapsed();
+                if idle_elapsed >= eventstream_idle_timeout {
+                    trace.log_body_timeout(buffer.len(), &buffer, eventstream_idle_timeout_ms);
+                    return Err(ResponseBodyReadFailure::Timeout {
+                        timeout_ms: eventstream_idle_timeout_ms,
+                        reason: "eventstream_idle_timeout",
+                        eventstream_diagnostics,
+                    });
+                }
+                let remaining_idle = eventstream_idle_timeout - idle_elapsed;
+                if remaining_idle < wait_for_next_chunk {
+                    wait_for_next_chunk = remaining_idle;
+                    timeout_reason = "eventstream_idle_timeout";
+                    reported_timeout_ms = eventstream_idle_timeout_ms;
+                }
+            }
+        }
+
+        match timeout(wait_for_next_chunk, body_stream.next()).await {
+            Ok(Some(Ok(chunk))) => {
+                if eventstream_response {
+                    last_eventstream_chunk_at = Some(Instant::now());
+                    if let Some(decoder) = eventstream_decoder.as_mut() {
+                        if let Err(err) = decoder.feed(&chunk) {
+                            if let Some(diagnostics) = eventstream_diagnostics.as_mut() {
+                                diagnostics.record_decoder_error();
+                            }
+                            tracing::warn!(
+                                request_id = %trace.request_id,
+                                api_type = trace.api_type,
+                                model = trace.model_label(),
+                                credential_id = trace.credential_id,
+                                attempt = trace.attempt,
+                                max_retries = trace.max_retries,
+                                region = %trace.region,
+                                status_code = trace.status_code,
+                                chunk_len = chunk.len(),
+                                decoder_buffer_len = decoder.buffer_len(),
+                                error = %err,
+                                "非流式上游 eventstream 读取诊断解码缓冲失败"
+                            );
+                        }
+
+                        loop {
+                            match decoder.decode() {
+                                Ok(Some(frame)) => {
+                                    if let Some(diagnostics) = eventstream_diagnostics.as_mut() {
+                                        diagnostics.observe_frame(frame);
+                                    }
+                                }
+                                Ok(None) => break,
+                                Err(err) => {
+                                    if let Some(diagnostics) = eventstream_diagnostics.as_mut() {
+                                        diagnostics.record_decoder_error();
+                                    }
+                                    tracing::warn!(
+                                        request_id = %trace.request_id,
+                                        api_type = trace.api_type,
+                                        model = trace.model_label(),
+                                        credential_id = trace.credential_id,
+                                        attempt = trace.attempt,
+                                        max_retries = trace.max_retries,
+                                        region = %trace.region,
+                                        status_code = trace.status_code,
+                                        decoder_buffer_len = decoder.buffer_len(),
+                                        decoder_error_count = decoder.error_count(),
+                                        decoder_bytes_skipped = decoder.bytes_skipped(),
+                                        error = %err,
+                                        "非流式上游 eventstream 读取诊断解码事件失败"
+                                    );
+                                    if err.is_fatal_stream_error() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                buffer.extend_from_slice(&chunk);
+            }
             Ok(Some(Err(err))) => {
                 trace.log_body_error(buffer.len(), &buffer, &err);
                 return Err(ResponseBodyReadFailure::Upstream(err));
             }
             Ok(None) => {
+                if let Some(diagnostics) = eventstream_diagnostics.as_ref() {
+                    tracing::info!(
+                        request_id = %trace.request_id,
+                        api_type = trace.api_type,
+                        model = trace.model_label(),
+                        request_body_bytes = trace.request_body_bytes,
+                        credential_id = trace.credential_id,
+                        attempt = trace.attempt,
+                        max_retries = trace.max_retries,
+                        region = %trace.region,
+                        status_code = trace.status_code,
+                        body_len = buffer.len(),
+                        eventstream_observed_frames = diagnostics.observed_frames,
+                        eventstream_event_frames = diagnostics.event_frames,
+                        eventstream_assistant_events = diagnostics.assistant_events,
+                        eventstream_assistant_content_bytes = diagnostics.assistant_content_bytes,
+                        eventstream_tool_use_events = diagnostics.tool_use_events,
+                        eventstream_tool_use_stop_events = diagnostics.tool_use_stop_events,
+                        eventstream_metering_events = diagnostics.metering_events,
+                        eventstream_context_usage_events = diagnostics.context_usage_events,
+                        eventstream_unknown_events = diagnostics.unknown_events,
+                        eventstream_error_events = diagnostics.error_events,
+                        eventstream_exception_events = diagnostics.exception_events,
+                        eventstream_payload_parse_errors = diagnostics.payload_parse_errors,
+                        eventstream_decoder_errors = diagnostics.decoder_errors,
+                        eventstream_last_message_type = diagnostics.last_message_type.as_str(),
+                        eventstream_last_event_type = diagnostics.last_event_type.as_str(),
+                        total_elapsed_ms = trace.overall_started_at.elapsed().as_millis(),
+                        upstream_elapsed_ms = trace.upstream_request_started_at.elapsed().as_millis(),
+                        body_read_elapsed_ms = trace.response_headers_at.elapsed().as_millis(),
+                        "非流式上游 eventstream 响应体读取完成"
+                    );
+                }
                 let bytes = buffer.freeze();
                 trace.log_body_complete(bytes.len());
                 return Ok(bytes);
             }
             Err(_) => {
-                trace.log_body_timeout(buffer.len(), &buffer, timeout_ms);
-                return Err(ResponseBodyReadFailure::Timeout { timeout_ms });
+                trace.log_body_timeout(buffer.len(), &buffer, reported_timeout_ms);
+                return Err(ResponseBodyReadFailure::Timeout {
+                    timeout_ms: reported_timeout_ms,
+                    reason: timeout_reason,
+                    eventstream_diagnostics,
+                });
             }
         }
     }
@@ -2092,6 +2321,7 @@ impl KiroProvider {
         let mut priority_rate_limit_hits: HashMap<u32, usize> = HashMap::new();
         let mut slow_first_content_failovers = 0usize;
         let mut pre_sse_fast_failovers = 0usize;
+        let mut non_stream_eventstream_stall_failovers = 0usize;
         let mut capacity_unavailable_count = 0usize;
         let api_type = if is_stream { "流式" } else { "非流式" };
         let request_id = options
@@ -2617,6 +2847,7 @@ impl KiroProvider {
                             response,
                             &trace,
                             non_stream_body_read_timeout_config.timeout_ms,
+                            non_stream_body_read_timeout_config.eventstream_idle_timeout_ms,
                         )
                         .await
                     } else {
@@ -2648,10 +2879,68 @@ impl KiroProvider {
                             }
                             continue;
                         }
-                        Err(ResponseBodyReadFailure::Timeout { timeout_ms }) => {
+                        Err(ResponseBodyReadFailure::Timeout {
+                            timeout_ms,
+                            reason,
+                            eventstream_diagnostics,
+                        }) => {
                             let body_read_elapsed_ms = response_headers_at.elapsed().as_millis();
-                            let will_retry = non_stream_body_read_timeout_config.retry_on_timeout
-                                && attempt + 1 < max_retries;
+                            let eventstream_safe_retry_candidate = reason
+                                == "eventstream_idle_timeout"
+                                && eventstream_diagnostics
+                                    .as_ref()
+                                    .is_some_and(|diagnostics| diagnostics.safe_to_retry_stall())
+                                && non_stream_eventstream_stall_failovers
+                                    < MAX_NON_STREAM_EVENTSTREAM_STALL_FAILOVERS;
+                            let will_retry = attempt + 1 < max_retries
+                                && (non_stream_body_read_timeout_config.retry_on_timeout
+                                    || (non_stream_body_read_timeout_config
+                                        .eventstream_safe_retry_on_stall
+                                        && eventstream_safe_retry_candidate));
+                            let eventstream_observed_frames = eventstream_diagnostics
+                                .as_ref()
+                                .map(|diagnostics| diagnostics.observed_frames)
+                                .unwrap_or(0);
+                            let eventstream_assistant_events = eventstream_diagnostics
+                                .as_ref()
+                                .map(|diagnostics| diagnostics.assistant_events)
+                                .unwrap_or(0);
+                            let eventstream_assistant_content_bytes = eventstream_diagnostics
+                                .as_ref()
+                                .map(|diagnostics| diagnostics.assistant_content_bytes)
+                                .unwrap_or(0);
+                            let eventstream_tool_use_events = eventstream_diagnostics
+                                .as_ref()
+                                .map(|diagnostics| diagnostics.tool_use_events)
+                                .unwrap_or(0);
+                            let eventstream_unknown_events = eventstream_diagnostics
+                                .as_ref()
+                                .map(|diagnostics| diagnostics.unknown_events)
+                                .unwrap_or(0);
+                            let eventstream_error_events = eventstream_diagnostics
+                                .as_ref()
+                                .map(|diagnostics| diagnostics.error_events)
+                                .unwrap_or(0);
+                            let eventstream_exception_events = eventstream_diagnostics
+                                .as_ref()
+                                .map(|diagnostics| diagnostics.exception_events)
+                                .unwrap_or(0);
+                            let eventstream_decoder_errors = eventstream_diagnostics
+                                .as_ref()
+                                .map(|diagnostics| diagnostics.decoder_errors)
+                                .unwrap_or(0);
+                            let eventstream_payload_parse_errors = eventstream_diagnostics
+                                .as_ref()
+                                .map(|diagnostics| diagnostics.payload_parse_errors)
+                                .unwrap_or(0);
+                            let eventstream_last_message_type = eventstream_diagnostics
+                                .as_ref()
+                                .map(|diagnostics| diagnostics.last_message_type.as_str())
+                                .unwrap_or("");
+                            let eventstream_last_event_type = eventstream_diagnostics
+                                .as_ref()
+                                .map(|diagnostics| diagnostics.last_event_type.as_str())
+                                .unwrap_or("");
                             tracing::warn!(
                                 request_id = %request_id,
                                 api_type,
@@ -2663,26 +2952,49 @@ impl KiroProvider {
                                 request_body_bytes,
                                 status_code = status.as_u16(),
                                 timeout_ms,
+                                timeout_reason = reason,
                                 body_read_elapsed_ms,
                                 total_elapsed_ms = overall_started_at.elapsed().as_millis(),
                                 retry_on_timeout =
                                     non_stream_body_read_timeout_config.retry_on_timeout,
+                                eventstream_safe_retry_on_stall =
+                                    non_stream_body_read_timeout_config
+                                        .eventstream_safe_retry_on_stall,
+                                eventstream_safe_retry_candidate,
+                                non_stream_eventstream_stall_failovers,
+                                max_non_stream_eventstream_stall_failovers =
+                                    MAX_NON_STREAM_EVENTSTREAM_STALL_FAILOVERS,
+                                eventstream_observed_frames,
+                                eventstream_assistant_events,
+                                eventstream_assistant_content_bytes,
+                                eventstream_tool_use_events,
+                                eventstream_unknown_events,
+                                eventstream_error_events,
+                                eventstream_exception_events,
+                                eventstream_decoder_errors,
+                                eventstream_payload_parse_errors,
+                                eventstream_last_message_type,
+                                eventstream_last_event_type,
                                 will_retry,
                                 "非流式上游响应体读取超时"
                             );
                             let timeout_error = anyhow::Error::new(
                                 PublicProviderError::gateway_timeout(
                                     format!(
-                                        "{} API 响应体读取超时: request_id={} credential_id={} attempt={} status={} timeout_ms={} body_read_elapsed_ms={} total_elapsed_ms={} retry_on_timeout={} will_retry={}",
+                                        "{} API 响应体读取超时: request_id={} credential_id={} attempt={} status={} timeout_ms={} timeout_reason={} body_read_elapsed_ms={} total_elapsed_ms={} retry_on_timeout={} eventstream_safe_retry_on_stall={} eventstream_safe_retry_candidate={} will_retry={}",
                                         api_type,
                                         request_id,
                                         ctx_id,
                                         attempt + 1,
                                         status.as_u16(),
                                         timeout_ms,
+                                        reason,
                                         body_read_elapsed_ms,
                                         overall_started_at.elapsed().as_millis(),
                                         non_stream_body_read_timeout_config.retry_on_timeout,
+                                        non_stream_body_read_timeout_config
+                                            .eventstream_safe_retry_on_stall,
+                                        eventstream_safe_retry_candidate,
                                         will_retry
                                     ),
                                     "Upstream response body timed out before a complete non-stream response was received.",
@@ -2690,6 +3002,10 @@ impl KiroProvider {
                             );
 
                             if will_retry {
+                                if eventstream_safe_retry_candidate {
+                                    non_stream_eventstream_stall_failovers =
+                                        non_stream_eventstream_stall_failovers.saturating_add(1);
+                                }
                                 last_error = Some(timeout_error);
                                 request_scoped_transient_error_credentials.insert(ctx_id);
                                 sleep(Self::retry_delay(attempt)).await;
@@ -3711,11 +4027,68 @@ impl KiroProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kiro::parser::crc::crc32;
+    use crate::kiro::parser::frame::PRELUDE_SIZE;
     use crate::model::config::Config;
+    use axum::{Router, body::Body, response::Response, routing::get};
+    use std::convert::Infallible;
+    use tokio::net::TcpListener;
 
     fn create_test_provider(config: Config, credentials: KiroCredentials) -> KiroProvider {
         let tm = MultiTokenManager::new(config, vec![credentials], None, None, false).unwrap();
         KiroProvider::with_proxy(Arc::new(tm), None)
+    }
+
+    fn test_response_trace(content_type: Option<&str>) -> ResponseTrace {
+        let now = Instant::now();
+        ResponseTrace {
+            request_id: "test-request".to_string(),
+            api_type: "非流式",
+            model: Some("claude-opus-4.8".to_string()),
+            request_body_bytes: 128,
+            credential_id: 1,
+            attempt: 1,
+            max_retries: 2,
+            region: "us-east-1".to_string(),
+            status_code: 200,
+            overall_started_at: now,
+            upstream_request_started_at: now,
+            response_headers_at: now,
+            response_content_type: content_type.map(ToOwned::to_owned),
+            response_content_encoding: None,
+            response_content_length: None,
+            response_transfer_encoding: None,
+            slow_model_cooldown: None,
+        }
+    }
+
+    fn string_header(name: &str, value: &str) -> Vec<u8> {
+        let mut header = Vec::new();
+        header.push(name.len() as u8);
+        header.extend_from_slice(name.as_bytes());
+        header.push(7);
+        header.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        header.extend_from_slice(value.as_bytes());
+        header
+    }
+
+    fn event_frame(event_type: &str, payload: &[u8]) -> Vec<u8> {
+        let mut headers = Vec::new();
+        headers.extend(string_header(":message-type", "event"));
+        headers.extend(string_header(":event-type", event_type));
+
+        let total_length = (PRELUDE_SIZE + headers.len() + payload.len() + 4) as u32;
+        let header_length = headers.len() as u32;
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&total_length.to_be_bytes());
+        frame.extend_from_slice(&header_length.to_be_bytes());
+        let prelude_crc = crc32(&frame);
+        frame.extend_from_slice(&prelude_crc.to_be_bytes());
+        frame.extend_from_slice(&headers);
+        frame.extend_from_slice(payload);
+        let message_crc = crc32(&frame);
+        frame.extend_from_slice(&message_crc.to_be_bytes());
+        frame
     }
 
     #[test]
@@ -4398,5 +4771,93 @@ mod tests {
             !non_thinking_probe
                 .should_release_after_stream_activity(STREAM_CONTENT_START_ACTIVITY_READY_BYTES)
         );
+    }
+
+    #[test]
+    fn test_non_stream_eventstream_diagnostics_marks_reasoning_only_stall_safe_to_retry() {
+        let mut decoder = EventStreamDecoder::new();
+        let frame = event_frame("reasoningContentEvent", br#"{"content":"thinking"}"#);
+        decoder.feed(&frame).unwrap();
+
+        let parsed = decoder.decode().unwrap().unwrap();
+        let mut diagnostics = NonStreamEventStreamReadDiagnostics::default();
+        diagnostics.observe_frame(parsed);
+
+        assert_eq!(diagnostics.observed_frames, 1);
+        assert_eq!(diagnostics.unknown_events, 1);
+        assert!(!diagnostics.has_usable_output());
+        assert!(diagnostics.safe_to_retry_stall());
+    }
+
+    #[test]
+    fn test_non_stream_eventstream_diagnostics_does_not_retry_after_output() {
+        let mut decoder = EventStreamDecoder::new();
+        let frame = event_frame("assistantResponseEvent", br#"{"content":"hello"}"#);
+        decoder.feed(&frame).unwrap();
+
+        let parsed = decoder.decode().unwrap().unwrap();
+        let mut diagnostics = NonStreamEventStreamReadDiagnostics::default();
+        diagnostics.observe_frame(parsed);
+
+        assert_eq!(diagnostics.assistant_events, 1);
+        assert_eq!(diagnostics.assistant_content_bytes, 5);
+        assert!(diagnostics.has_usable_output());
+        assert!(!diagnostics.safe_to_retry_stall());
+    }
+
+    #[tokio::test]
+    async fn test_non_stream_eventstream_reader_times_out_on_idle_with_diagnostics() {
+        let event = event_frame("reasoningContentEvent", br#"{"content":"thinking"}"#);
+        let app = Router::new().route(
+            "/eventstream",
+            get(move || {
+                let event = event.clone();
+                async move {
+                    let body_stream =
+                        stream::once(async move { Ok::<Bytes, Infallible>(Bytes::from(event)) })
+                            .chain(stream::pending::<Result<Bytes, Infallible>>());
+
+                    Response::builder()
+                        .status(200)
+                        .header("content-type", AMAZON_EVENTSTREAM_CONTENT_TYPE)
+                        .body(Body::from_stream(body_stream))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}/eventstream"))
+            .send()
+            .await
+            .unwrap();
+        let trace = test_response_trace(Some(AMAZON_EVENTSTREAM_CONTENT_TYPE));
+
+        let result = read_response_body_with_trace_timeout(response, &trace, 10_000, 20).await;
+
+        match result {
+            Err(ResponseBodyReadFailure::Timeout {
+                timeout_ms,
+                reason,
+                eventstream_diagnostics: Some(diagnostics),
+            }) => {
+                assert_eq!(timeout_ms, 20);
+                assert_eq!(reason, "eventstream_idle_timeout");
+                assert_eq!(diagnostics.observed_frames, 1);
+                assert_eq!(diagnostics.unknown_events, 1);
+                assert!(diagnostics.safe_to_retry_stall());
+            }
+            other => panic!(
+                "unexpected read result: {:?}",
+                other.map(|bytes| bytes.len())
+            ),
+        }
+
+        server.abort();
     }
 }

@@ -64,7 +64,9 @@ const DEFAULT_STREAM_PRE_SSE_FAILOVER: StreamPreSseFailoverConfig = {
 const DEFAULT_NON_STREAM_BODY_READ_TIMEOUT: NonStreamBodyReadTimeoutConfig = {
   enabled: true,
   timeoutMs: 540000,
+  eventstreamIdleTimeoutMs: 120000,
   retryOnTimeout: false,
+  eventstreamSafeRetryOnStall: true,
 }
 
 const THINKING_SIGNATURE_VALIDATION_OPTIONS: Array<{
@@ -459,8 +461,12 @@ export function SettingsPage() {
     useState(DEFAULT_NON_STREAM_BODY_READ_TIMEOUT.enabled)
   const [nonStreamBodyReadTimeoutMsInput, setNonStreamBodyReadTimeoutMsInput] =
     useState(String(DEFAULT_NON_STREAM_BODY_READ_TIMEOUT.timeoutMs))
+  const [nonStreamEventstreamIdleTimeoutMsInput, setNonStreamEventstreamIdleTimeoutMsInput] =
+    useState(String(DEFAULT_NON_STREAM_BODY_READ_TIMEOUT.eventstreamIdleTimeoutMs))
   const [nonStreamBodyReadTimeoutRetryOnTimeout, setNonStreamBodyReadTimeoutRetryOnTimeout] =
     useState(DEFAULT_NON_STREAM_BODY_READ_TIMEOUT.retryOnTimeout)
+  const [nonStreamEventstreamSafeRetryOnStall, setNonStreamEventstreamSafeRetryOnStall] =
+    useState(DEFAULT_NON_STREAM_BODY_READ_TIMEOUT.eventstreamSafeRetryOnStall)
   const [thinkingSignatureValidationMode, setThinkingSignatureValidationMode] =
     useState<ThinkingSignatureValidationMode>('strict')
   const [responseThinkingSignatureCompatEnabled, setResponseThinkingSignatureCompatEnabled] =
@@ -498,11 +504,15 @@ export function SettingsPage() {
       loadBalancingData.streamPreSseFailover ?? DEFAULT_STREAM_PRE_SSE_FAILOVER
     setStreamPreSseFailoverEnabled(streamPreSseFailover.enabled)
     setStreamPreSseFailoverInputs(createStreamPreSseFailoverInputs(streamPreSseFailover))
-    const nonStreamBodyReadTimeout =
-      loadBalancingData.nonStreamBodyReadTimeout ?? DEFAULT_NON_STREAM_BODY_READ_TIMEOUT
+    const nonStreamBodyReadTimeout = {
+      ...DEFAULT_NON_STREAM_BODY_READ_TIMEOUT,
+      ...(loadBalancingData.nonStreamBodyReadTimeout ?? {}),
+    }
     setNonStreamBodyReadTimeoutEnabled(nonStreamBodyReadTimeout.enabled)
     setNonStreamBodyReadTimeoutMsInput(String(nonStreamBodyReadTimeout.timeoutMs))
+    setNonStreamEventstreamIdleTimeoutMsInput(String(nonStreamBodyReadTimeout.eventstreamIdleTimeoutMs))
     setNonStreamBodyReadTimeoutRetryOnTimeout(nonStreamBodyReadTimeout.retryOnTimeout)
+    setNonStreamEventstreamSafeRetryOnStall(nonStreamBodyReadTimeout.eventstreamSafeRetryOnStall)
     setThinkingSignatureValidationMode(loadBalancingData.thinkingSignatureValidationMode ?? 'strict')
     setResponseThinkingSignatureCompatEnabled(loadBalancingData.responseThinkingSignatureCompatEnabled ?? false)
   }, [loadBalancingData])
@@ -543,6 +553,7 @@ export function SettingsPage() {
     const parsedRateLimitRefillRecoveryStep = rateLimitRefillRecoveryStepInput.trim() === '' ? 0 : Number.parseFloat(rateLimitRefillRecoveryStepInput)
     const parsedRateLimitRefillBackoffFactor = rateLimitRefillBackoffFactorInput.trim() === '' ? 0 : Number.parseFloat(rateLimitRefillBackoffFactorInput)
     const parsedNonStreamBodyReadTimeoutMs = nonStreamBodyReadTimeoutMsInput.trim() === '' ? 0 : parseInt(nonStreamBodyReadTimeoutMsInput, 10)
+    const parsedNonStreamEventstreamIdleTimeoutMs = nonStreamEventstreamIdleTimeoutMsInput.trim() === '' ? 0 : parseInt(nonStreamEventstreamIdleTimeoutMsInput, 10)
     const parsedRequestWeighting: RequestWeightingConfig = {
       enabled: requestWeightingEnabled,
       baseWeight: requestWeightingInputs.baseWeight.trim() === '' ? 0 : Number.parseFloat(requestWeightingInputs.baseWeight),
@@ -589,6 +600,7 @@ export function SettingsPage() {
       Number.isNaN(parsedRateLimitRefillRecoveryStep) ||
       Number.isNaN(parsedRateLimitRefillBackoffFactor) ||
       Number.isNaN(parsedNonStreamBodyReadTimeoutMs) ||
+      Number.isNaN(parsedNonStreamEventstreamIdleTimeoutMs) ||
       parsedQueueMaxSize < 0 ||
       parsedQueueMaxWaitMs < 0 ||
       parsedRateLimitCooldownMs < 0 ||
@@ -602,7 +614,8 @@ export function SettingsPage() {
       parsedRateLimitRefillPerSecond < 0 ||
       parsedRateLimitRefillMinPerSecond < 0 ||
       parsedRateLimitRefillRecoveryStep < 0 ||
-      parsedNonStreamBodyReadTimeoutMs < 0
+      parsedNonStreamBodyReadTimeoutMs < 0 ||
+      parsedNonStreamEventstreamIdleTimeoutMs < 0
     ) {
       toast.error('调度参数必须是大于等于 0 的数字')
       return
@@ -724,6 +737,11 @@ export function SettingsPage() {
       return
     }
 
+    if (nonStreamBodyReadTimeoutEnabled && parsedNonStreamEventstreamIdleTimeoutMs <= 0) {
+      toast.error('非流式 EventStream 空闲超时必须大于 0，或关闭启用开关')
+      return
+    }
+
     setLoadBalancingMode(
       {
         queueMaxSize: parsedQueueMaxSize,
@@ -752,7 +770,9 @@ export function SettingsPage() {
         nonStreamBodyReadTimeout: {
           enabled: nonStreamBodyReadTimeoutEnabled,
           timeoutMs: parsedNonStreamBodyReadTimeoutMs,
+          eventstreamIdleTimeoutMs: parsedNonStreamEventstreamIdleTimeoutMs,
           retryOnTimeout: nonStreamBodyReadTimeoutRetryOnTimeout,
+          eventstreamSafeRetryOnStall: nonStreamEventstreamSafeRetryOnStall,
         },
         thinkingSignatureValidationMode,
         responseThinkingSignatureCompatEnabled,
@@ -1200,7 +1220,7 @@ export function SettingsPage() {
           <div className="space-y-4">
             <h3 className="text-sm font-semibold flex items-center text-primary">非流式响应体超时</h3>
             <div className="space-y-4 rounded-lg bg-muted/30 p-4">
-              <div className="grid gap-4 lg:grid-cols-2">
+              <div className="grid gap-4 lg:grid-cols-3">
                 <SwitchSettingCard
                   title="限制完整 body 读取时间"
                   checked={nonStreamBodyReadTimeoutEnabled}
@@ -1211,6 +1231,20 @@ export function SettingsPage() {
                     <>
                       <p>非流式请求收到上游响应头后，对读取完整响应体设置独立总预算。</p>
                       <p>默认启用，避免上游已返回响应头但 body 长时间不结束时占满 AgentGear 总超时。</p>
+                    </>
+                  }
+                />
+
+                <SwitchSettingCard
+                  title="EventStream 卡住时安全重试"
+                  checked={nonStreamEventstreamSafeRetryOnStall}
+                  onCheckedChange={setNonStreamEventstreamSafeRetryOnStall}
+                  ariaLabel="切换非流式 EventStream 卡住安全重试"
+                  disabledLabel="不额外重试"
+                  description={
+                    <>
+                      <p>上游已返回 EventStream 且尚未产生可用输出时，空闲超时后允许一次切换凭据。</p>
+                      <p>已收到 assistant 文本、工具调用、错误或解码异常时不会触发，避免重复执行。</p>
                     </>
                   }
                 />
@@ -1246,6 +1280,23 @@ export function SettingsPage() {
                   />
                   <p className="text-xs text-muted-foreground">
                     建议低于 AgentGear 总超时，便于 kiro-rs 先返回明确 504 诊断。
+                  </p>
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm font-medium" htmlFor="nonStreamEventstreamIdleTimeoutMs">
+                    EventStream 空闲超时 (毫秒)
+                  </label>
+                  <Input
+                    id="nonStreamEventstreamIdleTimeoutMs"
+                    type="number"
+                    min="0"
+                    step="1000"
+                    value={nonStreamEventstreamIdleTimeoutMsInput}
+                    onChange={(e) => setNonStreamEventstreamIdleTimeoutMsInput(e.target.value)}
+                    placeholder="默认 120000"
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    仅在非流式上游返回 Amazon EventStream 且 body 已开始后生效。
                   </p>
                 </div>
               </div>
