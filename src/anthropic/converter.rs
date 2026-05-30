@@ -862,7 +862,15 @@ fn process_message_content(
                         "image" => {
                             if let Some(source) = block.source {
                                 if let Some(format) = get_image_format(&source.media_type) {
-                                    images.extend(build_kiro_images(format, source.data));
+                                    let built_images =
+                                        build_kiro_images(format.clone(), source.data);
+                                    if built_images.is_empty() {
+                                        text_parts.push(format!(
+                                            "[Image omitted for Kiro compatibility: invalid or unsupported {format} image payload.]"
+                                        ));
+                                    } else {
+                                        images.extend(built_images);
+                                    }
                                 }
                             }
                         }
@@ -1207,7 +1215,7 @@ fn build_kiro_images(format: String, data: String) -> Vec<KiroImage> {
         {
             vec![KiroImage::from_base64(processed_format, processed_data)]
         } else {
-            vec![KiroImage::from_base64(format, data)]
+            Vec::new()
         }
     } else if let Some((normalized_format, normalized_data)) =
         normalize_image_for_kiro(&format, &data)
@@ -1217,11 +1225,21 @@ fn build_kiro_images(format: String, data: String) -> Vec<KiroImage> {
         resize_or_reencode_image_base64(&format, &data)
     {
         vec![KiroImage::from_base64(processed_format, processed_data)]
-    } else {
+    } else if is_decodable_static_image_for_kiro(&format, &data) {
         vec![KiroImage::from_base64(format, data)]
+    } else {
+        Vec::new()
     };
     let elapsed_ms = started_at.elapsed().as_millis();
-    if input_base64_bytes >= 4 * 1024 * 1024 || elapsed_ms >= 1_000 {
+    if images.is_empty() {
+        tracing::warn!(
+            source_format,
+            input_base64_bytes,
+            normalized_base64_bytes,
+            elapsed_ms,
+            "丢弃无法解码或重编码的图片，避免 Kiro 上游 400"
+        );
+    } else if input_base64_bytes >= 4 * 1024 * 1024 || elapsed_ms >= 1_000 {
         let output_base64_bytes: usize = images.iter().map(|image| image.source.bytes.len()).sum();
         tracing::warn!(
             source_format,
@@ -1303,11 +1321,6 @@ fn target_kiro_image_dimensions(width: u32, height: u32) -> (u32, u32) {
         let scale = KIRO_MAX_IMAGE_DIMENSION_PX as f64 / max_dimension as f64;
         target_width = ((target_width as f64 * scale).round() as u32).max(1);
         target_height = ((target_height as f64 * scale).round() as u32).max(1);
-    }
-
-    if target_width < KIRO_MIN_IMAGE_DIMENSION_PX || target_height < KIRO_MIN_IMAGE_DIMENSION_PX {
-        target_width = target_width.max(KIRO_MIN_IMAGE_DIMENSION_PX);
-        target_height = target_height.max(KIRO_MIN_IMAGE_DIMENSION_PX);
     }
 
     (target_width, target_height)
@@ -1457,6 +1470,16 @@ fn resize_or_reencode_image_base64(format: &str, data: &str) -> Option<(String, 
     );
 
     Some((processed_format, BASE64_STANDARD.encode(output)))
+}
+
+fn is_decodable_static_image_for_kiro(format: &str, data: &str) -> bool {
+    let Some(image_format) = image_format_for_compat(format) else {
+        return false;
+    };
+    let Ok(bytes) = BASE64_STANDARD.decode(data) else {
+        return false;
+    };
+    load_image_with_optional_png_crc_repair(format, image_format, &bytes).is_some()
 }
 
 fn sample_gif_frames_for_kiro(data: &str) -> Option<Vec<KiroImage>> {
@@ -1995,8 +2018,6 @@ const KIRO_MAX_IMAGES_PER_USER_TURN: usize = 10;
 /// Kiro 上游对图片像素尺寸也较敏感；长边超过约 1200px 的截图会触发
 /// 400 Improperly formed request。等比例缩放保留图片语义，同时兼容上游。
 const KIRO_MAX_IMAGE_DIMENSION_PX: u32 = 1200;
-/// 极小图片（如 1x1 验证图）也会被上游拒绝，放大到最小兼容尺寸。
-const KIRO_MIN_IMAGE_DIMENSION_PX: u32 = 32;
 
 fn merge_user_message_parts(
     messages: &[&super::types::Message],
@@ -2852,13 +2873,17 @@ fn merge_assistant_messages(
 mod tests {
     use super::*;
 
+    const VALID_RGB_1X1_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADUlEQVR42mP8z8BQDwAFgwJ/PrcruAAAAABJRU5ErkJggg==";
+    const VALID_RGBA_1X1_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    const CORRUPT_RGBA_1X1_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
     fn png_image_block() -> serde_json::Value {
         serde_json::json!({
             "type": "image",
             "source": {
                 "type": "base64",
                 "media_type": "image/png",
-                "data": "aGVsbG8="
+                "data": VALID_RGB_1X1_PNG
             }
         })
     }
@@ -3001,7 +3026,7 @@ mod tests {
             "source": {
                 "type": "base64",
                 "media_type": "image/png",
-                "data": "data:image/png;base64,aGVsbG8="
+                "data": format!("data:image/png;base64,{VALID_RGB_1X1_PNG}")
             }
         })]);
 
@@ -3010,7 +3035,7 @@ mod tests {
 
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].format, "png");
-        assert_eq!(images[0].source.bytes, "aGVsbG8=");
+        assert_eq!(images[0].source.bytes, VALID_RGB_1X1_PNG);
     }
 
     #[test]
@@ -3082,28 +3107,59 @@ mod tests {
     }
 
     #[test]
-    fn test_process_message_content_upscales_tiny_png() {
+    fn test_process_message_content_keeps_tiny_png_unchanged() {
         let content = serde_json::Value::Array(vec![serde_json::json!({
             "type": "image",
             "source": {
                 "type": "base64",
                 "media_type": "image/png",
-                "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADUlEQVR42mP8z8BQDwAFgwJ/lc0p7wAAAABJRU5ErkJggg=="
+                "data": VALID_RGB_1X1_PNG
             }
         })]);
 
-        let (_, images, _) = process_message_content(&content).expect("tiny png should convert");
+        let (_, images, _) =
+            process_message_content(&content).expect("tiny png should pass through");
 
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].format, "png");
-        let resized_bytes = BASE64_STANDARD
-            .decode(&images[0].source.bytes)
-            .expect("resized image should be valid base64");
-        let resized = image::load_from_memory_with_format(&resized_bytes, image::ImageFormat::Png)
-            .expect("resized image should decode");
+        assert_eq!(images[0].source.bytes, VALID_RGB_1X1_PNG);
+    }
 
-        assert_eq!(resized.width(), KIRO_MIN_IMAGE_DIMENSION_PX);
-        assert_eq!(resized.height(), KIRO_MIN_IMAGE_DIMENSION_PX);
+    #[test]
+    fn test_process_message_content_keeps_tiny_rgba_png_unchanged() {
+        let content = serde_json::Value::Array(vec![serde_json::json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": VALID_RGBA_1X1_PNG
+            }
+        })]);
+
+        let (_, images, _) =
+            process_message_content(&content).expect("tiny rgba png should pass through");
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].format, "png");
+        assert_eq!(images[0].source.bytes, VALID_RGBA_1X1_PNG);
+    }
+
+    #[test]
+    fn test_process_message_content_omits_corrupt_png_for_kiro() {
+        let content = serde_json::Value::Array(vec![serde_json::json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": CORRUPT_RGBA_1X1_PNG
+            }
+        })]);
+
+        let (text, images, _) =
+            process_message_content(&content).expect("corrupt png should be handled");
+
+        assert!(images.is_empty());
+        assert!(text.contains("Image omitted for Kiro compatibility"));
     }
 
     #[test]
@@ -5317,7 +5373,7 @@ mod tests {
                             "source": {
                                 "type": "base64",
                                 "media_type": "image/png",
-                                "data": "aGVsbG8="
+                                "data": VALID_RGB_1X1_PNG
                             }
                         },
                         {
@@ -5434,7 +5490,7 @@ mod tests {
                             "source": {
                                 "type": "base64",
                                 "media_type": "image/png",
-                                "data": "aGVsbG8="
+                                "data": VALID_RGB_1X1_PNG
                             }
                         },
                         {
