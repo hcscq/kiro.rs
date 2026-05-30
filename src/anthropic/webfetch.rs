@@ -39,8 +39,12 @@ use super::websearch;
 
 const WEB_FETCH_TOOL_TYPE_20250910: &str = "web_fetch_20250910";
 const WEB_FETCH_TOOL_TYPE_20260209: &str = "web_fetch_20260209";
-const SUPPORTED_WEB_FETCH_TOOL_TYPES: &[&str] =
-    &[WEB_FETCH_TOOL_TYPE_20250910, WEB_FETCH_TOOL_TYPE_20260209];
+const WEB_FETCH_TOOL_TYPE_20260309: &str = "web_fetch_20260309";
+const SUPPORTED_WEB_FETCH_TOOL_TYPES: &[&str] = &[
+    WEB_FETCH_TOOL_TYPE_20250910,
+    WEB_FETCH_TOOL_TYPE_20260209,
+    WEB_FETCH_TOOL_TYPE_20260309,
+];
 const INTERNAL_WEB_FETCH_TOOL_NAME: &str = "__anthropic_server_web_fetch";
 const INTERNAL_WEB_SEARCH_TOOL_NAME: &str = "__anthropic_server_web_search";
 const EXTERNAL_WEB_FETCH_TOOL_NAME: &str = "web_fetch";
@@ -60,6 +64,7 @@ struct WebFetchConfig {
     citations_enabled: bool,
     allowed_domains: Vec<DomainPattern>,
     blocked_domains: Vec<DomainPattern>,
+    use_cache: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -630,6 +635,7 @@ fn build_web_fetch_config(tool: &Tool) -> Result<WebFetchConfig, String> {
         citations_enabled: tool.citations.as_ref().is_some_and(|c| c.enabled),
         allowed_domains,
         blocked_domains,
+        use_cache: tool.use_cache.unwrap_or(true),
     })
 }
 
@@ -680,6 +686,7 @@ fn build_internal_webfetch_tool(tool: &Tool) -> Tool {
         blocked_domains: None,
         citations: None,
         max_content_tokens: None,
+        use_cache: None,
     }
 }
 
@@ -713,6 +720,7 @@ fn build_internal_websearch_tool(tool: &Tool) -> Tool {
         blocked_domains: None,
         citations: None,
         max_content_tokens: None,
+        use_cache: None,
     }
 }
 
@@ -1003,9 +1011,16 @@ async fn execute_web_fetch(
         .build()
         .map_err(|err| ("unavailable", err.to_string(), false))?;
 
-    let response = client
+    let mut request = client
         .get(parsed_url.clone())
-        .header("User-Agent", "kiro-rs-web-fetch/1.0")
+        .header("User-Agent", "kiro-rs-web-fetch/1.0");
+    if !config.use_cache {
+        request = request
+            .header(header::CACHE_CONTROL, "no-cache")
+            .header(header::PRAGMA, "no-cache");
+    }
+
+    let response = request
         .send()
         .await
         .map_err(|err| ("url_not_accessible", err.to_string(), true))?;
@@ -2173,6 +2188,7 @@ mod tests {
             blocked_domains: None,
             citations: None,
             max_content_tokens: Some(1024),
+            use_cache: None,
         }
     }
 
@@ -2187,6 +2203,7 @@ mod tests {
             blocked_domains: None,
             citations: None,
             max_content_tokens: None,
+            use_cache: None,
         }
     }
 
@@ -2263,9 +2280,28 @@ mod tests {
         new_tool.tool_type = Some(WEB_FETCH_TOOL_TYPE_20260209.to_string());
         assert!(is_supported_web_fetch_tool(&new_tool));
 
+        let mut cache_control_tool = sample_tool();
+        cache_control_tool.tool_type = Some(WEB_FETCH_TOOL_TYPE_20260309.to_string());
+        assert!(is_supported_web_fetch_tool(&cache_control_tool));
+
         let mut unsupported_tool = sample_tool();
         unsupported_tool.tool_type = Some("web_fetch_20990101".to_string());
         assert!(!is_supported_web_fetch_tool(&unsupported_tool));
+    }
+
+    #[test]
+    fn test_validate_server_web_tools_accepts_20260309_use_cache_false() {
+        let mut tool = sample_tool();
+        tool.tool_type = Some(WEB_FETCH_TOOL_TYPE_20260309.to_string());
+        tool.use_cache = Some(false);
+        let req = sample_request(tool);
+
+        let config = validate_server_web_tools(&req).expect("20260309 should be supported");
+        let web_fetch = config
+            .web_fetch
+            .expect("web_fetch config should be present");
+
+        assert!(!web_fetch.use_cache);
     }
 
     #[test]
@@ -2322,6 +2358,7 @@ mod tests {
                 blocked_domains: None,
                 citations: None,
                 max_content_tokens: None,
+                use_cache: None,
             },
         ]);
 
@@ -2660,6 +2697,7 @@ mod tests {
             citations_enabled: true,
             allowed_domains: Vec::new(),
             blocked_domains: Vec::new(),
+            use_cache: true,
         };
 
         let result = execute_web_fetch(&req, &config, &url).await.unwrap();
@@ -2668,6 +2706,60 @@ mod tests {
         assert_eq!(result.external_document["type"], "document");
         assert_eq!(result.external_document["title"], "Example Article");
         assert_eq!(result.external_document["citations"]["enabled"], true);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_execute_web_fetch_use_cache_false_sends_no_cache_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/article",
+                get(|headers: axum::http::HeaderMap| async move {
+                    let cache_control = headers
+                        .get(header::CACHE_CONTROL)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("");
+                    let pragma = headers
+                        .get(header::PRAGMA)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("");
+                    format!("cache-control={cache_control}\npragma={pragma}")
+                }),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let url = format!("http://{addr}/article");
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 512,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: json!(format!("Read {}", url)),
+            }],
+            stream: false,
+            system: None,
+            tools: Some(vec![sample_tool()]),
+            tool_choice: Some(json!({"type":"auto"})),
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        let config = WebFetchConfig {
+            max_uses: None,
+            max_content_tokens: Some(1024),
+            citations_enabled: false,
+            allowed_domains: Vec::new(),
+            blocked_domains: Vec::new(),
+            use_cache: false,
+        };
+
+        let result = execute_web_fetch(&req, &config, &url).await.unwrap();
+        assert!(result.model_text.contains("cache-control=no-cache"));
+        assert!(result.model_text.contains("pragma=no-cache"));
 
         server.abort();
     }

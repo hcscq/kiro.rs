@@ -330,7 +330,7 @@ pub struct SystemMessage {
 /// 支持三种格式：
 /// 1. 普通工具：{ name, description, input_schema }
 /// 2. WebSearch 工具：{ type: "web_search_20250305", name: "web_search", max_uses: 8 }
-/// 3. WebFetch 工具：{ type: "web_fetch_20250910" 或 "web_fetch_20260209", name: "web_fetch", max_uses, ... }
+/// 3. WebFetch 工具：{ type: "web_fetch_20250910"、"web_fetch_20260209" 或 "web_fetch_20260309", name: "web_fetch", max_uses, ... }
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ToolCitations {
     #[serde(default)]
@@ -366,6 +366,9 @@ pub struct Tool {
     /// WebFetch 抓取内容的最大 token 数
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_content_tokens: Option<i32>,
+    /// WebFetch 是否使用缓存内容；20260309 版本支持 false 以绕过缓存
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub use_cache: Option<bool>,
 }
 
 fn deserialize_input_schema<'de, D>(
