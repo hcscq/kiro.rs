@@ -1122,6 +1122,7 @@ mod tests {
             },
             stream_pre_sse_failover: StreamPreSseFailoverConfig::default(),
             non_stream_body_read_timeout: Default::default(),
+            kiro_request_body_guard: Default::default(),
             thinking_signature_validation_mode: ThinkingSignatureValidationMode::WarnOnly,
             response_thinking_signature_compat_enabled: true,
             account_type_policies: std::collections::BTreeMap::new(),
@@ -1165,6 +1166,7 @@ mod tests {
         assert_eq!(rollback.request_weighting.max_weight, 4.0);
         assert_eq!(rollback.request_weighting.tools_bonus, 1.0);
         assert!(rollback.stream_pre_sse_failover.enabled);
+        assert_eq!(rollback.kiro_request_body_guard.max_bytes, 30 * 1024 * 1024);
         assert_eq!(
             rollback.thinking_signature_validation_mode,
             ThinkingSignatureValidationMode::WarnOnly

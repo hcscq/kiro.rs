@@ -26,8 +26,8 @@ use crate::kiro::model::token_refresh::{
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::{
-    Config, NonStreamBodyReadTimeoutConfig, RequestWeightingConfig, StreamPreSseFailoverConfig,
-    ThinkingSignatureValidationMode,
+    Config, KiroRequestBodyGuardConfig, NonStreamBodyReadTimeoutConfig, RequestWeightingConfig,
+    StreamPreSseFailoverConfig, ThinkingSignatureValidationMode,
 };
 use crate::model::model_policy::{
     AccountTypeDispatchPolicy, ModelSupportPolicy, normalize_account_type_dispatch_policies,
@@ -878,6 +878,7 @@ pub struct LoadBalancingConfigSnapshot {
     pub request_weighting: RequestWeightingConfig,
     pub stream_pre_sse_failover: StreamPreSseFailoverConfig,
     pub non_stream_body_read_timeout: NonStreamBodyReadTimeoutConfig,
+    pub kiro_request_body_guard: KiroRequestBodyGuardConfig,
     pub thinking_signature_validation_mode: ThinkingSignatureValidationMode,
     pub response_thinking_signature_compat_enabled: bool,
     pub waiting_requests: usize,
@@ -917,6 +918,7 @@ struct DispatchConfig {
     request_weighting: RequestWeightingConfig,
     stream_pre_sse_failover: StreamPreSseFailoverConfig,
     non_stream_body_read_timeout: NonStreamBodyReadTimeoutConfig,
+    kiro_request_body_guard: KiroRequestBodyGuardConfig,
     thinking_signature_validation_mode: ThinkingSignatureValidationMode,
     response_thinking_signature_compat_enabled: bool,
     account_type_policies: BTreeMap<String, ModelSupportPolicy>,
@@ -989,6 +991,7 @@ impl DispatchConfig {
             request_weighting: config.request_weighting.clone(),
             stream_pre_sse_failover: config.stream_pre_sse_failover.clone(),
             non_stream_body_read_timeout: config.non_stream_body_read_timeout.clone(),
+            kiro_request_body_guard: config.kiro_request_body_guard.clone(),
             thinking_signature_validation_mode: config.thinking_signature_validation_mode,
             response_thinking_signature_compat_enabled: config
                 .response_thinking_signature_compat_enabled,
@@ -6839,6 +6842,7 @@ impl MultiTokenManager {
             request_weighting: dispatch.request_weighting.clone(),
             stream_pre_sse_failover: dispatch.stream_pre_sse_failover.clone(),
             non_stream_body_read_timeout: dispatch.non_stream_body_read_timeout.clone(),
+            kiro_request_body_guard: dispatch.kiro_request_body_guard.clone(),
             thinking_signature_validation_mode: dispatch.thinking_signature_validation_mode,
             response_thinking_signature_compat_enabled: dispatch
                 .response_thinking_signature_compat_enabled,
@@ -6876,6 +6880,10 @@ impl MultiTokenManager {
 
     pub fn non_stream_body_read_timeout_config_snapshot(&self) -> NonStreamBodyReadTimeoutConfig {
         self.dispatch_config().non_stream_body_read_timeout
+    }
+
+    pub fn kiro_request_body_guard_config_snapshot(&self) -> KiroRequestBodyGuardConfig {
+        self.dispatch_config().kiro_request_body_guard
     }
 
     pub fn thinking_signature_validation_mode(&self) -> ThinkingSignatureValidationMode {
@@ -6928,6 +6936,7 @@ impl MultiTokenManager {
                 request_weighting: dispatch.request_weighting.clone(),
                 stream_pre_sse_failover: dispatch.stream_pre_sse_failover.clone(),
                 non_stream_body_read_timeout: dispatch.non_stream_body_read_timeout.clone(),
+                kiro_request_body_guard: dispatch.kiro_request_body_guard.clone(),
                 thinking_signature_validation_mode: dispatch.thinking_signature_validation_mode,
                 response_thinking_signature_compat_enabled: dispatch
                     .response_thinking_signature_compat_enabled,
@@ -6942,6 +6951,7 @@ impl MultiTokenManager {
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
         self.set_load_balancing_config(
             Some(mode),
+            None,
             None,
             None,
             None,
@@ -7050,6 +7060,7 @@ impl MultiTokenManager {
         request_weighting: Option<RequestWeightingConfig>,
         stream_pre_sse_failover: Option<StreamPreSseFailoverConfig>,
         non_stream_body_read_timeout: Option<NonStreamBodyReadTimeoutConfig>,
+        kiro_request_body_guard: Option<KiroRequestBodyGuardConfig>,
         session_affinity_enabled: Option<bool>,
         thinking_signature_validation_mode: Option<ThinkingSignatureValidationMode>,
         response_thinking_signature_compat_enabled: Option<bool>,
@@ -7155,6 +7166,9 @@ impl MultiTokenManager {
         if let Some(non_stream_body_read_timeout) = non_stream_body_read_timeout {
             next.non_stream_body_read_timeout = non_stream_body_read_timeout;
         }
+        if let Some(kiro_request_body_guard) = kiro_request_body_guard {
+            next.kiro_request_body_guard = kiro_request_body_guard;
+        }
         if let Some(session_affinity_enabled) = session_affinity_enabled {
             next.session_affinity_enabled = session_affinity_enabled;
         }
@@ -7187,6 +7201,7 @@ impl MultiTokenManager {
         Self::validate_dispatch_rate_limit_config(&next)?;
         next.stream_pre_sse_failover.validate()?;
         next.non_stream_body_read_timeout.validate()?;
+        next.kiro_request_body_guard.validate()?;
 
         if previous == next {
             return Ok(());
@@ -7234,7 +7249,7 @@ impl MultiTokenManager {
 
         self.availability_notify.notify_waiters();
         tracing::info!(
-            "调度配置已更新: mode={}, sessionAffinityEnabled={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, rateLimitCooldownEnabled={}, suspiciousActivityCooldownMs={}, suspiciousActivityCooldownEnabled={}, suspiciousActivityAutoClearEnabled={}, suspiciousActivityAutoClearSuccessThreshold={}, suspiciousActivityAutoClearAfterMs={}, modelCooldownEnabled={}, defaultMaxConcurrency={:?}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}, requestWeightingEnabled={}, requestWeightingBaseWeight={}, requestWeightingMaxWeight={}, streamPreSseFailoverEnabled={}, streamPreSseTotalBudgetMs={}, streamPreSseMaxFastFailovers={}, thinkingSignatureValidationMode={}, responseThinkingSignatureCompatEnabled={}",
+            "调度配置已更新: mode={}, sessionAffinityEnabled={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, rateLimitCooldownEnabled={}, suspiciousActivityCooldownMs={}, suspiciousActivityCooldownEnabled={}, suspiciousActivityAutoClearEnabled={}, suspiciousActivityAutoClearSuccessThreshold={}, suspiciousActivityAutoClearAfterMs={}, modelCooldownEnabled={}, defaultMaxConcurrency={:?}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}, requestWeightingEnabled={}, requestWeightingBaseWeight={}, requestWeightingMaxWeight={}, streamPreSseFailoverEnabled={}, streamPreSseTotalBudgetMs={}, streamPreSseMaxFastFailovers={}, kiroRequestBodyGuardEnabled={}, kiroRequestBodyGuardMaxBytes={}, thinkingSignatureValidationMode={}, responseThinkingSignatureCompatEnabled={}",
             next.mode,
             next.session_affinity_enabled,
             next.queue_max_size,
@@ -7259,6 +7274,8 @@ impl MultiTokenManager {
             next.stream_pre_sse_failover.enabled,
             next.stream_pre_sse_failover.total_budget_ms,
             next.stream_pre_sse_failover.max_fast_failovers,
+            next.kiro_request_body_guard.enabled,
+            next.kiro_request_body_guard.max_bytes,
             next.thinking_signature_validation_mode.as_str(),
             next.response_thinking_signature_compat_enabled
         );
@@ -9204,6 +9221,10 @@ mod tests {
             },
             stream_pre_sse_failover: StreamPreSseFailoverConfig::default(),
             non_stream_body_read_timeout: NonStreamBodyReadTimeoutConfig::default(),
+            kiro_request_body_guard: KiroRequestBodyGuardConfig {
+                max_bytes: 31 * 1024 * 1024,
+                ..KiroRequestBodyGuardConfig::default()
+            },
             thinking_signature_validation_mode: ThinkingSignatureValidationMode::WarnOnly,
             response_thinking_signature_compat_enabled: true,
             account_type_policies: BTreeMap::new(),
@@ -9247,6 +9268,7 @@ mod tests {
         assert_eq!(snapshot.request_weighting.max_weight, 4.0);
         assert_eq!(snapshot.request_weighting.tools_bonus, 1.0);
         assert!(snapshot.stream_pre_sse_failover.enabled);
+        assert_eq!(snapshot.kiro_request_body_guard.max_bytes, 31 * 1024 * 1024);
         assert_eq!(
             snapshot.thinking_signature_validation_mode,
             ThinkingSignatureValidationMode::WarnOnly
@@ -9380,6 +9402,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap_err()
             .to_string();
@@ -9440,6 +9463,10 @@ mod tests {
                     retry_on_timeout: true,
                     ..NonStreamBodyReadTimeoutConfig::default()
                 }),
+                Some(KiroRequestBodyGuardConfig {
+                    max_bytes: 31 * 1024 * 1024,
+                    ..KiroRequestBodyGuardConfig::default()
+                }),
                 Some(true),
                 Some(ThinkingSignatureValidationMode::StripInvalid),
                 Some(true),
@@ -9483,6 +9510,10 @@ mod tests {
         );
         assert_eq!(persisted.non_stream_body_read_timeout.timeout_ms, 510_000);
         assert!(persisted.non_stream_body_read_timeout.retry_on_timeout);
+        assert_eq!(
+            persisted.kiro_request_body_guard.max_bytes,
+            31 * 1024 * 1024
+        );
         assert!(persisted.response_thinking_signature_compat_enabled);
         assert_eq!(
             manager.thinking_signature_validation_mode(),
@@ -9535,6 +9566,7 @@ mod tests {
                 None,
                 None,
                 Some(false),
+                None,
                 None,
                 None,
                 None,

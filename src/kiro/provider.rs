@@ -2495,6 +2495,29 @@ impl KiroProvider {
             );
             let body_inject_ms = body_inject_started_at.elapsed().as_millis();
             let request_body_bytes = body.len();
+            let request_body_guard = self.token_manager.kiro_request_body_guard_config_snapshot();
+            if request_body_guard.should_reject(request_body_bytes) {
+                tracing::warn!(
+                    request_id = %request_id,
+                    api_type,
+                    model = model.as_deref().unwrap_or("unknown"),
+                    credential_id = ctx_id,
+                    attempt = attempt + 1,
+                    request_body_bytes,
+                    guard_limit_bytes = request_body_guard.max_bytes,
+                    profile_arn_present = effective_profile_arn.is_some(),
+                    "Kiro provider request body guard rejected oversized request before upstream dispatch"
+                );
+                return Err(anyhow::Error::new(
+                    PublicProviderError::context_length_exceeded(
+                        400,
+                        format!(
+                            "{} API 请求本地拦截: final Kiro request body {} bytes exceeds configured limit {} bytes",
+                            api_type, request_body_bytes, request_body_guard.max_bytes
+                        ),
+                    ),
+                ));
+            }
             if request_body_bytes >= LARGE_PROVIDER_REQUEST_WARN_THRESHOLD_BYTES
                 || body_inject_ms >= SLOW_HEADERS_TO_FIRST_CHUNK_MS
             {

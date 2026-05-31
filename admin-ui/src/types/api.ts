@@ -220,6 +220,11 @@ export interface NonStreamBodyReadTimeoutConfig {
   eventstreamSafeRetryOnStall: boolean
 }
 
+export interface KiroRequestBodyGuardConfig {
+  enabled: boolean
+  maxBytes: number
+}
+
 export type ThinkingSignatureValidationMode = 'strict' | 'warn_only' | 'disabled' | 'strip_invalid'
 
 export interface LoadBalancingConfigResponse {
@@ -248,6 +253,7 @@ export interface LoadBalancingConfigResponse {
   requestWeighting: RequestWeightingConfig
   streamPreSseFailover: StreamPreSseFailoverConfig
   nonStreamBodyReadTimeout: NonStreamBodyReadTimeoutConfig
+  kiroRequestBodyGuard: KiroRequestBodyGuardConfig
   thinkingSignatureValidationMode: ThinkingSignatureValidationMode
   responseThinkingSignatureCompatEnabled: boolean
   waitingRequests: number
@@ -279,6 +285,7 @@ export interface UpdateLoadBalancingConfigRequest {
   requestWeighting?: RequestWeightingConfig
   streamPreSseFailover?: StreamPreSseFailoverConfig
   nonStreamBodyReadTimeout?: NonStreamBodyReadTimeoutConfig
+  kiroRequestBodyGuard?: KiroRequestBodyGuardConfig
   thinkingSignatureValidationMode?: ThinkingSignatureValidationMode
   responseThinkingSignatureCompatEnabled?: boolean
 }

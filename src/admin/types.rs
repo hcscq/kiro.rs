@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 
 use crate::model::config::{
-    NonStreamBodyReadTimeoutConfig, RequestWeightingConfig, StreamPreSseFailoverConfig,
-    ThinkingSignatureValidationMode,
+    KiroRequestBodyGuardConfig, NonStreamBodyReadTimeoutConfig, RequestWeightingConfig,
+    StreamPreSseFailoverConfig, ThinkingSignatureValidationMode,
 };
 use crate::model::model_policy::{
     AccountTypeDispatchPolicy, ModelSupportPolicy, RuntimeModelRestriction,
@@ -412,6 +412,8 @@ pub struct LoadBalancingModeResponse {
     pub stream_pre_sse_failover: StreamPreSseFailoverConfig,
     /// 非流式请求上游响应体读取超时策略
     pub non_stream_body_read_timeout: NonStreamBodyReadTimeoutConfig,
+    /// 最终 Kiro 上游请求体大小保护
+    pub kiro_request_body_guard: KiroRequestBodyGuardConfig,
     /// 历史 thinking signature 的本地校验策略
     pub thinking_signature_validation_mode: ThinkingSignatureValidationMode,
     /// 响应侧隐藏 thinking signature 兼容补齐开关
@@ -474,6 +476,8 @@ pub struct SetLoadBalancingModeRequest {
     pub stream_pre_sse_failover: Option<StreamPreSseFailoverConfig>,
     /// 非流式请求上游响应体读取超时策略
     pub non_stream_body_read_timeout: Option<NonStreamBodyReadTimeoutConfig>,
+    /// 最终 Kiro 上游请求体大小保护
+    pub kiro_request_body_guard: Option<KiroRequestBodyGuardConfig>,
     /// 历史 thinking signature 的本地校验策略
     pub thinking_signature_validation_mode: Option<ThinkingSignatureValidationMode>,
     /// 响应侧隐藏 thinking signature 兼容补齐开关

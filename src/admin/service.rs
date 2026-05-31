@@ -478,6 +478,7 @@ impl AdminService {
             request_weighting: snapshot.request_weighting,
             stream_pre_sse_failover: snapshot.stream_pre_sse_failover,
             non_stream_body_read_timeout: snapshot.non_stream_body_read_timeout,
+            kiro_request_body_guard: snapshot.kiro_request_body_guard,
             thinking_signature_validation_mode: snapshot.thinking_signature_validation_mode,
             response_thinking_signature_compat_enabled: snapshot
                 .response_thinking_signature_compat_enabled,
@@ -559,6 +560,7 @@ impl AdminService {
             && req.request_weighting.is_none()
             && req.stream_pre_sse_failover.is_none()
             && req.non_stream_body_read_timeout.is_none()
+            && req.kiro_request_body_guard.is_none()
             && req.thinking_signature_validation_mode.is_none()
             && req.response_thinking_signature_compat_enabled.is_none()
         {
@@ -598,6 +600,7 @@ impl AdminService {
                 req.request_weighting,
                 req.stream_pre_sse_failover,
                 req.non_stream_body_read_timeout,
+                req.kiro_request_body_guard,
                 req.session_affinity_enabled,
                 req.thinking_signature_validation_mode,
                 req.response_thinking_signature_compat_enabled,

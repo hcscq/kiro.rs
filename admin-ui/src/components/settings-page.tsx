@@ -18,6 +18,7 @@ import {
 import { extractErrorMessage } from '@/lib/utils'
 import { Save, AlertCircle, Info } from 'lucide-react'
 import type {
+  KiroRequestBodyGuardConfig,
   NonStreamBodyReadTimeoutConfig,
   RequestWeightingConfig,
   StreamPreSseFailoverConfig,
@@ -29,6 +30,8 @@ type StreamPreSseFailoverNumericField = Exclude<keyof StreamPreSseFailoverConfig
 
 type RequestWeightingInputState = Record<RequestWeightingNumericField, string>
 type StreamPreSseFailoverInputState = Record<StreamPreSseFailoverNumericField, string>
+
+const MIB_BYTES = 1024 * 1024
 
 const DEFAULT_REQUEST_WEIGHTING: RequestWeightingConfig = {
   enabled: true,
@@ -67,6 +70,11 @@ const DEFAULT_NON_STREAM_BODY_READ_TIMEOUT: NonStreamBodyReadTimeoutConfig = {
   eventstreamIdleTimeoutMs: 120000,
   retryOnTimeout: false,
   eventstreamSafeRetryOnStall: true,
+}
+
+const DEFAULT_KIRO_REQUEST_BODY_GUARD: KiroRequestBodyGuardConfig = {
+  enabled: true,
+  maxBytes: 30 * MIB_BYTES,
 }
 
 const THINKING_SIGNATURE_VALIDATION_OPTIONS: Array<{
@@ -357,6 +365,11 @@ function createStreamPreSseFailoverInputs(
   }
 }
 
+function bytesToMiBInput(bytes: number): string {
+  const value = bytes / MIB_BYTES
+  return value.toFixed(2).replace(/\.?0+$/, '')
+}
+
 function SettingInfoTooltip({
   label,
   children,
@@ -467,6 +480,10 @@ export function SettingsPage() {
     useState(DEFAULT_NON_STREAM_BODY_READ_TIMEOUT.retryOnTimeout)
   const [nonStreamEventstreamSafeRetryOnStall, setNonStreamEventstreamSafeRetryOnStall] =
     useState(DEFAULT_NON_STREAM_BODY_READ_TIMEOUT.eventstreamSafeRetryOnStall)
+  const [kiroRequestBodyGuardEnabled, setKiroRequestBodyGuardEnabled] =
+    useState(DEFAULT_KIRO_REQUEST_BODY_GUARD.enabled)
+  const [kiroRequestBodyGuardMaxMiBInput, setKiroRequestBodyGuardMaxMiBInput] =
+    useState(bytesToMiBInput(DEFAULT_KIRO_REQUEST_BODY_GUARD.maxBytes))
   const [thinkingSignatureValidationMode, setThinkingSignatureValidationMode] =
     useState<ThinkingSignatureValidationMode>('strict')
   const [responseThinkingSignatureCompatEnabled, setResponseThinkingSignatureCompatEnabled] =
@@ -513,6 +530,12 @@ export function SettingsPage() {
     setNonStreamEventstreamIdleTimeoutMsInput(String(nonStreamBodyReadTimeout.eventstreamIdleTimeoutMs))
     setNonStreamBodyReadTimeoutRetryOnTimeout(nonStreamBodyReadTimeout.retryOnTimeout)
     setNonStreamEventstreamSafeRetryOnStall(nonStreamBodyReadTimeout.eventstreamSafeRetryOnStall)
+    const kiroRequestBodyGuard = {
+      ...DEFAULT_KIRO_REQUEST_BODY_GUARD,
+      ...(loadBalancingData.kiroRequestBodyGuard ?? {}),
+    }
+    setKiroRequestBodyGuardEnabled(kiroRequestBodyGuard.enabled)
+    setKiroRequestBodyGuardMaxMiBInput(bytesToMiBInput(kiroRequestBodyGuard.maxBytes))
     setThinkingSignatureValidationMode(loadBalancingData.thinkingSignatureValidationMode ?? 'strict')
     setResponseThinkingSignatureCompatEnabled(loadBalancingData.responseThinkingSignatureCompatEnabled ?? false)
   }, [loadBalancingData])
@@ -554,6 +577,7 @@ export function SettingsPage() {
     const parsedRateLimitRefillBackoffFactor = rateLimitRefillBackoffFactorInput.trim() === '' ? 0 : Number.parseFloat(rateLimitRefillBackoffFactorInput)
     const parsedNonStreamBodyReadTimeoutMs = nonStreamBodyReadTimeoutMsInput.trim() === '' ? 0 : parseInt(nonStreamBodyReadTimeoutMsInput, 10)
     const parsedNonStreamEventstreamIdleTimeoutMs = nonStreamEventstreamIdleTimeoutMsInput.trim() === '' ? 0 : parseInt(nonStreamEventstreamIdleTimeoutMsInput, 10)
+    const parsedKiroRequestBodyGuardMaxMiB = kiroRequestBodyGuardMaxMiBInput.trim() === '' ? 0 : Number.parseFloat(kiroRequestBodyGuardMaxMiBInput)
     const parsedRequestWeighting: RequestWeightingConfig = {
       enabled: requestWeightingEnabled,
       baseWeight: requestWeightingInputs.baseWeight.trim() === '' ? 0 : Number.parseFloat(requestWeightingInputs.baseWeight),
@@ -601,6 +625,7 @@ export function SettingsPage() {
       Number.isNaN(parsedRateLimitRefillBackoffFactor) ||
       Number.isNaN(parsedNonStreamBodyReadTimeoutMs) ||
       Number.isNaN(parsedNonStreamEventstreamIdleTimeoutMs) ||
+      Number.isNaN(parsedKiroRequestBodyGuardMaxMiB) ||
       parsedQueueMaxSize < 0 ||
       parsedQueueMaxWaitMs < 0 ||
       parsedRateLimitCooldownMs < 0 ||
@@ -615,7 +640,8 @@ export function SettingsPage() {
       parsedRateLimitRefillMinPerSecond < 0 ||
       parsedRateLimitRefillRecoveryStep < 0 ||
       parsedNonStreamBodyReadTimeoutMs < 0 ||
-      parsedNonStreamEventstreamIdleTimeoutMs < 0
+      parsedNonStreamEventstreamIdleTimeoutMs < 0 ||
+      parsedKiroRequestBodyGuardMaxMiB < 0
     ) {
       toast.error('调度参数必须是大于等于 0 的数字')
       return
@@ -742,6 +768,14 @@ export function SettingsPage() {
       return
     }
 
+    if (
+      kiroRequestBodyGuardEnabled &&
+      (parsedKiroRequestBodyGuardMaxMiB < 1 || parsedKiroRequestBodyGuardMaxMiB > 64)
+    ) {
+      toast.error('Kiro 上游 body 上限必须在 1 到 64 MiB 之间，或关闭启用开关')
+      return
+    }
+
     setLoadBalancingMode(
       {
         queueMaxSize: parsedQueueMaxSize,
@@ -773,6 +807,10 @@ export function SettingsPage() {
           eventstreamIdleTimeoutMs: parsedNonStreamEventstreamIdleTimeoutMs,
           retryOnTimeout: nonStreamBodyReadTimeoutRetryOnTimeout,
           eventstreamSafeRetryOnStall: nonStreamEventstreamSafeRetryOnStall,
+        },
+        kiroRequestBodyGuard: {
+          enabled: kiroRequestBodyGuardEnabled,
+          maxBytes: Math.round(parsedKiroRequestBodyGuardMaxMiB * MIB_BYTES),
         },
         thinkingSignatureValidationMode,
         responseThinkingSignatureCompatEnabled,
@@ -1297,6 +1335,46 @@ export function SettingsPage() {
                   />
                   <p className="text-xs text-muted-foreground">
                     仅在非流式上游返回 Amazon EventStream 且 body 已开始后生效。
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="space-y-4">
+            <h3 className="text-sm font-semibold flex items-center text-primary">Kiro 上游请求体保护</h3>
+            <div className="space-y-4 rounded-lg bg-muted/30 p-4">
+              <div className="grid gap-4 lg:grid-cols-3">
+                <SwitchSettingCard
+                  title="最终 body 大小拦截"
+                  checked={kiroRequestBodyGuardEnabled}
+                  onCheckedChange={setKiroRequestBodyGuardEnabled}
+                  ariaLabel="切换 Kiro 上游请求体大小拦截"
+                  disabledLabel="不拦截"
+                  description={
+                    <>
+                      <p>在 profileArn 注入后、发往 Kiro 上游前检查最终 JSON body 长度。</p>
+                      <p>命中后返回 context_length_exceeded，让客户端按上下文超限路径压缩。</p>
+                    </>
+                  }
+                />
+
+                <div className="space-y-2 rounded-lg border bg-background/70 p-4 lg:col-span-2">
+                  <label className="text-sm font-medium" htmlFor="kiroRequestBodyGuardMaxMiB">
+                    上游 body 上限 (MiB)
+                  </label>
+                  <Input
+                    id="kiroRequestBodyGuardMaxMiB"
+                    type="number"
+                    min="1"
+                    max="64"
+                    step="0.5"
+                    value={kiroRequestBodyGuardMaxMiBInput}
+                    onChange={(e) => setKiroRequestBodyGuardMaxMiBInput(e.target.value)}
+                    placeholder="默认 30"
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    默认 30MiB；保存时按 MiB 转换为字节写入运行时配置。
                   </p>
                 </div>
               </div>

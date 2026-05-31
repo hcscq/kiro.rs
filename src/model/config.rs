@@ -301,6 +301,47 @@ impl NonStreamBodyReadTimeoutConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct KiroRequestBodyGuardConfig {
+    #[serde(default = "default_kiro_request_body_guard_enabled")]
+    pub enabled: bool,
+
+    /// 最终发往 Kiro 上游的 JSON body 上限。该值在 profileArn 注入后检查。
+    #[serde(default = "default_kiro_request_body_guard_max_bytes")]
+    pub max_bytes: usize,
+}
+
+impl Default for KiroRequestBodyGuardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_kiro_request_body_guard_enabled(),
+            max_bytes: default_kiro_request_body_guard_max_bytes(),
+        }
+    }
+}
+
+impl KiroRequestBodyGuardConfig {
+    pub fn should_reject(&self, body_bytes: usize) -> bool {
+        self.enabled && body_bytes > self.max_bytes
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        if self.max_bytes < 1024 * 1024 {
+            anyhow::bail!("kiroRequestBodyGuard.maxBytes 必须不小于 1MiB，或关闭 enabled");
+        }
+        if self.max_bytes > 64 * 1024 * 1024 {
+            anyhow::bail!("kiroRequestBodyGuard.maxBytes 不能大于 64MiB");
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ConversionRuntimeConfig {
@@ -621,6 +662,10 @@ pub struct Config {
     #[serde(default)]
     pub non_stream_body_read_timeout: NonStreamBodyReadTimeoutConfig,
 
+    /// 最终 Kiro 上游请求体大小保护。
+    #[serde(default, alias = "kiro_request_body_guard")]
+    pub kiro_request_body_guard: KiroRequestBodyGuardConfig,
+
     /// Anthropic -> Kiro 转换与图片处理的本地 blocking 运行池。
     #[serde(default)]
     pub conversion_runtime: ConversionRuntimeConfig,
@@ -885,6 +930,14 @@ fn default_non_stream_eventstream_safe_retry_on_stall() -> bool {
     true
 }
 
+fn default_kiro_request_body_guard_enabled() -> bool {
+    true
+}
+
+pub fn default_kiro_request_body_guard_max_bytes() -> usize {
+    30 * 1024 * 1024
+}
+
 fn default_conversion_max_concurrent() -> usize {
     16
 }
@@ -969,6 +1022,7 @@ impl Default for Config {
             request_weighting: RequestWeightingConfig::default(),
             stream_pre_sse_failover: StreamPreSseFailoverConfig::default(),
             non_stream_body_read_timeout: NonStreamBodyReadTimeoutConfig::default(),
+            kiro_request_body_guard: KiroRequestBodyGuardConfig::default(),
             conversion_runtime: ConversionRuntimeConfig::default(),
             thinking_signature_validation_mode: ThinkingSignatureValidationMode::default(),
             response_thinking_signature_compat_enabled: false,
@@ -1106,6 +1160,7 @@ impl Config {
         self.request_weighting.validate()?;
         self.stream_pre_sse_failover.validate()?;
         self.non_stream_body_read_timeout.validate()?;
+        self.kiro_request_body_guard.validate()?;
         self.conversion_runtime.validate()?;
 
         Ok(())
@@ -1184,7 +1239,8 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, ConversionRuntimeConfig, RequestWeightingConfig, ThinkingSignatureValidationMode,
+        Config, ConversionRuntimeConfig, KiroRequestBodyGuardConfig, RequestWeightingConfig,
+        ThinkingSignatureValidationMode,
     };
 
     #[test]
@@ -1319,6 +1375,8 @@ mod tests {
         assert_eq!(config.conversion_runtime.max_queue_weight, 128);
         assert_eq!(config.conversion_runtime.queue_wait_ms, 60_000);
         assert_eq!(config.conversion_runtime.max_request_weight, 8);
+        assert!(config.kiro_request_body_guard.enabled);
+        assert_eq!(config.kiro_request_body_guard.max_bytes, 30 * 1024 * 1024);
     }
 
     #[test]
@@ -1350,6 +1408,26 @@ mod tests {
         let err = config.validate().unwrap_err().to_string();
 
         assert!(err.contains("nonStreamBodyReadTimeout.timeoutMs"));
+    }
+
+    #[test]
+    fn kiro_request_body_guard_defaults_and_rejects_over_limit_only() {
+        let guard = KiroRequestBodyGuardConfig::default();
+
+        assert!(guard.enabled);
+        assert_eq!(guard.max_bytes, 30 * 1024 * 1024);
+        assert!(!guard.should_reject(30 * 1024 * 1024));
+        assert!(guard.should_reject(30 * 1024 * 1024 + 1));
+    }
+
+    #[test]
+    fn validate_rejects_enabled_kiro_request_body_guard_too_small() {
+        let mut config = Config::default();
+        config.kiro_request_body_guard.max_bytes = 1024;
+
+        let err = config.validate().unwrap_err().to_string();
+
+        assert!(err.contains("kiroRequestBodyGuard.maxBytes"));
     }
 
     #[test]
