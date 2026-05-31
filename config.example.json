@@ -59,6 +59,7 @@
   },
   "thinkingSignatureValidationMode": "strict",
   "responseThinkingSignatureCompatEnabled": false,
+  "serverWebToolsMode": "max_compat",
   "accountTypePolicies": {
     "power": {
       "allowedModels": [

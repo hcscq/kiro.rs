@@ -27,8 +27,8 @@ use crate::kiro::token_manager::{
     RuntimeRefreshLeaseBusyError,
 };
 use crate::model::config::{
-    Config, RequestWeightingConfig, StreamPreSseFailoverConfig, ThinkingSignatureValidationMode,
-    TlsBackend,
+    Config, RequestWeightingConfig, ServerWebToolsMode, StreamPreSseFailoverConfig,
+    ThinkingSignatureValidationMode, TlsBackend,
 };
 use parking_lot::Mutex;
 
@@ -1185,6 +1185,10 @@ impl KiroProvider {
     pub fn response_thinking_signature_compat_enabled(&self) -> bool {
         self.token_manager
             .response_thinking_signature_compat_enabled()
+    }
+
+    pub fn server_web_tools_mode(&self) -> ServerWebToolsMode {
+        self.token_manager.config().server_web_tools_mode
     }
 
     pub fn supports_model(&self, model: &str) -> bool {

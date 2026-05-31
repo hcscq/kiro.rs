@@ -235,6 +235,7 @@ GitHub Actions 镜像构建：
 | `requestWeighting` | object | 默认开启 | 轻/重请求加权配置。默认值已按单号/少号场景收敛：重请求会多消耗 bucket，但不会像旧参数那样过快把桶打空 |
 | `thinkingSignatureValidationMode` | string | `strict` | 历史 thinking signature 校验模式：`strict` 拒绝无效自签名，`warn_only` 只告警放行，`disabled` 跳过校验，`strip_invalid` 移除无效自签名后放行；也可在 Admin UI 的“调度与并发配置”页面热更新 |
 | `responseThinkingSignatureCompatEnabled` | boolean | `false` | 响应侧 thinking signature 兼容补齐；启用后，thinking 流式请求若上游先返回普通内容，会在首个非 thinking 内容块前补齐隐藏 thinking block 和动态 AWS-shaped `signature_delta` |
+| `serverWebToolsMode` | string | `max_compat` | Anthropic server-side web tools 兼容模式：`max_compat` 最大化复原 Claude 官方 `web_search`/`web_fetch` 能力；`native_only` 只使用 Kiro 原生 MCP 能力（当前仅 `web_search`）；`disabled` 直接拒绝 server web tools，可作为上线快速回滚开关 |
 
 完整配置示例：
 
@@ -309,7 +310,8 @@ GitHub Actions 镜像构建：
       "heavyThinkingBudgetBonus": 0.35
    },
    "thinkingSignatureValidationMode": "strict",
-   "responseThinkingSignatureCompatEnabled": false
+   "responseThinkingSignatureCompatEnabled": false,
+   "serverWebToolsMode": "max_compat"
 }
 ```
 
@@ -322,6 +324,11 @@ GitHub Actions 镜像构建：
 - 估算输入 tokens >= `12000` / `24000` 时分别额外增加 `0.25` / `0.35`
 - 最终权重限制在 `1.0..=2.5`
 - 同时默认 bucket 也会提升到 `capacity=6`、`refill=2`、`minRefill=1`，避免重请求默认把单号拖死
+
+`serverWebToolsMode` 可用于 server-side Web 工具上线回滚：
+- `max_compat`：默认，`web_search` 使用 Kiro MCP，`web_fetch` 由 kiro.rs 本地兼容层执行，并保留官方 server tool 响应形状。
+- `native_only`：保留 Kiro 原生 `web_search`，让 `web_fetch` 以 `tool_unavailable` 返回，适合快速绕开本地抓取兼容层。
+- `disabled`：直接拒绝小写 `web_search_*` / `web_fetch_*` server tool 请求；大写客户端工具 `WebSearch` / `WebFetch` 不受影响，仍由客户端处理。
 
 ### 外部状态存储
 

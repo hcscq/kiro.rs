@@ -444,6 +444,30 @@ impl ThinkingSignatureValidationMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerWebToolsMode {
+    /// 最大化复原 Anthropic server-side web tools 行为。
+    #[default]
+    #[serde(alias = "max-compat", alias = "maxCompat")]
+    MaxCompat,
+    /// 只使用 Kiro 上游原生能力；当前原生 MCP 仅提供 web_search。
+    #[serde(alias = "native-only", alias = "nativeOnly")]
+    NativeOnly,
+    /// 禁用 Anthropic server-side web tools 兼容层。
+    Disabled,
+}
+
+impl ServerWebToolsMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MaxCompat => "max_compat",
+            Self::NativeOnly => "native_only",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -679,6 +703,12 @@ pub struct Config {
     /// 补齐隐藏 thinking block 和动态 signature_delta。默认关闭。
     #[serde(default, alias = "response_thinking_signature_compat_enabled")]
     pub response_thinking_signature_compat_enabled: bool,
+
+    /// Anthropic server-side web tools 兼容模式。
+    /// max_compat 会在 kiro.rs 本地补齐 web_fetch；native_only 只使用 Kiro 原生 MCP 能力；
+    /// disabled 直接拒绝 server web tool 请求，作为快速回滚开关。
+    #[serde(default, alias = "server_web_tools_mode")]
+    pub server_web_tools_mode: ServerWebToolsMode,
 
     /// 账号类型默认模型策略
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -1026,6 +1056,7 @@ impl Default for Config {
             conversion_runtime: ConversionRuntimeConfig::default(),
             thinking_signature_validation_mode: ThinkingSignatureValidationMode::default(),
             response_thinking_signature_compat_enabled: false,
+            server_web_tools_mode: ServerWebToolsMode::default(),
             account_type_policies: BTreeMap::new(),
             account_type_dispatch_policies: BTreeMap::new(),
             config_path: None,
@@ -1240,7 +1271,7 @@ impl Config {
 mod tests {
     use super::{
         Config, ConversionRuntimeConfig, KiroRequestBodyGuardConfig, RequestWeightingConfig,
-        ThinkingSignatureValidationMode,
+        ServerWebToolsMode, ThinkingSignatureValidationMode,
     };
 
     #[test]
@@ -1457,5 +1488,21 @@ mod tests {
 
         assert!(camel.response_thinking_signature_compat_enabled);
         assert!(snake.response_thinking_signature_compat_enabled);
+    }
+
+    #[test]
+    fn server_web_tools_mode_defaults_to_max_compat_and_accepts_aliases() {
+        let default_config: Config = serde_json::from_str("{}").unwrap();
+        let kebab: Config =
+            serde_json::from_str(r#"{"serverWebToolsMode":"native-only"}"#).unwrap();
+        let snake: Config =
+            serde_json::from_str(r#"{"server_web_tools_mode":"disabled"}"#).unwrap();
+
+        assert_eq!(
+            default_config.server_web_tools_mode,
+            ServerWebToolsMode::MaxCompat
+        );
+        assert_eq!(kebab.server_web_tools_mode, ServerWebToolsMode::NativeOnly);
+        assert_eq!(snake.server_web_tools_mode, ServerWebToolsMode::Disabled);
     }
 }

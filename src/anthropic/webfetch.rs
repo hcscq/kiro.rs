@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 use std::convert::Infallible;
 use std::io::Cursor;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -18,8 +19,9 @@ use axum::{
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use bytes::Bytes;
-use futures::{Stream, stream};
+use futures::{Stream, StreamExt, stream};
 use regex::Regex;
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::redirect::Policy;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -27,6 +29,7 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::common::logging::summarize_text_for_log;
+use crate::model::config::ServerWebToolsMode;
 use crate::token;
 
 use super::conversion_runtime::ConversionRuntime;
@@ -52,6 +55,7 @@ const EXTERNAL_WEB_SEARCH_TOOL_NAME: &str = "web_search";
 const WEB_FETCH_REQUEST_TIMEOUT_SECS: u64 = 20;
 const WEB_FETCH_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const WEB_FETCH_MAX_URL_LEN: usize = 250;
+const WEB_FETCH_MAX_REDIRECTS: usize = 5;
 const WEB_FETCH_HARD_MAX_USES: usize = 16;
 const WEB_TOOL_LOOP_RECENT_ATTEMPTS_LIMIT: usize = 5;
 const WEB_FETCH_DEFAULT_MAX_CONTENT_TOKENS: i32 = 100_000;
@@ -99,10 +103,13 @@ struct ServerToolExecution {
 #[derive(Debug, Clone)]
 struct WebSearchConfig {
     max_uses: Option<usize>,
+    allowed_domains: Vec<DomainPattern>,
+    blocked_domains: Vec<DomainPattern>,
 }
 
 #[derive(Debug, Clone)]
 struct ServerWebToolConfig {
+    mode: ServerWebToolsMode,
     web_fetch: Option<WebFetchConfig>,
     web_search: Option<WebSearchConfig>,
 }
@@ -149,6 +156,23 @@ pub async fn handle_server_web_tool_request(
     request_id: &str,
     structured_output: Option<JsonSchemaOutput>,
 ) -> Response {
+    let mode = provider.server_web_tools_mode();
+    if mode == ServerWebToolsMode::Disabled {
+        tracing::warn!(
+            request_id = %request_id,
+            mode = mode.as_str(),
+            "server-side Web tools disabled by configuration"
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                "server-side web tools are disabled by serverWebToolsMode",
+            )),
+        )
+            .into_response();
+    }
+
     let run = match execute_server_web_tool_loop(
         provider.clone(),
         payload,
@@ -156,6 +180,7 @@ pub async fn handle_server_web_tool_request(
         conversion_runtime.clone(),
         probe.clone(),
         request_id,
+        mode,
     )
     .await
     {
@@ -195,8 +220,9 @@ async fn execute_server_web_tool_loop(
     conversion_runtime: Arc<ConversionRuntime>,
     probe: UpstreamProbe,
     request_id: &str,
+    mode: ServerWebToolsMode,
 ) -> Result<ServerWebToolRun, Response> {
-    let config = validate_server_web_tools(payload)?;
+    let config = validate_server_web_tools(payload, mode)?;
     let mut internal_payload = build_internal_server_web_tool_payload(payload);
     let mut outward_content: Vec<serde_json::Value> = Vec::new();
     let mut total_input_tokens = 0;
@@ -224,7 +250,12 @@ async fn execute_server_web_tool_loop(
 
         for block in &round.content {
             if is_internal_web_fetch_tool_use(block) {
-                let execution = if let Some(fetch_config) = &config.web_fetch {
+                let execution = if config.mode == ServerWebToolsMode::NativeOnly {
+                    build_unavailable_web_fetch_execution(
+                        block,
+                        "web_fetch is not available in serverWebToolsMode=native_only",
+                    )
+                } else if let Some(fetch_config) = &config.web_fetch {
                     execute_web_fetch_tool(
                         &internal_payload,
                         fetch_config,
@@ -491,7 +522,10 @@ fn final_synthesis_content(content: Vec<Value>) -> Vec<Value> {
     final_content
 }
 
-fn validate_server_web_tools(payload: &MessagesRequest) -> Result<ServerWebToolConfig, Response> {
+fn validate_server_web_tools(
+    payload: &MessagesRequest,
+    mode: ServerWebToolsMode,
+) -> Result<ServerWebToolConfig, Response> {
     let Some(tools) = payload.tools.as_ref() else {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -572,13 +606,40 @@ fn validate_server_web_tools(payload: &MessagesRequest) -> Result<ServerWebToolC
         None
     };
 
-    let web_search = web_search_tools.first().map(|tool| WebSearchConfig {
-        max_uses: tool
-            .max_uses
-            .and_then(|value| usize::try_from(value.max(0)).ok()),
-    });
+    let web_search = if let Some(tool) = web_search_tools.first().copied() {
+        if !websearch::is_supported_web_search_tool(tool) {
+            let version = tool.tool_type.as_deref().unwrap_or("unknown");
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(
+                    "invalid_request_error",
+                    format!(
+                        "kiro.rs currently supports Anthropic web_search server tool versions {}, {}, or legacy web_search only; received {}",
+                        websearch::WEB_SEARCH_TOOL_TYPE_20250305,
+                        websearch::WEB_SEARCH_TOOL_TYPE_20260209,
+                        version
+                    ),
+                )),
+            )
+                .into_response());
+        }
+
+        match build_web_search_config(tool) {
+            Ok(config) => Some(config),
+            Err(message) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse::new("invalid_request_error", message)),
+                )
+                    .into_response());
+            }
+        }
+    } else {
+        None
+    };
 
     Ok(ServerWebToolConfig {
+        mode,
         web_fetch,
         web_search,
     })
@@ -636,6 +697,40 @@ fn build_web_fetch_config(tool: &Tool) -> Result<WebFetchConfig, String> {
         allowed_domains,
         blocked_domains,
         use_cache: tool.use_cache.unwrap_or(true),
+    })
+}
+
+fn build_web_search_config(tool: &Tool) -> Result<WebSearchConfig, String> {
+    if tool.allowed_domains.as_ref().is_some_and(|v| !v.is_empty())
+        && tool.blocked_domains.as_ref().is_some_and(|v| !v.is_empty())
+    {
+        return Err(
+            "web_search may declare either allowed_domains or blocked_domains, but not both"
+                .to_string(),
+        );
+    }
+
+    let allowed_domains = tool
+        .allowed_domains
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|entry| DomainPattern::parse(&entry))
+        .collect::<Result<Vec<_>, _>>()?;
+    let blocked_domains = tool
+        .blocked_domains
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|entry| DomainPattern::parse(&entry))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(WebSearchConfig {
+        max_uses: tool
+            .max_uses
+            .and_then(|value| usize::try_from(value.max(0)).ok()),
+        allowed_domains,
+        blocked_domains,
     })
 }
 
@@ -697,6 +792,20 @@ fn build_internal_websearch_tool(tool: &Tool) -> Tool {
             "\nThe tool may be used at most {} time(s) in this response.",
             max_uses.max(0)
         ));
+    }
+    if let Some(allowed) = &tool.allowed_domains {
+        if !allowed.is_empty() {
+            description.push_str("\nSearch results will be limited to: ");
+            description.push_str(&allowed.join(", "));
+            description.push('.');
+        }
+    }
+    if let Some(blocked) = &tool.blocked_domains {
+        if !blocked.is_empty() {
+            description.push_str("\nSearch results must exclude: ");
+            description.push_str(&blocked.join(", "));
+            description.push('.');
+        }
     }
 
     Tool {
@@ -882,7 +991,11 @@ async fn execute_web_search_tool(
     let outcome = if max_uses_exceeded {
         websearch::WebSearchOutcome::Unavailable("web_search max_uses exceeded".to_string())
     } else if performed_request {
-        websearch::perform_web_search(provider, query).await
+        let outcome = websearch::perform_web_search(provider, query).await;
+        match config {
+            Some(config) => filter_web_search_outcome(outcome, config),
+            None => outcome,
+        }
     } else {
         websearch::WebSearchOutcome::Unavailable("Missing `query` in web_search input".to_string())
     };
@@ -956,6 +1069,23 @@ fn build_unavailable_web_fetch_execution(
     }
 }
 
+fn filter_web_search_outcome(
+    outcome: websearch::WebSearchOutcome,
+    config: &WebSearchConfig,
+) -> websearch::WebSearchOutcome {
+    match outcome {
+        websearch::WebSearchOutcome::Results(mut results) => {
+            results.results.retain(|result| {
+                Url::parse(&result.url).ok().is_some_and(|url| {
+                    url_allowed_by_patterns(&url, &config.allowed_domains, &config.blocked_domains)
+                })
+            });
+            websearch::WebSearchOutcome::Results(results)
+        }
+        other => other,
+    }
+}
+
 async fn execute_web_fetch(
     payload: &MessagesRequest,
     config: &WebFetchConfig,
@@ -1007,23 +1137,73 @@ async fn execute_web_fetch(
         .timeout(std::time::Duration::from_secs(
             WEB_FETCH_REQUEST_TIMEOUT_SECS,
         ))
-        .redirect(Policy::limited(5))
+        .dns_resolver(Arc::new(GuardedWebFetchResolver))
+        .redirect(Policy::none())
         .build()
         .map_err(|err| ("unavailable", err.to_string(), false))?;
 
-    let mut request = client
-        .get(parsed_url.clone())
-        .header("User-Agent", "kiro-rs-web-fetch/1.0");
-    if !config.use_cache {
-        request = request
-            .header(header::CACHE_CONTROL, "no-cache")
-            .header(header::PRAGMA, "no-cache");
-    }
+    let mut current_url = parsed_url.clone();
+    let mut redirects = 0usize;
 
-    let response = request
-        .send()
-        .await
-        .map_err(|err| ("url_not_accessible", err.to_string(), true))?;
+    let response = loop {
+        if !url_allowed_by_patterns(
+            &current_url,
+            &config.allowed_domains,
+            &config.blocked_domains,
+        ) {
+            return Err((
+                "url_not_allowed",
+                "Redirect target is excluded by the web_fetch domain policy".to_string(),
+                redirects > 0,
+            ));
+        }
+        ensure_fetch_url_network_allowed(&current_url)
+            .await
+            .map_err(|message| ("url_not_allowed", message, redirects > 0))?;
+
+        let mut request = client
+            .get(current_url.clone())
+            .header("User-Agent", "kiro-rs-web-fetch/1.0");
+        if !config.use_cache {
+            request = request
+                .header(header::CACHE_CONTROL, "no-cache")
+                .header(header::PRAGMA, "no-cache");
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|err| ("url_not_accessible", err.to_string(), true))?;
+        let status = response.status();
+
+        if status.is_redirection() {
+            if redirects >= WEB_FETCH_MAX_REDIRECTS {
+                return Err((
+                    "url_not_accessible",
+                    "Origin returned too many redirects".to_string(),
+                    true,
+                ));
+            }
+            let Some(location) = response.headers().get(header::LOCATION) else {
+                return Err((
+                    "url_not_accessible",
+                    "Origin redirect response omitted Location".to_string(),
+                    true,
+                ));
+            };
+            let location = location
+                .to_str()
+                .map_err(|err| ("url_not_accessible", err.to_string(), true))?;
+            current_url = response
+                .url()
+                .join(location)
+                .map_err(|err| ("url_not_accessible", err.to_string(), true))?;
+            redirects += 1;
+            continue;
+        }
+
+        break response;
+    };
 
     let status = response.status();
     if status == StatusCode::TOO_MANY_REQUESTS {
@@ -1041,16 +1221,28 @@ async fn execute_web_fetch(
         ));
     }
 
+    let retrieved_url = response.url().clone();
     let content_type = response
         .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let body = response
-        .bytes()
-        .await
-        .map_err(|err| ("url_not_accessible", err.to_string(), true))?;
+    let content_length_exceeds_limit = response
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|length| length > WEB_FETCH_MAX_RESPONSE_BYTES);
+    if content_length_exceeds_limit {
+        return Err((
+            "url_not_accessible",
+            "Fetched document exceeded the local size budget".to_string(),
+            true,
+        ));
+    }
+
+    let body = read_limited_response_body(response).await?;
 
     if body.len() > WEB_FETCH_MAX_RESPONSE_BYTES {
         return Err((
@@ -1061,7 +1253,7 @@ async fn execute_web_fetch(
     }
 
     if is_pdf_content(&content_type, &body) {
-        return build_pdf_fetch_success(&parsed_url, &body, config);
+        return build_pdf_fetch_success(&retrieved_url, &body, config);
     }
 
     if !is_text_content_type(&content_type, &body) {
@@ -1072,7 +1264,28 @@ async fn execute_web_fetch(
         ));
     }
 
-    build_text_fetch_success(&parsed_url, &content_type, &body, config)
+    build_text_fetch_success(&retrieved_url, &content_type, &body, config)
+}
+
+async fn read_limited_response_body(
+    response: reqwest::Response,
+) -> Result<Bytes, (&'static str, String, bool)> {
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|err| ("url_not_accessible", err.to_string(), true))?;
+        if body.len().saturating_add(chunk.len()) > WEB_FETCH_MAX_RESPONSE_BYTES {
+            return Err((
+                "url_not_accessible",
+                "Fetched document exceeded the local size budget".to_string(),
+                true,
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok(Bytes::from(body))
 }
 
 fn build_text_fetch_success(
@@ -1884,6 +2097,110 @@ fn parse_fetch_url(raw: &str) -> Option<Url> {
     Some(url)
 }
 
+#[derive(Debug, Default)]
+struct GuardedWebFetchResolver;
+
+impl Resolve for GuardedWebFetchResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addrs = resolve_fetch_host_allowed(&host, 0)
+                .await
+                .map_err(|message| {
+                    std::io::Error::new(std::io::ErrorKind::PermissionDenied, message)
+                })?;
+            let addrs: Addrs = Box::new(addrs.into_iter());
+            Ok::<Addrs, Box<dyn std::error::Error + Send + Sync>>(addrs)
+        })
+    }
+}
+
+async fn ensure_fetch_url_network_allowed(url: &Url) -> Result<(), String> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| "URL must include a host".to_string())?;
+    let port = url.port_or_known_default().unwrap_or(443);
+    resolve_fetch_host_allowed(host, port).await.map(|_| ())
+}
+
+async fn resolve_fetch_host_allowed(raw_host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
+    let normalized_host = raw_host.trim_end_matches('.').to_ascii_lowercase();
+    if normalized_host.is_empty() {
+        return Err("URL must include a host".to_string());
+    }
+
+    #[cfg(test)]
+    if matches!(normalized_host.as_str(), "127.0.0.1" | "::1" | "localhost") {
+        return lookup_fetch_host_addrs(&normalized_host, port).await;
+    }
+
+    if normalized_host == "localhost"
+        || normalized_host.ends_with(".localhost")
+        || normalized_host == "localdomain"
+        || normalized_host.ends_with(".localdomain")
+    {
+        return Err("URL host is not allowed for web_fetch".to_string());
+    }
+
+    if let Ok(ip) = normalized_host.parse::<IpAddr>() {
+        if is_disallowed_fetch_ip(ip) {
+            return Err("URL resolves to a private or local network address".to_string());
+        }
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+
+    let addrs = lookup_fetch_host_addrs(&normalized_host, port).await?;
+    if addrs.is_empty() {
+        return Err("URL host did not resolve to an address".to_string());
+    }
+    if addrs.iter().any(|addr| is_disallowed_fetch_ip(addr.ip())) {
+        return Err("URL resolves to a private or local network address".to_string());
+    }
+
+    Ok(addrs)
+}
+
+async fn lookup_fetch_host_addrs(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
+    tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|err| format!("URL host could not be resolved: {}", err))
+        .map(|addrs| addrs.collect())
+}
+
+fn is_disallowed_fetch_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => is_disallowed_fetch_ipv4(ip),
+        IpAddr::V6(ip) => is_disallowed_fetch_ipv6(ip),
+    }
+}
+
+fn is_disallowed_fetch_ipv4(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || ip.is_documentation()
+        || ip.is_multicast()
+        || ip.is_unspecified()
+        || octets[0] == 0
+        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        || (octets[0] == 169 && octets[1] == 254)
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+        || (octets[0] == 198 && (18..=19).contains(&octets[1]))
+}
+
+fn is_disallowed_fetch_ipv6(ip: Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || (segments[0] & 0xfe00) == 0xfc00
+        || (segments[0] & 0xffc0) == 0xfe80
+        || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+        || ip.to_ipv4_mapped().is_some_and(is_disallowed_fetch_ipv4)
+}
+
 fn url_appears_in_context(payload: &MessagesRequest, target_url: &str) -> bool {
     let Some(target) = parse_fetch_url(target_url).map(|url| url.to_string()) else {
         return false;
@@ -2271,6 +2588,50 @@ mod tests {
     }
 
     #[test]
+    fn test_has_server_web_tool_ignores_client_web_tools() {
+        let client_web_fetch = Tool {
+            tool_type: None,
+            name: "WebFetch".to_string(),
+            description: "client-side fetch".to_string(),
+            input_schema: serde_json::from_value(json!({
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "prompt": {"type": "string"}
+                },
+                "required": ["url", "prompt"]
+            }))
+            .unwrap(),
+            max_uses: None,
+            allowed_domains: None,
+            blocked_domains: None,
+            citations: None,
+            max_content_tokens: None,
+            use_cache: None,
+        };
+        let client_web_search = Tool {
+            tool_type: None,
+            name: "WebSearch".to_string(),
+            description: "client-side search".to_string(),
+            input_schema: serde_json::from_value(json!({
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"]
+            }))
+            .unwrap(),
+            max_uses: None,
+            allowed_domains: None,
+            blocked_domains: None,
+            citations: None,
+            max_content_tokens: None,
+            use_cache: None,
+        };
+        let req = sample_request_with_tools(vec![client_web_fetch, client_web_search]);
+
+        assert!(!has_server_web_tool(&req));
+    }
+
+    #[test]
     fn test_supported_web_fetch_tool_versions() {
         let mut old_tool = sample_tool();
         old_tool.tool_type = Some(WEB_FETCH_TOOL_TYPE_20250910.to_string());
@@ -2290,18 +2651,115 @@ mod tests {
     }
 
     #[test]
+    fn test_supported_web_search_tool_versions() {
+        let mut current_tool = sample_web_search_tool();
+        current_tool.tool_type = Some(websearch::WEB_SEARCH_TOOL_TYPE_20250305.to_string());
+        assert!(websearch::is_supported_web_search_tool(&current_tool));
+
+        current_tool.tool_type = Some(websearch::WEB_SEARCH_TOOL_TYPE_20260209.to_string());
+        assert!(websearch::is_supported_web_search_tool(&current_tool));
+
+        current_tool.tool_type = Some(websearch::WEB_SEARCH_TOOL_TYPE.to_string());
+        assert!(websearch::is_supported_web_search_tool(&current_tool));
+
+        current_tool.tool_type = Some("web_search_20990101".to_string());
+        assert!(!websearch::is_supported_web_search_tool(&current_tool));
+    }
+
+    #[test]
     fn test_validate_server_web_tools_accepts_20260309_use_cache_false() {
         let mut tool = sample_tool();
         tool.tool_type = Some(WEB_FETCH_TOOL_TYPE_20260309.to_string());
         tool.use_cache = Some(false);
         let req = sample_request(tool);
 
-        let config = validate_server_web_tools(&req).expect("20260309 should be supported");
+        let config = validate_server_web_tools(&req, ServerWebToolsMode::MaxCompat)
+            .expect("20260309 should be supported");
         let web_fetch = config
             .web_fetch
             .expect("web_fetch config should be present");
 
         assert!(!web_fetch.use_cache);
+    }
+
+    #[test]
+    fn test_validate_server_web_tools_rejects_unsupported_web_search_version() {
+        let mut tool = sample_web_search_tool();
+        tool.tool_type = Some("web_search_20990101".to_string());
+        let req = sample_request_with_tools(vec![tool]);
+
+        assert!(validate_server_web_tools(&req, ServerWebToolsMode::MaxCompat).is_err());
+    }
+
+    #[test]
+    fn test_validate_server_web_tools_captures_mode_for_rollback() {
+        let req = sample_request(sample_tool());
+        let config = validate_server_web_tools(&req, ServerWebToolsMode::NativeOnly)
+            .expect("valid web tools");
+
+        assert_eq!(config.mode, ServerWebToolsMode::NativeOnly);
+    }
+
+    #[test]
+    fn test_web_search_domain_filters_are_applied_locally() {
+        let config = WebSearchConfig {
+            max_uses: None,
+            allowed_domains: vec![DomainPattern::parse("example.com").unwrap()],
+            blocked_domains: Vec::new(),
+        };
+        let outcome = websearch::WebSearchOutcome::Results(websearch::WebSearchResults {
+            results: vec![
+                websearch::WebSearchResult {
+                    title: "kept".to_string(),
+                    url: "https://example.com/docs".to_string(),
+                    snippet: None,
+                    published_date: None,
+                    id: None,
+                    domain: None,
+                    max_verbatim_word_limit: None,
+                    public_domain: None,
+                },
+                websearch::WebSearchResult {
+                    title: "filtered".to_string(),
+                    url: "https://not-example.test/docs".to_string(),
+                    snippet: None,
+                    published_date: None,
+                    id: None,
+                    domain: None,
+                    max_verbatim_word_limit: None,
+                    public_domain: None,
+                },
+            ],
+            total_results: None,
+            query: Some("test".to_string()),
+            error: None,
+        });
+
+        let filtered = filter_web_search_outcome(outcome, &config);
+        match filtered {
+            websearch::WebSearchOutcome::Results(results) => {
+                assert_eq!(results.results.len(), 1);
+                assert_eq!(results.results[0].title, "kept");
+            }
+            _ => panic!("expected filtered results"),
+        }
+    }
+
+    #[test]
+    fn test_fetch_network_guard_blocks_private_addresses() {
+        assert!(is_disallowed_fetch_ip(IpAddr::V4(Ipv4Addr::new(
+            127, 0, 0, 1
+        ))));
+        assert!(is_disallowed_fetch_ip(IpAddr::V4(Ipv4Addr::new(
+            10, 0, 0, 1
+        ))));
+        assert!(is_disallowed_fetch_ip(IpAddr::V4(Ipv4Addr::new(
+            169, 254, 169, 254
+        ))));
+        assert!(is_disallowed_fetch_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert!(!is_disallowed_fetch_ip(IpAddr::V4(Ipv4Addr::new(
+            93, 184, 216, 34
+        ))));
     }
 
     #[test]
@@ -2376,7 +2834,7 @@ mod tests {
         let req =
             sample_request_with_tools(vec![sample_web_search_tool(), sample_web_search_tool()]);
 
-        assert!(validate_server_web_tools(&req).is_err());
+        assert!(validate_server_web_tools(&req, ServerWebToolsMode::MaxCompat).is_err());
     }
 
     #[test]

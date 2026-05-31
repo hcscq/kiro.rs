@@ -12,6 +12,15 @@ use crate::common::logging::summarize_text_for_log;
 use super::stream::SseEvent;
 use super::types::{MessagesRequest, Tool};
 
+pub(crate) const WEB_SEARCH_TOOL_TYPE: &str = "web_search";
+pub(crate) const WEB_SEARCH_TOOL_TYPE_20250305: &str = "web_search_20250305";
+pub(crate) const WEB_SEARCH_TOOL_TYPE_20260209: &str = "web_search_20260209";
+const SUPPORTED_WEB_SEARCH_TOOL_TYPES: &[&str] = &[
+    WEB_SEARCH_TOOL_TYPE,
+    WEB_SEARCH_TOOL_TYPE_20250305,
+    WEB_SEARCH_TOOL_TYPE_20260209,
+];
+
 /// MCP 请求
 #[derive(Debug, Serialize)]
 pub struct McpRequest {
@@ -69,7 +78,7 @@ pub struct McpContent {
 }
 
 /// WebSearch 搜索结果
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[allow(dead_code)]
 pub struct WebSearchResults {
     #[serde(default)]
@@ -127,6 +136,15 @@ pub(crate) fn is_web_search_tool(tool: &Tool) -> bool {
     let tool_type = tool.tool_type.as_deref().unwrap_or("").trim();
 
     name == "web_search" || tool_type == "web_search" || tool_type.starts_with("web_search_")
+}
+
+pub(crate) fn is_supported_web_search_tool(tool: &Tool) -> bool {
+    let tool_type = tool.tool_type.as_deref().unwrap_or("").trim();
+    if tool_type.is_empty() {
+        return tool.name.trim() == "web_search";
+    }
+
+    SUPPORTED_WEB_SEARCH_TOOL_TYPES.contains(&tool_type)
 }
 
 /// 从消息中提取搜索查询
