@@ -107,6 +107,8 @@ fn normalize_schema_value_for_kiro(value: &mut serde_json::Value) {
 }
 
 fn normalize_schema_object_for_kiro(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    normalize_schema_dialect_for_kiro(obj);
+
     for key in ["allOf", "anyOf", "oneOf"] {
         normalize_schema_union_for_kiro(obj, key);
     }
@@ -145,6 +147,19 @@ fn normalize_schema_object_for_kiro(obj: &mut serde_json::Map<String, serde_json
             normalize_schema_value_for_kiro(child);
         }
     }
+}
+
+fn normalize_schema_dialect_for_kiro(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    let Some(schema_uri) = obj.get("$schema") else {
+        return;
+    };
+    if schema_uri
+        .as_str()
+        .is_some_and(|value| value.contains("2020-12"))
+    {
+        return;
+    }
+    obj.remove("$schema");
 }
 
 fn normalize_schema_union_for_kiro(
@@ -606,7 +621,6 @@ fn create_placeholder_tool(name: &str) -> Tool {
             name: name.to_string(),
             description: "Tool used in conversation history".to_string(),
             input_schema: InputSchema::from_json(serde_json::json!({
-                "$schema": "http://json-schema.org/draft-07/schema#",
                 "type": "object",
                 "properties": {},
                 "required": [],
@@ -3968,6 +3982,74 @@ mod tests {
                 .get("description")
                 .and_then(|value| value.as_str())
                 .is_some_and(|value| value.contains("Nullable"))
+        );
+    }
+
+    #[test]
+    fn test_convert_tools_strips_older_schema_dialect_declarations() {
+        let tools = Some(vec![super::super::types::Tool {
+            tool_type: None,
+            name: "DraftSevenTool".to_string(),
+            description: "Tool with older schema dialect".to_string(),
+            input_schema: HashMap::from([
+                (
+                    "$schema".to_string(),
+                    serde_json::json!("http://json-schema.org/draft-07/schema#"),
+                ),
+                ("type".to_string(), serde_json::json!("object")),
+                (
+                    "properties".to_string(),
+                    serde_json::json!({
+                        "path": {
+                            "$schema": "http://json-schema.org/draft-07/schema#",
+                            "type": "string"
+                        },
+                        "modern": {
+                            "$schema": "https://json-schema.org/draft/2020-12/schema",
+                            "type": "object",
+                            "properties": {}
+                        }
+                    }),
+                ),
+                ("required".to_string(), serde_json::json!(["path"])),
+            ]),
+            max_uses: None,
+            ..super::super::types::Tool::default()
+        }]);
+
+        let converted = convert_tools(&tools, &mut HashMap::new());
+
+        let schema = &converted[0].tool_specification.input_schema.json;
+        assert!(
+            schema.get("$schema").is_none(),
+            "older root $schema must be removed: {schema}"
+        );
+        assert!(
+            schema.pointer("/properties/path/$schema").is_none(),
+            "older nested $schema must be removed: {schema}"
+        );
+        assert_eq!(
+            schema
+                .pointer("/properties/modern/$schema")
+                .and_then(|value| value.as_str()),
+            Some("https://json-schema.org/draft/2020-12/schema")
+        );
+        assert!(
+            jsonschema::validator_for(schema).is_ok(),
+            "normalized schema should remain locally valid: {schema}"
+        );
+    }
+
+    #[test]
+    fn test_placeholder_tool_omits_schema_dialect_declaration() {
+        let tool = create_placeholder_tool("historical_tool");
+
+        assert!(
+            tool.tool_specification
+                .input_schema
+                .json
+                .get("$schema")
+                .is_none()
         );
     }
 

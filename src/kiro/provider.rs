@@ -1461,6 +1461,10 @@ impl KiroProvider {
         if Self::is_context_length_exceeded_body(body) {
             return CONTEXT_LENGTH_EXCEEDED_PUBLIC_MESSAGE.to_string();
         }
+        if Self::is_tool_schema_invalid_body(body) {
+            return "Upstream rejected one of the tool definitions as invalid. Review the request tools and try again."
+                .to_string();
+        }
         if body.contains("Input is too long") {
             return "Input is too long. Reduce the size of your messages.".to_string();
         }
@@ -1476,6 +1480,12 @@ impl KiroProvider {
         }
         "Upstream rejected the request as invalid. Review the request payload and try again."
             .to_string()
+    }
+
+    fn is_tool_schema_invalid_body(body: &str) -> bool {
+        body.contains("TOOL_SCHEMA_INVALID")
+            || (body.contains("custom.input_schema") && body.contains("JSON schema is invalid"))
+            || (body.contains("input_schema") && body.contains("draft 2020-12"))
     }
 
     fn request_too_large_public_message(body: &str) -> String {
@@ -4266,6 +4276,17 @@ mod tests {
             r#"{"reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD","message":"Input is too long and must be reduced immediately"}"#,
         );
         assert_eq!(message, CONTEXT_LENGTH_EXCEEDED_PUBLIC_MESSAGE);
+    }
+
+    #[test]
+    fn test_invalid_request_public_message_special_cases_tool_schema_invalid() {
+        let message = KiroProvider::invalid_request_public_message(
+            r#"{"reason":"TOOL_SCHEMA_INVALID","message":"tools.0.custom.input_schema: JSON schema is invalid. It must match JSON Schema draft 2020-12"}"#,
+        );
+        assert_eq!(
+            message,
+            "Upstream rejected one of the tool definitions as invalid. Review the request tools and try again."
+        );
     }
 
     #[test]

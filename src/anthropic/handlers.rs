@@ -51,6 +51,10 @@ const DETAILED_ANTHROPIC_PRE_UPSTREAM_TRACE_THRESHOLD_BYTES: usize = 512 * 1024;
 const DETAILED_ANTHROPIC_PRE_UPSTREAM_TRACE_MESSAGE_THRESHOLD: usize = 250;
 const SLOW_ANTHROPIC_PRE_UPSTREAM_PHASE_MS: u128 = 1_000;
 const SLOW_ANTHROPIC_PRE_UPSTREAM_STAGE_MS: u128 = 250;
+const TOOL_SCHEMA_DIAGNOSTIC_MAX_TOOLS: usize = 64;
+const TOOL_SCHEMA_DIAGNOSTIC_MAX_SCHEMA_BYTES: usize = 128 * 1024;
+const TOOL_SCHEMA_DIAGNOSTIC_MAX_TOTAL_BYTES: usize = 512 * 1024;
+const TOOL_SCHEMA_DIAGNOSTIC_MAX_INVALID_LOGS: usize = 4;
 
 #[derive(Debug, Clone)]
 pub(crate) struct NonStreamMessageResponse {
@@ -125,6 +129,110 @@ async fn convert_request_on_runtime(
         Ok(result) => Ok(result),
         Err(err) => Err(conversion_runtime_error_response(err, request_id, route)),
     }
+}
+
+fn log_converted_tool_schema_diagnostics(
+    request_id: Option<&str>,
+    route: &str,
+    model: &str,
+    conversion_result: &ConversionResult,
+) {
+    let tools = &conversion_result
+        .conversation_state
+        .current_message
+        .user_input_message
+        .user_input_message_context
+        .tools;
+    if tools.is_empty() {
+        return;
+    }
+
+    let request_id = request_id.unwrap_or("");
+    let mut total_schema_bytes = 0usize;
+    let mut skipped_tools = 0usize;
+    let mut invalid_logged = 0usize;
+
+    for (tool_index, tool) in tools.iter().enumerate() {
+        if tool_index >= TOOL_SCHEMA_DIAGNOSTIC_MAX_TOOLS {
+            skipped_tools = skipped_tools.saturating_add(tools.len().saturating_sub(tool_index));
+            break;
+        }
+
+        let schema = &tool.tool_specification.input_schema.json;
+        let schema_bytes = serde_json::to_vec(schema)
+            .map(|bytes| bytes.len())
+            .unwrap_or(0);
+        if schema_bytes > TOOL_SCHEMA_DIAGNOSTIC_MAX_SCHEMA_BYTES
+            || total_schema_bytes.saturating_add(schema_bytes)
+                > TOOL_SCHEMA_DIAGNOSTIC_MAX_TOTAL_BYTES
+        {
+            skipped_tools = skipped_tools.saturating_add(1);
+            continue;
+        }
+        total_schema_bytes = total_schema_bytes.saturating_add(schema_bytes);
+
+        if let Some(schema_uri) = non_2020_12_schema_uri(schema) {
+            invalid_logged = invalid_logged.saturating_add(1);
+            tracing::warn!(
+                request_id = %request_id,
+                route = %route,
+                model = %model,
+                mapped_model_id = %conversion_result.model_id,
+                tool_index,
+                tool_name = %summarize_text_for_log(&tool.tool_specification.name, 96),
+                schema_bytes,
+                schema_uri = %summarize_text_for_log(schema_uri, 160),
+                "converted tool input_schema declares a non-2020-12 JSON Schema draft"
+            );
+            if invalid_logged >= TOOL_SCHEMA_DIAGNOSTIC_MAX_INVALID_LOGS {
+                break;
+            }
+        }
+
+        if let Err(err) = jsonschema::validator_for(schema) {
+            invalid_logged = invalid_logged.saturating_add(1);
+            tracing::warn!(
+                request_id = %request_id,
+                route = %route,
+                model = %model,
+                mapped_model_id = %conversion_result.model_id,
+                tool_index,
+                tool_name = %summarize_text_for_log(&tool.tool_specification.name, 96),
+                schema_bytes,
+                error = %summarize_text_for_log(&err.to_string(), 240),
+                "converted tool input_schema failed local JSON Schema validation"
+            );
+            if invalid_logged >= TOOL_SCHEMA_DIAGNOSTIC_MAX_INVALID_LOGS {
+                break;
+            }
+        }
+    }
+
+    if skipped_tools > 0 {
+        tracing::debug!(
+            request_id = %request_id,
+            route = %route,
+            model = %model,
+            tool_count = tools.len(),
+            skipped_tools,
+            total_schema_bytes,
+            max_tools = TOOL_SCHEMA_DIAGNOSTIC_MAX_TOOLS,
+            max_schema_bytes = TOOL_SCHEMA_DIAGNOSTIC_MAX_SCHEMA_BYTES,
+            max_total_schema_bytes = TOOL_SCHEMA_DIAGNOSTIC_MAX_TOTAL_BYTES,
+            "skipped converted tool input_schema diagnostics due to budget"
+        );
+    }
+}
+
+fn non_2020_12_schema_uri(schema: &serde_json::Value) -> Option<&str> {
+    let schema_uri = schema
+        .as_object()
+        .and_then(|obj| obj.get("$schema"))
+        .and_then(|value| value.as_str())?;
+    if schema_uri.contains("2020-12") {
+        return None;
+    }
+    Some(schema_uri)
 }
 
 fn conversion_runtime_error_response(
@@ -1073,6 +1181,12 @@ pub async fn post_messages(
             "Anthropic request conversion completed"
         );
     }
+    log_converted_tool_schema_diagnostics(
+        Some(&request_id),
+        "messages",
+        &payload.model,
+        &conversion_result,
+    );
 
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
     let kiro_request = KiroRequest {
@@ -1465,7 +1579,11 @@ fn create_sse_stream(
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, false, message_started, ping_interval, next_can_ping, request_id)))
                         }
                         Some(Err(e)) => {
-                            tracing::error!("读取响应流失败: {}", e);
+                            tracing::error!(
+                                request_id = %request_id.as_deref().unwrap_or(""),
+                                error = %e,
+                                "读取响应流失败"
+                            );
                             // 流读取失败时不要伪装成正常 message_stop。
                             let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_stream_error_sse(
                                 "Upstream stream ended with a transport error.",
@@ -1547,6 +1665,12 @@ pub(crate) async fn execute_non_stream_round(
         None,
     )
     .await?;
+    log_converted_tool_schema_diagnostics(
+        request_id.as_deref(),
+        "non_stream_round",
+        &payload.model,
+        &conversion_result,
+    );
 
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
@@ -2551,6 +2675,12 @@ pub async fn post_messages_cc(
             "Anthropic request conversion completed"
         );
     }
+    log_converted_tool_schema_diagnostics(
+        Some(&request_id),
+        "cc_messages",
+        &payload.model,
+        &conversion_result,
+    );
 
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
     let kiro_request = KiroRequest {
@@ -2879,9 +3009,9 @@ mod tests {
     use super::{
         ANTHROPIC_RUNTIME_LEADER_REQUIRED_HEADER, NonStreamMessageResponse,
         coerce_structured_response, decode_non_stream_message, finalize_stream_events,
-        is_adaptive_opus_model, map_provider_error, override_thinking_from_model_name,
-        prepare_stream_events_for_emit, request_thinking_enabled,
-        should_synthesize_hidden_thinking_signature_for_request,
+        is_adaptive_opus_model, map_provider_error, non_2020_12_schema_uri,
+        override_thinking_from_model_name, prepare_stream_events_for_emit,
+        request_thinking_enabled, should_synthesize_hidden_thinking_signature_for_request,
         validate_thinking_signature_payload,
     };
     use crate::anthropic::stream::{SseEvent, StreamContext};
@@ -3428,5 +3558,28 @@ mod tests {
             json["error"]["message"],
             "Shared credential refresh must be handled by the runtime leader. Retry later or route this request to the leader."
         );
+    }
+
+    #[test]
+    fn test_non_2020_12_schema_uri_detects_older_draft() {
+        let schema = serde_json::json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object"
+        });
+
+        assert_eq!(
+            non_2020_12_schema_uri(&schema),
+            Some("http://json-schema.org/draft-07/schema#")
+        );
+    }
+
+    #[test]
+    fn test_non_2020_12_schema_uri_allows_2020_12() {
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object"
+        });
+
+        assert_eq!(non_2020_12_schema_uri(&schema), None);
     }
 }
