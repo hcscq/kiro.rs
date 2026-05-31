@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufReader, Cursor};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Instant;
 
 use base64::Engine;
@@ -961,7 +962,9 @@ fn extract_document_text(source: &super::types::ImageSource) -> Option<Extracted
                 );
                 return None;
             }
-            pdf_extract::extract_text_from_mem(&bytes).ok()?
+            extract_text_with_panic_guard(&media_type, bytes.len(), || {
+                pdf_extract::extract_text_from_mem(&bytes)
+            })?
         }
         "text/plain" | "text/markdown" | "text/csv" | "application/json" => {
             if source_type == "base64" {
@@ -999,6 +1002,42 @@ fn extract_document_text(source: &super::types::ImageSource) -> Option<Extracted
         original_chars,
         clipped,
     })
+}
+
+fn extract_text_with_panic_guard<F, E>(
+    media_type: &str,
+    source_bytes: usize,
+    operation: F,
+) -> Option<String>
+where
+    F: FnOnce() -> Result<String, E>,
+{
+    match catch_unwind(AssertUnwindSafe(operation)) {
+        Ok(Ok(text)) => Some(text),
+        Ok(Err(_)) => {
+            tracing::warn!(media_type, source_bytes, "跳过无法提取文本的文档");
+            None
+        }
+        Err(payload) => {
+            tracing::warn!(
+                media_type,
+                source_bytes,
+                panic_type = panic_payload_kind(payload.as_ref()),
+                "文档文本提取 panic，已跳过文档内容"
+            );
+            None
+        }
+    }
+}
+
+fn panic_payload_kind(payload: &(dyn std::any::Any + Send)) -> &'static str {
+    if payload.is::<&'static str>() {
+        "str"
+    } else if payload.is::<String>() {
+        "string"
+    } else {
+        "unknown"
+    }
 }
 
 fn extract_document_text_for_kiro(source: &super::types::ImageSource) -> Option<String> {
@@ -3174,6 +3213,16 @@ mod tests {
 
         assert!(images.is_empty());
         assert!(text.contains("Image omitted for Kiro compatibility"));
+    }
+
+    #[test]
+    fn test_extract_text_with_panic_guard_catches_extractor_panic() {
+        let result =
+            extract_text_with_panic_guard("application/pdf", 128, || -> Result<String, ()> {
+                panic!("pdf extractor panic");
+            });
+
+        assert!(result.is_none());
     }
 
     #[test]

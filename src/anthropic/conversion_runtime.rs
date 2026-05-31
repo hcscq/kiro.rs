@@ -1,4 +1,5 @@
 use std::{
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -262,14 +263,24 @@ impl ConversionRuntime {
 
         let payload = payload.clone();
         let convert_started_at = Instant::now();
-        let result = task::spawn_blocking(move || convert_request_with_probe(&payload, probe))
-            .await
-            .map_err(|err| {
-                self.metrics
-                    .worker_join_error_total
-                    .fetch_add(1, Ordering::Relaxed);
-                ConversionRuntimeError::WorkerJoin(err.to_string())
-            })?;
+        let result = task::spawn_blocking(move || {
+            catch_unwind(AssertUnwindSafe(|| {
+                convert_request_with_probe(&payload, probe)
+            }))
+        })
+        .await
+        .map_err(|err| {
+            self.metrics
+                .worker_join_error_total
+                .fetch_add(1, Ordering::Relaxed);
+            ConversionRuntimeError::WorkerJoin(err.to_string())
+        })?
+        .map_err(|_| {
+            self.metrics
+                .worker_join_error_total
+                .fetch_add(1, Ordering::Relaxed);
+            ConversionRuntimeError::WorkerJoin("conversion worker panicked".to_string())
+        })?;
 
         let convert_ms = elapsed_ms(convert_started_at);
         self.metrics.convert_ms.record(convert_ms);

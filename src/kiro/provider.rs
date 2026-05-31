@@ -494,8 +494,7 @@ impl ResponseTrace {
         error: &reqwest::Error,
     ) {
         let error_sources = summarize_error_sources(error);
-        let partial_body_prefix_hex = format_body_prefix_hex(partial_body);
-        let partial_body_prefix_text = format_body_prefix_text(partial_body);
+        let _ = partial_body;
         tracing::warn!(
             request_id = %self.request_id,
             api_type = self.api_type,
@@ -511,8 +510,6 @@ impl ResponseTrace {
             response_content_length = self.response_content_length.as_deref().unwrap_or("unknown"),
             response_transfer_encoding = self.response_transfer_encoding.as_deref().unwrap_or("unknown"),
             partial_body_len,
-            partial_body_prefix_hex = %partial_body_prefix_hex,
-            partial_body_prefix_text = %partial_body_prefix_text,
             total_elapsed_ms = self.overall_started_at.elapsed().as_millis(),
             upstream_elapsed_ms = self.upstream_request_started_at.elapsed().as_millis(),
             body_read_elapsed_ms = self.response_headers_at.elapsed().as_millis(),
@@ -528,8 +525,7 @@ impl ResponseTrace {
     }
 
     fn log_body_timeout(&self, partial_body_len: usize, partial_body: &BytesMut, timeout_ms: u64) {
-        let partial_body_prefix_hex = format_body_prefix_hex(partial_body);
-        let partial_body_prefix_text = format_body_prefix_text(partial_body);
+        let _ = partial_body;
         tracing::warn!(
             request_id = %self.request_id,
             api_type = self.api_type,
@@ -545,8 +541,6 @@ impl ResponseTrace {
             response_content_length = self.response_content_length.as_deref().unwrap_or("unknown"),
             response_transfer_encoding = self.response_transfer_encoding.as_deref().unwrap_or("unknown"),
             partial_body_len,
-            partial_body_prefix_hex = %partial_body_prefix_hex,
-            partial_body_prefix_text = %partial_body_prefix_text,
             total_elapsed_ms = self.overall_started_at.elapsed().as_millis(),
             upstream_elapsed_ms = self.upstream_request_started_at.elapsed().as_millis(),
             body_read_elapsed_ms = self.response_headers_at.elapsed().as_millis(),
@@ -683,36 +677,6 @@ fn response_header_for_log(headers: &HeaderMap, name: &'static str) -> Option<St
         .and_then(|value| value.to_str().ok())
         .map(|value| summarize_text_for_log(value, 160))
         .filter(|value| value != "<empty>")
-}
-
-fn format_body_prefix_hex(bytes: &BytesMut) -> String {
-    const BODY_ERROR_PREFIX_BYTES: usize = 96;
-
-    if bytes.is_empty() {
-        return "<empty>".to_string();
-    }
-
-    let prefix_len = bytes.len().min(BODY_ERROR_PREFIX_BYTES);
-    let mut output = String::with_capacity(prefix_len * 2);
-    for byte in &bytes[..prefix_len] {
-        use std::fmt::Write as _;
-        let _ = write!(output, "{byte:02x}");
-    }
-    if bytes.len() > prefix_len {
-        output.push_str("...");
-    }
-    output
-}
-
-fn format_body_prefix_text(bytes: &BytesMut) -> String {
-    const BODY_ERROR_PREFIX_BYTES: usize = 96;
-
-    if bytes.is_empty() {
-        return "<empty>".to_string();
-    }
-
-    let prefix_len = bytes.len().min(BODY_ERROR_PREFIX_BYTES);
-    summarize_text_for_log(&String::from_utf8_lossy(&bytes[..prefix_len]), 120)
 }
 
 async fn read_response_body_with_trace(
@@ -2974,6 +2938,18 @@ impl KiroProvider {
                                 .as_ref()
                                 .map(|diagnostics| diagnostics.last_event_type.as_str())
                                 .unwrap_or("");
+                            let eventstream_timeout_output_state = eventstream_diagnostics
+                                .as_ref()
+                                .map(|diagnostics| {
+                                    if diagnostics.has_usable_output() {
+                                        "after_usable_output"
+                                    } else if diagnostics.observed_frames > 0 {
+                                        "before_usable_output"
+                                    } else {
+                                        "no_observed_frames"
+                                    }
+                                })
+                                .unwrap_or("not_eventstream");
                             tracing::warn!(
                                 request_id = %request_id,
                                 api_type,
@@ -3008,6 +2984,7 @@ impl KiroProvider {
                                 eventstream_payload_parse_errors,
                                 eventstream_last_message_type,
                                 eventstream_last_event_type,
+                                eventstream_timeout_output_state,
                                 will_retry,
                                 "非流式上游响应体读取超时"
                             );
