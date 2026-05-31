@@ -14,6 +14,7 @@ use url::Url;
 use super::types::MessagesRequest;
 
 const MAX_REMOTE_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_REMOTE_DOCUMENT_BYTES: usize = 4_718_592;
 const MAX_IMAGE_REDIRECTS: usize = 3;
 const IMAGE_FETCH_TIMEOUT_SECS: u64 = 10;
 static IMAGE_FETCH_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
@@ -22,8 +23,12 @@ static IMAGE_FETCH_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 pub(crate) struct MultimodalNormalizeStats {
     pub remote_images: usize,
     pub data_url_images: usize,
+    pub remote_documents: usize,
+    pub data_url_documents: usize,
     pub openai_image_url_blocks: usize,
     pub anthropic_url_blocks: usize,
+    pub document_url_blocks: usize,
+    pub anthropic_document_url_blocks: usize,
 }
 
 #[derive(Debug)]
@@ -108,10 +113,123 @@ async fn normalize_content_block(
             *source = new_source;
             stats.anthropic_url_blocks += 1;
         }
+        Some("document_url") | Some("documentUrl") => {
+            let document_url_key = if obj.contains_key("document_url") {
+                "document_url"
+            } else {
+                "documentUrl"
+            };
+            let Some(document_url) = obj
+                .get(document_url_key)
+                .and_then(Value::as_object)
+                .cloned()
+            else {
+                return Ok(());
+            };
+            let reference = document_url
+                .get("data")
+                .and_then(Value::as_str)
+                .or_else(|| document_url.get("url").and_then(Value::as_str))
+                .ok_or_else(|| {
+                    MultimodalNormalizeError::new(
+                        "document_url block requires document_url.url or document_url.data",
+                    )
+                })?;
+            let declared_media_type = document_url
+                .get("mimeType")
+                .or_else(|| document_url.get("mime_type"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let has_raw_data = document_url.get("data").is_some()
+                && !reference
+                    .get(..5)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"));
+            let (media_type, data) = if has_raw_data {
+                let media_type = declared_media_type
+                    .as_deref()
+                    .and_then(supported_document_media_type)
+                    .ok_or_else(|| {
+                        MultimodalNormalizeError::new(
+                            "document_url.data requires a supported mimeType",
+                        )
+                    })?
+                    .to_string();
+                (media_type, reference.trim().to_string())
+            } else {
+                document_reference_to_base64(reference, declared_media_type, client, stats).await?
+            };
+
+            obj.insert(
+                "type".to_string(),
+                Value::String("document_url".to_string()),
+            );
+            if document_url_key == "documentUrl" {
+                obj.remove("documentUrl");
+                obj.insert(
+                    "document_url".to_string(),
+                    Value::Object(document_url.clone()),
+                );
+            }
+            let Some(target) = obj.get_mut("document_url").and_then(Value::as_object_mut) else {
+                return Ok(());
+            };
+            target.insert("data".to_string(), Value::String(data));
+            target.insert("mimeType".to_string(), Value::String(media_type));
+            target.remove("url");
+            stats.document_url_blocks += 1;
+        }
+        Some("document") => {
+            let Some(source) = obj.get("source").and_then(Value::as_object).cloned() else {
+                return Ok(());
+            };
+            if source.get("type").and_then(Value::as_str) != Some("url") {
+                return Ok(());
+            }
+
+            let reference = source
+                .get("url")
+                .and_then(Value::as_str)
+                .or_else(|| source.get("data").and_then(Value::as_str))
+                .ok_or_else(|| {
+                    MultimodalNormalizeError::new("document source type=url requires a url field")
+                })?;
+            let declared_media_type = source
+                .get("media_type")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let (media_type, data) =
+                document_reference_to_base64(reference, declared_media_type, client, stats).await?;
+
+            let Some(target) = obj.get_mut("source").and_then(Value::as_object_mut) else {
+                return Ok(());
+            };
+            target.insert("type".to_string(), Value::String("base64".to_string()));
+            target.insert("media_type".to_string(), Value::String(media_type));
+            target.insert("data".to_string(), Value::String(data));
+            target.remove("url");
+            stats.anthropic_document_url_blocks += 1;
+        }
         _ => {}
     }
 
     Ok(())
+}
+
+async fn document_reference_to_base64(
+    reference: &str,
+    declared_media_type: Option<String>,
+    client: &reqwest::Client,
+    stats: &mut MultimodalNormalizeStats,
+) -> Result<(String, String), MultimodalNormalizeError> {
+    let reference = reference.trim();
+    if let Some((media_type, data)) = parse_document_data_url(reference)? {
+        stats.data_url_documents += 1;
+        return Ok((media_type, data));
+    }
+
+    let fetched = fetch_remote_document(reference, declared_media_type, client).await?;
+    stats.remote_documents += 1;
+    Ok(fetched)
 }
 
 fn openai_image_url_reference(obj: &Map<String, Value>) -> Result<&str, MultimodalNormalizeError> {
@@ -184,6 +302,39 @@ fn parse_image_data_url(
     Ok(Some((media_type.to_string(), data.trim().to_string())))
 }
 
+fn parse_document_data_url(
+    reference: &str,
+) -> Result<Option<(String, String)>, MultimodalNormalizeError> {
+    if !reference
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
+    {
+        return Ok(None);
+    }
+
+    let Some((metadata, data)) = reference.split_once(',') else {
+        return Err(MultimodalNormalizeError::new("invalid document data URL"));
+    };
+    let metadata = metadata.strip_prefix("data:").unwrap_or(metadata);
+    let mut parts = metadata.split(';');
+    let media_type = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+    let is_base64 = parts.any(|part| part.eq_ignore_ascii_case("base64"));
+
+    let Some(media_type) = supported_document_media_type(&media_type) else {
+        return Err(MultimodalNormalizeError::new(
+            "document data URL must use a supported pdf/csv/doc/docx/xls/xlsx/html/txt/md MIME type",
+        ));
+    };
+
+    if !is_base64 {
+        return Err(MultimodalNormalizeError::new(
+            "document data URL must be base64 encoded",
+        ));
+    }
+
+    Ok(Some((media_type.to_string(), data.trim().to_string())))
+}
+
 fn image_fetch_client() -> Result<&'static reqwest::Client, MultimodalNormalizeError> {
     if let Some(client) = IMAGE_FETCH_CLIENT.get() {
         return Ok(client);
@@ -248,7 +399,7 @@ async fn fetch_remote_image(
         }
 
         let header_media_type = content_type_media_type(response.headers());
-        let bytes = read_limited_response_body(response).await?;
+        let bytes = read_limited_response_body(response, MAX_REMOTE_IMAGE_BYTES, "image").await?;
         let media_type = select_image_media_type(
             declared_media_type.as_deref(),
             header_media_type.as_deref(),
@@ -262,64 +413,139 @@ async fn fetch_remote_image(
     ))
 }
 
+async fn fetch_remote_document(
+    url: &str,
+    declared_media_type: Option<String>,
+    client: &reqwest::Client,
+) -> Result<(String, String), MultimodalNormalizeError> {
+    let mut current = parse_and_validate_remote_url(url, "document").await?;
+
+    for redirect_count in 0..=MAX_IMAGE_REDIRECTS {
+        let response = client
+            .get(current.clone())
+            .header(
+                ACCEPT,
+                "application/pdf,text/csv,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/html,text/plain,text/markdown",
+            )
+            .send()
+            .await
+            .map_err(|err| {
+                MultimodalNormalizeError::new(format!("failed to fetch document: {err}"))
+            })?;
+
+        if response.status().is_redirection() {
+            if redirect_count == MAX_IMAGE_REDIRECTS {
+                return Err(MultimodalNormalizeError::new(
+                    "document URL redirected too many times",
+                ));
+            }
+            let location = response
+                .headers()
+                .get(LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| {
+                    MultimodalNormalizeError::new("document URL redirect missing Location header")
+                })?;
+            current = current.join(location).map_err(|err| {
+                MultimodalNormalizeError::new(format!("invalid document redirect URL: {err}"))
+            })?;
+            validate_remote_url(&current, "document").await?;
+            continue;
+        }
+
+        if !response.status().is_success() {
+            return Err(MultimodalNormalizeError::new(format!(
+                "document URL returned HTTP {}",
+                response.status()
+            )));
+        }
+
+        let header_media_type = raw_content_type_media_type(response.headers());
+        let url_path = current.path().to_string();
+        let bytes =
+            read_limited_response_body(response, MAX_REMOTE_DOCUMENT_BYTES, "document").await?;
+        let media_type = select_document_media_type(
+            declared_media_type.as_deref(),
+            header_media_type.as_deref(),
+            &url_path,
+        )?;
+        return Ok((media_type, BASE64_STANDARD.encode(bytes)));
+    }
+
+    Err(MultimodalNormalizeError::new(
+        "document URL redirected too many times",
+    ))
+}
+
 async fn parse_and_validate_remote_image_url(raw: &str) -> Result<Url, MultimodalNormalizeError> {
-    let url = Url::parse(raw)
-        .map_err(|err| MultimodalNormalizeError::new(format!("invalid image URL: {err}")))?;
-    validate_remote_image_url(&url).await?;
-    Ok(url)
+    parse_and_validate_remote_url(raw, "image").await
 }
 
 async fn validate_remote_image_url(url: &Url) -> Result<(), MultimodalNormalizeError> {
+    validate_remote_url(url, "image").await
+}
+
+async fn parse_and_validate_remote_url(
+    raw: &str,
+    kind: &str,
+) -> Result<Url, MultimodalNormalizeError> {
+    let url = Url::parse(raw)
+        .map_err(|err| MultimodalNormalizeError::new(format!("invalid {kind} URL: {err}")))?;
+    validate_remote_url(&url, kind).await?;
+    Ok(url)
+}
+
+async fn validate_remote_url(url: &Url, kind: &str) -> Result<(), MultimodalNormalizeError> {
     match url.scheme() {
         "http" | "https" => {}
         _ => {
-            return Err(MultimodalNormalizeError::new(
-                "image URL must use http or https",
-            ));
+            return Err(MultimodalNormalizeError::new(format!(
+                "{kind} URL must use http or https"
+            )));
         }
     }
 
     let host = url
         .host_str()
-        .ok_or_else(|| MultimodalNormalizeError::new("image URL missing host"))?;
+        .ok_or_else(|| MultimodalNormalizeError::new(format!("{kind} URL missing host")))?;
     if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") {
-        return Err(MultimodalNormalizeError::new(
-            "image URL host is not allowed",
-        ));
+        return Err(MultimodalNormalizeError::new(format!(
+            "{kind} URL host is not allowed"
+        )));
     }
 
     if let Ok(ip) = host.parse::<IpAddr>() {
-        validate_public_ip(ip)?;
+        validate_public_ip(ip, kind)?;
         return Ok(());
     }
 
-    let port = url
-        .port_or_known_default()
-        .ok_or_else(|| MultimodalNormalizeError::new("image URL missing known port for scheme"))?;
+    let port = url.port_or_known_default().ok_or_else(|| {
+        MultimodalNormalizeError::new(format!("{kind} URL missing known port for scheme"))
+    })?;
     let addrs = lookup_host((host, port)).await.map_err(|err| {
-        MultimodalNormalizeError::new(format!("failed to resolve image URL host: {err}"))
+        MultimodalNormalizeError::new(format!("failed to resolve {kind} URL host: {err}"))
     })?;
 
     let mut saw_addr = false;
     for addr in addrs {
         saw_addr = true;
-        validate_public_ip(addr.ip())?;
+        validate_public_ip(addr.ip(), kind)?;
     }
 
     if !saw_addr {
-        return Err(MultimodalNormalizeError::new(
-            "image URL host did not resolve",
-        ));
+        return Err(MultimodalNormalizeError::new(format!(
+            "{kind} URL host did not resolve"
+        )));
     }
 
     Ok(())
 }
 
-fn validate_public_ip(ip: IpAddr) -> Result<(), MultimodalNormalizeError> {
+fn validate_public_ip(ip: IpAddr, kind: &str) -> Result<(), MultimodalNormalizeError> {
     if is_blocked_ip(ip) {
-        return Err(MultimodalNormalizeError::new(
-            "image URL resolves to a private or reserved address",
-        ));
+        return Err(MultimodalNormalizeError::new(format!(
+            "{kind} URL resolves to a private or reserved address"
+        )));
     }
     Ok(())
 }
@@ -357,16 +583,20 @@ fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
 
 async fn read_limited_response_body(
     response: reqwest::Response,
+    max_bytes: usize,
+    kind: &str,
 ) -> Result<Vec<u8>, MultimodalNormalizeError> {
     let mut out = Vec::new();
     let mut stream = response.bytes_stream();
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|err| {
-            MultimodalNormalizeError::new(format!("failed to read image body: {err}"))
+            MultimodalNormalizeError::new(format!("failed to read {kind} body: {err}"))
         })?;
-        if out.len() + chunk.len() > MAX_REMOTE_IMAGE_BYTES {
-            return Err(MultimodalNormalizeError::new("image URL body is too large"));
+        if out.len() + chunk.len() > max_bytes {
+            return Err(MultimodalNormalizeError::new(format!(
+                "{kind} URL body is too large"
+            )));
         }
         out.extend_from_slice(&chunk);
     }
@@ -374,14 +604,17 @@ async fn read_limited_response_body(
     Ok(out)
 }
 
-fn content_type_media_type(headers: &HeaderMap) -> Option<String> {
+fn raw_content_type_media_type(headers: &HeaderMap) -> Option<String> {
     headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(';').next())
         .map(str::trim)
         .map(str::to_ascii_lowercase)
-        .filter(|value| supported_image_media_type(value).is_some())
+}
+
+fn content_type_media_type(headers: &HeaderMap) -> Option<String> {
+    raw_content_type_media_type(headers).filter(|value| supported_image_media_type(value).is_some())
 }
 
 fn select_image_media_type(
@@ -409,6 +642,68 @@ fn detect_image_media_type(bytes: &[u8]) -> Option<String> {
         image::ImageFormat::Jpeg => Some("image/jpeg".to_string()),
         image::ImageFormat::Gif => Some("image/gif".to_string()),
         image::ImageFormat::WebP => Some("image/webp".to_string()),
+        _ => None,
+    }
+}
+
+fn select_document_media_type(
+    declared: Option<&str>,
+    header: Option<&str>,
+    url_path: &str,
+) -> Result<String, MultimodalNormalizeError> {
+    if let Some(media_type) = declared.and_then(|value| supported_document_media_type(value.trim()))
+    {
+        return Ok(media_type.to_string());
+    }
+    if let Some(media_type) = header.and_then(|value| supported_document_media_type(value.trim())) {
+        return Ok(media_type.to_string());
+    }
+    if let Some(media_type) = document_media_type_from_extension(url_path) {
+        return Ok(media_type.to_string());
+    }
+    Err(MultimodalNormalizeError::new(
+        "document URL did not contain a supported pdf/csv/doc/docx/xls/xlsx/html/txt/md document",
+    ))
+}
+
+fn document_media_type_from_extension(name: &str) -> Option<&'static str> {
+    let extension = name.rsplit_once('.')?.1.to_ascii_lowercase();
+    match extension.as_str() {
+        "pdf" => Some("application/pdf"),
+        "csv" => Some("text/csv"),
+        "doc" => Some("application/msword"),
+        "docx" => Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        "xls" => Some("application/vnd.ms-excel"),
+        "xlsx" => Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        "html" | "htm" => Some("text/html"),
+        "txt" => Some("text/plain"),
+        "md" | "markdown" => Some("text/markdown"),
+        _ => None,
+    }
+}
+
+fn supported_document_media_type(media_type: &str) -> Option<&'static str> {
+    match media_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "application/pdf" => Some("application/pdf"),
+        "text/csv" => Some("text/csv"),
+        "application/msword" => Some("application/msword"),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => {
+            Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        }
+        "application/vnd.ms-excel" => Some("application/vnd.ms-excel"),
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => {
+            Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        }
+        "text/html" => Some("text/html"),
+        "text/plain" => Some("text/plain"),
+        "text/markdown" => Some("text/markdown"),
         _ => None,
     }
 }
@@ -506,6 +801,50 @@ mod tests {
         assert_eq!(block["source"]["type"], "base64");
         assert_eq!(block["source"]["media_type"], "image/jpeg");
         assert_eq!(block["source"]["data"], "aGVsbG8=");
+    }
+
+    #[tokio::test]
+    async fn test_normalize_document_url_data_url() {
+        let mut req = request_with_content(serde_json::json!([
+            {
+                "type":"documentUrl",
+                "documentUrl":{
+                    "name":"Spec.pdf",
+                    "url":"data:application/pdf;base64,cGRm"
+                }
+            }
+        ]));
+
+        let stats = normalize_multimodal_urls(&mut req)
+            .await
+            .expect("document data URL should normalize");
+
+        assert_eq!(stats.document_url_blocks, 1);
+        assert_eq!(stats.data_url_documents, 1);
+        let block = &req.messages[0].content.as_array().unwrap()[0];
+        assert_eq!(block["type"], "document_url");
+        assert_eq!(block["document_url"]["name"], "Spec.pdf");
+        assert_eq!(block["document_url"]["mimeType"], "application/pdf");
+        assert_eq!(block["document_url"]["data"], "cGRm");
+        assert!(block["document_url"].get("url").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_normalize_anthropic_document_url_source_data_url() {
+        let mut req = request_with_content(serde_json::json!([
+            {"type":"document","source":{"type":"url","url":"data:text/markdown;base64,IyBUaXRsZQ=="}}
+        ]));
+
+        let stats = normalize_multimodal_urls(&mut req)
+            .await
+            .expect("Anthropic document URL source should normalize");
+
+        assert_eq!(stats.anthropic_document_url_blocks, 1);
+        assert_eq!(stats.data_url_documents, 1);
+        let block = &req.messages[0].content.as_array().unwrap()[0];
+        assert_eq!(block["source"]["type"], "base64");
+        assert_eq!(block["source"]["media_type"], "text/markdown");
+        assert_eq!(block["source"]["data"], "IyBUaXRsZQ==");
     }
 
     #[tokio::test]

@@ -102,6 +102,9 @@ pub struct UserInputMessage {
     /// 图片列表
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<KiroImage>,
+    /// 文档列表
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub documents: Vec<KiroDocument>,
     /// 消息来源（通常为 "AI_EDITOR"）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
@@ -115,6 +118,7 @@ impl UserInputMessage {
             content: content.into(),
             model_id: model_id.into(),
             images: Vec::new(),
+            documents: Vec::new(),
             origin: Some("AI_EDITOR".to_string()),
         }
     }
@@ -128,6 +132,12 @@ impl UserInputMessage {
     /// 添加图片
     pub fn with_images(mut self, images: Vec<KiroImage>) -> Self {
         self.images = images;
+        self
+    }
+
+    /// 添加文档
+    pub fn with_documents(mut self, documents: Vec<KiroDocument>) -> Self {
+        self.documents = documents;
         self
     }
 
@@ -200,6 +210,42 @@ pub struct KiroImageSource {
     pub bytes: String,
 }
 
+/// Kiro 文档
+///
+/// API 中使用的文档格式
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KiroDocument {
+    /// 文档名称
+    pub name: String,
+    /// 文档格式（"pdf", "csv", "doc", "docx", "xls", "xlsx", "html", "txt", "md"）
+    pub format: String,
+    /// 文档数据源
+    pub source: KiroDocumentSource,
+}
+
+impl KiroDocument {
+    /// 从 base64 数据创建文档
+    pub fn from_base64(
+        name: impl Into<String>,
+        format: impl Into<String>,
+        data: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            format: format.into(),
+            source: KiroDocumentSource { bytes: data.into() },
+        }
+    }
+}
+
+/// Kiro 文档数据源
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KiroDocumentSource {
+    /// base64 编码的文档数据
+    pub bytes: String,
+}
+
 /// 历史消息
 ///
 /// 可以是用户消息或助手消息
@@ -243,6 +289,9 @@ pub struct UserMessage {
     /// 图片列表
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<KiroImage>,
+    /// 文档列表
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub documents: Vec<KiroDocument>,
     /// 用户输入消息上下文
     #[serde(default, skip_serializing_if = "is_default_context")]
     pub user_input_message_context: UserInputMessageContext,
@@ -260,6 +309,7 @@ impl UserMessage {
             model_id: model_id.into(),
             origin: Some("AI_EDITOR".to_string()),
             images: Vec::new(),
+            documents: Vec::new(),
             user_input_message_context: UserInputMessageContext::default(),
         }
     }
@@ -267,6 +317,12 @@ impl UserMessage {
     /// 设置图片
     pub fn with_images(mut self, images: Vec<KiroImage>) -> Self {
         self.images = images;
+        self
+    }
+
+    /// 设置文档
+    pub fn with_documents(mut self, documents: Vec<KiroDocument>) -> Self {
+        self.documents = documents;
         self
     }
 

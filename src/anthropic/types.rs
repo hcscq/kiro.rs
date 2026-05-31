@@ -410,15 +410,56 @@ pub struct ContentBlock {
     pub is_error: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<ImageSource>,
+    #[serde(
+        default,
+        alias = "documentUrl",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub document_url: Option<DocumentUrlSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<ResourceSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
-/// 图片数据源
+/// 图片或文档数据源
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ImageSource {
     #[serde(rename = "type")]
+    #[serde(default)]
     pub source_type: String,
+    #[serde(default)]
     pub media_type: String,
+    #[serde(default)]
     pub data: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+/// document_url 数据源
+#[derive(Debug, Deserialize, Serialize)]
+pub struct DocumentUrlSource {
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub data: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default, alias = "mimeType")]
+    pub mime_type: Option<String>,
+}
+
+/// ACP/resource 数据源
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ResourceSource {
+    #[serde(default)]
+    pub blob: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default, alias = "mimeType")]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub uri: Option<String>,
 }
 
 // === Count Tokens 端点类型 ===

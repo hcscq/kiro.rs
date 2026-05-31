@@ -249,6 +249,9 @@ fn conversion_runtime_error_response(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
+                ConversionError::DocumentValidation(message) => {
+                    ("invalid_request_error", message.clone())
+                }
             };
             if let Some(request_id) = request_id {
                 tracing::warn!(request_id = %request_id, route, error = %e, "请求转换失败");
@@ -522,27 +525,35 @@ async fn normalize_multimodal_payload(
         Ok(stats) => {
             if stats.remote_images > 0
                 || stats.data_url_images > 0
+                || stats.remote_documents > 0
+                || stats.data_url_documents > 0
                 || stats.openai_image_url_blocks > 0
                 || stats.anthropic_url_blocks > 0
+                || stats.document_url_blocks > 0
+                || stats.anthropic_document_url_blocks > 0
             {
                 tracing::info!(
                     request_id = %request_id,
                     remote_images = stats.remote_images,
                     data_url_images = stats.data_url_images,
+                    remote_documents = stats.remote_documents,
+                    data_url_documents = stats.data_url_documents,
                     openai_image_url_blocks = stats.openai_image_url_blocks,
                     anthropic_url_blocks = stats.anthropic_url_blocks,
-                    "normalized multimodal image references"
+                    document_url_blocks = stats.document_url_blocks,
+                    anthropic_document_url_blocks = stats.anthropic_document_url_blocks,
+                    "normalized multimodal references"
                 );
             }
             Ok(())
         }
         Err(err) => {
-            tracing::warn!(request_id = %request_id, error = %err, "多模态图片归一化失败");
+            tracing::warn!(request_id = %request_id, error = %err, "多模态归一化失败");
             Err((
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse::new(
                     "invalid_request_error",
-                    format!("Invalid image URL: {err}"),
+                    format!("Invalid multimodal URL: {err}"),
                 )),
             )
                 .into_response())

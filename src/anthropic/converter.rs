@@ -19,7 +19,8 @@ use uuid::Uuid;
 
 use crate::kiro::model::requests::conversation::{
     AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
-    HistoryUserMessage, KiroImage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
+    HistoryUserMessage, KiroDocument, KiroImage, Message, UserInputMessage,
+    UserInputMessageContext, UserMessage,
 };
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
@@ -454,6 +455,8 @@ const MISSING_TOOL_USE_NAME_PLACEHOLDER: &str = "historical_tool";
 
 /// 避免把异常大的文档直接加载到 Kiro 转换层里。
 const MAX_DOCUMENT_EXTRACT_BYTES: usize = 64 * 1024 * 1024;
+const KIRO_MAX_DOCUMENT_BYTES: usize = 4_718_592;
+const KIRO_MAX_DOCUMENTS_PER_CONVERSATION: usize = 5;
 const MAX_INLINE_DOCUMENT_TEXT_CHARS: usize = 40_000;
 const MAX_RENDERED_DOCUMENT_TEXT_CHARS: usize = 7_200;
 const MAX_RENDERED_DOCUMENT_IMAGES: usize = 4;
@@ -547,6 +550,7 @@ pub struct ConversionResult {
 pub enum ConversionError {
     UnsupportedModel(String),
     EmptyMessages,
+    DocumentValidation(String),
 }
 
 impl std::fmt::Display for ConversionError {
@@ -554,6 +558,7 @@ impl std::fmt::Display for ConversionError {
         match self {
             ConversionError::UnsupportedModel(model) => write!(f, "模型不支持: {}", model),
             ConversionError::EmptyMessages => write!(f, "消息列表为空"),
+            ConversionError::DocumentValidation(message) => write!(f, "文档校验失败: {}", message),
         }
     }
 }
@@ -739,6 +744,7 @@ pub fn convert_request_with_probe(
         &probe,
         &mut merged_current,
     );
+    dedupe_documents_across_conversation(&mut history, &mut merged_current.documents)?;
     inject_current_tool_result_fallback_text(
         &mut merged_current,
         !validated_tool_results.is_empty() || moved_tool_results_to_history > 0,
@@ -785,6 +791,9 @@ pub fn convert_request_with_probe(
     if !merged_current.images.is_empty() {
         user_input = user_input.with_images(merged_current.images);
     }
+    if !merged_current.documents.is_empty() {
+        user_input = user_input.with_documents(merged_current.documents);
+    }
 
     let current_message = CurrentMessage::new(user_input);
 
@@ -820,6 +829,7 @@ fn inject_current_tool_result_fallback_text(
     if !has_relevant_tool_results
         || !merged_current.content.trim().is_empty()
         || !merged_current.images.is_empty()
+        || !merged_current.documents.is_empty()
     {
         return;
     }
@@ -853,12 +863,401 @@ fn determine_chat_trigger_type(_req: &MessagesRequest) -> String {
     "MANUAL".to_string()
 }
 
+fn get_document_format(media_type: &str) -> Option<&'static str> {
+    match media_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "application/pdf" => Some("pdf"),
+        "text/csv" => Some("csv"),
+        "application/msword" => Some("doc"),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => Some("docx"),
+        "application/vnd.ms-excel" => Some("xls"),
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => Some("xlsx"),
+        "text/html" => Some("html"),
+        "text/plain" => Some("txt"),
+        "text/markdown" => Some("md"),
+        _ => None,
+    }
+}
+
+fn get_document_format_from_extension(name: &str) -> Option<&'static str> {
+    let extension = name.rsplit_once('.')?.1.to_ascii_lowercase();
+    match extension.as_str() {
+        "pdf" => Some("pdf"),
+        "csv" => Some("csv"),
+        "doc" => Some("doc"),
+        "docx" => Some("docx"),
+        "xls" => Some("xls"),
+        "xlsx" => Some("xlsx"),
+        "html" | "htm" => Some("html"),
+        "txt" => Some("txt"),
+        "md" | "markdown" => Some("md"),
+        _ => None,
+    }
+}
+
+fn document_format_for_media_or_name(
+    media_type: Option<&str>,
+    name: Option<&str>,
+) -> Option<String> {
+    media_type
+        .and_then(get_document_format)
+        .or_else(|| name.and_then(get_document_format_from_extension))
+        .map(str::to_string)
+}
+
+fn parse_base64_data_url(value: &str) -> Option<(String, String)> {
+    let (metadata, data) = value.split_once(',')?;
+    let metadata = metadata.trim();
+    if !metadata
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
+    {
+        return None;
+    }
+    let metadata = metadata.strip_prefix("data:").unwrap_or(metadata);
+    let mut parts = metadata.split(';');
+    let media_type = parts.next()?.trim().to_ascii_lowercase();
+    if media_type.is_empty() || !parts.any(|part| part.eq_ignore_ascii_case("base64")) {
+        return None;
+    }
+    Some((media_type, normalize_base64_payload(data)))
+}
+
+fn document_base64_from_source(source: &super::types::ImageSource) -> Option<String> {
+    let source_type = source.source_type.trim().to_ascii_lowercase();
+    if source_type == "text" {
+        return Some(BASE64_STANDARD.encode(source.data.as_bytes()));
+    }
+
+    if let Some((_, data)) = parse_base64_data_url(&source.data) {
+        return Some(data);
+    }
+    if let Some(url) = source.url.as_deref()
+        && let Some((_, data)) = parse_base64_data_url(url)
+    {
+        return Some(data);
+    }
+
+    if !source.data.trim().is_empty() && source_type != "url" {
+        return Some(normalize_base64_payload(&source.data));
+    }
+
+    None
+}
+
+fn source_media_type(source: &super::types::ImageSource) -> Option<String> {
+    if !source.media_type.trim().is_empty() {
+        return Some(source.media_type.trim().to_ascii_lowercase());
+    }
+    if let Some((media_type, _)) = parse_base64_data_url(&source.data) {
+        return Some(media_type);
+    }
+    if let Some(url) = source.url.as_deref()
+        && let Some((media_type, _)) = parse_base64_data_url(url)
+    {
+        return Some(media_type);
+    }
+    None
+}
+
+fn sanitize_document_name(name: &str) -> String {
+    let without_extension = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+    let mut sanitized = String::with_capacity(without_extension.len().min(200));
+    let mut previous_dash = false;
+    let mut previous_space = false;
+
+    for ch in without_extension.chars() {
+        let mapped = if ch.is_ascii_alphanumeric()
+            || ch == ' '
+            || ch == '-'
+            || ch == '('
+            || ch == ')'
+            || ch == '['
+            || ch == ']'
+        {
+            ch
+        } else {
+            '-'
+        };
+
+        if mapped == '-' {
+            if previous_dash {
+                continue;
+            }
+            previous_dash = true;
+            previous_space = false;
+        } else if mapped.is_whitespace() {
+            if previous_space {
+                continue;
+            }
+            previous_space = true;
+            previous_dash = false;
+        } else {
+            previous_dash = false;
+            previous_space = false;
+        }
+
+        sanitized.push(mapped);
+    }
+
+    let sanitized = sanitized.trim();
+    let sanitized: String = sanitized.chars().take(200).collect();
+    if sanitized.is_empty() {
+        "document".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn document_name_from_uri(uri: &str) -> Option<String> {
+    let without_fragment = uri.split('#').next().unwrap_or(uri);
+    let without_query = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment);
+    without_query
+        .rsplit('/')
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn build_kiro_document(
+    name_hint: Option<&str>,
+    media_type: Option<&str>,
+    data: String,
+) -> Option<KiroDocument> {
+    let format = document_format_for_media_or_name(media_type, name_hint)?;
+    let name = sanitize_document_name(name_hint.unwrap_or("document"));
+    Some(KiroDocument::from_base64(name, format, data))
+}
+
+fn base64_decoded_len(data: &str) -> Option<usize> {
+    let data = data.trim();
+    if data.is_empty() {
+        return Some(0);
+    }
+
+    let padding = data
+        .as_bytes()
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'=')
+        .count()
+        .min(2);
+    let unpadded_len = data.len().checked_sub(padding)?;
+    if unpadded_len % 4 == 1 {
+        return None;
+    }
+
+    let tail = match unpadded_len % 4 {
+        0 => 0,
+        2 => 1,
+        3 => 2,
+        _ => return None,
+    };
+    Some((unpadded_len / 4) * 3 + tail)
+}
+
+fn validate_kiro_document(document: &KiroDocument) -> Result<(), ConversionError> {
+    let data = normalize_base64_payload(&document.source.bytes);
+    let decoded_len = base64_decoded_len(&data).ok_or_else(|| {
+        ConversionError::DocumentValidation(format!(
+            "Invalid base64 data for document '{}'.",
+            document.name
+        ))
+    })?;
+
+    if decoded_len > KIRO_MAX_DOCUMENT_BYTES {
+        return Err(ConversionError::DocumentValidation(format!(
+            "Document '{}' is too large ({} bytes). Maximum is {} bytes.",
+            document.name, decoded_len, KIRO_MAX_DOCUMENT_BYTES
+        )));
+    }
+
+    BASE64_STANDARD.decode(&data).map_err(|_| {
+        ConversionError::DocumentValidation(format!(
+            "Invalid base64 data for document '{}'.",
+            document.name
+        ))
+    })?;
+    Ok(())
+}
+
+fn push_kiro_document(
+    documents: &mut Vec<KiroDocument>,
+    document: KiroDocument,
+) -> Result<(), ConversionError> {
+    validate_kiro_document(&document)?;
+    documents.push(document);
+    Ok(())
+}
+
+fn build_kiro_document_from_document_block(block: &ContentBlock) -> Option<KiroDocument> {
+    let source = block.source.as_ref()?;
+    let name_hint = block.title.as_deref().or(block.name.as_deref());
+    let media_type = source_media_type(source);
+    let data = document_base64_from_source(source)?;
+    build_kiro_document(name_hint, media_type.as_deref(), data)
+}
+
+fn build_kiro_document_from_document_url(block: &ContentBlock) -> Option<KiroDocument> {
+    let document_url = block.document_url.as_ref()?;
+    let name_hint = document_url
+        .name
+        .as_deref()
+        .or(block.title.as_deref())
+        .or(block.name.as_deref());
+
+    let mut media_type = document_url.mime_type.clone();
+    let data = if let Some(data) = document_url.data.as_deref() {
+        if let Some((parsed_media_type, data)) = parse_base64_data_url(data) {
+            media_type.get_or_insert(parsed_media_type);
+            data
+        } else {
+            normalize_base64_payload(data)
+        }
+    } else if let Some(url) = document_url.url.as_deref() {
+        let (parsed_media_type, data) = parse_base64_data_url(url)?;
+        media_type.get_or_insert(parsed_media_type);
+        data
+    } else {
+        return None;
+    };
+
+    if data.is_empty() {
+        return None;
+    }
+    build_kiro_document(name_hint, media_type.as_deref(), data)
+}
+
+fn build_kiro_document_from_resource(block: &ContentBlock) -> Option<KiroDocument> {
+    let resource = block.resource.as_ref()?;
+    let media_type = resource.mime_type.as_deref()?;
+    let name_from_uri = resource.uri.as_deref().and_then(document_name_from_uri);
+    let name_hint = block
+        .title
+        .as_deref()
+        .or(block.name.as_deref())
+        .or(name_from_uri.as_deref());
+
+    let data = if let Some(blob) = resource.blob.as_deref() {
+        normalize_base64_payload(blob)
+    } else if let Some(text) = resource.text.as_deref() {
+        BASE64_STANDARD.encode(text.as_bytes())
+    } else {
+        return None;
+    };
+
+    if data.is_empty() {
+        return None;
+    }
+    build_kiro_document(name_hint, Some(media_type), data)
+}
+
+fn text_from_resource(block: &ContentBlock) -> Option<String> {
+    block.resource.as_ref()?.text.clone()
+}
+
+fn image_from_resource(block: &ContentBlock) -> Vec<KiroImage> {
+    let Some(resource) = block.resource.as_ref() else {
+        return Vec::new();
+    };
+    let Some(media_type) = resource.mime_type.as_deref() else {
+        return Vec::new();
+    };
+    let Some(format) = get_image_format(media_type) else {
+        return Vec::new();
+    };
+    let Some(blob) = resource.blob.as_deref() else {
+        return Vec::new();
+    };
+    build_kiro_images(format, blob.to_string())
+}
+
+fn dedupe_documents_by_name(documents: Vec<KiroDocument>) -> Vec<KiroDocument> {
+    if documents.len() <= 1 {
+        return documents;
+    }
+
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::with_capacity(documents.len());
+    for document in documents {
+        if seen.insert(document.name.clone()) {
+            deduped.push(document);
+        } else {
+            tracing::warn!(
+                document_name = %document.name,
+                "跳过同一消息内重复名称的 Kiro 文档附件"
+            );
+        }
+    }
+    deduped
+}
+
+fn dedupe_documents_across_conversation(
+    history: &mut [Message],
+    current_documents: &mut Vec<KiroDocument>,
+) -> Result<(), ConversionError> {
+    let mut seen = HashSet::new();
+    let mut document_count = 0usize;
+
+    for msg in history {
+        let Message::User(user_msg) = msg else {
+            continue;
+        };
+        let documents = &mut user_msg.user_input_message.documents;
+        documents.retain(|document| {
+            if seen.insert(document.name.clone()) {
+                document_count += 1;
+                true
+            } else {
+                tracing::warn!(
+                    document_name = %document.name,
+                    "跳过会话内重复名称的 Kiro 文档附件"
+                );
+                false
+            }
+        });
+    }
+
+    current_documents.retain(|document| {
+        if seen.insert(document.name.clone()) {
+            document_count += 1;
+            true
+        } else {
+            tracing::warn!(
+                document_name = %document.name,
+                "跳过 current 中与历史重复名称的 Kiro 文档附件"
+            );
+            false
+        }
+    });
+
+    if document_count > KIRO_MAX_DOCUMENTS_PER_CONVERSATION {
+        return Err(ConversionError::DocumentValidation(format!(
+            "Too many documents attached ({}). Maximum is {} per conversation.",
+            document_count, KIRO_MAX_DOCUMENTS_PER_CONVERSATION
+        )));
+    }
+
+    Ok(())
+}
+
 /// 处理消息内容，提取文本、图片和工具结果
 fn process_message_content(
     content: &serde_json::Value,
-) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
+) -> Result<(String, Vec<KiroImage>, Vec<KiroDocument>, Vec<ToolResult>), ConversionError> {
     let mut text_parts = Vec::new();
     let mut images = Vec::new();
+    let mut documents = Vec::new();
     let mut tool_results = Vec::new();
 
     match content {
@@ -890,7 +1289,10 @@ fn process_message_content(
                             }
                         }
                         "document" => {
-                            if let Some(source) = block.source {
+                            if let Some(document) = build_kiro_document_from_document_block(&block)
+                            {
+                                push_kiro_document(&mut documents, document)?;
+                            } else if let Some(source) = block.source {
                                 if let Some(document) = extract_document_text(&source) {
                                     let rendered_images =
                                         render_document_text_as_kiro_images(&document.text);
@@ -900,6 +1302,25 @@ fn process_message_content(
                                         images.extend(rendered_images);
                                         text_parts.push(rendered_document_notice(&document));
                                     }
+                                }
+                            }
+                        }
+                        "document_url" | "documentUrl" => {
+                            if let Some(document) = build_kiro_document_from_document_url(&block) {
+                                push_kiro_document(&mut documents, document)?;
+                            }
+                        }
+                        "resource" => {
+                            if let Some(document) = build_kiro_document_from_resource(&block) {
+                                push_kiro_document(&mut documents, document)?;
+                            } else {
+                                let resource_images = image_from_resource(&block);
+                                if resource_images.is_empty() {
+                                    if let Some(text) = text_from_resource(&block) {
+                                        text_parts.push(text);
+                                    }
+                                } else {
+                                    images.extend(resource_images);
                                 }
                             }
                         }
@@ -930,7 +1351,12 @@ fn process_message_content(
         _ => {}
     }
 
-    Ok((text_parts.join("\n"), images, tool_results))
+    Ok((
+        text_parts.join("\n"),
+        images,
+        dedupe_documents_by_name(documents),
+        tool_results,
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -2055,12 +2481,17 @@ fn build_history(
 struct MergedUserMessageParts {
     content: String,
     images: Vec<KiroImage>,
+    documents: Vec<KiroDocument>,
     tool_results: Vec<ToolResult>,
 }
 
 impl MergedUserMessageParts {
-    fn has_mixed_tool_results_and_images(&self) -> bool {
-        !self.tool_results.is_empty() && !self.images.is_empty()
+    fn has_attachments(&self) -> bool {
+        !self.images.is_empty() || !self.documents.is_empty()
+    }
+
+    fn has_mixed_tool_results_and_attachments(&self) -> bool {
+        !self.tool_results.is_empty() && self.has_attachments()
     }
 }
 
@@ -2077,22 +2508,27 @@ fn merge_user_message_parts(
 ) -> Result<MergedUserMessageParts, ConversionError> {
     let mut content_parts = Vec::new();
     let mut images = Vec::new();
+    let mut documents = Vec::new();
     let mut tool_results = Vec::new();
 
     for msg in messages {
-        let (text, msg_images, msg_tool_results) = process_message_content(&msg.content)?;
+        let (text, msg_images, msg_documents, msg_tool_results) =
+            process_message_content(&msg.content)?;
         if !text.is_empty() {
             content_parts.push(text);
         }
         images.extend(msg_images);
+        documents.extend(msg_documents);
         tool_results.extend(msg_tool_results);
     }
 
     let tool_results = dedupe_tool_results_by_id(tool_results);
+    let documents = dedupe_documents_by_name(documents);
 
     Ok(MergedUserMessageParts {
         content: content_parts.join("\n"),
         images,
+        documents,
         tool_results,
     })
 }
@@ -2123,6 +2559,7 @@ fn build_history_user_message_from_parts(
     content: impl Into<String>,
     model_id: &str,
     images: Vec<KiroImage>,
+    documents: Vec<KiroDocument>,
     tool_results: Vec<ToolResult>,
 ) -> HistoryUserMessage {
     let mut user_msg = UserMessage::new(content, model_id);
@@ -2130,6 +2567,9 @@ fn build_history_user_message_from_parts(
 
     if !images.is_empty() {
         user_msg = user_msg.with_images(images);
+    }
+    if !documents.is_empty() {
+        user_msg = user_msg.with_documents(documents);
     }
 
     if !tool_results.is_empty() {
@@ -2187,7 +2627,8 @@ fn append_history_image_chunks(
     image_chunks: Vec<Vec<KiroImage>>,
 ) {
     for chunk in image_chunks {
-        let user_msg = build_history_user_message_from_parts("", model_id, chunk, Vec::new());
+        let user_msg =
+            build_history_user_message_from_parts("", model_id, chunk, Vec::new(), Vec::new());
         push_history_user_message(history, probe, user_msg);
         history.push(Message::Assistant(HistoryAssistantMessage::new("OK")));
     }
@@ -2200,20 +2641,24 @@ fn append_history_user_messages(
     probe: &UpstreamProbe,
     close_with_ack: bool,
 ) {
-    let has_mixed_tool_results_and_images = merged.has_mixed_tool_results_and_images();
+    let has_mixed_tool_results_and_attachments = merged.has_mixed_tool_results_and_attachments();
     let MergedUserMessageParts {
         content,
         images,
+        documents,
         tool_results,
     } = merged;
 
-    let final_tool_results = if has_mixed_tool_results_and_images {
-        tracing::info!(
-            "拆分 mixed user message：tool_results 与 images 分离到不同 Kiro user turns"
-        );
+    let final_tool_results = if has_mixed_tool_results_and_attachments {
+        tracing::info!("拆分 mixed user message：tool_results 与附件分离到不同 Kiro user turns");
 
-        let tool_result_msg =
-            build_history_user_message_from_parts("", model_id, Vec::new(), tool_results);
+        let tool_result_msg = build_history_user_message_from_parts(
+            "",
+            model_id,
+            Vec::new(),
+            Vec::new(),
+            tool_results,
+        );
         push_history_user_message(history, probe, tool_result_msg);
         history.push(Message::Assistant(HistoryAssistantMessage::new("OK")));
         Vec::new()
@@ -2240,8 +2685,13 @@ fn append_history_user_messages(
 
     append_history_image_chunks(history, model_id, probe, history_image_chunks);
 
-    let user_msg =
-        build_history_user_message_from_parts(content, model_id, final_images, final_tool_results);
+    let user_msg = build_history_user_message_from_parts(
+        content,
+        model_id,
+        final_images,
+        documents,
+        final_tool_results,
+    );
     push_history_user_message(history, probe, user_msg);
 
     if close_with_ack {
@@ -2256,16 +2706,17 @@ fn move_current_tool_results_to_history_for_image_compat(
     merged_current: &MergedUserMessageParts,
     validated_tool_results: &mut Vec<ToolResult>,
 ) {
-    if validated_tool_results.is_empty() || merged_current.images.is_empty() {
+    if validated_tool_results.is_empty() || !merged_current.has_attachments() {
         return;
     }
 
     tracing::info!(
-        "拆分 current mixed user message：将 tool_results 下沉到 history，保留 images/text 在 current"
+        "拆分 current mixed user message：将 tool_results 下沉到 history，保留附件/text 在 current"
     );
 
     let moved_results = std::mem::take(validated_tool_results);
-    let user_msg = build_history_user_message_from_parts("", model_id, Vec::new(), moved_results);
+    let user_msg =
+        build_history_user_message_from_parts("", model_id, Vec::new(), Vec::new(), moved_results);
     push_history_user_message(history, probe, user_msg);
     history.push(Message::Assistant(HistoryAssistantMessage::new("OK")));
 }
@@ -2466,7 +2917,8 @@ fn insert_tool_result_history_turn(
     }
 
     let tool_result_count = tool_results.len();
-    let user_msg = build_history_user_message_from_parts("", model_id, Vec::new(), tool_results);
+    let user_msg =
+        build_history_user_message_from_parts("", model_id, Vec::new(), Vec::new(), tool_results);
     let mut history_msg = Message::User(user_msg);
     if let Message::User(user_msg) = &mut history_msg {
         probe.apply_origin(&mut user_msg.user_input_message.origin);
@@ -3047,6 +3499,18 @@ mod tests {
         })
     }
 
+    fn named_document_block(title: &str, media_type: &str, data: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "document",
+            "title": title,
+            "source": {
+                "type": "base64",
+                "media_type": media_type,
+                "data": data
+            }
+        })
+    }
+
     fn text_document_data_url_block() -> serde_json::Value {
         serde_json::json!({
             "type": "document",
@@ -3083,12 +3547,13 @@ mod tests {
             }
         })]);
 
-        let (_, images, _) =
+        let (_, images, documents, _) =
             process_message_content(&content).expect("data url image should convert");
 
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].format, "png");
         assert_eq!(images[0].source.bytes, VALID_RGB_1X1_PNG);
+        assert!(documents.is_empty());
     }
 
     #[test]
@@ -3101,35 +3566,28 @@ mod tests {
             }),
         ]);
 
-        let (text, images, tool_results) =
+        let (text, images, documents, tool_results) =
             process_message_content(&content).expect("text data url document should convert");
 
-        assert_eq!(images.len(), 1);
-        assert_eq!(images[0].format, "png");
+        assert!(images.is_empty());
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].name, "document");
+        assert_eq!(documents[0].format, "txt");
+        assert_eq!(documents[0].source.bytes, "U0tRRFlHREY=");
         assert!(tool_results.is_empty());
-        assert!(text.contains("attached image is a rendering"));
-        assert!(text.contains("text/plain document"));
-        assert!(!text.contains("SKQDYGDF"));
         assert!(text.contains("What text does this document contain?"));
-
-        let png_bytes = BASE64_STANDARD
-            .decode(&images[0].source.bytes)
-            .expect("rendered document should be valid base64");
-        let rendered = image::load_from_memory_with_format(&png_bytes, image::ImageFormat::Png)
-            .expect("rendered document should decode as png");
-        assert_eq!(rendered.width(), DOCUMENT_RENDER_WIDTH_PX);
-        assert_eq!(rendered.height(), DOCUMENT_RENDER_HEIGHT_PX);
     }
 
     #[test]
     fn test_process_message_content_downscales_oversized_current_jpeg() {
         let content = serde_json::Value::Array(vec![oversized_jpeg_block(952, 1552)]);
 
-        let (_, images, _) =
+        let (_, images, documents, _) =
             process_message_content(&content).expect("oversized jpeg should convert");
 
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].format, "jpeg");
+        assert!(documents.is_empty());
 
         let resized_bytes = BASE64_STANDARD
             .decode(&images[0].source.bytes)
@@ -3152,11 +3610,12 @@ mod tests {
             .to_string();
         let content = serde_json::Value::Array(vec![block]);
 
-        let (_, images, _) =
+        let (_, images, documents, _) =
             process_message_content(&content).expect("compatible jpeg should convert");
 
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].source.bytes, original_data);
+        assert!(documents.is_empty());
     }
 
     #[test]
@@ -3170,12 +3629,13 @@ mod tests {
             }
         })]);
 
-        let (_, images, _) =
+        let (_, images, documents, _) =
             process_message_content(&content).expect("tiny png should pass through");
 
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].format, "png");
         assert_eq!(images[0].source.bytes, VALID_RGB_1X1_PNG);
+        assert!(documents.is_empty());
     }
 
     #[test]
@@ -3189,12 +3649,13 @@ mod tests {
             }
         })]);
 
-        let (_, images, _) =
+        let (_, images, documents, _) =
             process_message_content(&content).expect("tiny rgba png should pass through");
 
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].format, "png");
         assert_eq!(images[0].source.bytes, VALID_RGBA_1X1_PNG);
+        assert!(documents.is_empty());
     }
 
     #[test]
@@ -3208,10 +3669,11 @@ mod tests {
             }
         })]);
 
-        let (text, images, _) =
+        let (text, images, documents, _) =
             process_message_content(&content).expect("corrupt png should be handled");
 
         assert!(images.is_empty());
+        assert!(documents.is_empty());
         assert!(text.contains("Image omitted for Kiro compatibility"));
     }
 
@@ -3235,32 +3697,121 @@ mod tests {
             }),
         ]);
 
-        let (text, images, tool_results) =
+        let (text, images, documents, tool_results) =
             process_message_content(&content).expect("pdf document should convert");
 
-        assert_eq!(images.len(), 1);
-        assert_eq!(images[0].format, "png");
+        assert!(images.is_empty());
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].name, "document");
+        assert_eq!(documents[0].format, "pdf");
         assert!(tool_results.is_empty());
-        assert!(text.contains("attached image is a rendering"));
-        assert!(text.contains("application/pdf document"));
-        assert!(!text.contains("6G6S7MSS"));
         assert!(text.contains("What text does this PDF contain?"));
+    }
 
-        let png_bytes = BASE64_STANDARD
-            .decode(&images[0].source.bytes)
-            .expect("rendered pdf should be valid base64");
-        image::load_from_memory_with_format(&png_bytes, image::ImageFormat::Png)
-            .expect("rendered pdf should decode as png");
+    #[test]
+    fn test_process_message_content_preserves_supported_documents_natively() {
+        let content = serde_json::Value::Array(vec![
+            named_document_block(
+                "Quarterly Report!.docx",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "ZG9jeA==",
+            ),
+            named_document_block(
+                "Budget.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "eGxzeA==",
+            ),
+            named_document_block("index.html", "text/html", "PGgxPkhlbGxvPC9oMT4="),
+        ]);
+
+        let (text, images, documents, tool_results) =
+            process_message_content(&content).expect("supported documents should convert");
+
+        assert!(text.is_empty());
+        assert!(images.is_empty());
+        assert!(tool_results.is_empty());
+        assert_eq!(documents.len(), 3);
+        assert_eq!(documents[0].name, "Quarterly Report-");
+        assert_eq!(documents[0].format, "docx");
+        assert_eq!(documents[1].name, "Budget");
+        assert_eq!(documents[1].format, "xlsx");
+        assert_eq!(documents[2].name, "index");
+        assert_eq!(documents[2].format, "html");
+    }
+
+    #[test]
+    fn test_process_message_content_handles_document_url_and_resource_documents() {
+        let content = serde_json::Value::Array(vec![
+            serde_json::json!({
+                "type": "document_url",
+                "document_url": {
+                    "name": "Spec Sheet.pdf",
+                    "mimeType": "application/pdf",
+                    "data": "cGRm"
+                }
+            }),
+            serde_json::json!({
+                "type": "resource",
+                "resource": {
+                    "uri": "file:///workspace/notes.md",
+                    "mimeType": "text/markdown",
+                    "blob": "IyBOb3Rlcw=="
+                }
+            }),
+        ]);
+
+        let (_, images, documents, tool_results) =
+            process_message_content(&content).expect("document_url/resource should convert");
+
+        assert!(images.is_empty());
+        assert!(tool_results.is_empty());
+        assert_eq!(documents.len(), 2);
+        assert_eq!(documents[0].name, "Spec Sheet");
+        assert_eq!(documents[0].format, "pdf");
+        assert_eq!(documents[0].source.bytes, "cGRm");
+        assert_eq!(documents[1].name, "notes");
+        assert_eq!(documents[1].format, "md");
+    }
+
+    #[test]
+    fn test_process_message_content_rejects_oversized_native_document() {
+        let oversized_data = BASE64_STANDARD.encode(vec![0_u8; KIRO_MAX_DOCUMENT_BYTES + 1]);
+        let content = serde_json::Value::Array(vec![named_document_block(
+            "large.pdf",
+            "application/pdf",
+            &oversized_data,
+        )]);
+
+        let err = process_message_content(&content).expect_err("oversized document should fail");
+
+        assert!(matches!(err, ConversionError::DocumentValidation(_)));
+        assert!(err.to_string().contains("too large"));
+    }
+
+    #[test]
+    fn test_process_message_content_rejects_invalid_document_base64() {
+        let content = serde_json::Value::Array(vec![named_document_block(
+            "bad.pdf",
+            "application/pdf",
+            "not valid base64!",
+        )]);
+
+        let err = process_message_content(&content).expect_err("invalid document should fail");
+
+        assert!(matches!(err, ConversionError::DocumentValidation(_)));
+        assert!(err.to_string().contains("Invalid base64"));
     }
 
     #[test]
     fn test_process_message_content_transcodes_gif_to_png() {
         let content = serde_json::Value::Array(vec![gif_image_block()]);
 
-        let (_, images, _) = process_message_content(&content).expect("gif should convert");
+        let (_, images, documents, _) =
+            process_message_content(&content).expect("gif should convert");
 
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].format, "png");
+        assert!(documents.is_empty());
         let png_bytes = BASE64_STANDARD
             .decode(&images[0].source.bytes)
             .expect("converted image should be valid base64");
@@ -6099,6 +6650,91 @@ mod tests {
             current.user_input_message_context.tool_results.is_empty(),
             "current message should no longer carry tool_results after compatibility splitting"
         );
+    }
+
+    #[test]
+    fn test_convert_request_sends_current_pdf_as_kiro_document() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = request_from_messages(vec![AnthropicMessage {
+            role: "user".to_string(),
+            content: serde_json::Value::Array(vec![
+                pdf_document_block(),
+                serde_json::json!({
+                    "type": "text",
+                    "text": "Summarize the PDF."
+                }),
+            ]),
+        }]);
+
+        let state = convert_request(&req)
+            .expect("pdf should convert to native Kiro document")
+            .conversation_state;
+
+        let current = &state.current_message.user_input_message;
+        assert_eq!(current.content, "Summarize the PDF.");
+        assert!(current.images.is_empty());
+        assert_eq!(current.documents.len(), 1);
+        assert_eq!(current.documents[0].name, "document");
+        assert_eq!(current.documents[0].format, "pdf");
+    }
+
+    #[test]
+    fn test_convert_request_drops_duplicate_document_names_across_conversation() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let duplicate_doc = || named_document_block("Plan.pdf", "application/pdf", "cGRm");
+        let req = request_from_messages(vec![
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::Value::Array(vec![duplicate_doc()]),
+            },
+            AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!("I saw the plan."),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::Value::Array(vec![
+                    duplicate_doc(),
+                    serde_json::json!({"type":"text","text":"Use the latest attachment."}),
+                ]),
+            },
+        ]);
+
+        let state = convert_request(&req)
+            .expect("duplicate document names should be dropped")
+            .conversation_state;
+
+        match &state.history[0] {
+            Message::User(user) => {
+                assert_eq!(user.user_input_message.documents.len(), 1);
+                assert_eq!(user.user_input_message.documents[0].name, "Plan");
+            }
+            other => panic!("history[0] should be document user, got {:?}", other),
+        }
+
+        let current = &state.current_message.user_input_message;
+        assert_eq!(current.content, "Use the latest attachment.");
+        assert!(current.documents.is_empty());
+    }
+
+    #[test]
+    fn test_convert_request_rejects_more_than_five_documents() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let docs = (0..6)
+            .map(|idx| named_document_block(&format!("Doc {idx}.pdf"), "application/pdf", "cGRm"))
+            .collect();
+        let req = request_from_messages(vec![AnthropicMessage {
+            role: "user".to_string(),
+            content: serde_json::Value::Array(docs),
+        }]);
+
+        let err = convert_request(&req).expect_err("six documents should exceed Kiro limit");
+
+        assert!(matches!(err, ConversionError::DocumentValidation(_)));
+        assert!(err.to_string().contains("Maximum is 5"));
     }
 
     #[test]
