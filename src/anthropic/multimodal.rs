@@ -14,7 +14,8 @@ use url::Url;
 use super::types::MessagesRequest;
 
 const MAX_REMOTE_IMAGE_BYTES: usize = 8 * 1024 * 1024;
-const MAX_REMOTE_DOCUMENT_BYTES: usize = 4_718_592;
+// Keep remote document fetches within the Kiro runtime hard limit.
+const MAX_REMOTE_DOCUMENT_BYTES: usize = 4_500_000;
 const MAX_IMAGE_REDIRECTS: usize = 3;
 const IMAGE_FETCH_TIMEOUT_SECS: u64 = 10;
 static IMAGE_FETCH_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();

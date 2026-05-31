@@ -455,7 +455,9 @@ const MISSING_TOOL_USE_NAME_PLACEHOLDER: &str = "historical_tool";
 
 /// 避免把异常大的文档直接加载到 Kiro 转换层里。
 const MAX_DOCUMENT_EXTRACT_BYTES: usize = 64 * 1024 * 1024;
-const KIRO_MAX_DOCUMENT_BYTES: usize = 4_718_592;
+// Kiro client UI uses 4.5 * 1024 * 1024, but the upstream runtime rejects
+// 4_500_001 bytes with DOCUMENT_SIZE_EXCEEDED and accepts 4_500_000 bytes.
+const KIRO_MAX_DOCUMENT_BYTES: usize = 4_500_000;
 const KIRO_MAX_DOCUMENTS_PER_CONVERSATION: usize = 5;
 const MAX_INLINE_DOCUMENT_TEXT_CHARS: usize = 40_000;
 const MAX_RENDERED_DOCUMENT_TEXT_CHARS: usize = 7_200;
