@@ -448,6 +448,10 @@ Complete all chunked operations without commentary.";
 /// 文本可以稳定恢复正常生成，同时尽量不改变原始语义。
 const CURRENT_TOOL_RESULT_FALLBACK_TEXT: &str = "Please continue based on the tool result.";
 
+/// Bedrock/Kiro rejects document-bearing user turns unless they also include a
+/// text block. Use a minimal neutral prompt when clients send document-only turns.
+const DOCUMENT_FALLBACK_TEXT: &str = "Please process the attached document.";
+
 /// Some compacted historical transcripts contain tool_use blocks with an id
 /// and input but no name. Kiro/Bedrock still requires a tool name, so use a
 /// stable placeholder instead of dropping the structured call/result pair.
@@ -747,6 +751,10 @@ pub fn convert_request_with_probe(
         &mut merged_current,
     );
     dedupe_documents_across_conversation(&mut history, &mut merged_current.documents)?;
+    inject_document_fallback_text(
+        &mut merged_current.content,
+        !merged_current.documents.is_empty(),
+    );
     inject_current_tool_result_fallback_text(
         &mut merged_current,
         !validated_tool_results.is_empty() || moved_tool_results_to_history > 0,
@@ -822,6 +830,15 @@ pub fn convert_request_with_probe(
         conversation_state,
         tool_name_map,
     })
+}
+
+fn inject_document_fallback_text(content: &mut String, has_documents: bool) {
+    if !has_documents || !content.trim().is_empty() {
+        return;
+    }
+
+    tracing::info!("为仅含 document 的 user message 注入最小文本，避免上游 REQUEST_BODY_INVALID");
+    *content = DOCUMENT_FALLBACK_TEXT.to_string();
 }
 
 fn inject_current_tool_result_fallback_text(
@@ -2564,6 +2581,9 @@ fn build_history_user_message_from_parts(
     documents: Vec<KiroDocument>,
     tool_results: Vec<ToolResult>,
 ) -> HistoryUserMessage {
+    let mut content = content.into();
+    inject_document_fallback_text(&mut content, !documents.is_empty());
+
     let mut user_msg = UserMessage::new(content, model_id);
     let tool_results = dedupe_tool_results_by_id(tool_results);
 
@@ -6679,6 +6699,62 @@ mod tests {
         assert_eq!(current.documents.len(), 1);
         assert_eq!(current.documents[0].name, "document");
         assert_eq!(current.documents[0].format, "pdf");
+    }
+
+    #[test]
+    fn test_convert_request_injects_fallback_text_for_document_only_current_message() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = request_from_messages(vec![AnthropicMessage {
+            role: "user".to_string(),
+            content: serde_json::Value::Array(vec![pdf_document_block()]),
+        }]);
+
+        let state = convert_request(&req)
+            .expect("document-only current message should convert")
+            .conversation_state;
+
+        let current = &state.current_message.user_input_message;
+        assert_eq!(current.content, DOCUMENT_FALLBACK_TEXT);
+        assert_eq!(current.documents.len(), 1);
+        assert_eq!(current.documents[0].format, "pdf");
+    }
+
+    #[test]
+    fn test_convert_request_injects_fallback_text_for_document_only_history_message() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = request_from_messages(vec![
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::Value::Array(vec![pdf_document_block()]),
+            },
+            AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!("I saw the document."),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Summarize it now."),
+            },
+        ]);
+
+        let state = convert_request(&req)
+            .expect("document-only history message should convert")
+            .conversation_state;
+
+        match &state.history[0] {
+            Message::User(user) => {
+                assert_eq!(user.user_input_message.content, DOCUMENT_FALLBACK_TEXT);
+                assert_eq!(user.user_input_message.documents.len(), 1);
+            }
+            other => panic!("history[0] should be document user, got {:?}", other),
+        }
+
+        assert_eq!(
+            state.current_message.user_input_message.content,
+            "Summarize it now."
+        );
     }
 
     #[test]

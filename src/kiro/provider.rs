@@ -1110,6 +1110,7 @@ struct KiroRequestBodyDiagnostics {
     current_origin: Option<String>,
     current_content_bytes: usize,
     current_image_count: usize,
+    current_document_count: usize,
     current_tool_count: usize,
     current_tool_result_count: usize,
     current_tool_result_error_count: usize,
@@ -1117,6 +1118,7 @@ struct KiroRequestBodyDiagnostics {
     history_user_count: usize,
     history_assistant_count: usize,
     history_user_image_count: usize,
+    history_user_document_count: usize,
     history_tool_result_count: usize,
     history_tool_use_count: usize,
     tail_history_roles: Vec<String>,
@@ -1295,6 +1297,7 @@ impl KiroProvider {
                 .map(str::len)
                 .unwrap_or_default(),
             current_image_count: Self::json_array_len(current.get("images")),
+            current_document_count: Self::json_array_len(current.get("documents")),
             current_tool_count: Self::json_array_len(
                 current_context.and_then(|ctx| ctx.get("tools")),
             ),
@@ -1331,6 +1334,8 @@ impl KiroProvider {
                         append_bounded_tail(diagnostics.tail_history_roles, "user", 16);
                     diagnostics.history_user_image_count +=
                         Self::json_array_len(user.get("images"));
+                    diagnostics.history_user_document_count +=
+                        Self::json_array_len(user.get("documents"));
                     if let Some(ctx) = user.get("userInputMessageContext") {
                         diagnostics.history_tool_result_count +=
                             Self::json_array_len(ctx.get("toolResults"));
@@ -3478,6 +3483,7 @@ impl KiroProvider {
                         kiro_current_origin = diagnostics.current_origin.as_deref().unwrap_or(""),
                         kiro_current_content_bytes = diagnostics.current_content_bytes,
                         kiro_current_image_count = diagnostics.current_image_count,
+                        kiro_current_document_count = diagnostics.current_document_count,
                         kiro_current_tool_count = diagnostics.current_tool_count,
                         kiro_current_tool_result_count = diagnostics.current_tool_result_count,
                         kiro_current_tool_result_error_count = diagnostics.current_tool_result_error_count,
@@ -3485,6 +3491,7 @@ impl KiroProvider {
                         kiro_history_user_count = diagnostics.history_user_count,
                         kiro_history_assistant_count = diagnostics.history_assistant_count,
                         kiro_history_user_image_count = diagnostics.history_user_image_count,
+                        kiro_history_user_document_count = diagnostics.history_user_document_count,
                         kiro_history_tool_result_count = diagnostics.history_tool_result_count,
                         kiro_history_tool_use_count = diagnostics.history_tool_use_count,
                         kiro_tail_history_roles = ?diagnostics.tail_history_roles,
@@ -4298,6 +4305,7 @@ mod tests {
                     "origin":"AI_EDITOR",
                     "content":"secret current text",
                     "images":[{"format":"png","source":{"bytes":"AA=="}}],
+                    "documents":[{"name":"Current","format":"pdf","source":{"bytes":"AA=="}}],
                     "userInputMessageContext":{
                         "tools":[{"toolSpecification":{"name":"Read","description":"read","inputSchema":{"json":{"type":"object"}}}}],
                         "toolResults":[
@@ -4307,7 +4315,7 @@ mod tests {
                     }
                 }},
                 "history":[
-                    {"userInputMessage":{"content":"old","modelId":"m","images":[{"format":"png","source":{"bytes":"AA=="}}],"userInputMessageContext":{"toolResults":[{"toolUseId":"toolu_old","content":[{"text":"hidden"}]}]}}},
+                    {"userInputMessage":{"content":"old","modelId":"m","images":[{"format":"png","source":{"bytes":"AA=="}}],"documents":[{"name":"History","format":"pdf","source":{"bytes":"AA=="}}],"userInputMessageContext":{"toolResults":[{"toolUseId":"toolu_old","content":[{"text":"hidden"}]}]}}},
                     {"assistantResponseMessage":{"content":"old","toolUses":[{"toolUseId":"toolu_old","name":"Read","input":{"path":"secret"}}]}},
                     {"unknownMessage":{}}
                 ]
@@ -4332,6 +4340,7 @@ mod tests {
             "secret current text".len()
         );
         assert_eq!(diagnostics.current_image_count, 1);
+        assert_eq!(diagnostics.current_document_count, 1);
         assert_eq!(diagnostics.current_tool_count, 1);
         assert_eq!(diagnostics.current_tool_result_count, 2);
         assert_eq!(diagnostics.current_tool_result_error_count, 1);
@@ -4339,6 +4348,7 @@ mod tests {
         assert_eq!(diagnostics.history_user_count, 1);
         assert_eq!(diagnostics.history_assistant_count, 1);
         assert_eq!(diagnostics.history_user_image_count, 1);
+        assert_eq!(diagnostics.history_user_document_count, 1);
         assert_eq!(diagnostics.history_tool_result_count, 1);
         assert_eq!(diagnostics.history_tool_use_count, 1);
         assert_eq!(
