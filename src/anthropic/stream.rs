@@ -828,6 +828,8 @@ impl StreamContext {
         );
         events.extend(start_events);
 
+        events.push(self.create_thinking_delta_event(thinking_index, ""));
+
         let signature = sign_synthetic_hidden_thinking_block(
             0,
             "",
@@ -2080,12 +2082,16 @@ mod tests {
         assert!(thinking_start < signature_pos);
         assert!(signature_pos < thinking_stop);
         assert!(thinking_stop < text_start);
-        assert!(
-            all.iter().all(|e| {
-                !(e.event == "content_block_delta" && e.data["delta"]["type"] == "thinking_delta")
-            }),
-            "hidden synthetic thinking must not expose thinking_delta content"
-        );
+        let hidden_thinking_deltas: Vec<_> = all
+            .iter()
+            .filter(|e| {
+                e.event == "content_block_delta"
+                    && e.data["index"].as_i64() == Some(0)
+                    && e.data["delta"]["type"] == "thinking_delta"
+            })
+            .collect();
+        assert_eq!(hidden_thinking_deltas.len(), 1);
+        assert_eq!(hidden_thinking_deltas[0].data["delta"]["thinking"], "");
 
         let signature = collect_first_signature(&all).expect("signature should exist");
         assert_eq!(signature.len(), 736);
