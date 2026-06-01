@@ -19,8 +19,9 @@ const ISSUER_TAG_LEN: usize = 16;
 const HMAC_LEN: usize = 32;
 const HASH_LEN: usize = 32;
 const SIGNATURE_RAW_LEN: usize = 1 + ISSUER_TAG_LEN + 4 + HASH_LEN + HMAC_LEN;
-const STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_SHORT: usize = 559;
-const STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_LONG: usize = 589;
+const STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN: usize = 550;
+const STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_LEGACY_SHORT: usize = 559;
+const STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_LEGACY_LONG: usize = 589;
 const STANDARD_SHAPED_SYNTHETIC_OUTER_OVERHEAD_LEN: usize = 5;
 const STANDARD_SHAPED_SYNTHETIC_HEADER_RANDOM_LEN: usize = 64;
 const STANDARD_SHAPED_SYNTHETIC_FIELD2_LEN: usize = 12;
@@ -444,8 +445,9 @@ fn classify_signature(signature: &str, thinking_ordinal: u32, thinking: &str) ->
 }
 
 fn is_standard_shaped_synthetic_signature(raw: &[u8]) -> bool {
-    if raw.len() != STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_SHORT
-        && raw.len() != STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_LONG
+    if raw.len() != STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN
+        && raw.len() != STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_LEGACY_SHORT
+        && raw.len() != STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_LEGACY_LONG
     {
         return false;
     }
@@ -647,12 +649,8 @@ fn signature_mac(key: &[u8; 32], body: &[u8]) -> [u8; HMAC_LEN] {
     hmac_sha256(key, &payload)
 }
 
-fn standard_shaped_synthetic_signature_raw_len(nonce: &[u8; HASH_LEN]) -> usize {
-    if nonce[0] & 1 == 0 {
-        STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_LONG
-    } else {
-        STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_SHORT
-    }
+fn standard_shaped_synthetic_signature_raw_len(_nonce: &[u8; HASH_LEN]) -> usize {
+    STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN
 }
 
 fn standard_shaped_synthetic_header(
@@ -814,10 +812,8 @@ pub(crate) fn canonicalize_thinking_for_signature(thinking: &str) -> &str {
 mod tests {
     use super::{
         HASH_LEN, HMAC_LEN, ISSUER_TAG_LEN, SIGNATURE_RAW_LEN, SIGNATURE_VERSION, STANDARD_NO_PAD,
-        STANDARD_SHAPED_SYNTHETIC_SIGNATURE_PREFIX,
-        STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_LONG,
-        STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_SHORT, SignatureClass,
-        ThinkingSignatureInvalidReason, classify_signature, decode_signature,
+        STANDARD_SHAPED_SYNTHETIC_SIGNATURE_PREFIX, STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN,
+        SignatureClass, ThinkingSignatureInvalidReason, classify_signature, decode_signature,
         extract_thinking_and_text, hmac_sha256, inspect_thinking_signatures, issuer_tag,
         sha256_bytes, sign_synthetic_hidden_thinking_block, sign_thinking_block, signature_mac,
         signing_key, strip_invalid_own_thinking_signatures, validate_thinking_signatures,
@@ -879,13 +875,9 @@ mod tests {
     }
 
     fn assert_standard_synthetic_signature_shape(signature: &str, model: &[u8]) -> Vec<u8> {
-        assert!(matches!(signature.len(), 748 | 788));
+        assert_eq!(signature.len(), 736);
         let raw = decode_signature(signature).expect("signature should decode");
-        assert!(matches!(
-            raw.len(),
-            STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_SHORT
-                | STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_LONG
-        ));
+        assert_eq!(raw.len(), STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN);
         assert_eq!(raw[3..11], STANDARD_SHAPED_SYNTHETIC_SIGNATURE_PREFIX);
         assert_eq!(&raw[77..92], model);
         assert_eq!(&raw[96..104], b"thinking");

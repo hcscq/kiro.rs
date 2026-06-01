@@ -2088,7 +2088,7 @@ mod tests {
         );
 
         let signature = collect_first_signature(&all).expect("signature should exist");
-        assert!(matches!(signature.len(), 748 | 788));
+        assert_eq!(signature.len(), 736);
         let req = request_with_stream_thinking(String::new(), signature);
         validate_thinking_signatures(&req).expect("synthetic hidden signature should validate");
         assert_eq!(
