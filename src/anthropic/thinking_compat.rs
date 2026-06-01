@@ -19,25 +19,18 @@ const ISSUER_TAG_LEN: usize = 16;
 const HMAC_LEN: usize = 32;
 const HASH_LEN: usize = 32;
 const SIGNATURE_RAW_LEN: usize = 1 + ISSUER_TAG_LEN + 4 + HASH_LEN + HMAC_LEN;
-const AWS_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN: usize = 2463;
-const AWS_SHAPED_SYNTHETIC_OUTER_PAYLOAD_LEN: usize = 2458;
-const AWS_SHAPED_SYNTHETIC_HEADER_RANDOM_LEN: usize = 64;
-const AWS_SHAPED_SYNTHETIC_FIELD2_LEN: usize = 12;
-const AWS_SHAPED_SYNTHETIC_FIELD3_LEN: usize = 12;
-const AWS_SHAPED_SYNTHETIC_FIELD4_LEN: usize = 48;
-const AWS_SHAPED_SYNTHETIC_FIELD5_LEN: usize = 2276;
-const AWS_SHAPED_SYNTHETIC_FIELD5_VALUE_OFFSET: usize = 185;
-const AWS_SHAPED_SYNTHETIC_SELF_OFFSET: usize =
-    AWS_SHAPED_SYNTHETIC_FIELD5_VALUE_OFFSET + AWS_SHAPED_SYNTHETIC_HEADER_RANDOM_LEN;
-const AWS_SHAPED_SYNTHETIC_SIGNATURE_PREFIX: [u8; 11] = [
-    0x12, 0x9a, 0x13, 0x0a, 0x63, 0x08, 0x0d, 0x18, 0x02, 0x2a, 0x40,
-];
-const AWS_SHAPED_SYNTHETIC_HEADER_RANDOM_TEMPLATE: [u8; AWS_SHAPED_SYNTHETIC_HEADER_RANDOM_LEN] = [
-    0x0b, 0xea, 0x3f, 0x40, 0xd2, 0x98, 0x2a, 0xdb, 0xce, 0x9e, 0x7e, 0xca, 0xf6, 0xa5, 0x4d, 0x68,
-    0x35, 0x7b, 0x5c, 0x93, 0x59, 0xf0, 0xf3, 0xf4, 0x73, 0x11, 0xa8, 0x65, 0x0d, 0x84, 0x0b, 0x95,
-    0xe0, 0xfc, 0x18, 0x3c, 0x53, 0xc4, 0xd6, 0x9b, 0x6e, 0x7b, 0x29, 0xde, 0x2c, 0x2a, 0x09, 0x51,
-    0x84, 0x6f, 0x70, 0x06, 0xad, 0xbb, 0xc7, 0x57, 0xe5, 0x67, 0xb0, 0xf6, 0x6b, 0xbf, 0xa6, 0x3a,
-];
+const STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_SHORT: usize = 559;
+const STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_LONG: usize = 589;
+const STANDARD_SHAPED_SYNTHETIC_OUTER_OVERHEAD_LEN: usize = 5;
+const STANDARD_SHAPED_SYNTHETIC_HEADER_RANDOM_LEN: usize = 64;
+const STANDARD_SHAPED_SYNTHETIC_FIELD2_LEN: usize = 12;
+const STANDARD_SHAPED_SYNTHETIC_FIELD3_LEN: usize = 12;
+const STANDARD_SHAPED_SYNTHETIC_FIELD4_LEN: usize = 48;
+const STANDARD_SHAPED_SYNTHETIC_FIELD5_VALUE_OFFSET: usize = 185;
+const STANDARD_SHAPED_SYNTHETIC_SELF_OFFSET: usize =
+    STANDARD_SHAPED_SYNTHETIC_FIELD5_VALUE_OFFSET + STANDARD_SHAPED_SYNTHETIC_HEADER_RANDOM_LEN;
+const STANDARD_SHAPED_SYNTHETIC_SIGNATURE_PREFIX: [u8; 8] =
+    [0x0a, 0x63, 0x08, 0x0e, 0x18, 0x02, 0x2a, 0x40];
 
 static SIGNING_KEY: OnceLock<[u8; 32]> = OnceLock::new();
 static VALIDATION_KEYS: OnceLock<Vec<[u8; 32]>> = OnceLock::new();
@@ -201,10 +194,10 @@ pub(crate) fn sign_thinking_block(thinking_ordinal: u32, thinking: &str) -> Stri
     STANDARD_NO_PAD.encode(raw)
 }
 
-/// 签发用于隐藏 synthetic thinking block 的动态 AWS-shaped signature。
+/// 签发用于隐藏 synthetic thinking block 的动态 Claude-shaped signature。
 ///
 /// Kiro 上游有时不会返回可见 thinking 内容；为了响应侧仍符合 Claude thinking
-/// SSE 形状，这里按 AWS Claude 样本的 protobuf 线框组织外层结构、长度、model
+/// SSE 形状，这里按当前标准 Claude 样本的 protobuf 线框组织外层结构、长度、model
 /// 和 block type，并在随机载荷区写入本服务可校验的 issuer、thinking hash、
 /// nonce 和 MAC，因此不是整段固定捕获值。
 pub(crate) fn sign_synthetic_hidden_thinking_block(
@@ -218,18 +211,21 @@ pub(crate) fn sign_synthetic_hidden_thinking_block(
     let thinking = canonicalize_thinking_for_signature(thinking);
     let thinking_hash = sha256_bytes(thinking.as_bytes());
     let nonce = synthetic_signature_nonce(nonce_material);
+    let raw_len = standard_shaped_synthetic_signature_raw_len(&nonce);
+    let outer_payload_len = raw_len - STANDARD_SHAPED_SYNTHETIC_OUTER_OVERHEAD_LEN;
+    let field5_len = outer_payload_len - 182;
 
-    let mut inner = Vec::with_capacity(AWS_SHAPED_SYNTHETIC_OUTER_PAYLOAD_LEN);
-    let header = aws_shaped_synthetic_header(model);
+    let mut inner = Vec::with_capacity(outer_payload_len);
+    let header = standard_shaped_synthetic_header(&key, model, &nonce);
     push_protobuf_len_field(&mut inner, 1, &header);
     push_protobuf_len_field(
         &mut inner,
         2,
         &synthetic_signature_chunk(
             &key,
-            b"aws-field-2",
+            b"standard-field-2",
             &nonce,
-            AWS_SHAPED_SYNTHETIC_FIELD2_LEN,
+            STANDARD_SHAPED_SYNTHETIC_FIELD2_LEN,
         ),
     );
     push_protobuf_len_field(
@@ -237,9 +233,9 @@ pub(crate) fn sign_synthetic_hidden_thinking_block(
         3,
         &synthetic_signature_chunk(
             &key,
-            b"aws-field-3",
+            b"standard-field-3",
             &nonce,
-            AWS_SHAPED_SYNTHETIC_FIELD3_LEN,
+            STANDARD_SHAPED_SYNTHETIC_FIELD3_LEN,
         ),
     );
     push_protobuf_len_field(
@@ -247,37 +243,44 @@ pub(crate) fn sign_synthetic_hidden_thinking_block(
         4,
         &synthetic_signature_chunk(
             &key,
-            b"aws-field-4",
+            b"standard-field-4",
             &nonce,
-            AWS_SHAPED_SYNTHETIC_FIELD4_LEN,
+            STANDARD_SHAPED_SYNTHETIC_FIELD4_LEN,
         ),
     );
 
     inner.push(0x2a);
-    push_varint(&mut inner, AWS_SHAPED_SYNTHETIC_FIELD5_LEN as u64);
-    inner.extend_from_slice(&AWS_SHAPED_SYNTHETIC_HEADER_RANDOM_TEMPLATE);
+    push_varint(&mut inner, field5_len as u64);
+    inner.extend_from_slice(&synthetic_signature_chunk(
+        &key,
+        b"standard-field-5-prefix",
+        &nonce,
+        STANDARD_SHAPED_SYNTHETIC_HEADER_RANDOM_LEN,
+    ));
     inner.extend_from_slice(&issuer);
     inner.extend_from_slice(&thinking_ordinal.to_be_bytes());
     inner.extend_from_slice(&thinking_hash);
 
     let mut mac_body = Vec::with_capacity(3 + inner.len());
-    mac_body.extend_from_slice(&[0x12, 0x9a, 0x13]);
+    mac_body.push(0x12);
+    push_varint(&mut mac_body, outer_payload_len as u64);
     mac_body.extend_from_slice(&inner);
     let mac = signature_mac(&key, &mac_body);
     inner.extend_from_slice(&mac);
     inner.extend_from_slice(&nonce);
 
-    let filler_len = AWS_SHAPED_SYNTHETIC_OUTER_PAYLOAD_LEN - inner.len();
+    let filler_len = outer_payload_len - inner.len();
     inner.extend_from_slice(&synthetic_signature_filler(&key, &inner, filler_len));
-    debug_assert_eq!(inner.len(), AWS_SHAPED_SYNTHETIC_OUTER_PAYLOAD_LEN);
+    debug_assert_eq!(inner.len(), outer_payload_len);
 
-    let mut raw = Vec::with_capacity(AWS_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN);
-    raw.extend_from_slice(&[0x12, 0x9a, 0x13]);
+    let mut raw = Vec::with_capacity(raw_len);
+    raw.push(0x12);
+    push_varint(&mut raw, outer_payload_len as u64);
     raw.extend_from_slice(&inner);
     raw.extend_from_slice(&[0x18, 0x01]);
-    debug_assert_eq!(raw.len(), AWS_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN);
+    debug_assert_eq!(raw.len(), raw_len);
 
-    STANDARD_NO_PAD.encode(raw)
+    STANDARD.encode(raw)
 }
 
 pub(crate) fn validate_thinking_signatures(
@@ -419,10 +422,8 @@ fn classify_signature(signature: &str, thinking_ordinal: u32, thinking: &str) ->
         );
     }
 
-    if raw.len() == AWS_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN
-        && raw.starts_with(&AWS_SHAPED_SYNTHETIC_SIGNATURE_PREFIX)
-    {
-        let issuer_start = AWS_SHAPED_SYNTHETIC_SELF_OFFSET;
+    if is_standard_shaped_synthetic_signature(&raw) {
+        let issuer_start = STANDARD_SHAPED_SYNTHETIC_SELF_OFFSET;
         let mac_start = issuer_start + ISSUER_TAG_LEN + 4 + HASH_LEN;
         return classify_own_signature(
             signature,
@@ -440,6 +441,19 @@ fn classify_signature(signature: &str, thinking_ordinal: u32, thinking: &str) ->
     }
 
     SignatureClass::Foreign
+}
+
+fn is_standard_shaped_synthetic_signature(raw: &[u8]) -> bool {
+    if raw.len() != STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_SHORT
+        && raw.len() != STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_LONG
+    {
+        return false;
+    }
+
+    raw.len() > 11
+        && raw[0] == 0x12
+        && raw[raw.len() - 2..] == [0x18, 0x01]
+        && raw[3..11] == STANDARD_SHAPED_SYNTHETIC_SIGNATURE_PREFIX
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -633,11 +647,28 @@ fn signature_mac(key: &[u8; 32], body: &[u8]) -> [u8; HMAC_LEN] {
     hmac_sha256(key, &payload)
 }
 
-fn aws_shaped_synthetic_header(model: &str) -> Vec<u8> {
+fn standard_shaped_synthetic_signature_raw_len(nonce: &[u8; HASH_LEN]) -> usize {
+    if nonce[0] & 1 == 0 {
+        STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_LONG
+    } else {
+        STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_SHORT
+    }
+}
+
+fn standard_shaped_synthetic_header(
+    key: &[u8; 32],
+    model: &str,
+    nonce: &[u8; HASH_LEN],
+) -> Vec<u8> {
     let synthetic_model = synthetic_signature_model_id(model);
     let mut header = Vec::with_capacity(99);
-    header.extend_from_slice(&[0x08, 0x0d, 0x18, 0x02, 0x2a, 0x40]);
-    header.extend_from_slice(&AWS_SHAPED_SYNTHETIC_HEADER_RANDOM_TEMPLATE);
+    header.extend_from_slice(&[0x08, 0x0e, 0x18, 0x02, 0x2a, 0x40]);
+    header.extend_from_slice(&synthetic_signature_chunk(
+        key,
+        b"standard-header-random",
+        nonce,
+        STANDARD_SHAPED_SYNTHETIC_HEADER_RANDOM_LEN,
+    ));
     push_protobuf_len_field(&mut header, 6, synthetic_model.as_bytes());
     header.extend_from_slice(&[0x38, 0x00]);
     push_protobuf_len_field(&mut header, 8, b"thinking");
@@ -782,9 +813,11 @@ pub(crate) fn canonicalize_thinking_for_signature(thinking: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        AWS_SHAPED_SYNTHETIC_SIGNATURE_PREFIX, AWS_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN, HASH_LEN,
-        HMAC_LEN, ISSUER_TAG_LEN, SIGNATURE_RAW_LEN, SIGNATURE_VERSION, STANDARD_NO_PAD,
-        SignatureClass, ThinkingSignatureInvalidReason, classify_signature, decode_signature,
+        HASH_LEN, HMAC_LEN, ISSUER_TAG_LEN, SIGNATURE_RAW_LEN, SIGNATURE_VERSION, STANDARD_NO_PAD,
+        STANDARD_SHAPED_SYNTHETIC_SIGNATURE_PREFIX,
+        STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_LONG,
+        STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_SHORT, SignatureClass,
+        ThinkingSignatureInvalidReason, classify_signature, decode_signature,
         extract_thinking_and_text, hmac_sha256, inspect_thinking_signatures, issuer_tag,
         sha256_bytes, sign_synthetic_hidden_thinking_block, sign_thinking_block, signature_mac,
         signing_key, strip_invalid_own_thinking_signatures, validate_thinking_signatures,
@@ -845,6 +878,21 @@ mod tests {
         STANDARD_NO_PAD.encode(raw)
     }
 
+    fn assert_standard_synthetic_signature_shape(signature: &str, model: &[u8]) -> Vec<u8> {
+        assert!(matches!(signature.len(), 748 | 788));
+        let raw = decode_signature(signature).expect("signature should decode");
+        assert!(matches!(
+            raw.len(),
+            STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_SHORT
+                | STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_LONG
+        ));
+        assert_eq!(raw[3..11], STANDARD_SHAPED_SYNTHETIC_SIGNATURE_PREFIX);
+        assert_eq!(&raw[77..92], model);
+        assert_eq!(&raw[96..104], b"thinking");
+        assert_eq!(&raw[raw.len() - 2..], &[0x18, 0x01]);
+        raw
+    }
+
     #[test]
     fn test_sign_thinking_block_is_opaque_and_verifiable() {
         let signature = sign_thinking_block(0, "hello");
@@ -891,13 +939,7 @@ mod tests {
             sign_synthetic_hidden_thinking_block(0, "", "claude-opus-4-7", b"response-b");
 
         assert_ne!(signature_a, signature_b);
-        assert_eq!(signature_a.len(), 3284);
-        let raw = decode_signature(&signature_a).expect("signature should decode");
-        assert_eq!(raw.len(), AWS_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN);
-        assert!(raw.starts_with(&AWS_SHAPED_SYNTHETIC_SIGNATURE_PREFIX));
-        assert_eq!(&raw[77..92], b"claude-opus-4-7");
-        assert_eq!(&raw[96..104], b"thinking");
-        assert_eq!(&raw[raw.len() - 2..], &[0x18, 0x01]);
+        assert_standard_synthetic_signature_shape(&signature_a, b"claude-opus-4-7");
         assert_eq!(
             classify_signature(&signature_a, 0, ""),
             SignatureClass::ValidOwn
@@ -913,8 +955,7 @@ mod tests {
     fn test_synthetic_hidden_thinking_block_uses_opus_4_8_model_when_requested() {
         let signature =
             sign_synthetic_hidden_thinking_block(0, "", "claude-opus-4.8", b"response-a");
-        let raw = decode_signature(&signature).expect("signature should decode");
-        assert_eq!(&raw[77..92], b"claude-opus-4-8");
+        assert_standard_synthetic_signature_shape(&signature, b"claude-opus-4-8");
         assert_eq!(
             classify_signature(&signature, 0, ""),
             SignatureClass::ValidOwn
