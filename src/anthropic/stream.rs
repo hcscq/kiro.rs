@@ -2039,7 +2039,7 @@ mod tests {
 
     #[test]
     fn test_synthetic_hidden_thinking_signature_precedes_first_text_block() {
-        let mut ctx = StreamContext::new_with_thinking("claude-opus-4-7", 1, true, HashMap::new())
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-4-8", 1, true, HashMap::new())
             .with_synthetic_hidden_thinking_signature(true);
         let mut all = ctx.generate_initial_events();
 
@@ -2091,7 +2091,7 @@ mod tests {
         assert!(hidden_thinking_deltas.is_empty());
 
         let signature = collect_first_signature(&all).expect("signature should exist");
-        assert_eq!(signature.len(), 3284);
+        assert_eq!(signature.len(), 752);
         let req = request_with_stream_thinking(String::new(), signature);
         validate_thinking_signatures(&req).expect("synthetic hidden signature should validate");
         assert_eq!(
