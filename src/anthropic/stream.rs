@@ -828,8 +828,6 @@ impl StreamContext {
         );
         events.extend(start_events);
 
-        events.push(self.create_hidden_thinking_delta_event(thinking_index));
-
         let signature = sign_synthetic_hidden_thinking_block(
             0,
             "",
@@ -926,22 +924,6 @@ impl StreamContext {
                 "delta": {
                     "type": "thinking_delta",
                     "thinking": thinking
-                }
-            }),
-        )
-    }
-
-    /// 创建隐藏 synthetic thinking 的空 thinking_delta，匹配 AWS Claude 当前流式形状。
-    fn create_hidden_thinking_delta_event(&self, index: i32) -> SseEvent {
-        SseEvent::new(
-            "content_block_delta",
-            json!({
-                "type": "content_block_delta",
-                "index": index,
-                "delta": {
-                    "type": "thinking_delta",
-                    "thinking": "",
-                    "estimated_tokens": 50
                 }
             }),
         )
@@ -2106,15 +2088,10 @@ mod tests {
                     && e.data["delta"]["type"] == "thinking_delta"
             })
             .collect();
-        assert_eq!(hidden_thinking_deltas.len(), 1);
-        assert_eq!(hidden_thinking_deltas[0].data["delta"]["thinking"], "");
-        assert_eq!(
-            hidden_thinking_deltas[0].data["delta"]["estimated_tokens"],
-            50
-        );
+        assert!(hidden_thinking_deltas.is_empty());
 
         let signature = collect_first_signature(&all).expect("signature should exist");
-        assert_eq!(signature.len(), 736);
+        assert_eq!(signature.len(), 3284);
         let req = request_with_stream_thinking(String::new(), signature);
         validate_thinking_signatures(&req).expect("synthetic hidden signature should validate");
         assert_eq!(
