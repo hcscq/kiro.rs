@@ -135,7 +135,11 @@ pub(crate) fn is_web_search_tool(tool: &Tool) -> bool {
     let name = tool.name.trim();
     let tool_type = tool.tool_type.as_deref().unwrap_or("").trim();
 
-    name == "web_search" || tool_type == "web_search" || tool_type.starts_with("web_search_")
+    if tool_type.is_empty() {
+        return name == "web_search";
+    }
+
+    tool_type == "web_search" || tool_type.starts_with("web_search_")
 }
 
 pub(crate) fn is_supported_web_search_tool(tool: &Tool) -> bool {
@@ -788,6 +792,39 @@ mod tests {
         };
 
         assert!(has_web_search_tool(&req));
+    }
+
+    #[test]
+    fn test_has_web_search_tool_ignores_custom_type_named_web_search() {
+        use crate::anthropic::types::{Message, Tool};
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!("test"),
+            }],
+            stream: true,
+            system: None,
+            tools: Some(vec![Tool {
+                tool_type: Some("custom".to_string()),
+                name: "web_search".to_string(),
+                description: "ordinary custom search tool".to_string(),
+                input_schema: Default::default(),
+                max_uses: None,
+                ..Tool::default()
+            }]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        assert!(!has_web_search_tool(&req));
+        assert!(!is_web_search_tool(
+            req.tools.as_ref().unwrap().first().unwrap()
+        ));
     }
 
     #[test]

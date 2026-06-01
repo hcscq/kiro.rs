@@ -2632,6 +2632,32 @@ mod tests {
     }
 
     #[test]
+    fn test_has_server_web_tool_ignores_custom_web_search_tool() {
+        let custom_web_search = Tool {
+            tool_type: Some("custom".to_string()),
+            name: "web_search".to_string(),
+            description: "ordinary custom search tool".to_string(),
+            input_schema: serde_json::from_value(json!({
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"]
+            }))
+            .unwrap(),
+            max_uses: None,
+            allowed_domains: None,
+            blocked_domains: None,
+            citations: None,
+            max_content_tokens: None,
+            use_cache: None,
+        };
+        let req = sample_request_with_tools(vec![custom_web_search]);
+
+        assert!(!has_server_web_tool(&req));
+        let config = validate_server_web_tools(&req, ServerWebToolsMode::MaxCompat);
+        assert!(config.is_err());
+    }
+
+    #[test]
     fn test_supported_web_fetch_tool_versions() {
         let mut old_tool = sample_tool();
         old_tool.tool_type = Some(WEB_FETCH_TOOL_TYPE_20250910.to_string());
