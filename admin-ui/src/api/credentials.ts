@@ -225,6 +225,18 @@ export async function getCredentialBalance(id: number): Promise<BalanceResponse>
   return data
 }
 
+// 设置凭据超额使用开关
+export async function setCredentialOverageStatus(
+  id: number,
+  enabled: boolean
+): Promise<BalanceResponse> {
+  const { data } = await api.post<BalanceResponse>(
+    `/credentials/${id}/overage`,
+    { enabled }
+  )
+  return data
+}
+
 // 添加新凭据
 export async function addCredential(
   req: AddCredentialRequest

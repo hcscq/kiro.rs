@@ -69,9 +69,19 @@ export interface BalanceResponse {
   subscriptionType?: string | null
   currentUsage: number
   usageLimit: number
+  effectiveUsageLimit: number
   remaining: number
   usagePercentage: number
   nextResetAt: number | null
+  overageCapability?: string | null
+  overageStatus?: string | null
+  overageEnabled?: boolean | null
+  overageCap: number
+  currentOverages: number
+  overageCharges: number
+  overageRate?: number | null
+  currency?: string | null
+  unit?: string | null
 }
 
 // 成功响应

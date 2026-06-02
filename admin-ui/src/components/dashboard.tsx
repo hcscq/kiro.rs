@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2 } from 'lucide-react'
+import { RefreshCw, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Zap, ZapOff } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -21,7 +21,7 @@ import {
   useModelCapabilitiesConfig,
   useModelCatalog,
 } from '@/hooks/use-credentials'
-import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
+import { getCredentialBalance, forceRefreshToken, setCredentialOverageStatus } from '@/api/credentials'
 import { getCredentialLabel, getCredentialLabelWithId } from '@/lib/credential-label'
 import { cn, extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse, CredentialStatusItem } from '@/types/api'
@@ -146,6 +146,8 @@ export function Dashboard() {
   const [queryInfoProgress, setQueryInfoProgress] = useState({ current: 0, total: 0 })
   const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [batchRefreshProgress, setBatchRefreshProgress] = useState({ current: 0, total: 0 })
+  const [batchOverageUpdating, setBatchOverageUpdating] = useState(false)
+  const [batchOverageProgress, setBatchOverageProgress] = useState({ current: 0, total: 0 })
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
   const [levelFilter, setLevelFilter] = useState<string>(ALL_LEVELS)
@@ -569,6 +571,66 @@ export function Dashboard() {
     deselectAll()
   }
 
+  const handleBatchSetOverage = async (enabled: boolean) => {
+    if (selectedIds.size === 0) {
+      toast.error('请先选择要设置的凭据')
+      return
+    }
+
+    const ids = Array.from(selectedIds)
+    if (
+      enabled &&
+      !confirm(`确定为选中的 ${ids.length} 个凭据开启超额使用吗？开启后可能产生超额费用。`)
+    ) {
+      return
+    }
+
+    setBatchOverageUpdating(true)
+    setBatchOverageProgress({ current: 0, total: ids.length })
+
+    let successCount = 0
+    let failCount = 0
+    const failedLabels: string[] = []
+
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i]
+      const credential = credentials.find(item => item.id === id)
+      const label = credential ? getCredentialLabelWithId(credential) : `凭据 #${id}`
+
+      try {
+        const balance = await setCredentialOverageStatus(id, enabled)
+        successCount++
+        setBalanceMap(prev => {
+          const next = new Map(prev)
+          next.set(id, balance)
+          return next
+        })
+        queryClient.setQueryData(['credential-balance', id], balance)
+      } catch (error) {
+        failCount++
+        if (failedLabels.length < 3) {
+          failedLabels.push(`${label}: ${extractErrorMessage(error)}`)
+        }
+      }
+
+      setBatchOverageProgress({ current: i + 1, total: ids.length })
+    }
+
+    setBatchOverageUpdating(false)
+    queryClient.invalidateQueries({ queryKey: ['credentials'] })
+
+    const action = enabled ? '开启超额' : '关闭超额'
+    if (failCount === 0) {
+      toast.success(`${action}完成：成功 ${successCount}/${ids.length}`)
+    } else {
+      toast.warning(
+        `${action}完成：成功 ${successCount} 个，失败 ${failCount} 个${failedLabels.length > 0 ? `；${failedLabels.join('；')}` : ''}`
+      )
+    }
+
+    deselectAll()
+  }
+
   // 一键清除所有已禁用凭据
   const handleClearAll = async () => {
     if (!data?.credentials || data.credentials.length === 0) {
@@ -891,10 +953,30 @@ export function Dashboard() {
                     onClick={handleBatchForceRefresh}
                     size="sm"
                     variant="outline"
-                    disabled={batchRefreshing}
+                    disabled={batchRefreshing || batchOverageUpdating}
                   >
                     <RefreshCw className={`h-4 w-4 mr-2 ${batchRefreshing ? 'animate-spin' : ''}`} />
                     {batchRefreshing ? `刷新中... ${batchRefreshProgress.current}/${batchRefreshProgress.total}` : '批量刷新 Token'}
+                  </Button>
+                  <Button
+                    onClick={() => handleBatchSetOverage(true)}
+                    size="sm"
+                    variant="outline"
+                    disabled={batchOverageUpdating}
+                  >
+                    <Zap className={`h-4 w-4 mr-2 ${batchOverageUpdating ? 'animate-pulse' : ''}`} />
+                    {batchOverageUpdating
+                      ? `设置中... ${batchOverageProgress.current}/${batchOverageProgress.total}`
+                      : '批量开启超额'}
+                  </Button>
+                  <Button
+                    onClick={() => handleBatchSetOverage(false)}
+                    size="sm"
+                    variant="outline"
+                    disabled={batchOverageUpdating}
+                  >
+                    <ZapOff className="h-4 w-4 mr-2" />
+                    批量关闭超额
                   </Button>
                   <Button onClick={handleBatchResetFailure} size="sm" variant="outline">
                     <RotateCcw className="h-4 w-4 mr-2" />
@@ -1065,6 +1147,13 @@ export function Dashboard() {
         credentialLabel={selectedCredentialLabel}
         open={balanceDialogOpen}
         onOpenChange={setBalanceDialogOpen}
+        onBalanceUpdated={(balance) => {
+          setBalanceMap(prev => {
+            const next = new Map(prev)
+            next.set(balance.id, balance)
+            return next
+          })
+        }}
       />
 
       {/* 添加凭据对话框 */}

@@ -4,19 +4,45 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import { Badge } from '@/components/ui/badge'
 import { Progress } from '@/components/ui/progress'
+import { Switch } from '@/components/ui/switch'
 import { useCredentialBalance } from '@/hooks/use-credentials'
+import { setCredentialOverageStatus } from '@/api/credentials'
 import { parseError } from '@/lib/utils'
+import type { BalanceResponse } from '@/types/api'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { toast } from 'sonner'
 
 interface BalanceDialogProps {
   credentialId: number | null
   credentialLabel?: string | null
   open: boolean
   onOpenChange: (open: boolean) => void
+  onBalanceUpdated?: (balance: BalanceResponse) => void
 }
 
-export function BalanceDialog({ credentialId, credentialLabel, open, onOpenChange }: BalanceDialogProps) {
+export function BalanceDialog({
+  credentialId,
+  credentialLabel,
+  open,
+  onOpenChange,
+  onBalanceUpdated,
+}: BalanceDialogProps) {
+  const queryClient = useQueryClient()
   const { data: balance, isLoading, error } = useCredentialBalance(credentialId)
+  const setOverage = useMutation({
+    mutationFn: (enabled: boolean) => setCredentialOverageStatus(credentialId!, enabled),
+    onSuccess: (updatedBalance) => {
+      queryClient.setQueryData(['credential-balance', credentialId], updatedBalance)
+      onBalanceUpdated?.(updatedBalance)
+      toast.success(updatedBalance.overageEnabled ? '超额使用已开启' : '超额使用已关闭')
+    },
+    onError: (mutationError) => {
+      const parsed = parseError(mutationError)
+      toast.error(`超额开关设置失败：${parsed.title}`)
+    },
+  })
 
   const formatDate = (timestamp: number | null) => {
     if (!timestamp) return '未知'
@@ -26,6 +52,11 @@ export function BalanceDialog({ credentialId, credentialLabel, open, onOpenChang
   const formatNumber = (num: number) => {
     return num.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
   }
+
+  const isOverageCapable = balance?.overageCapability === 'OVERAGE_CAPABLE'
+  const overageEnabled = balance?.overageEnabled ?? balance?.overageStatus === 'ENABLED'
+  const effectiveUsageLimit = balance?.effectiveUsageLimit ?? balance?.usageLimit ?? 0
+  const overageCurrency = balance?.currency === 'USD' || !balance?.currency ? '$' : balance.currency
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -79,12 +110,61 @@ export function BalanceDialog({ credentialId, credentialLabel, open, onOpenChang
             <div className="space-y-2">
               <div className="flex justify-between text-sm">
                 <span>已使用: ${formatNumber(balance.currentUsage)}</span>
-                <span>限额: ${formatNumber(balance.usageLimit)}</span>
+                <span>限额: ${formatNumber(effectiveUsageLimit)}</span>
               </div>
               <Progress value={balance.usagePercentage} />
               <div className="text-center text-sm text-muted-foreground">
                 {balance.usagePercentage.toFixed(1)}% 已使用
               </div>
+            </div>
+
+            <div className="rounded-md border p-3 text-sm">
+              <div className="flex items-center justify-between gap-3">
+                <div className="space-y-1">
+                  <div className="flex items-center gap-2">
+                    <span className="font-medium">超额使用</span>
+                    {isOverageCapable ? (
+                      <Badge variant={overageEnabled ? 'warning' : 'outline'}>
+                        {overageEnabled ? '已开启' : '可开启'}
+                      </Badge>
+                    ) : (
+                      <Badge variant="secondary">不支持</Badge>
+                    )}
+                  </div>
+                  <div className="text-xs text-muted-foreground">
+                    基础限额 ${formatNumber(balance.usageLimit)}
+                    {balance.overageCap > 0 && `，超额上限 ${formatNumber(balance.overageCap)}`}
+                  </div>
+                </div>
+                <Switch
+                  checked={overageEnabled}
+                  disabled={!isOverageCapable || setOverage.isPending}
+                  onCheckedChange={(checked) => setOverage.mutate(Boolean(checked))}
+                />
+              </div>
+
+              {(balance.overageCap > 0 || balance.currentOverages > 0 || balance.overageRate) && (
+                <div className="mt-3 grid grid-cols-2 gap-3 border-t pt-3 text-xs">
+                  <div>
+                    <span className="text-muted-foreground">当前超额：</span>
+                    <span className="font-medium">{formatNumber(balance.currentOverages)}</span>
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">超额费用：</span>
+                    <span className="font-medium">
+                      {overageCurrency}{formatNumber(balance.overageCharges)}
+                    </span>
+                  </div>
+                  {balance.overageRate != null && (
+                    <div className="col-span-2">
+                      <span className="text-muted-foreground">费率：</span>
+                      <span className="font-medium">
+                        {overageCurrency}{balance.overageRate}/{balance.unit || 'credit'}
+                      </span>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
 
             {/* 详细信息 */}

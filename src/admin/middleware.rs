@@ -332,7 +332,12 @@ fn retryable_credential_admin_action(path: &str) -> bool {
     if segments.len() == 3 {
         return matches!(
             segments[2],
-            "disabled" | "priority" | "max-concurrency" | "rate-limit-config" | "model-policy"
+            "disabled"
+                | "priority"
+                | "max-concurrency"
+                | "rate-limit-config"
+                | "model-policy"
+                | "overage"
         );
     }
 
@@ -374,6 +379,10 @@ mod tests {
         assert!(is_retryable_admin_write_route(
             &Method::POST,
             "/api/admin/credentials/12/model-policy",
+        ));
+        assert!(is_retryable_admin_write_route(
+            &Method::POST,
+            "/api/admin/credentials/12/overage",
         ));
         assert!(is_retryable_admin_write_route(
             &Method::POST,

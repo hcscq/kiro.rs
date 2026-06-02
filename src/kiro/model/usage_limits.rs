@@ -19,6 +19,10 @@ pub struct UsageLimitsResponse {
     /// 使用量明细列表
     #[serde(default)]
     pub usage_breakdown_list: Vec<UsageBreakdown>,
+
+    /// 超额使用配置
+    #[serde(default)]
+    pub overage_configuration: Option<OverageConfiguration>,
 }
 
 /// 订阅信息
@@ -32,6 +36,10 @@ pub struct SubscriptionInfo {
     /// 订阅内部类型 (如 Q_DEVELOPER_STANDALONE_PRO)
     #[serde(default, rename = "type")]
     pub subscription_type: Option<String>,
+
+    /// 超额使用能力 (OVERAGE_CAPABLE / OVERAGE_INCAPABLE)
+    #[serde(default)]
+    pub overage_capability: Option<String>,
 }
 
 /// 使用量明细
@@ -66,6 +74,51 @@ pub struct UsageBreakdown {
     /// 使用限额（精确值）
     #[serde(default)]
     pub usage_limit_with_precision: f64,
+
+    /// 当前超额使用量
+    #[serde(default)]
+    pub current_overages: f64,
+
+    /// 当前超额使用量（精确值）
+    #[serde(default)]
+    pub current_overages_with_precision: f64,
+
+    /// 超额上限
+    #[serde(default)]
+    pub overage_cap: f64,
+
+    /// 超额上限（精确值）
+    #[serde(default)]
+    pub overage_cap_with_precision: f64,
+
+    /// 当前超额费用
+    #[serde(default)]
+    pub overage_charges: f64,
+
+    /// 超额费率
+    #[serde(default)]
+    pub overage_rate: Option<f64>,
+
+    /// 费用币种
+    #[serde(default)]
+    pub currency: Option<String>,
+
+    /// 计量单位
+    #[serde(default)]
+    pub unit: Option<String>,
+}
+
+/// 超额使用配置
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverageConfiguration {
+    /// 新版 API 返回 ENABLED / DISABLED
+    #[serde(default)]
+    pub overage_status: Option<String>,
+
+    /// 旧版 API 返回 true / false
+    #[serde(default)]
+    pub overage_enabled: Option<bool>,
 }
 
 /// 奖励额度
@@ -152,6 +205,50 @@ impl UsageLimitsResponse {
             .and_then(|info| info.subscription_type.as_deref())
     }
 
+    /// 获取超额使用能力
+    pub fn overage_capability(&self) -> Option<&str> {
+        self.subscription_info
+            .as_ref()
+            .and_then(|info| info.overage_capability.as_deref())
+    }
+
+    /// 是否支持开启超额使用
+    pub fn is_overage_capable(&self) -> bool {
+        self.overage_capability()
+            .is_some_and(|value| value == "OVERAGE_CAPABLE")
+    }
+
+    /// 获取超额状态字符串
+    pub fn overage_status(&self) -> Option<&str> {
+        self.overage_configuration
+            .as_ref()
+            .and_then(|config| config.overage_status.as_deref())
+    }
+
+    /// 获取超额状态布尔值
+    pub fn overage_enabled(&self) -> Option<bool> {
+        if let Some(status) = self.overage_status() {
+            return match status {
+                "ENABLED" => Some(true),
+                "DISABLED" => Some(false),
+                _ => None,
+            };
+        }
+
+        self.overage_configuration
+            .as_ref()
+            .and_then(|config| config.overage_enabled)
+    }
+
+    /// 本地更新超额状态，用于 setUserPreference 成功后更新缓存视图
+    pub fn set_overage_enabled_local(&mut self, enabled: bool) {
+        let config = self
+            .overage_configuration
+            .get_or_insert_with(OverageConfiguration::default);
+        config.overage_status = Some(if enabled { "ENABLED" } else { "DISABLED" }.to_string());
+        config.overage_enabled = Some(enabled);
+    }
+
     /// 获取第一个使用量明细
     fn primary_breakdown(&self) -> Option<&UsageBreakdown> {
         self.usage_breakdown_list.first()
@@ -165,12 +262,13 @@ impl UsageLimitsResponse {
             return 0.0;
         };
 
-        let mut total = breakdown.usage_limit_with_precision;
+        let mut total =
+            precise_or_integer(breakdown.usage_limit_with_precision, breakdown.usage_limit);
 
         // 累加激活的 free trial 额度
         if let Some(trial) = &breakdown.free_trial_info {
             if trial.is_active() {
-                total += trial.usage_limit_with_precision;
+                total += precise_or_integer(trial.usage_limit_with_precision, trial.usage_limit);
             }
         }
 
@@ -178,7 +276,7 @@ impl UsageLimitsResponse {
         if let Some(bonuses) = &breakdown.bonuses {
             for bonus in bonuses {
                 if bonus.is_active() {
-                    total += bonus.usage_limit;
+                    total += bonus.usage_limit_value();
                 }
             }
         }
@@ -194,12 +292,16 @@ impl UsageLimitsResponse {
             return 0.0;
         };
 
-        let mut total = breakdown.current_usage_with_precision;
+        let mut total = precise_or_integer(
+            breakdown.current_usage_with_precision,
+            breakdown.current_usage,
+        );
 
         // 累加激活的 free trial 使用量
         if let Some(trial) = &breakdown.free_trial_info {
             if trial.is_active() {
-                total += trial.current_usage_with_precision;
+                total +=
+                    precise_or_integer(trial.current_usage_with_precision, trial.current_usage);
             }
         }
 
@@ -207,12 +309,90 @@ impl UsageLimitsResponse {
         if let Some(bonuses) = &breakdown.bonuses {
             for bonus in bonuses {
                 if bonus.is_active() {
-                    total += bonus.current_usage;
+                    total += bonus.current_usage_value();
                 }
             }
         }
 
         total
+    }
+
+    /// 获取超额上限
+    pub fn overage_cap(&self) -> f64 {
+        self.primary_breakdown()
+            .map(|breakdown| {
+                precise_or_float(breakdown.overage_cap_with_precision, breakdown.overage_cap)
+            })
+            .unwrap_or(0.0)
+    }
+
+    /// 获取当前超额使用量
+    pub fn current_overages(&self) -> f64 {
+        self.primary_breakdown()
+            .map(|breakdown| {
+                precise_or_float(
+                    breakdown.current_overages_with_precision,
+                    breakdown.current_overages,
+                )
+            })
+            .unwrap_or(0.0)
+    }
+
+    /// 获取超额费用
+    pub fn overage_charges(&self) -> f64 {
+        self.primary_breakdown()
+            .map(|breakdown| breakdown.overage_charges)
+            .unwrap_or(0.0)
+    }
+
+    /// 获取超额费率
+    pub fn overage_rate(&self) -> Option<f64> {
+        self.primary_breakdown()
+            .and_then(|breakdown| breakdown.overage_rate)
+    }
+
+    /// 获取费用币种
+    pub fn currency(&self) -> Option<&str> {
+        self.primary_breakdown()
+            .and_then(|breakdown| breakdown.currency.as_deref())
+    }
+
+    /// 获取计量单位
+    pub fn unit(&self) -> Option<&str> {
+        self.primary_breakdown()
+            .and_then(|breakdown| breakdown.unit.as_deref())
+    }
+
+    /// 获取实际可用限额。超额开启时包含 overageCap。
+    pub fn effective_usage_limit(&self) -> f64 {
+        let base_limit = self.usage_limit();
+        if self.overage_enabled().unwrap_or(false) {
+            base_limit + self.overage_cap()
+        } else {
+            base_limit
+        }
+    }
+}
+
+fn precise_or_integer(precision: f64, integer: i64) -> f64 {
+    if precision > 0.0 {
+        precision
+    } else {
+        integer as f64
+    }
+}
+
+fn precise_or_float(precision: f64, fallback: f64) -> f64 {
+    if precision > 0.0 { precision } else { fallback }
+}
+
+impl Bonus {
+    fn current_usage_value(&self) -> f64 {
+        self.current_usage
+    }
+
+    fn usage_limit_value(&self) -> f64 {
+        self.usage_limit
     }
 }
 
@@ -261,5 +441,65 @@ mod tests {
 
         assert_eq!(response.current_usage(), 15.0);
         assert_eq!(response.usage_limit(), 150.0);
+    }
+
+    #[test]
+    fn test_usage_limits_reads_overage_status_and_effective_limit() {
+        let payload = r#"{
+            "subscriptionInfo": {
+                "subscriptionTitle": "KIRO PRO+",
+                "type": "Q_DEVELOPER_STANDALONE_PRO_PLUS",
+                "overageCapability": "OVERAGE_CAPABLE"
+            },
+            "overageConfiguration": {
+                "overageStatus": "ENABLED"
+            },
+            "usageBreakdownList": [{
+                "currentUsageWithPrecision": 120.0,
+                "usageLimitWithPrecision": 100.0,
+                "currentOveragesWithPrecision": 20.0,
+                "overageCapWithPrecision": 50.0,
+                "overageCharges": 0.8,
+                "overageRate": 0.04
+            }]
+        }"#;
+
+        let response: UsageLimitsResponse =
+            serde_json::from_str(payload).expect("overage fields should deserialize");
+
+        assert!(response.is_overage_capable());
+        assert_eq!(response.overage_enabled(), Some(true));
+        assert_eq!(response.usage_limit(), 100.0);
+        assert_eq!(response.effective_usage_limit(), 150.0);
+        assert_eq!(response.current_overages(), 20.0);
+        assert_eq!(response.overage_charges(), 0.8);
+        assert_eq!(response.overage_rate(), Some(0.04));
+    }
+
+    #[test]
+    fn test_usage_limits_accepts_legacy_overage_enabled() {
+        let payload = r#"{
+            "overageConfiguration": {
+                "overageEnabled": true
+            },
+            "usageBreakdownList": [{
+                "currentUsage": 1,
+                "usageLimit": 10,
+                "overageCap": 5.0
+            }]
+        }"#;
+
+        let mut response: UsageLimitsResponse =
+            serde_json::from_str(payload).expect("legacy overageEnabled should deserialize");
+
+        assert_eq!(response.overage_enabled(), Some(true));
+        assert_eq!(response.current_usage(), 1.0);
+        assert_eq!(response.usage_limit(), 10.0);
+        assert_eq!(response.effective_usage_limit(), 15.0);
+
+        response.set_overage_enabled_local(false);
+        assert_eq!(response.overage_status(), Some("DISABLED"));
+        assert_eq!(response.overage_enabled(), Some(false));
+        assert_eq!(response.effective_usage_limit(), 10.0);
     }
 }

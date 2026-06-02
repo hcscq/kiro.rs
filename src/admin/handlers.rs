@@ -11,7 +11,8 @@ use super::{
     types::{
         AddCredentialRequest, SetCredentialModelPolicyRequest, SetCredentialRateLimitConfigRequest,
         SetDisabledRequest, SetLoadBalancingModeRequest, SetMaxConcurrencyRequest,
-        SetModelCapabilitiesConfigRequest, SetPriorityRequest, SuccessResponse,
+        SetModelCapabilitiesConfigRequest, SetOverageStatusRequest, SetPriorityRequest,
+        SuccessResponse,
     },
 };
 
@@ -112,6 +113,19 @@ pub async fn set_credential_model_policy(
 ) -> impl IntoResponse {
     match state.service.set_model_policy(id, payload) {
         Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 模型策略已更新", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/overage
+/// 设置凭据超额使用开关
+pub async fn set_credential_overage_status(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetOverageStatusRequest>,
+) -> impl IntoResponse {
+    match state.service.set_overage_status(id, payload.enabled).await {
+        Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

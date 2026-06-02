@@ -7,6 +7,7 @@ use chrono::Utc;
 use parking_lot::Mutex;
 
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::account_type_preset::{
     built_in_account_type_presets, infer_standard_account_type_id_from_subscription,
@@ -300,25 +301,60 @@ impl AdminService {
             .await
             .map_err(|e| self.classify_balance_error(e, id))?;
 
+        Ok(Self::balance_from_usage(id, &usage))
+    }
+
+    /// 设置凭据超额使用开关
+    pub async fn set_overage_status(
+        &self,
+        id: u64,
+        enabled: bool,
+    ) -> Result<BalanceResponse, AdminServiceError> {
+        self.ensure_runtime_write_leader()?;
+
+        let usage = self
+            .token_manager
+            .set_overage_status_for(id, enabled)
+            .await
+            .map_err(|e| self.classify_balance_error(e, id))?;
+        let balance = Self::balance_from_usage(id, &usage);
+
+        self.cache_balance(id, balance.clone());
+
+        Ok(balance)
+    }
+
+    fn balance_from_usage(id: u64, usage: &UsageLimitsResponse) -> BalanceResponse {
         let current_usage = usage.current_usage();
         let usage_limit = usage.usage_limit();
-        let remaining = (usage_limit - current_usage).max(0.0);
-        let usage_percentage = if usage_limit > 0.0 {
-            (current_usage / usage_limit * 100.0).min(100.0)
+        let effective_usage_limit = usage.effective_usage_limit();
+        let remaining = (effective_usage_limit - current_usage).max(0.0);
+        let usage_percentage = if effective_usage_limit > 0.0 {
+            (current_usage / effective_usage_limit * 100.0).min(100.0)
         } else {
             0.0
         };
 
-        Ok(BalanceResponse {
+        BalanceResponse {
             id,
             subscription_title: usage.subscription_title().map(|s| s.to_string()),
             subscription_type: usage.subscription_type().map(|s| s.to_string()),
             current_usage,
             usage_limit,
+            effective_usage_limit,
             remaining,
             usage_percentage,
             next_reset_at: usage.next_date_reset,
-        })
+            overage_capability: usage.overage_capability().map(|value| value.to_string()),
+            overage_status: usage.overage_status().map(|value| value.to_string()),
+            overage_enabled: usage.overage_enabled(),
+            overage_cap: usage.overage_cap(),
+            current_overages: usage.current_overages(),
+            overage_charges: usage.overage_charges(),
+            overage_rate: usage.overage_rate(),
+            currency: usage.currency().map(|value| value.to_string()),
+            unit: usage.unit().map(|value| value.to_string()),
+        }
     }
 
     /// 添加新凭据
@@ -665,7 +701,10 @@ impl AdminService {
     fn load_pruned_balance_cache(
         state_store: &crate::state::StateStore,
     ) -> anyhow::Result<HashMap<u64, CachedBalanceRecord>> {
-        let cache = state_store.load_balance_cache()?;
+        let mut cache = state_store.load_balance_cache()?;
+        for entry in cache.values_mut() {
+            entry.data.normalize_cached_compat();
+        }
         let original_len = cache.len();
         let pruned = Self::prune_expired_balance_cache(cache);
         if pruned.len() != original_len {
@@ -684,6 +723,20 @@ impl AdminService {
             .get(&id)
             .filter(|cached| Self::is_balance_cache_fresh(cached))
             .map(|cached| cached.data.clone())
+    }
+
+    fn cache_balance(&self, id: u64, balance: BalanceResponse) {
+        {
+            let mut cache = self.balance_cache.lock();
+            cache.insert(
+                id,
+                CachedBalanceRecord {
+                    cached_at: Utc::now().timestamp() as f64,
+                    data: balance,
+                },
+            );
+        }
+        self.save_balance_cache();
     }
 
     fn is_balance_cache_fresh(cached: &CachedBalanceRecord) -> bool {
@@ -835,6 +888,10 @@ impl AdminService {
             return AdminServiceError::NotFound { id };
         }
 
+        if msg.contains("不支持超额") {
+            return AdminServiceError::InvalidCredential(msg);
+        }
+
         // 2. 上游服务错误特征：HTTP 响应错误或网络错误
         let is_upstream_error =
             // HTTP 响应错误（来自 refresh_*_token 的错误消息）
@@ -947,9 +1004,19 @@ mod tests {
             subscription_type: Some("Q_DEVELOPER_STANDALONE_PRO_PLUS".to_string()),
             current_usage: 12.5,
             usage_limit: 100.0,
+            effective_usage_limit: 100.0,
             remaining: 87.5,
             usage_percentage: 12.5,
             next_reset_at: Some(1_744_739_200.0),
+            overage_capability: Some("OVERAGE_CAPABLE".to_string()),
+            overage_status: Some("DISABLED".to_string()),
+            overage_enabled: Some(false),
+            overage_cap: 0.0,
+            current_overages: 0.0,
+            overage_charges: 0.0,
+            overage_rate: None,
+            currency: None,
+            unit: None,
         };
         let mut shared_cache = HashMap::new();
         shared_cache.insert(

@@ -15,6 +15,7 @@ import {
   Trash2,
   UserRound,
   Wallet,
+  Zap,
 } from 'lucide-react'
 import {
   AccountTypeInput,
@@ -527,9 +528,10 @@ export function CredentialCard({
   const balanceSummary = loadingBalance
     ? null
     : balance
-      ? `${balance.remaining.toFixed(2)} / ${balance.usageLimit.toFixed(2)}`
+      ? `${balance.remaining.toFixed(2)} / ${(balance.effectiveUsageLimit ?? balance.usageLimit).toFixed(2)}`
       : '未知'
   const balancePercentRemaining = balance ? `${(100 - balance.usagePercentage).toFixed(1)}% 剩余` : null
+  const overageEnabled = balance?.overageEnabled ?? balance?.overageStatus === 'ENABLED'
   const subscriptionLabel = credential.subscriptionTitle || balance?.subscriptionTitle || '未知'
   const subscriptionTypeLabel = credential.subscriptionType || balance?.subscriptionType || null
   const subscriptionTypeCompactLabel = formatSubscriptionTypeCompactLabel(subscriptionTypeLabel)
@@ -744,6 +746,12 @@ export function CredentialCard({
                       title={`内部订阅类型：${subscriptionTypeLabel}`}
                       tone="accent"
                     />
+                  )}
+                  {overageEnabled && (
+                    <Badge variant="warning" className="shrink-0 px-1.5 py-0 text-[10px]">
+                      <Zap className="mr-1 h-3 w-3" />
+                      超额
+                    </Badge>
                   )}
                 </div>
                 <div className="flex min-w-0 items-center gap-1.5 text-xs font-normal text-muted-foreground">

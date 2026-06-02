@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as TokioMutex, Notify, oneshot};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::error::Error as StdError;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -46,6 +47,27 @@ const UPSTREAM_ERROR_EXCERPT_CHARS: usize = 240;
 const SESSION_AFFINITY_TTL_MS: u64 = 60 * 60 * 1000;
 const SESSION_AFFINITY_LOCAL_TTL: StdDuration = StdDuration::from_secs(60 * 60);
 const SESSION_AFFINITY_LOCAL_MAX_ENTRIES: usize = 10_000;
+
+#[derive(Debug)]
+struct KiroManagementApiError {
+    api: &'static str,
+    status_code: u16,
+    message: String,
+}
+
+impl KiroManagementApiError {
+    fn is_auth_error(&self) -> bool {
+        matches!(self.status_code, 401 | 403)
+    }
+}
+
+impl fmt::Display for KiroManagementApiError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.api, self.message)
+    }
+}
+
+impl StdError for KiroManagementApiError {}
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -468,6 +490,82 @@ pub(crate) async fn get_usage_limits(
 
     let data: UsageLimitsResponse = response.json().await?;
     Ok(data)
+}
+
+pub(crate) async fn set_user_preference_overage_status(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    enabled: bool,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<()> {
+    tracing::debug!("正在设置超额使用开关...");
+
+    let region = credentials.effective_api_region(config);
+    let management_endpoint = config.effective_management_endpoint_base(region);
+    let host = Config::endpoint_host(&management_endpoint);
+    let machine_id = machine_id::generate_from_credentials(credentials, config)
+        .ok_or_else(|| anyhow::anyhow!("无法生成 machineId"))?;
+    let kiro_version = &config.kiro_version;
+    let os_name = &config.system_version;
+    let node_version = &config.node_version;
+    let url = format!("{}/setUserPreference", management_endpoint);
+    let overage_status = if enabled { "ENABLED" } else { "DISABLED" };
+
+    let user_agent = format!(
+        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
+        os_name, node_version, kiro_version, machine_id
+    );
+    let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
+
+    let mut body = serde_json::json!({
+        "overageConfiguration": {
+            "overageStatus": overage_status
+        }
+    });
+
+    if let Some(profile_arn) = credentials.effective_profile_arn_for_kiro_requests() {
+        body["profileArn"] = serde_json::Value::String(profile_arn.to_string());
+    }
+
+    let client = build_client(proxy, 60, config.tls_backend)?;
+
+    let response = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .header("accept", "application/json")
+        .header("x-amz-user-agent", &amz_user_agent)
+        .header("user-agent", &user_agent)
+        .header("host", &host)
+        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+        .header("amz-sdk-request", "attempt=1; max=1")
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&body)
+        .send()
+        .await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+        let error_summary =
+            summarize_upstream_error(status.as_u16(), &body_text, UPSTREAM_ERROR_EXCERPT_CHARS);
+        let error_msg = match status.as_u16() {
+            401 => "认证失败，Token 无效或已过期",
+            403 => "权限不足，无法设置超额使用开关",
+            429 => "请求过于频繁，已被限流",
+            500..=599 => "服务器错误，AWS 服务暂时不可用",
+            _ => "设置超额使用开关失败",
+        };
+
+        return Err(KiroManagementApiError {
+            api: "setUserPreference",
+            status_code: status.as_u16(),
+            message: format!("{}: {}", error_msg, error_summary),
+        }
+        .into());
+    }
+
+    Ok(())
 }
 
 // ============================================================================
@@ -6539,6 +6637,86 @@ impl MultiTokenManager {
             id,
             usage_limits.subscription_title(),
             usage_limits.subscription_type(),
+        );
+
+        Ok(usage_limits)
+    }
+
+    /// 设置指定凭据的超额使用开关（Admin API）
+    pub async fn set_overage_status_for(
+        &self,
+        id: u64,
+        enabled: bool,
+    ) -> anyhow::Result<UsageLimitsResponse> {
+        let credentials = self.current_credentials(id)?;
+        let (mut credentials, mut token) = self.try_ensure_token(id, &credentials).await?;
+        let mut effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+        let mut usage_limits =
+            get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
+
+        self.apply_subscription_info_update(
+            id,
+            usage_limits.subscription_title(),
+            usage_limits.subscription_type(),
+        );
+
+        if !usage_limits.is_overage_capable() {
+            anyhow::bail!("此账号订阅级别不支持超额使用");
+        }
+
+        if usage_limits.overage_enabled() == Some(enabled) {
+            return Ok(usage_limits);
+        }
+
+        let mut result = set_user_preference_overage_status(
+            &credentials,
+            &self.config,
+            &token,
+            enabled,
+            effective_proxy.as_ref(),
+        )
+        .await;
+
+        let should_refresh_and_retry = result
+            .as_ref()
+            .err()
+            .and_then(|err| err.downcast_ref::<KiroManagementApiError>())
+            .is_some_and(KiroManagementApiError::is_auth_error);
+
+        if should_refresh_and_retry {
+            tracing::info!(
+                "设置凭据 #{} 超额使用开关时 accessToken 失效，刷新后重试",
+                id
+            );
+            let refresh_lock = self.refresh_lock_for(id)?;
+            let _guard = refresh_lock.lock().await;
+            let current_credentials = self.current_credentials(id)?;
+            credentials = self
+                .refresh_credentials_with_runtime_coordination(id, &current_credentials)
+                .await?;
+            token = credentials
+                .access_token
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("没有可用的 accessToken"))?;
+            effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+
+            result = set_user_preference_overage_status(
+                &credentials,
+                &self.config,
+                &token,
+                enabled,
+                effective_proxy.as_ref(),
+            )
+            .await;
+        }
+
+        result?;
+        usage_limits.set_overage_enabled_local(enabled);
+
+        tracing::info!(
+            "凭据 #{} 超额使用开关已设置为 {}",
+            id,
+            if enabled { "ENABLED" } else { "DISABLED" }
         );
 
         Ok(usage_limits)

@@ -235,6 +235,14 @@ pub struct SetCredentialModelPolicyRequest {
     pub clear_runtime_model_restrictions: bool,
 }
 
+/// 设置凭据超额使用开关请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetOverageStatusRequest {
+    /// 是否开启超额使用
+    pub enabled: bool,
+}
+
 /// 添加凭据请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -348,12 +356,44 @@ pub struct BalanceResponse {
     pub current_usage: f64,
     /// 使用限额
     pub usage_limit: f64,
+    /// 实际可用限额；超额开启时包含 overageCap
+    #[serde(default)]
+    pub effective_usage_limit: f64,
     /// 剩余额度
     pub remaining: f64,
     /// 使用百分比
     pub usage_percentage: f64,
     /// 下次重置时间（Unix 时间戳）
     pub next_reset_at: Option<f64>,
+    /// 超额使用能力
+    pub overage_capability: Option<String>,
+    /// 超额使用状态
+    pub overage_status: Option<String>,
+    /// 超额使用开关
+    pub overage_enabled: Option<bool>,
+    /// 超额上限
+    #[serde(default)]
+    pub overage_cap: f64,
+    /// 当前超额使用量
+    #[serde(default)]
+    pub current_overages: f64,
+    /// 当前超额费用
+    #[serde(default)]
+    pub overage_charges: f64,
+    /// 超额费率
+    pub overage_rate: Option<f64>,
+    /// 费用币种
+    pub currency: Option<String>,
+    /// 计量单位
+    pub unit: Option<String>,
+}
+
+impl BalanceResponse {
+    pub fn normalize_cached_compat(&mut self) {
+        if self.effective_usage_limit <= 0.0 {
+            self.effective_usage_limit = self.usage_limit;
+        }
+    }
 }
 
 // ============ 负载均衡配置 ============
