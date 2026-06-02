@@ -209,6 +209,7 @@ GitHub Actions 镜像构建：
 | `stateRedisHeartbeatIntervalSecs` | number | `10` | Redis 运行时协调心跳间隔（秒） |
 | `stateRedisLeaderLeaseTtlSecs` | number | `30` | Redis leader 租约 TTL（秒），必须大于心跳间隔 |
 | `stateHotPathSyncMinIntervalMs` | number | `25` | 数据面热路径检查共享状态修订号的最小间隔（毫秒，`0` 表示每次请求都检查） |
+| `KIRO_RS_STATE_BLOCKING_WORKERS` | env | CPU 核心数 × 2（4-64） | 状态外置同步操作的固定 worker 数；用于复用阻塞 Redis/PostgreSQL 操作线程，避免请求热路径频繁创建 OS 线程 |
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
 | `sessionAffinityEnabled` | boolean | `false` | 是否启用会话到凭据的软亲和调度；启用后同一模型+会话优先复用上次成功凭据，凭据不可调度时回退现有策略 |
 | `defaultMaxConcurrency` | number | - | 全局默认单账号并发上限；仅在凭据未单独配置 `maxConcurrency` 时生效，留空或 <= 0 表示不限制 |
@@ -352,6 +353,8 @@ GitHub Actions 镜像构建：
 - 如果 PostgreSQL 中还没有凭据，会用本地 `credentials.json` 做一次种子导入
 - 如果配置了 Redis，Admin API 启动时会优先从 Redis 读取余额缓存
 - 如果配置了 Redis，请求热路径会基于 Redis 共享调度运行态做选号和租约保留，多副本下单账号并发上限、429 冷却和 token bucket 会按全局语义生效
+- 请求热路径只会为本次可能参与调度的账号读取 Redis 共享调度热态；已停调、当前模型不支持、请求内已排除或仍在本地隔离/后台刷新冷却中的账号不会产生 Redis runtime snapshot 读取
+- 状态外置的同步 Redis/PostgreSQL 操作会复用固定 worker 池；容器 CPU/Redis 延迟较高时可通过 `KIRO_RS_STATE_BLOCKING_WORKERS` 调整并发度
 - 启用 Redis 共享运行态只改变调度热态的承载位置，不改变 `priority` / `balanced` / 等待队列 / 429 冷却 / fallback 等原有业务分支语义
 - 如果配置了 Redis，启动时会先完成一次实例注册和 Leader 租约续约；失败会直接终止启动，避免多实例状态不一致
 - 如果配置了 Redis，Admin API 的写操作会优先路由到当前 leader；命中 follower 时会自动转发到 leader，只有当前无 leader 或无法解析 leader 地址时才会返回 `409` 或 `503`

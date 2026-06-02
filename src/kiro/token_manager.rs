@@ -1369,11 +1369,19 @@ impl Drop for CallLeaseState {
     }
 }
 
+#[derive(Debug)]
 enum ReservationFailure {
     NoCredentials,
     AllDisabled,
     NoModelSupport,
     AllTemporarilyUnavailable { next_ready_at: Option<Instant> },
+}
+
+#[derive(Debug)]
+struct SharedDispatchSnapshotCandidates {
+    credentials: Vec<DispatchRuntimeCredential>,
+    candidate_ids: HashSet<u64>,
+    next_ready_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2674,6 +2682,96 @@ impl MultiTokenManager {
             .load_dispatch_runtime_snapshots(&credentials, now_epoch_ms)
     }
 
+    fn load_shared_dispatch_runtime_snapshots_for(
+        &self,
+        credentials: &[DispatchRuntimeCredential],
+        now_epoch_ms: u64,
+    ) -> anyhow::Result<HashMap<u64, DispatchRuntimeSnapshot>> {
+        self.state_store
+            .load_dispatch_runtime_snapshots(credentials, now_epoch_ms)
+    }
+
+    fn collect_shared_dispatch_snapshot_candidates(
+        &self,
+        dispatch: &DispatchConfig,
+        model: Option<&str>,
+        model_requirement: ModelRequirement,
+        excluded_credential_ids: &HashSet<u64>,
+        now: Instant,
+        now_utc: &DateTime<Utc>,
+        fallback_next_ready_at: Option<Instant>,
+    ) -> Result<SharedDispatchSnapshotCandidates, ReservationFailure> {
+        let entries = self.entries.lock();
+        if entries.is_empty() {
+            return Err(ReservationFailure::NoCredentials);
+        }
+
+        let mut has_enabled = false;
+        let mut has_supported = false;
+        let mut next_ready_at = fallback_next_ready_at;
+        let mut credentials = Vec::new();
+        let mut candidate_ids = HashSet::new();
+
+        for entry in entries.iter() {
+            if entry.disabled {
+                continue;
+            }
+            has_enabled = true;
+
+            if excluded_credential_ids.contains(&entry.id) {
+                continue;
+            }
+
+            if !Self::is_model_supported(&dispatch, &entry.credentials, model, model_requirement) {
+                continue;
+            }
+            has_supported = true;
+
+            if let Some(ready_at) =
+                Self::suspicious_activity_quarantine_ready_at(&entry.credentials, now, now_utc)
+            {
+                next_ready_at = Some(match next_ready_at {
+                    Some(existing) => existing.min(ready_at),
+                    None => ready_at,
+                });
+                continue;
+            }
+
+            if let Some(ready_at) = entry
+                .background_refresh_cooldown_until
+                .filter(|until| *until > now)
+            {
+                next_ready_at = Some(match next_ready_at {
+                    Some(existing) => existing.min(ready_at),
+                    None => ready_at,
+                });
+                continue;
+            }
+
+            candidate_ids.insert(entry.id);
+            credentials.push(DispatchRuntimeCredential {
+                id: entry.id,
+                bucket_policy: dispatch.shared_bucket_policy_for(&entry.credentials),
+            });
+        }
+
+        if !has_enabled {
+            return Err(ReservationFailure::AllDisabled);
+        }
+        if !has_supported {
+            return Err(ReservationFailure::NoModelSupport);
+        }
+        if credentials.is_empty() {
+            return Err(ReservationFailure::AllTemporarilyUnavailable { next_ready_at });
+        }
+
+        Ok(SharedDispatchSnapshotCandidates {
+            credentials,
+            candidate_ids,
+            next_ready_at,
+        })
+    }
+
     fn reserve_call_lease(&self, id: u64, shared_lease_id: Option<String>) -> CallLease {
         let shared_dispatch = shared_lease_id.map(|lease_id| {
             let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
@@ -3087,14 +3185,43 @@ impl MultiTokenManager {
             let now = Instant::now();
             let now_utc = Utc::now();
             let now_epoch_ms = current_epoch_ms();
+            let snapshot_candidates = self.collect_shared_dispatch_snapshot_candidates(
+                &dispatch,
+                model,
+                model_requirement,
+                excluded_credential_ids,
+                now,
+                &now_utc,
+                fallback_next_ready_at,
+            )?;
+            let snapshot_candidate_count = snapshot_candidates.credentials.len();
+            let snapshot_started_at = Instant::now();
             let snapshots = self
-                .load_shared_dispatch_runtime_snapshots(&dispatch, now_epoch_ms)
+                .load_shared_dispatch_runtime_snapshots_for(
+                    &snapshot_candidates.credentials,
+                    now_epoch_ms,
+                )
                 .map_err(|err| {
                     tracing::warn!("读取共享调度热态失败: {}", err);
                     ReservationFailure::AllTemporarilyUnavailable {
                         next_ready_at: None,
                     }
                 })?;
+            let snapshot_elapsed_ms = snapshot_started_at.elapsed().as_millis();
+            if snapshot_elapsed_ms >= 100 {
+                tracing::warn!(
+                    shared_dispatch_candidate_count = snapshot_candidate_count,
+                    shared_dispatch_snapshot_ms = snapshot_elapsed_ms,
+                    total_credentials = self.total_count(),
+                    "共享调度候选热态读取较慢"
+                );
+            } else {
+                tracing::debug!(
+                    shared_dispatch_candidate_count = snapshot_candidate_count,
+                    shared_dispatch_snapshot_ms = snapshot_elapsed_ms,
+                    "共享调度候选热态读取完成"
+                );
+            }
 
             let selection = {
                 let entries = self.entries.lock();
@@ -3111,7 +3238,7 @@ impl MultiTokenManager {
                 let mut selected_bucket_policy: Option<DispatchRuntimeBucketPolicy> = None;
                 let mut priority_key: Option<(u8, u32, u8, usize, u8, u8, u64)> = None;
                 let mut balanced_key: Option<(u8, u8, u8, usize, u64, u32, u64)> = None;
-                let mut next_ready_at: Option<Instant> = fallback_next_ready_at;
+                let mut next_ready_at: Option<Instant> = snapshot_candidates.next_ready_at;
 
                 for entry in entries.iter() {
                     if entry.disabled {
@@ -3131,6 +3258,12 @@ impl MultiTokenManager {
                         continue;
                     }
                     has_supported = true;
+
+                    // 候选预筛选和 Redis snapshot 读取之间可能发生 Admin 写入或热重载；
+                    // 这里保留防御性复核，确保最终选择仍以最新本地状态为准。
+                    if !snapshot_candidates.candidate_ids.contains(&entry.id) {
+                        continue;
+                    }
 
                     if let Some(ready_at) = Self::suspicious_activity_quarantine_ready_at(
                         &entry.credentials,
@@ -7508,6 +7641,26 @@ mod tests {
         u64::from_be_bytes(bytes[..8].try_into().unwrap())
     }
 
+    fn shared_candidate_ids(manager: &MultiTokenManager) -> Vec<u64> {
+        let dispatch = manager.dispatch_config();
+        let candidates = manager
+            .collect_shared_dispatch_snapshot_candidates(
+                &dispatch,
+                None,
+                ModelRequirement::Any,
+                &HashSet::new(),
+                Instant::now(),
+                &Utc::now(),
+                None,
+            )
+            .unwrap();
+        candidates
+            .credentials
+            .into_iter()
+            .map(|credential| credential.id)
+            .collect()
+    }
+
     #[test]
     fn test_enabled_supported_priority_helpers_detect_lower_priority_fallback() {
         let manager = MultiTokenManager::new(
@@ -7540,6 +7693,58 @@ mod tests {
             0,
             &excluded_fallback
         ));
+    }
+
+    #[test]
+    fn test_shared_dispatch_snapshot_candidates_skip_disabled_credentials() {
+        let mut disabled = available_credential(0);
+        disabled.id = Some(1);
+        disabled.disabled = true;
+        disabled.disabled_reason = Some(DisabledReason::Manual.as_str().to_string());
+
+        let mut enabled = available_credential(1);
+        enabled.id = Some(2);
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![disabled, enabled],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(shared_candidate_ids(&manager), vec![2]);
+    }
+
+    #[test]
+    fn test_shared_dispatch_snapshot_candidates_include_reenabled_credentials() {
+        let mut credential = available_credential(0);
+        credential.id = Some(1);
+        credential.disabled = true;
+        credential.disabled_reason = Some(DisabledReason::Manual.as_str().to_string());
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
+
+        let dispatch = manager.dispatch_config();
+        let disabled_result = manager.collect_shared_dispatch_snapshot_candidates(
+            &dispatch,
+            None,
+            ModelRequirement::Any,
+            &HashSet::new(),
+            Instant::now(),
+            &Utc::now(),
+            None,
+        );
+        assert!(matches!(
+            disabled_result,
+            Err(ReservationFailure::AllDisabled)
+        ));
+
+        manager.set_disabled(1, false).unwrap();
+
+        assert_eq!(shared_candidate_ids(&manager), vec![1]);
     }
 
     #[test]

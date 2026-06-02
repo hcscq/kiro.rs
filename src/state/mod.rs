@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
@@ -43,6 +44,7 @@ const REDIS_STATE_CHANGE_NAMESPACE: &str = "kiro:runtime:state_change";
 const REDIS_STATE_CHANGE_CREDENTIALS_KEY: &str = "credentials_revision";
 const REDIS_STATE_CHANGE_DISPATCH_KEY: &str = "dispatch_revision";
 const REDIS_STATE_CHANGE_BALANCE_CACHE_KEY: &str = "balance_cache_revision";
+const DEFAULT_STATE_BLOCKING_WORKERS: usize = 16;
 const REDIS_RUNTIME_LEADER_SCRIPT: &str = r#"
 local current = redis.call('GET', KEYS[1])
 if not current then
@@ -1609,15 +1611,90 @@ fn merge_stats_records(
     stats
 }
 
+type StateBlockingJob = Box<dyn FnOnce() + Send + 'static>;
+
+struct StateBlockingWorkerPool {
+    sender: mpsc::Sender<StateBlockingJob>,
+}
+
+impl StateBlockingWorkerPool {
+    fn new() -> Self {
+        let (sender, receiver) = mpsc::channel::<StateBlockingJob>();
+        let receiver = Arc::new(Mutex::new(receiver));
+        let worker_count = state_blocking_worker_count();
+
+        for index in 0..worker_count {
+            let receiver = Arc::clone(&receiver);
+            std::thread::Builder::new()
+                .name(format!("kiro-state-blocking-{index}"))
+                .spawn(move || {
+                    loop {
+                        let job = {
+                            let receiver = receiver.lock();
+                            receiver.recv()
+                        };
+
+                        match job {
+                            Ok(job) => job(),
+                            Err(_) => break,
+                        }
+                    }
+                })
+                .expect("failed to spawn state blocking worker");
+        }
+
+        Self { sender }
+    }
+
+    fn run<R, F>(&self, operation: F) -> R
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        self.sender
+            .send(Box::new(move || {
+                let result = catch_unwind(AssertUnwindSafe(operation));
+                let _ = result_tx.send(result);
+            }))
+            .expect("state blocking worker pool stopped");
+
+        match result_rx
+            .recv()
+            .expect("state blocking worker stopped before returning result")
+        {
+            Ok(result) => result,
+            Err(payload) => resume_unwind(payload),
+        }
+    }
+}
+
+static STATE_BLOCKING_WORKER_POOL: OnceLock<StateBlockingWorkerPool> = OnceLock::new();
+
+fn state_blocking_worker_pool() -> &'static StateBlockingWorkerPool {
+    STATE_BLOCKING_WORKER_POOL.get_or_init(StateBlockingWorkerPool::new)
+}
+
+fn state_blocking_worker_count() -> usize {
+    std::env::var("KIRO_RS_STATE_BLOCKING_WORKERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|value| value.get().saturating_mul(2))
+                .unwrap_or(DEFAULT_STATE_BLOCKING_WORKERS)
+        })
+        .clamp(4, 64)
+}
+
 fn run_blocking_state_op<R, F>(operation: F) -> R
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
     match tokio::runtime::Handle::try_current() {
-        Ok(_) => std::thread::spawn(operation)
-            .join()
-            .expect("state blocking operation thread panicked"),
+        Ok(_) => state_blocking_worker_pool().run(operation),
         Err(_) => operation(),
     }
 }
@@ -1627,9 +1704,7 @@ where
     T: Send + 'static,
 {
     match tokio::runtime::Handle::try_current() {
-        Ok(_) => std::thread::spawn(move || drop(value))
-            .join()
-            .expect("state blocking drop thread panicked"),
+        Ok(_) => state_blocking_worker_pool().run(move || drop(value)),
         Err(_) => drop(value),
     }
 }
@@ -2315,22 +2390,15 @@ impl RedisStateChangeBackend {
 
         run_blocking_state_op(move || -> anyhow::Result<StateChangeRevisions> {
             let mut connection = client.get_connection().context("连接 Redis 状态变更失败")?;
-            let credentials = connection
-                .get::<_, Option<u64>>(&credentials_key)
-                .with_context(|| format!("读取 Redis 状态变更版本失败: {credentials_key}"))?
-                .unwrap_or_default();
-            let dispatch_config = connection
-                .get::<_, Option<u64>>(&dispatch_key)
-                .with_context(|| format!("读取 Redis 状态变更版本失败: {dispatch_key}"))?
-                .unwrap_or_default();
-            let balance_cache = connection
-                .get::<_, Option<u64>>(&balance_cache_key)
-                .with_context(|| format!("读取 Redis 状态变更版本失败: {balance_cache_key}"))?
-                .unwrap_or_default();
+            let values: Vec<Option<u64>> = redis::cmd("MGET")
+                .arg(&[&credentials_key, &dispatch_key, &balance_cache_key])
+                .query(&mut connection)
+                .context("批量读取 Redis 状态变更版本失败")?;
+            debug_assert_eq!(values.len(), 3, "Redis MGET 应返回 3 个状态修订号");
             Ok(StateChangeRevisions {
-                credentials,
-                dispatch_config,
-                balance_cache,
+                credentials: values.first().and_then(|value| *value).unwrap_or_default(),
+                dispatch_config: values.get(1).and_then(|value| *value).unwrap_or_default(),
+                balance_cache: values.get(2).and_then(|value| *value).unwrap_or_default(),
             })
         })
     }
