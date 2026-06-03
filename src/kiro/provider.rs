@@ -1112,6 +1112,7 @@ struct KiroRequestBodyDiagnostics {
     current_image_count: usize,
     current_document_count: usize,
     current_tool_count: usize,
+    current_tool_schemas: Vec<KiroToolSchemaDiagnostics>,
     current_tool_result_count: usize,
     current_tool_result_error_count: usize,
     history_count: usize,
@@ -1124,7 +1125,15 @@ struct KiroRequestBodyDiagnostics {
     tail_history_roles: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KiroToolSchemaDiagnostics {
+    index: usize,
+    name: String,
+    root_type: String,
+}
+
 const KIRO_REQUEST_DIAGNOSTICS_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+const KIRO_REQUEST_DIAGNOSTICS_MAX_TOOL_SCHEMAS: usize = 64;
 
 fn append_bounded_tail(mut values: Vec<String>, value: &str, limit: usize) -> Vec<String> {
     if limit == 0 {
@@ -1298,14 +1307,24 @@ impl KiroProvider {
                 .unwrap_or_default(),
             current_image_count: Self::json_array_len(current.get("images")),
             current_document_count: Self::json_array_len(current.get("documents")),
-            current_tool_count: Self::json_array_len(
-                current_context.and_then(|ctx| ctx.get("tools")),
-            ),
             current_tool_result_count: Self::json_array_len(
                 current_context.and_then(|ctx| ctx.get("toolResults")),
             ),
             ..Default::default()
         };
+
+        if let Some(tools) = current_context
+            .and_then(|ctx| ctx.get("tools"))
+            .and_then(|value| value.as_array())
+        {
+            diagnostics.current_tool_count = tools.len();
+            diagnostics.current_tool_schemas = tools
+                .iter()
+                .enumerate()
+                .take(KIRO_REQUEST_DIAGNOSTICS_MAX_TOOL_SCHEMAS)
+                .map(|(index, tool)| Self::summarize_kiro_tool_schema_for_log(index, tool))
+                .collect();
+        }
 
         if let Some(tool_results) = current_context
             .and_then(|ctx| ctx.get("toolResults"))
@@ -1356,6 +1375,97 @@ impl KiroProvider {
         }
 
         Some(diagnostics)
+    }
+
+    fn summarize_kiro_tool_schema_for_log(
+        index: usize,
+        tool: &serde_json::Value,
+    ) -> KiroToolSchemaDiagnostics {
+        let tool_spec = tool
+            .get("toolSpecification")
+            .or_else(|| tool.get("toolSpec"));
+        let name = tool_spec
+            .and_then(|spec| spec.get("name"))
+            .and_then(|value| value.as_str())
+            .map(|value| truncate_log_string(value.trim(), 96))
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "<missing>".to_string());
+        let root_type = tool_spec
+            .and_then(|spec| spec.get("inputSchema"))
+            .and_then(|schema| schema.get("json"))
+            .and_then(|schema| schema.get("type"))
+            .map(Self::summarize_json_schema_type_for_log)
+            .unwrap_or_else(|| "<missing>".to_string());
+
+        KiroToolSchemaDiagnostics {
+            index,
+            name,
+            root_type,
+        }
+    }
+
+    fn summarize_json_schema_type_for_log(value: &serde_json::Value) -> String {
+        match value {
+            serde_json::Value::String(value) => {
+                let value = value.trim();
+                if value.is_empty() {
+                    "<empty>".to_string()
+                } else {
+                    truncate_log_string(value, 64)
+                }
+            }
+            serde_json::Value::Array(values) => {
+                let joined = values
+                    .iter()
+                    .map(|value| match value {
+                        serde_json::Value::String(value) => truncate_log_string(value.trim(), 32),
+                        other => format!("<{}>", Self::json_value_kind(other)),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                truncate_log_string(&format!("[{joined}]"), 96)
+            }
+            other => format!("<{}>", Self::json_value_kind(other)),
+        }
+    }
+
+    fn json_value_kind(value: &serde_json::Value) -> &'static str {
+        match value {
+            serde_json::Value::Null => "null",
+            serde_json::Value::Bool(_) => "bool",
+            serde_json::Value::Number(_) => "number",
+            serde_json::Value::String(_) => "string",
+            serde_json::Value::Array(_) => "array",
+            serde_json::Value::Object(_) => "object",
+        }
+    }
+
+    fn rejected_tool_index_from_error_body(body: &str) -> Option<usize> {
+        for marker in ["toolConfig.tools.", "tools."] {
+            if let Some(index) = Self::parse_index_after_marker(body, marker) {
+                return Some(index);
+            }
+        }
+        None
+    }
+
+    fn parse_index_after_marker(text: &str, marker: &str) -> Option<usize> {
+        let mut search_from = 0usize;
+        while search_from < text.len() {
+            let Some(relative_marker_start) = text[search_from..].find(marker) else {
+                return None;
+            };
+            let digits_start = search_from + relative_marker_start + marker.len();
+            let digits = text[digits_start..]
+                .chars()
+                .take_while(|ch| ch.is_ascii_digit())
+                .collect::<String>();
+            if !digits.is_empty() {
+                return digits.parse().ok();
+            }
+            search_from = digits_start;
+        }
+        None
     }
 
     fn json_array_len(value: Option<&serde_json::Value>) -> usize {
@@ -3442,6 +3552,9 @@ impl KiroProvider {
                 }
 
                 if request_body.len() > KIRO_REQUEST_DIAGNOSTICS_MAX_BODY_BYTES {
+                    let rejected_tool_index = Self::rejected_tool_index_from_error_body(&body)
+                        .map(|index| index.to_string())
+                        .unwrap_or_default();
                     tracing::warn!(
                         request_id = %request_id,
                         api_type,
@@ -3456,12 +3569,28 @@ impl KiroProvider {
                         error_summary = %error_summary,
                         kiro_body_bytes = request_body.len(),
                         kiro_diagnostic_body_limit_bytes = KIRO_REQUEST_DIAGNOSTICS_MAX_BODY_BYTES,
+                        kiro_tool_error_index = %rejected_tool_index,
                         total_elapsed_ms = overall_started_at.elapsed().as_millis(),
                         "API 请求失败（上游 400，诊断摘要跳过：请求体超过诊断上限）"
                     );
                 } else if let Some(diagnostics) =
                     Self::summarize_kiro_request_body_for_log(request_body)
                 {
+                    let rejected_tool_index = Self::rejected_tool_index_from_error_body(&body);
+                    let rejected_tool = rejected_tool_index.and_then(|index| {
+                        diagnostics
+                            .current_tool_schemas
+                            .iter()
+                            .find(|tool| tool.index == index)
+                    });
+                    let rejected_tool_index = rejected_tool_index
+                        .map(|index| index.to_string())
+                        .unwrap_or_default();
+                    let rejected_tool_name =
+                        rejected_tool.map(|tool| tool.name.as_str()).unwrap_or("");
+                    let rejected_tool_root_type = rejected_tool
+                        .map(|tool| tool.root_type.as_str())
+                        .unwrap_or("");
                     tracing::warn!(
                         request_id = %request_id,
                         api_type,
@@ -3485,6 +3614,10 @@ impl KiroProvider {
                         kiro_current_image_count = diagnostics.current_image_count,
                         kiro_current_document_count = diagnostics.current_document_count,
                         kiro_current_tool_count = diagnostics.current_tool_count,
+                        kiro_tool_error_index = %rejected_tool_index,
+                        kiro_tool_error_name = %rejected_tool_name,
+                        kiro_tool_error_root_type = %rejected_tool_root_type,
+                        kiro_current_tool_schemas = ?diagnostics.current_tool_schemas,
                         kiro_current_tool_result_count = diagnostics.current_tool_result_count,
                         kiro_current_tool_result_error_count = diagnostics.current_tool_result_error_count,
                         kiro_history_count = diagnostics.history_count,
@@ -3499,6 +3632,9 @@ impl KiroProvider {
                         "API 请求失败（上游 400 诊断摘要）"
                     );
                 } else {
+                    let rejected_tool_index = Self::rejected_tool_index_from_error_body(&body)
+                        .map(|index| index.to_string())
+                        .unwrap_or_default();
                     tracing::warn!(
                         request_id = %request_id,
                         api_type,
@@ -3511,6 +3647,7 @@ impl KiroProvider {
                         request_body_bytes,
                         status_code = status.as_u16(),
                         error_summary = %error_summary,
+                        kiro_tool_error_index = %rejected_tool_index,
                         total_elapsed_ms = overall_started_at.elapsed().as_millis(),
                         "API 请求失败（上游 400，诊断摘要解析失败）"
                     );
@@ -4307,7 +4444,12 @@ mod tests {
                     "images":[{"format":"png","source":{"bytes":"AA=="}}],
                     "documents":[{"name":"Current","format":"pdf","source":{"bytes":"AA=="}}],
                     "userInputMessageContext":{
-                        "tools":[{"toolSpecification":{"name":"Read","description":"read","inputSchema":{"json":{"type":"object"}}}}],
+                        "tools":[
+                            {"toolSpecification":{"name":"Read","description":"read","inputSchema":{"json":{"type":"object"}}}},
+                            {"toolSpecification":{"name":"BadScalar","description":"bad","inputSchema":{"json":{"type":"string"}}}},
+                            {"toolSpecification":{"name":"Nullable","description":"nullable","inputSchema":{"json":{"type":["object","null"]}}}},
+                            {"toolSpecification":{"name":"MissingType","description":"missing","inputSchema":{"json":{"properties":{}}}}}
+                        ],
                         "toolResults":[
                             {"toolUseId":"toolu_1","content":[{"text":"hidden"}],"status":"success"},
                             {"toolUseId":"toolu_2","content":[{"text":"hidden"}],"status":"error","isError":true}
@@ -4341,7 +4483,32 @@ mod tests {
         );
         assert_eq!(diagnostics.current_image_count, 1);
         assert_eq!(diagnostics.current_document_count, 1);
-        assert_eq!(diagnostics.current_tool_count, 1);
+        assert_eq!(diagnostics.current_tool_count, 4);
+        assert_eq!(
+            diagnostics.current_tool_schemas,
+            vec![
+                KiroToolSchemaDiagnostics {
+                    index: 0,
+                    name: "Read".to_string(),
+                    root_type: "object".to_string(),
+                },
+                KiroToolSchemaDiagnostics {
+                    index: 1,
+                    name: "BadScalar".to_string(),
+                    root_type: "string".to_string(),
+                },
+                KiroToolSchemaDiagnostics {
+                    index: 2,
+                    name: "Nullable".to_string(),
+                    root_type: "[object,null]".to_string(),
+                },
+                KiroToolSchemaDiagnostics {
+                    index: 3,
+                    name: "MissingType".to_string(),
+                    root_type: "<missing>".to_string(),
+                },
+            ]
+        );
         assert_eq!(diagnostics.current_tool_result_count, 2);
         assert_eq!(diagnostics.current_tool_result_error_count, 1);
         assert_eq!(diagnostics.history_count, 3);
@@ -4358,6 +4525,28 @@ mod tests {
                 "assistant".to_string(),
                 "unknown".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn test_rejected_tool_index_from_error_body_detects_bedrock_paths() {
+        assert_eq!(
+            KiroProvider::rejected_tool_index_from_error_body(
+                r#"{"reason":"TOOL_SCHEMA_INVALID","message":"Bedrock error message: The value at toolConfig.tools.20.toolSpec.inputSchema.json.type must be one of the following: object."}"#
+            ),
+            Some(20)
+        );
+        assert_eq!(
+            KiroProvider::rejected_tool_index_from_error_body(
+                r#"{"reason":"TOOL_SCHEMA_INVALID","message":"tools.0.custom.input_schema: JSON schema is invalid."}"#
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            KiroProvider::rejected_tool_index_from_error_body(
+                r#"{"reason":"TOOL_SCHEMA_INVALID","message":"tool schema is invalid"}"#
+            ),
+            None
         );
     }
 

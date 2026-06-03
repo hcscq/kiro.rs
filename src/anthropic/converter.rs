@@ -47,12 +47,13 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     };
 
     normalize_schema_object_for_kiro(&mut obj);
+    normalize_root_tool_schema_for_kiro(&mut obj);
 
-    // type（必须是字符串）
+    // type（Bedrock/Kiro 要求工具 inputSchema 根节点必须是 object）
     if !obj
         .get("type")
         .and_then(|v| v.as_str())
-        .is_some_and(|s| !s.is_empty())
+        .is_some_and(|s| s == "object")
     {
         obj.insert(
             "type".to_string(),
@@ -94,6 +95,107 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     }
 
     serde_json::Value::Object(obj)
+}
+
+fn normalize_root_tool_schema_for_kiro(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    let raw_type = obj.remove("type");
+    let accepts_object = schema_type_accepts_object(raw_type.as_ref());
+    let nullable = schema_type_accepts_null(raw_type.as_ref());
+
+    obj.insert(
+        "type".to_string(),
+        serde_json::Value::String("object".to_string()),
+    );
+
+    if !accepts_object {
+        if let Some(type_hint) = schema_type_description(raw_type.as_ref()) {
+            add_schema_description_hint(
+                obj,
+                &format!(
+                    "Original root schema type {type_hint} was simplified to object for tool compatibility."
+                ),
+            );
+        }
+        if !obj.get("properties").is_some_and(|value| value.is_object()) {
+            strip_non_object_root_schema_keywords(obj);
+        }
+    } else if raw_type.as_ref().is_some_and(
+        |value| !matches!(value, serde_json::Value::String(type_name) if type_name == "object"),
+    ) {
+        add_schema_description_hint(
+            obj,
+            "Original root schema accepted object plus other types; simplified to object for tool compatibility.",
+        );
+    }
+
+    if nullable {
+        add_schema_description_hint(obj, "Nullable: null is also accepted.");
+    }
+}
+
+fn schema_type_accepts_object(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        None => true,
+        Some(serde_json::Value::String(type_name)) => type_name == "object",
+        Some(serde_json::Value::Array(type_names)) => type_names
+            .iter()
+            .any(|type_name| type_name.as_str() == Some("object")),
+        _ => false,
+    }
+}
+
+fn schema_type_accepts_null(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        Some(serde_json::Value::String(type_name)) => type_name == "null",
+        Some(serde_json::Value::Array(type_names)) => type_names
+            .iter()
+            .any(|type_name| type_name.as_str() == Some("null")),
+        _ => false,
+    }
+}
+
+fn schema_type_description(value: Option<&serde_json::Value>) -> Option<String> {
+    match value {
+        Some(serde_json::Value::String(type_name)) if !type_name.trim().is_empty() => {
+            Some(format!("\"{}\"", type_name.trim()))
+        }
+        Some(serde_json::Value::Array(type_names)) => {
+            let joined = type_names
+                .iter()
+                .filter_map(|type_name| type_name.as_str())
+                .filter(|type_name| !type_name.trim().is_empty())
+                .map(|type_name| format!("\"{}\"", type_name.trim()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            (!joined.is_empty()).then_some(format!("[{joined}]"))
+        }
+        _ => None,
+    }
+}
+
+fn strip_non_object_root_schema_keywords(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    for key in [
+        "enum",
+        "const",
+        "format",
+        "pattern",
+        "minLength",
+        "maxLength",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "items",
+        "prefixItems",
+        "contains",
+        "minItems",
+        "maxItems",
+        "uniqueItems",
+        "required",
+    ] {
+        obj.remove(key);
+    }
 }
 
 fn normalize_schema_value_for_kiro(value: &mut serde_json::Value) {
@@ -4601,6 +4703,138 @@ mod tests {
         );
         assert!(
             status
+                .get("description")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| value.contains("Nullable"))
+        );
+    }
+
+    #[test]
+    fn test_convert_tools_coerces_scalar_root_schema_to_object() {
+        let tools = Some(vec![super::super::types::Tool {
+            tool_type: None,
+            name: "ScalarRootTool".to_string(),
+            description: "Tool with invalid scalar root schema".to_string(),
+            input_schema: HashMap::from([
+                ("type".to_string(), serde_json::json!("string")),
+                ("enum".to_string(), serde_json::json!(["fast", "slow"])),
+            ]),
+            max_uses: None,
+            ..super::super::types::Tool::default()
+        }]);
+
+        let converted = convert_tools(&tools, &mut HashMap::new());
+
+        let schema = &converted[0].tool_specification.input_schema.json;
+        assert_eq!(
+            schema.get("type").and_then(|value| value.as_str()),
+            Some("object"),
+            "root tool schema must be object for Kiro/Bedrock: {schema}"
+        );
+        assert_eq!(
+            schema
+                .get("properties")
+                .and_then(|value| value.as_object())
+                .map(|properties| properties.len()),
+            Some(0)
+        );
+        assert!(schema.get("enum").is_none(), "scalar enum must be removed");
+        assert!(
+            schema
+                .get("description")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| value.contains("Original root schema type \"string\""))
+        );
+        assert!(
+            jsonschema::validator_for(schema).is_ok(),
+            "normalized schema should remain locally valid: {schema}"
+        );
+    }
+
+    #[test]
+    fn test_convert_tools_coerces_scalar_root_union_schema_to_object() {
+        let tools = Some(vec![super::super::types::Tool {
+            tool_type: None,
+            name: "ScalarUnionRootTool".to_string(),
+            description: "Tool with scalar anyOf root schema".to_string(),
+            input_schema: HashMap::from([(
+                "anyOf".to_string(),
+                serde_json::json!([
+                    {"type": "string", "enum": ["pending", "done"]},
+                    {"type": "null"}
+                ]),
+            )]),
+            max_uses: None,
+            ..super::super::types::Tool::default()
+        }]);
+
+        let converted = convert_tools(&tools, &mut HashMap::new());
+
+        let schema = &converted[0].tool_specification.input_schema.json;
+        assert!(
+            !schema_contains_key(schema, "anyOf"),
+            "normalized schema must not retain anyOf: {schema}"
+        );
+        assert_eq!(
+            schema.get("type").and_then(|value| value.as_str()),
+            Some("object"),
+            "root tool schema must be object for Kiro/Bedrock: {schema}"
+        );
+        assert!(schema.get("enum").is_none(), "scalar enum must be removed");
+        assert!(
+            schema
+                .get("description")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| {
+                    value.contains("Original root schema type \"string\"")
+                        && value.contains("Nullable")
+                })
+        );
+    }
+
+    #[test]
+    fn test_convert_tools_preserves_nullable_object_root_type_array() {
+        let tools = Some(vec![super::super::types::Tool {
+            tool_type: None,
+            name: "NullableObjectRootTool".to_string(),
+            description: "Tool with nullable object root schema".to_string(),
+            input_schema: HashMap::from([
+                ("type".to_string(), serde_json::json!(["object", "null"])),
+                (
+                    "properties".to_string(),
+                    serde_json::json!({
+                        "path": {"type": "string"}
+                    }),
+                ),
+                ("required".to_string(), serde_json::json!(["path"])),
+            ]),
+            max_uses: None,
+            ..super::super::types::Tool::default()
+        }]);
+
+        let converted = convert_tools(&tools, &mut HashMap::new());
+
+        let schema = &converted[0].tool_specification.input_schema.json;
+        assert_eq!(
+            schema.get("type").and_then(|value| value.as_str()),
+            Some("object")
+        );
+        assert_eq!(
+            schema
+                .pointer("/properties/path/type")
+                .and_then(|value| value.as_str()),
+            Some("string")
+        );
+        assert_eq!(
+            schema
+                .get("required")
+                .and_then(|value| value.as_array())
+                .and_then(|values| values.first())
+                .and_then(|value| value.as_str()),
+            Some("path")
+        );
+        assert!(
+            schema
                 .get("description")
                 .and_then(|value| value.as_str())
                 .is_some_and(|value| value.contains("Nullable"))
