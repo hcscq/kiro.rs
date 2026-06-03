@@ -1237,9 +1237,11 @@ pub async fn post_messages(
 
     // 检查是否启用了thinking
     let thinking_enabled = request_thinking_enabled(&payload);
-    let synthesize_hidden_thinking_signature = thinking_enabled
-        && provider.response_thinking_signature_compat_enabled()
-        && should_synthesize_hidden_thinking_signature_for_request(&payload);
+    let synthesize_hidden_thinking_signature =
+        should_synthesize_hidden_thinking_signature_for_request(
+            &payload,
+            provider.response_thinking_signature_compat_enabled(),
+        );
     let request_weighting = provider.request_weighting_config();
 
     // 调度使用本地估算，返回给下游的 usage 使用远端计数优先。
@@ -2353,75 +2355,11 @@ fn request_thinking_enabled(payload: &MessagesRequest) -> bool {
         || system_contains_thinking_tags(payload.system.as_ref())
 }
 
-fn should_synthesize_hidden_thinking_signature_for_request(payload: &MessagesRequest) -> bool {
-    let mut text = String::new();
-    for message in &payload.messages {
-        if message.role.eq_ignore_ascii_case("user") {
-            append_message_content_text(&message.content, &mut text);
-            text.push('\n');
-        }
-    }
-
-    let normalized = text.to_lowercase();
-    if normalized.trim().is_empty() {
-        return false;
-    }
-
-    if looks_like_direct_literal_or_identity_probe(&normalized)
-        || looks_like_multimodal_exact_text_probe(&normalized)
-    {
-        return false;
-    }
-
-    looks_like_reasoning_hidden_thinking_probe(&normalized)
-}
-
-fn append_message_content_text(content: &serde_json::Value, out: &mut String) {
-    if let Some(text) = content.as_str() {
-        out.push_str(text);
-        return;
-    }
-
-    let Some(blocks) = content.as_array() else {
-        return;
-    };
-    for block in blocks {
-        let Some(block_type) = block.get("type").and_then(|value| value.as_str()) else {
-            continue;
-        };
-        if block_type == "text" {
-            if let Some(text) = block.get("text").and_then(|value| value.as_str()) {
-                out.push_str(text);
-                out.push('\n');
-            }
-        }
-    }
-}
-
-fn looks_like_direct_literal_or_identity_probe(text: &str) -> bool {
-    (text.contains("tag") && text.contains("<antml:") && text.contains("不要使用任何工具"))
-        || (text.contains("tag")
-            && text.contains("<antml:")
-            && text.contains("do not use any tool"))
-        || text.contains("<identity>")
-        || text.contains("你是谁")
-        || text.contains("模型id")
-        || text.contains("underlying model")
-}
-
-fn looks_like_multimodal_exact_text_probe(text: &str) -> bool {
-    text.contains("reply with only the text")
-        || text.contains("reply with only the exact text")
-        || text.contains("what does the text in the picture say")
-        || text.contains("what text does this pdf contain")
-}
-
-fn looks_like_reasoning_hidden_thinking_probe(text: &str) -> bool {
-    (text.contains("逻辑网格题")
-        || text.contains("五座颜色不同的房子")
-        || text.contains("挪威人住第一座房子")
-        || text.contains("谁养鱼"))
-        && (text.contains("推理") || text.contains("完整推理") || text.contains("最终表格"))
+fn should_synthesize_hidden_thinking_signature_for_request(
+    payload: &MessagesRequest,
+    response_thinking_signature_compat_enabled: bool,
+) -> bool {
+    response_thinking_signature_compat_enabled && request_thinking_enabled(payload)
 }
 
 /// POST /v1/messages/count_tokens
@@ -2731,9 +2669,11 @@ pub async fn post_messages_cc(
 
     // 检查是否启用了thinking
     let thinking_enabled = request_thinking_enabled(&payload);
-    let synthesize_hidden_thinking_signature = thinking_enabled
-        && provider.response_thinking_signature_compat_enabled()
-        && should_synthesize_hidden_thinking_signature_for_request(&payload);
+    let synthesize_hidden_thinking_signature =
+        should_synthesize_hidden_thinking_signature_for_request(
+            &payload,
+            provider.response_thinking_signature_compat_enabled(),
+        );
     let request_weighting = provider.request_weighting_config();
 
     // 调度使用本地估算，返回给下游的 usage 使用远端计数优先。
@@ -3326,25 +3266,23 @@ mod tests {
     }
 
     #[test]
-    fn test_hidden_thinking_signature_synthesis_allows_logic_probe() {
+    fn test_hidden_thinking_signature_synthesis_allows_generic_thinking_request() {
         let mut payload = base_request("claude-opus-4-7");
         payload.thinking = Some(Thinking {
             thinking_type: "adaptive".to_string(),
             display: None,
             budget_tokens: 20000,
         });
-        payload.messages[0].content = serde_json::Value::String(
-            "请逐步推理求解以下逻辑网格题，并写出完整推理过程：五座颜色不同的房子并排。挪威人住第一座房子。谁养鱼？"
-                .to_string(),
-        );
+        payload.messages[0].content =
+            serde_json::Value::String("请用两步解释为什么天空看起来是蓝色。".to_string());
 
         assert!(should_synthesize_hidden_thinking_signature_for_request(
-            &payload
+            &payload, true
         ));
     }
 
     #[test]
-    fn test_hidden_thinking_signature_synthesis_skips_literal_tag_probe() {
+    fn test_hidden_thinking_signature_synthesis_does_not_filter_by_prompt_text() {
         let mut payload = base_request("claude-opus-4-7");
         payload.thinking = Some(Thinking {
             thinking_type: "adaptive".to_string(),
@@ -3356,26 +3294,31 @@ mod tests {
                 .to_string(),
         );
 
-        assert!(!should_synthesize_hidden_thinking_signature_for_request(
-            &payload
+        assert!(should_synthesize_hidden_thinking_signature_for_request(
+            &payload, true
         ));
     }
 
     #[test]
-    fn test_hidden_thinking_signature_synthesis_skips_multimodal_exact_text_probe() {
+    fn test_hidden_thinking_signature_synthesis_respects_compat_switch() {
         let mut payload = base_request("claude-opus-4-7");
         payload.thinking = Some(Thinking {
             thinking_type: "adaptive".to_string(),
             display: None,
             budget_tokens: 20000,
         });
-        payload.messages[0].content = serde_json::json!([
-            {"type":"text","text":"What does the text in the picture say? Reply with ONLY the text, nothing else."},
-            {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}}
-        ]);
 
         assert!(!should_synthesize_hidden_thinking_signature_for_request(
-            &payload
+            &payload, false
+        ));
+    }
+
+    #[test]
+    fn test_hidden_thinking_signature_synthesis_skips_when_thinking_disabled() {
+        let payload = base_request("claude-opus-4-7");
+
+        assert!(!should_synthesize_hidden_thinking_signature_for_request(
+            &payload, true
         ));
     }
 
