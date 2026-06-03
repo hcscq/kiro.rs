@@ -493,6 +493,8 @@ pub struct StreamContext {
     strip_thinking_leading_newline: bool,
     /// 已发送给客户端的 thinking 内容，用于生成不透明 signature
     thinking_signature_source: String,
+    /// 当前 assistant message 中已签发的 thinking block 序号
+    thinking_ordinal: u32,
     /// 是否在上游未返回 thinking 内容时补齐隐藏 synthetic thinking signature
     synthesize_hidden_thinking_signature: bool,
     /// 是否已经补齐过隐藏 synthetic thinking block
@@ -524,6 +526,7 @@ impl StreamContext {
             text_block_index: None,
             strip_thinking_leading_newline: false,
             thinking_signature_source: String::new(),
+            thinking_ordinal: 0,
             synthesize_hidden_thinking_signature: false,
             synthetic_hidden_thinking_emitted: false,
         }
@@ -829,11 +832,12 @@ impl StreamContext {
         events.extend(start_events);
 
         let signature = sign_synthetic_hidden_thinking_block(
-            0,
+            self.thinking_ordinal,
             "",
             &self.model,
             &self.synthetic_hidden_signature_seed(),
         );
+        self.thinking_ordinal = self.thinking_ordinal.saturating_add(1);
         if let Some(signature_event) =
             self.create_signature_delta_event_with_signature(thinking_index, signature)
         {
@@ -938,12 +942,13 @@ impl StreamContext {
     }
 
     /// 创建 signature_delta 事件
-    fn create_signature_delta_event(&self, index: i32) -> Option<SseEvent> {
+    fn create_signature_delta_event(&mut self, index: i32) -> Option<SseEvent> {
         let thinking = canonicalize_thinking_for_signature(&self.thinking_signature_source);
         if thinking.is_empty() {
             return None;
         }
-        let signature = sign_thinking_block(0, thinking);
+        let signature = sign_thinking_block(self.thinking_ordinal, thinking, &self.model);
+        self.thinking_ordinal = self.thinking_ordinal.saturating_add(1);
         self.create_signature_delta_event_with_signature(index, signature)
     }
 
@@ -1330,6 +1335,7 @@ mod tests {
     use super::*;
     use crate::anthropic::thinking_compat::validate_thinking_signatures;
     use crate::anthropic::types::{Message, MessagesRequest};
+    use base64::Engine;
 
     #[test]
     fn test_sse_event_format() {
@@ -2112,9 +2118,16 @@ mod tests {
         assert_eq!(collect_thinking_content(&all), "abc");
         let signature =
             collect_first_signature(&all).expect("real thinking signature should exist");
-        assert!(
-            signature.len() < 200,
-            "real thinking should keep compact native signature"
+        // After protobuf wrapping, real thinking signatures also use standard protobuf shape
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(&signature)
+            .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(&signature))
+            .expect("signature should decode");
+        assert_eq!(raw[0], 0x12, "should start with protobuf tag 2");
+        assert_eq!(
+            &raw[raw.len() - 2..],
+            &[0x18, 0x01],
+            "should end with protobuf trailer"
         );
         let req = request_with_stream_thinking("abc".to_string(), signature);
         validate_thinking_signatures(&req).expect("real thinking signature should validate");

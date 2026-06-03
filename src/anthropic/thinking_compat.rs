@@ -30,11 +30,10 @@ const STANDARD_SHAPED_SYNTHETIC_HEADER_RANDOM_LEN: usize = 64;
 const STANDARD_SHAPED_SYNTHETIC_FIELD2_LEN: usize = 12;
 const STANDARD_SHAPED_SYNTHETIC_FIELD3_LEN: usize = 12;
 const STANDARD_SHAPED_SYNTHETIC_FIELD4_LEN: usize = 48;
-const STANDARD_SHAPED_SYNTHETIC_FIELD5_VALUE_OFFSET: usize = 185;
-const STANDARD_SHAPED_SYNTHETIC_SELF_OFFSET: usize =
-    STANDARD_SHAPED_SYNTHETIC_FIELD5_VALUE_OFFSET + STANDARD_SHAPED_SYNTHETIC_HEADER_RANDOM_LEN;
-const STANDARD_SHAPED_SYNTHETIC_SIGNATURE_PREFIX: [u8; 8] =
-    [0x0a, 0x63, 0x08, 0x0e, 0x18, 0x02, 0x2a, 0x40];
+/// The first 6 bytes of the protobuf header content (after field1 tag and length varint).
+/// Used to identify standard-shaped synthetic signatures regardless of header length.
+const STANDARD_SHAPED_SYNTHETIC_HEADER_CONTENT_PREFIX: [u8; 6] =
+    [0x08, 0x0e, 0x18, 0x02, 0x2a, 0x40];
 
 static SIGNING_KEY: OnceLock<[u8; 32]> = OnceLock::new();
 static VALIDATION_KEYS: OnceLock<Vec<[u8; 32]>> = OnceLock::new();
@@ -170,8 +169,12 @@ pub(crate) fn init_thinking_signature_key(api_key: &str) {
     let validation_keys =
         validation_keys_for_material(material.as_bytes(), explicit.as_ref().map(|_| api_key));
     let key = validation_keys[0];
-    let _ = SIGNING_KEY.set(key);
-    let _ = VALIDATION_KEYS.set(validation_keys);
+    // Only set VALIDATION_KEYS when SIGNING_KEY is also set by this caller,
+    // to avoid a mismatch where signing uses one key (from lazy init) but
+    // validation uses a different key (from a concurrent init_thinking_signature_key call).
+    if SIGNING_KEY.set(key).is_ok() {
+        let _ = VALIDATION_KEYS.set(validation_keys);
+    }
 }
 
 /// 签发 Anthropic 风格的不透明 thinking signature。
@@ -179,23 +182,13 @@ pub(crate) fn init_thinking_signature_key(api_key: &str) {
 /// `thinking_ordinal` 是同一 assistant message 中第几个 thinking block，而不是
 /// SSE content block index；这样 agentgear 只要不改 thinking block 本身，就不会
 /// 因为其他兼容性注入而破坏校验。
-pub(crate) fn sign_thinking_block(thinking_ordinal: u32, thinking: &str) -> String {
-    let key = signing_key();
-    let issuer = issuer_tag(&key);
-    let thinking = canonicalize_thinking_for_signature(thinking);
-    let thinking_hash = sha256_bytes(thinking.as_bytes());
-
-    let mut body = Vec::with_capacity(1 + ISSUER_TAG_LEN + 4 + HASH_LEN);
-    body.push(SIGNATURE_VERSION);
-    body.extend_from_slice(&issuer);
-    body.extend_from_slice(&thinking_ordinal.to_be_bytes());
-    body.extend_from_slice(&thinking_hash);
-
-    let mac = signature_mac(&key, &body);
-    let mut raw = body;
-    raw.extend_from_slice(&mac);
-
-    STANDARD_NO_PAD.encode(raw)
+pub(crate) fn sign_thinking_block(thinking_ordinal: u32, thinking: &str, model: &str) -> String {
+    let canonical = canonicalize_thinking_for_signature(thinking);
+    let thinking_hash = sha256_bytes(canonical.as_bytes());
+    let mut nonce_material = Vec::with_capacity(HASH_LEN + 4);
+    nonce_material.extend_from_slice(&thinking_hash);
+    nonce_material.extend_from_slice(&thinking_ordinal.to_be_bytes());
+    sign_synthetic_hidden_thinking_block(thinking_ordinal, thinking, model, &nonce_material)
 }
 
 /// 签发用于隐藏 synthetic thinking block 的动态 Claude-shaped signature。
@@ -217,10 +210,18 @@ pub(crate) fn sign_synthetic_hidden_thinking_block(
     let nonce = synthetic_signature_nonce(nonce_material);
     let raw_len = standard_shaped_synthetic_signature_raw_len(model);
     let outer_payload_len = raw_len - STANDARD_SHAPED_SYNTHETIC_OUTER_OVERHEAD_LEN;
-    let field5_len = outer_payload_len - 182;
+
+    let header = standard_shaped_synthetic_header(&key, model, &nonce);
+    // field5_len is derived from actual header length so models with longer names
+    // (e.g. claude-sonnet-4-6) produce correct layout without fixed-size assumptions.
+    let fields_1_to_4_len = (header.len() + 2)
+        + (STANDARD_SHAPED_SYNTHETIC_FIELD2_LEN + 2)
+        + (STANDARD_SHAPED_SYNTHETIC_FIELD3_LEN + 2)
+        + (STANDARD_SHAPED_SYNTHETIC_FIELD4_LEN + 2);
+    // field5 tag (1 byte) + varint(field5_len) (2 bytes for values > 127)
+    let field5_len = outer_payload_len - fields_1_to_4_len - 3;
 
     let mut inner = Vec::with_capacity(outer_payload_len);
-    let header = standard_shaped_synthetic_header(&key, model, &nonce);
     push_protobuf_len_field(&mut inner, 1, &header);
     push_protobuf_len_field(
         &mut inner,
@@ -427,7 +428,14 @@ fn classify_signature(signature: &str, thinking_ordinal: u32, thinking: &str) ->
     }
 
     if is_standard_shaped_synthetic_signature(&raw) {
-        let issuer_start = STANDARD_SHAPED_SYNTHETIC_SELF_OFFSET;
+        // Read header length from raw[4] (single-byte varint, always < 128)
+        let header_len = raw[4] as usize;
+        // self_offset = 3 (outer prefix) + 2 (field1 tag+len) + header_len
+        //             + 14 (field2) + 14 (field3) + 50 (field4)
+        //             + 3 (field5 tag + 2-byte varint)
+        //             + 64 (field5 random prefix)
+        let self_offset = 150 + header_len;
+        let issuer_start = self_offset;
         let mac_start = issuer_start + ISSUER_TAG_LEN + 4 + HASH_LEN;
         return classify_own_signature(
             signature,
@@ -461,7 +469,8 @@ fn is_standard_shaped_synthetic_signature(raw: &[u8]) -> bool {
     raw.len() > 11
         && raw[0] == 0x12
         && raw[raw.len() - 2..] == [0x18, 0x01]
-        && raw[3..11] == STANDARD_SHAPED_SYNTHETIC_SIGNATURE_PREFIX
+        && raw[3] == 0x0a
+        && raw[5..11] == STANDARD_SHAPED_SYNTHETIC_HEADER_CONTENT_PREFIX
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -669,7 +678,7 @@ fn standard_shaped_synthetic_header(
     nonce: &[u8; HASH_LEN],
 ) -> Vec<u8> {
     let synthetic_model = synthetic_signature_model_id(model);
-    let mut header = Vec::with_capacity(99);
+    let mut header = Vec::with_capacity(110);
     header.extend_from_slice(&[0x08, 0x0e, 0x18, 0x02, 0x2a, 0x40]);
     header.extend_from_slice(&synthetic_signature_chunk(
         key,
@@ -680,7 +689,6 @@ fn standard_shaped_synthetic_header(
     push_protobuf_len_field(&mut header, 6, synthetic_model.as_bytes());
     header.extend_from_slice(&[0x38, 0x00]);
     push_protobuf_len_field(&mut header, 8, b"thinking");
-    debug_assert_eq!(header.len(), 99);
     header
 }
 
@@ -688,6 +696,14 @@ fn synthetic_signature_model_id(model: &str) -> &'static str {
     let lower = model.to_ascii_lowercase();
     if lower.contains("claude-opus-4.8") || lower.contains("claude-opus-4-8") {
         "claude-opus-4-8"
+    } else if lower.contains("claude-opus-4.7") || lower.contains("claude-opus-4-7") {
+        "claude-opus-4-7"
+    } else if lower.contains("claude-sonnet-4.6") || lower.contains("claude-sonnet-4-6") {
+        "claude-sonnet-4-6"
+    } else if lower.contains("claude-sonnet-4.5") || lower.contains("claude-sonnet-4-5") {
+        "claude-sonnet-4-5"
+    } else if lower.contains("claude-haiku-3.5") || lower.contains("claude-haiku-3-5") {
+        "claude-haiku-3-5"
     } else {
         "claude-opus-4-7"
     }
@@ -821,8 +837,8 @@ pub(crate) fn canonicalize_thinking_for_signature(thinking: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        HASH_LEN, HMAC_LEN, ISSUER_TAG_LEN, SIGNATURE_RAW_LEN, SIGNATURE_VERSION, STANDARD_NO_PAD,
-        STANDARD_SHAPED_SYNTHETIC_SIGNATURE_PREFIX,
+        HASH_LEN, HMAC_LEN, ISSUER_TAG_LEN, SIGNATURE_VERSION, STANDARD_NO_PAD,
+        STANDARD_SHAPED_SYNTHETIC_HEADER_CONTENT_PREFIX,
         STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_OPUS_4_7,
         STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_OPUS_4_8, SignatureClass,
         ThinkingSignatureInvalidReason, classify_signature, decode_signature,
@@ -893,20 +909,32 @@ mod tests {
     ) -> Vec<u8> {
         let raw = decode_signature(signature).expect("signature should decode");
         assert_eq!(raw.len(), expected_raw_len);
-        assert_eq!(raw[3..11], STANDARD_SHAPED_SYNTHETIC_SIGNATURE_PREFIX);
-        assert_eq!(&raw[77..92], model);
-        assert_eq!(&raw[96..104], b"thinking");
+        assert_eq!(raw[3], 0x0a, "field 1 tag");
+        assert_eq!(raw[5..11], STANDARD_SHAPED_SYNTHETIC_HEADER_CONTENT_PREFIX);
+        // model at offset 77 (after outer prefix + field1 tag/len + header prefix + random + field6 tag/len)
+        assert_eq!(&raw[77..77 + model.len()], model);
+        // "thinking" follows: model + 0x38 0x00 + field8 tag + field8 len
+        let thinking_offset = 77 + model.len() + 2 + 1 + 1;
+        assert_eq!(&raw[thinking_offset..thinking_offset + 8], b"thinking");
         assert_eq!(&raw[raw.len() - 2..], &[0x18, 0x01]);
         raw
     }
 
     #[test]
     fn test_sign_thinking_block_is_opaque_and_verifiable() {
-        let signature = sign_thinking_block(0, "hello");
+        let signature = sign_thinking_block(0, "hello", "claude-sonnet-4-6-thinking");
 
         assert!(!signature.contains('.'));
         assert!(!signature.to_lowercase().contains("kiro"));
         assert!(signature.len() >= 100);
+        // After protobuf wrapping, sign_thinking_block now produces standard-shaped signatures
+        let raw = decode_signature(&signature).expect("signature should decode");
+        assert_eq!(raw[0], 0x12, "should start with protobuf tag 2");
+        assert_eq!(
+            &raw[raw.len() - 2..],
+            &[0x18, 0x01],
+            "should end with protobuf trailer"
+        );
         assert_eq!(
             classify_signature(&signature, 0, "hello"),
             SignatureClass::ValidOwn
@@ -926,7 +954,7 @@ mod tests {
 
     #[test]
     fn test_sign_thinking_block_canonicalizes_boundary_newlines() {
-        let signature = sign_thinking_block(0, "\nstep 1\n");
+        let signature = sign_thinking_block(0, "\nstep 1\n", "claude-sonnet-4-6-thinking");
 
         assert_eq!(
             classify_signature(&signature, 0, "step 1"),
@@ -1018,7 +1046,7 @@ mod tests {
 
     #[test]
     fn test_validate_thinking_signatures_accepts_valid_own_signature() {
-        let signature = sign_thinking_block(0, "step 1");
+        let signature = sign_thinking_block(0, "step 1", "claude-sonnet-4-6-thinking");
         let req = request_with_assistant_content(serde_json::json!([
             {"type":"thinking","thinking":"step 1","signature": signature},
             {"type":"text","text":"done"}
@@ -1033,7 +1061,7 @@ mod tests {
 
     #[test]
     fn test_validate_thinking_signatures_rejects_tampered_own_signature() {
-        let signature = sign_thinking_block(0, "step 1");
+        let signature = sign_thinking_block(0, "step 1", "claude-sonnet-4-6-thinking");
         let req = request_with_assistant_content(serde_json::json!([
             {"type":"thinking","thinking":"changed","signature": signature}
         ]));
@@ -1050,7 +1078,10 @@ mod tests {
         assert_eq!(diagnostic.thinking_ordinal, 0);
         assert_eq!(diagnostic.signed_ordinal, 0);
         assert_eq!(diagnostic.canonical_thinking_len, "changed".len());
-        assert_eq!(diagnostic.raw_signature_len, SIGNATURE_RAW_LEN);
+        assert_eq!(
+            diagnostic.raw_signature_len,
+            STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_OPUS_4_7
+        );
         assert!(!diagnostic.signature_sha256_prefix.is_empty());
         assert!(!diagnostic.signed_thinking_hash_prefix.is_empty());
         assert!(!diagnostic.computed_thinking_hash_prefix.is_empty());
@@ -1082,10 +1113,13 @@ mod tests {
 
     #[test]
     fn test_validate_thinking_signatures_rejects_tampered_signature_bytes() {
-        let signature = sign_thinking_block(0, "step 1");
+        let signature = sign_thinking_block(0, "step 1", "claude-sonnet-4-6-thinking");
         let mut raw = decode_signature(&signature).expect("signature should decode");
-        let last = raw.last_mut().expect("raw signature should not be empty");
-        *last ^= 0x01;
+        // Tamper a byte in the MAC region (not the protobuf trailer) so the signature
+        // is still recognized as standard-shaped but fails MAC validation.
+        let header_len = raw[4] as usize;
+        let mac_offset = 150 + header_len + ISSUER_TAG_LEN + 4 + HASH_LEN;
+        raw[mac_offset] ^= 0x01;
         let signature = STANDARD_NO_PAD.encode(raw);
         let req = request_with_assistant_content(serde_json::json!([
             {"type":"thinking","thinking":"step 1","signature": signature}
@@ -1101,7 +1135,7 @@ mod tests {
 
     #[test]
     fn test_inspect_thinking_signatures_counts_invalid_without_short_circuit() {
-        let signature = sign_thinking_block(0, "step 1");
+        let signature = sign_thinking_block(0, "step 1", "claude-sonnet-4-6-thinking");
         let req = request_with_assistant_content(serde_json::json!([
             {"type":"thinking","thinking":"changed","signature": signature},
             {"type":"thinking","thinking":"external","signature":"sig_1"},
@@ -1119,8 +1153,8 @@ mod tests {
 
     #[test]
     fn test_strip_invalid_own_thinking_signatures_removes_only_invalid_own_signature() {
-        let invalid_signature = sign_thinking_block(0, "step 1");
-        let valid_signature = sign_thinking_block(1, "ok");
+        let invalid_signature = sign_thinking_block(0, "step 1", "claude-sonnet-4-6-thinking");
+        let valid_signature = sign_thinking_block(1, "ok", "claude-sonnet-4-6-thinking");
         let foreign_signature = foreign_anthropic_shaped_signature(2, "external");
         let mut req = request_with_assistant_content(serde_json::json!([
             {"type":"thinking","thinking":"changed","signature": invalid_signature},

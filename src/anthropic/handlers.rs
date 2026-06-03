@@ -2225,7 +2225,7 @@ fn decode_non_stream_message(
 
     if !text_content.is_empty() {
         if let Some((thinking, remaining_text)) = extract_thinking_and_text(&text_content) {
-            let signature = sign_thinking_block(0, &thinking);
+            let signature = sign_thinking_block(0, &thinking, model);
             content.push(json!({
                 "type": "thinking",
                 "thinking": thinking,
@@ -3187,7 +3187,7 @@ mod tests {
 
     #[test]
     fn test_thinking_signature_validation_strict_rejects_invalid_own_signature() {
-        let signature = sign_thinking_block(0, "step 1");
+        let signature = sign_thinking_block(0, "step 1", "claude-sonnet-4-6-thinking");
         let mut payload = request_with_assistant_thinking("changed", signature);
 
         let response = validate_thinking_signature_payload(
@@ -3202,7 +3202,7 @@ mod tests {
 
     #[test]
     fn test_thinking_signature_validation_warn_only_continues_without_mutating_payload() {
-        let signature = sign_thinking_block(0, "step 1");
+        let signature = sign_thinking_block(0, "step 1", "claude-sonnet-4-6-thinking");
         let mut payload = request_with_assistant_thinking("changed", signature);
 
         let stats = validate_thinking_signature_payload(
@@ -3219,7 +3219,7 @@ mod tests {
 
     #[test]
     fn test_thinking_signature_validation_disabled_skips_invalid_own_signature() {
-        let signature = sign_thinking_block(0, "step 1");
+        let signature = sign_thinking_block(0, "step 1", "claude-sonnet-4-6-thinking");
         let mut payload = request_with_assistant_thinking("changed", signature);
 
         let stats = validate_thinking_signature_payload(
@@ -3236,7 +3236,7 @@ mod tests {
 
     #[test]
     fn test_thinking_signature_validation_strip_invalid_removes_signature_and_continues() {
-        let signature = sign_thinking_block(0, "step 1");
+        let signature = sign_thinking_block(0, "step 1", "claude-sonnet-4-6-thinking");
         let mut payload = request_with_assistant_thinking("changed", signature);
 
         let stats = validate_thinking_signature_payload(
