@@ -19,6 +19,8 @@ const ISSUER_TAG_LEN: usize = 16;
 const HMAC_LEN: usize = 32;
 const HASH_LEN: usize = 32;
 const SIGNATURE_RAW_LEN: usize = 1 + ISSUER_TAG_LEN + 4 + HASH_LEN + HMAC_LEN;
+const STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_OPUS_4_8_MIN: usize = 775;
+const STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_OPUS_4_8_MAX: usize = 900;
 const STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_OPUS_4_8: usize = 563;
 const STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_OPUS_4_7: usize = 2463;
 const STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_LEGACY_OPUS_4_8_LONG: usize = 2540;
@@ -208,7 +210,7 @@ pub(crate) fn sign_synthetic_hidden_thinking_block(
     let thinking = canonicalize_thinking_for_signature(thinking);
     let thinking_hash = sha256_bytes(thinking.as_bytes());
     let nonce = synthetic_signature_nonce(nonce_material);
-    let raw_len = standard_shaped_synthetic_signature_raw_len(model);
+    let raw_len = standard_shaped_synthetic_signature_raw_len(model, &nonce);
     let outer_payload_len = raw_len - STANDARD_SHAPED_SYNTHETIC_OUTER_OVERHEAD_LEN;
 
     let header = standard_shaped_synthetic_header(&key, model, &nonce);
@@ -456,7 +458,8 @@ fn classify_signature(signature: &str, thinking_ordinal: u32, thinking: &str) ->
 }
 
 fn is_standard_shaped_synthetic_signature(raw: &[u8]) -> bool {
-    if raw.len() != STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_OPUS_4_8
+    if !standard_shaped_synthetic_signature_raw_len_allowed(raw.len())
+        && raw.len() != STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_OPUS_4_8
         && raw.len() != STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_OPUS_4_7
         && raw.len() != STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_LEGACY_OPUS_4_8_LONG
         && raw.len() != STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_LEGACY_CURRENT
@@ -664,12 +667,26 @@ fn signature_mac(key: &[u8; 32], body: &[u8]) -> [u8; HMAC_LEN] {
     hmac_sha256(key, &payload)
 }
 
-fn standard_shaped_synthetic_signature_raw_len(model: &str) -> usize {
+fn standard_shaped_synthetic_signature_raw_len(model: &str, nonce: &[u8; HASH_LEN]) -> usize {
     if synthetic_signature_model_id(model) == "claude-opus-4-8" {
-        STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_OPUS_4_8
+        standard_shaped_synthetic_signature_raw_len_opus_4_8(nonce)
     } else {
         STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_OPUS_4_7
     }
+}
+
+fn standard_shaped_synthetic_signature_raw_len_opus_4_8(nonce: &[u8; HASH_LEN]) -> usize {
+    let span = STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_OPUS_4_8_MAX
+        - STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_OPUS_4_8_MIN
+        + 1;
+    let seed = u16::from_be_bytes([nonce[0], nonce[1]]) as usize;
+    STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_OPUS_4_8_MIN + (seed % span)
+}
+
+fn standard_shaped_synthetic_signature_raw_len_allowed(raw_len: usize) -> bool {
+    (STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_OPUS_4_8_MIN
+        ..=STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_OPUS_4_8_MAX)
+        .contains(&raw_len)
 }
 
 fn standard_shaped_synthetic_header(
@@ -840,7 +857,8 @@ mod tests {
         HASH_LEN, HMAC_LEN, ISSUER_TAG_LEN, SIGNATURE_VERSION, STANDARD_NO_PAD,
         STANDARD_SHAPED_SYNTHETIC_HEADER_CONTENT_PREFIX,
         STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_OPUS_4_7,
-        STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_OPUS_4_8, SignatureClass,
+        STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_OPUS_4_8_MAX,
+        STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_OPUS_4_8_MIN, SignatureClass,
         ThinkingSignatureInvalidReason, classify_signature, decode_signature,
         extract_thinking_and_text, hmac_sha256, inspect_thinking_signatures, issuer_tag,
         sha256_bytes, sign_synthetic_hidden_thinking_block, sign_thinking_block, signature_mac,
@@ -909,6 +927,29 @@ mod tests {
     ) -> Vec<u8> {
         let raw = decode_signature(signature).expect("signature should decode");
         assert_eq!(raw.len(), expected_raw_len);
+        assert_standard_synthetic_signature_markers(&raw, model);
+        raw
+    }
+
+    fn assert_standard_synthetic_signature_shape_in_range(
+        signature: &str,
+        model: &[u8],
+        min_raw_len: usize,
+        max_raw_len: usize,
+    ) -> Vec<u8> {
+        let raw = decode_signature(signature).expect("signature should decode");
+        assert!(
+            (min_raw_len..=max_raw_len).contains(&raw.len()),
+            "raw signature length {} should be in {}..={}",
+            raw.len(),
+            min_raw_len,
+            max_raw_len
+        );
+        assert_standard_synthetic_signature_markers(&raw, model);
+        raw
+    }
+
+    fn assert_standard_synthetic_signature_markers(raw: &[u8], model: &[u8]) {
         assert_eq!(raw[3], 0x0a, "field 1 tag");
         assert_eq!(raw[5..11], STANDARD_SHAPED_SYNTHETIC_HEADER_CONTENT_PREFIX);
         // model at offset 77 (after outer prefix + field1 tag/len + header prefix + random + field6 tag/len)
@@ -917,7 +958,6 @@ mod tests {
         let thinking_offset = 77 + model.len() + 2 + 1 + 1;
         assert_eq!(&raw[thinking_offset..thinking_offset + 8], b"thinking");
         assert_eq!(&raw[raw.len() - 2..], &[0x18, 0x01]);
-        raw
     }
 
     #[test]
@@ -994,14 +1034,40 @@ mod tests {
     fn test_synthetic_hidden_thinking_block_uses_opus_4_8_model_when_requested() {
         let signature =
             sign_synthetic_hidden_thinking_block(0, "", "claude-opus-4.8", b"response-a");
-        assert_standard_synthetic_signature_shape(
+        assert_standard_synthetic_signature_shape_in_range(
             &signature,
             b"claude-opus-4-8",
-            STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_OPUS_4_8,
+            STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_OPUS_4_8_MIN,
+            STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_OPUS_4_8_MAX,
         );
         assert_eq!(
             classify_signature(&signature, 0, ""),
             SignatureClass::ValidOwn
+        );
+    }
+
+    #[test]
+    fn test_synthetic_hidden_thinking_block_opus_4_8_length_varies_in_standard_range() {
+        let mut lengths = std::collections::BTreeSet::new();
+        for i in 0..16 {
+            let signature = sign_synthetic_hidden_thinking_block(
+                0,
+                "",
+                "claude-opus-4-8",
+                format!("response-{i}").as_bytes(),
+            );
+            let raw = assert_standard_synthetic_signature_shape_in_range(
+                &signature,
+                b"claude-opus-4-8",
+                STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_OPUS_4_8_MIN,
+                STANDARD_SHAPED_SYNTHETIC_SIGNATURE_RAW_LEN_OPUS_4_8_MAX,
+            );
+            lengths.insert(raw.len());
+        }
+
+        assert!(
+            lengths.len() > 1,
+            "opus 4.8 synthetic signature length should not be fixed"
         );
     }
 

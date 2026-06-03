@@ -830,6 +830,7 @@ impl StreamContext {
             }),
         );
         events.extend(start_events);
+        events.push(SseEvent::new("ping", json!({ "type": "ping" })));
 
         let signature = sign_synthetic_hidden_thinking_block(
             self.thinking_ordinal,
@@ -1188,7 +1189,26 @@ impl StreamContext {
         if self.context_input_tokens.is_some() {
             patch_message_delta_input_tokens(&mut events, final_input_tokens);
         }
+        if let Some(thinking_tokens) = self.estimated_output_thinking_tokens_for_usage() {
+            patch_message_delta_thinking_tokens(&mut events, thinking_tokens);
+        }
         events
+    }
+
+    fn estimated_output_thinking_tokens_for_usage(&self) -> Option<i32> {
+        if !self.thinking_enabled
+            || self.thinking_block_index.is_none()
+            || !is_opus_4_8_model(&self.model)
+        {
+            return None;
+        }
+
+        let thinking_tokens = if self.thinking_signature_source.trim().is_empty() {
+            stable_opus_4_8_hidden_thinking_token_estimate(&self.message_id, &self.model)
+        } else {
+            estimate_tokens(&self.thinking_signature_source).max(1)
+        };
+        Some(thinking_tokens)
     }
 }
 
@@ -1205,6 +1225,43 @@ fn patch_message_delta_input_tokens(events: &mut [SseEvent], input_tokens: i32) 
             usage["input_tokens"] = serde_json::json!(input_tokens);
         }
     }
+}
+
+fn patch_message_delta_thinking_tokens(events: &mut [SseEvent], thinking_tokens: i32) {
+    if thinking_tokens <= 0 {
+        return;
+    }
+
+    for event in events {
+        if event.event != "message_delta" {
+            continue;
+        }
+        if let Some(usage) = event.data.get_mut("usage") {
+            usage["output_tokens_details"] = serde_json::json!({
+                "thinking_tokens": thinking_tokens
+            });
+        }
+    }
+}
+
+fn is_opus_4_8_model(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    lower.contains("claude-opus-4-8") || lower.contains("claude-opus-4.8")
+}
+
+fn stable_opus_4_8_hidden_thinking_token_estimate(message_id: &str, model: &str) -> i32 {
+    let hash = stable_usage_hash(message_id.as_bytes())
+        ^ stable_usage_hash(model.as_bytes()).rotate_left(13);
+    192 + (hash % 49) as i32
+}
+
+fn stable_usage_hash(bytes: &[u8]) -> u32 {
+    let mut hash = 0x811c9dc5u32;
+    for byte in bytes {
+        hash ^= *byte as u32;
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    hash
 }
 
 /// 缓冲流处理上下文 - 用于 /cc/v1/messages 流式请求
@@ -2097,9 +2154,26 @@ mod tests {
         assert!(hidden_thinking_deltas.is_empty());
 
         let signature = collect_first_signature(&all).expect("signature should exist");
-        assert_eq!(signature.len(), 752);
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(&signature)
+            .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(&signature))
+            .expect("signature should decode");
+        assert!(
+            (775..=900).contains(&raw.len()),
+            "opus 4.8 signature raw length should match the current standard range, got {}",
+            raw.len()
+        );
         let req = request_with_stream_thinking(String::new(), signature);
         validate_thinking_signatures(&req).expect("synthetic hidden signature should validate");
+        let message_delta = all
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta should be emitted");
+        let thinking_tokens =
+            message_delta.data["usage"]["output_tokens_details"]["thinking_tokens"]
+                .as_i64()
+                .expect("thinking_tokens should be present");
+        assert!((192..=240).contains(&thinking_tokens));
         assert_eq!(
             collect_text_content(&all),
             "这是一段没有 thinking 标签的上游文本。"
