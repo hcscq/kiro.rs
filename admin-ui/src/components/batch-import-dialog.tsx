@@ -206,7 +206,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           const authRegion = cred.authRegion?.trim() || region || undefined
           const apiRegion = cred.apiRegion?.trim() || region || undefined
           const startUrl = cred.startUrl?.trim() || undefined
-          const profileArn = enterprise ? undefined : cred.profileArn?.trim() || undefined
+          const profileArn = cred.profileArn?.trim() || undefined
 
           // idc 模式下必须同时提供 clientId 和 clientSecret
           if (authMethod === 'social' && (clientId || clientSecret)) {

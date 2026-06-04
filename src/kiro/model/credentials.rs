@@ -577,14 +577,6 @@ impl KiroCredentials {
     }
 
     pub fn effective_profile_arn_for_kiro_requests(&self) -> Option<&str> {
-        if self
-            .detected_auth_account_type()
-            .as_deref()
-            .is_some_and(|account_type| account_type == "enterprise")
-        {
-            return None;
-        }
-
         if let Some(profile_arn) = self.profile_arn.as_deref() {
             let trimmed = profile_arn.trim();
             if !trimmed.is_empty() {
@@ -592,6 +584,8 @@ impl KiroCredentials {
             }
         }
 
+        // BuilderID uses Kiro's default profile when the credential does not carry
+        // one. Enterprise profiles are account-specific and must be explicit.
         if self
             .detected_auth_account_type()
             .as_deref()
@@ -1296,7 +1290,7 @@ mod tests {
             client_secret: Some("secret".to_string()),
             start_url: Some("https://example.awsapps.com/start".to_string()),
             profile_arn: Some(
-                "arn:aws:codewhisperer:us-east-1:123456789012:profile/invalid".to_string(),
+                "arn:aws:codewhisperer:us-east-1:123456789012:profile/test".to_string(),
             ),
             ..Default::default()
         };
@@ -1306,7 +1300,10 @@ mod tests {
             credentials.detected_auth_account_type().as_deref(),
             Some("enterprise")
         );
-        assert_eq!(credentials.effective_profile_arn_for_kiro_requests(), None);
+        assert_eq!(
+            credentials.effective_profile_arn_for_kiro_requests(),
+            Some("arn:aws:codewhisperer:us-east-1:123456789012:profile/test")
+        );
     }
 
     #[test]
@@ -1931,7 +1928,7 @@ mod tests {
     }
 
     #[test]
-    fn test_enterprise_provider_ignores_explicit_profile_arn() {
+    fn test_enterprise_provider_uses_explicit_profile_arn() {
         let creds = KiroCredentials {
             provider: Some("Enterprise".to_string()),
             profile_arn: Some(
@@ -1944,7 +1941,10 @@ mod tests {
             creds.detected_auth_account_type().as_deref(),
             Some("enterprise")
         );
-        assert_eq!(creds.effective_profile_arn_for_kiro_requests(), None);
+        assert_eq!(
+            creds.effective_profile_arn_for_kiro_requests(),
+            Some("arn:aws:codewhisperer:eu-west-1:123456789012:profile/test")
+        );
     }
 
     #[test]

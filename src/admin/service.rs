@@ -421,7 +421,7 @@ impl AdminService {
             id: None,
             access_token: None,
             refresh_token: Some(req.refresh_token),
-            profile_arn: if is_enterprise { None } else { req.profile_arn },
+            profile_arn: req.profile_arn,
             expires_at: None,
             auth_method: Some(if is_enterprise {
                 "idc".to_string()

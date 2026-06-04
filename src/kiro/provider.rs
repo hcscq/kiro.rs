@@ -2230,6 +2230,7 @@ impl KiroProvider {
                 .header("content-type", "application/json");
 
             // MCP 请求需要携带 profile ARN；BuilderID 缺省时使用 Kiro 默认值。
+            // Enterprise profile ARN 是账号特定值，仅在凭据中显式存在时携带。
             if let Some(arn) = credentials.effective_profile_arn_for_kiro_requests() {
                 request = request.header("x-amzn-kiro-profile-arn", arn);
             }
@@ -2287,6 +2288,28 @@ impl KiroProvider {
 
             // 400 Bad Request
             if status.as_u16() == 400 {
+                if Self::should_disable_missing_profile_arn(&credentials, &body, &error_summary) {
+                    tracing::warn!(
+                        credential_id = ctx_id,
+                        attempt = attempt + 1,
+                        max_retries,
+                        error_summary = %error_summary,
+                        "MCP 请求失败（Enterprise 凭据缺少 profileArn，停调并切换）"
+                    );
+
+                    let has_available = self.token_manager.report_auth_or_permission_failure(
+                        ctx_id,
+                        DisabledReason::MissingProfileArn,
+                        status.as_u16(),
+                        &error_summary,
+                    );
+                    if !has_available {
+                        anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {}", error_summary);
+                    }
+                    last_error = Some(anyhow::anyhow!("MCP 请求失败: {}", error_summary));
+                    continue;
+                }
+
                 anyhow::bail!("MCP 请求失败: {}", error_summary);
             }
 
@@ -2645,7 +2668,7 @@ impl KiroProvider {
             let acquire_context_ms = attempt_started_at.elapsed().as_millis();
             let invocation_id = Uuid::new_v4().to_string();
 
-            // BuilderID 缺省时使用 Kiro 默认 profileArn，Enterprise 仍保持不注入。
+            // BuilderID 缺省时使用 Kiro 默认 profileArn；Enterprise 仅使用显式 ARN。
             let body_inject_started_at = Instant::now();
             let effective_profile_arn = credentials
                 .effective_profile_arn_for_kiro_requests()
@@ -3613,6 +3636,45 @@ impl KiroProvider {
                     continue;
                 }
 
+                if Self::should_disable_missing_profile_arn(&credentials, &body, &error_summary) {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        api_type,
+                        model = model.as_deref().unwrap_or("unknown"),
+                        credential_id = ctx_id,
+                        attempt = attempt + 1,
+                        max_retries,
+                        region = %region,
+                        stream = is_stream,
+                        request_body_bytes,
+                        status_code = status.as_u16(),
+                        error_summary = %error_summary,
+                        total_elapsed_ms = overall_started_at.elapsed().as_millis(),
+                        "API 请求失败（Enterprise 凭据缺少 profileArn，停调并切换）"
+                    );
+
+                    let has_available = self.token_manager.report_auth_or_permission_failure(
+                        ctx_id,
+                        DisabledReason::MissingProfileArn,
+                        status.as_u16(),
+                        &error_summary,
+                    );
+                    if !has_available {
+                        anyhow::bail!(
+                            "{} API 请求失败（所有凭据已用尽）: {}",
+                            api_type,
+                            error_summary
+                        );
+                    }
+
+                    last_error = Some(anyhow::anyhow!(
+                        "{} API 请求失败: {}",
+                        api_type,
+                        error_summary
+                    ));
+                    continue;
+                }
+
                 if Self::is_invalid_thinking_signature_error(&body, &error_summary) {
                     tracing::warn!(
                         request_id = %request_id,
@@ -4208,6 +4270,27 @@ impl KiroProvider {
         model.is_some() && Self::is_invalid_model_id(body)
     }
 
+    fn is_profile_arn_required_error(body: &str, error_summary: &str) -> bool {
+        let body = body.to_ascii_lowercase();
+        let error_summary = error_summary.to_ascii_lowercase();
+        body.contains("profilearn is required")
+            || body.contains("profile arn is required")
+            || error_summary.contains("profilearn is required")
+            || error_summary.contains("profile arn is required")
+    }
+
+    fn should_disable_missing_profile_arn(
+        credentials: &KiroCredentials,
+        body: &str,
+        error_summary: &str,
+    ) -> bool {
+        credentials.detected_auth_account_type().as_deref() == Some("enterprise")
+            && credentials
+                .effective_profile_arn_for_kiro_requests()
+                .is_none()
+            && Self::is_profile_arn_required_error(body, error_summary)
+    }
+
     fn is_quota_exhausted(body: &str) -> bool {
         const QUOTA_EXHAUSTED_REASONS: &[&str] =
             &["MONTHLY_REQUEST_COUNT", "OVERAGE_REQUEST_LIMIT_EXCEEDED"];
@@ -4361,6 +4444,55 @@ mod tests {
     }
 
     #[test]
+    fn test_should_disable_missing_profile_arn_for_enterprise_without_arn() {
+        let credentials = KiroCredentials {
+            provider: Some("Enterprise".to_string()),
+            start_url: Some("https://example.awsapps.com/start".to_string()),
+            ..Default::default()
+        };
+        let body = r#"{"message":"profileArn is required for this request."}"#;
+
+        assert!(KiroProvider::should_disable_missing_profile_arn(
+            &credentials,
+            body,
+            "400 Bad Request"
+        ));
+    }
+
+    #[test]
+    fn test_should_not_disable_missing_profile_arn_when_enterprise_has_arn() {
+        let credentials = KiroCredentials {
+            provider: Some("Enterprise".to_string()),
+            start_url: Some("https://example.awsapps.com/start".to_string()),
+            profile_arn: Some("arn:aws:codewhisperer:us-east-1:123:profile/test".to_string()),
+            ..Default::default()
+        };
+        let body = r#"{"message":"profileArn is required for this request."}"#;
+
+        assert!(!KiroProvider::should_disable_missing_profile_arn(
+            &credentials,
+            body,
+            "400 Bad Request"
+        ));
+    }
+
+    #[test]
+    fn test_should_not_disable_missing_profile_arn_for_builder_id() {
+        let credentials = KiroCredentials {
+            provider: Some("BuilderId".to_string()),
+            start_url: Some("https://view.awsapps.com/start/".to_string()),
+            ..Default::default()
+        };
+        let body = r#"{"message":"profileArn is required for this request."}"#;
+
+        assert!(!KiroProvider::should_disable_missing_profile_arn(
+            &credentials,
+            body,
+            "400 Bad Request"
+        ));
+    }
+
+    #[test]
     fn test_disabled_reason_for_suspended_403() {
         let body = r#"{"message":"Your User ID temporarily is suspended. We've locked your account as a security precaution."}"#;
         assert_eq!(
@@ -4463,6 +4595,26 @@ mod tests {
         );
         let json: serde_json::Value = serde_json::from_slice(&result).unwrap();
         assert!(json.get("profileArn").is_none());
+        assert_eq!(json["modelId"], "claude-sonnet-4.5");
+    }
+
+    #[test]
+    fn test_enterprise_request_body_uses_explicit_profile_arn() {
+        let body = r#"{"conversationState":{},"profileArn":"old-arn","modelId":"claude-opus-4.7"}"#;
+        let mut original_body = None;
+        let arn = Some("arn:aws:codewhisperer:us-east-1:123:profile/test".to_string());
+        let result = KiroProvider::request_body_for_profile_arn_and_model(
+            body,
+            &mut original_body,
+            &arn,
+            &Some("claude-sonnet-4.5".to_string()),
+            true,
+        );
+        let json: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(
+            json["profileArn"],
+            "arn:aws:codewhisperer:us-east-1:123:profile/test"
+        );
         assert_eq!(json["modelId"], "claude-sonnet-4.5");
     }
 
