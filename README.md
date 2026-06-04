@@ -134,6 +134,19 @@ IdC 认证：
 }
 ```
 
+Enterprise 账号：
+```json
+{
+   "refreshToken": "你的刷新token",
+   "authMethod": "idc",
+   "provider": "Enterprise",
+   "clientId": "你的clientId",
+   "clientSecret": "你的clientSecret",
+   "region": "us-east-1",
+   "startUrl": "https://example.awsapps.com/start"
+}
+```
+
 ### 3. 启动
 
 ```bash
@@ -424,17 +437,24 @@ kiro-rs \
 | `profileArn`   | string | AWS Profile ARN（可选，登录时返回）                   |
 | `expiresAt`    | string | Token 过期时间 (RFC3339)                        |
 | `authMethod`   | string | 认证方式：`social` 或 `idc`                       |
+| `provider`     | string | 登录 Provider：`Google`、`Github`、`BuilderId`、`Enterprise`（可选） |
 | `clientId`     | string | IdC 登录的客户端 ID（IdC 认证必填）                     |
 | `clientSecret` | string | IdC 登录的客户端密钥（IdC 认证必填）                      |
+| `startUrl`     | string | AWS IAM Identity Center Start URL（Enterprise / BuilderId 识别用） |
 | `priority`     | number | 凭据优先级，数字越小越优先，默认为 0                         |
 | `maxConcurrency` | number | 单账号并发上限（可选，留空或 <= 0 表示不限制）             |
 | `rateLimitBucketCapacity` | number | 凭据级 token bucket 容量覆盖（可选，设为 `0` 可对该账号禁用） |
 | `rateLimitRefillPerSecond` | number | 凭据级 token bucket 回填速率覆盖（token/s，可选，设为 `0` 可对该账号禁用） |
-| `region`       | string | 凭据级 Auth Region, 兼容字段                       |
+| `region`       | string | 凭据级 Region 兼容字段；可同时作为 Auth/API Region 回退值 |
 | `authRegion`   | string | 凭据级 Auth Region，用于 Token 刷新, 未配置时回退到 region |
-| `apiRegion`    | string | 凭据级 API Region，用于 API 请求                    |
+| `apiRegion`    | string | 凭据级 API Region，用于 API 请求；未配置时回退到 `region` |
 | `machineId`    | string | 凭据级机器码（64位十六进制）                             |
 | `email`        | string | 用户邮箱（可选，从 API 获取）                           |
+| `userId`       | string | 用户 ID（可选；Enterprise 账号可能没有 email）             |
+| `accountType`  | string | 账号类型（可选，用于账号类型模型/调度策略）                    |
+| `allowedModels` | array | 账号级额外允许模型列表（可选）                           |
+| `blockedModels` | array | 账号级额外禁用模型列表（可选）                           |
+| `availableModelIds` | array | 从 Kiro/KAM 可用模型列表导入的模型缓存（可选）         |
 | `proxyUrl`     | string | 凭据级代理 URL（可选，特殊值 `direct` 表示不使用代理）       |
 | `proxyUsername`| string | 凭据级代理用户名（可选）                                |
 | `proxyPassword`| string | 凭据级代理密码（可选）                                 |
@@ -442,6 +462,8 @@ kiro-rs \
 说明：
 - IdC / Builder-ID / IAM 在本项目里属于同一种登录方式，配置时统一使用 `authMethod: "idc"`
 - 为兼容旧配置，`builder-id` / `iam` 仍可被识别，但会按 `idc` 处理
+- `provider: "Enterprise"` 会强制按 IdC 刷新，并在请求 Kiro 上游时移除/避免注入 `profileArn`
+- BuilderId 账号未显式配置 `profileArn` 时会使用 Kiro 默认 BuilderId profile；Enterprise 不会补默认 profile
 
 #### 单凭据格式（旧格式，向后兼容）
 
@@ -487,6 +509,17 @@ kiro-rs \
       "proxyPassword": "pass"
    },
    {
+      "refreshToken": "Enterprise 凭据的刷新token",
+      "authMethod": "idc",
+      "provider": "Enterprise",
+      "clientId": "xxxxxxxxx",
+      "clientSecret": "xxxxxxxxx",
+      "region": "us-east-1",
+      "startUrl": "https://example.awsapps.com/start",
+      "userId": "enterprise-user-id",
+      "availableModelIds": ["claude-sonnet-4.5"]
+   },
+   {
       "refreshToken": "第三个凭据（显式不走代理）",
       "expiresAt": "2025-12-31T02:32:45.144Z",
       "authMethod": "social",
@@ -523,7 +556,7 @@ kiro-rs \
 `凭据.authRegion` > `凭据.region` > `config.authRegion` > `config.region`
 
 **API Region**（API 请求）优先级：
-`凭据.apiRegion` > `config.apiRegion` > `config.region`
+`profileArn` 中的 Region（Enterprise 不使用） > `凭据.apiRegion` > `凭据.region` > `config.apiRegion` > `config.region`
 
 ### 代理配置
 
