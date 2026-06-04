@@ -287,6 +287,23 @@ fn has_client_credentials(credentials: &KiroCredentials) -> bool {
             .is_some_and(|value| !value.trim().is_empty())
 }
 
+fn detected_idc_start_url(credentials: &KiroCredentials) -> Option<Cow<'_, str>> {
+    if let Some(start_url) = credentials
+        .start_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(Cow::Borrowed(start_url));
+    }
+
+    credentials
+        .client_secret
+        .as_deref()
+        .and_then(extract_start_url_from_client_secret)
+        .map(Cow::Owned)
+}
+
 fn extract_start_url_from_client_secret(client_secret: &str) -> Option<String> {
     let parts: Vec<&str> = client_secret.split('.').collect();
     if parts.len() < 2 {
@@ -517,6 +534,9 @@ impl KiroCredentials {
         {
             return "idc";
         }
+        if detected_idc_start_url(self).is_some() {
+            return "idc";
+        }
 
         match self.auth_method.as_deref() {
             Some(value)
@@ -542,25 +562,15 @@ impl KiroCredentials {
             return Some(account_type.to_string());
         }
 
-        if self.effective_auth_method() == "social" {
-            return Some("social".to_string());
-        }
-
-        let start_url = self.start_url.as_deref().and_then(|value| {
-            let trimmed = value.trim();
-            (!trimmed.is_empty()).then_some(trimmed)
-        });
-        let extracted_start_url = self
-            .client_secret
-            .as_deref()
-            .and_then(extract_start_url_from_client_secret);
-        let detected_start_url = start_url.or(extracted_start_url.as_deref());
-
-        if let Some(start_url) = detected_start_url {
-            if is_builder_id_start_url(start_url) {
+        if let Some(start_url) = detected_idc_start_url(self) {
+            if is_builder_id_start_url(&start_url) {
                 return Some("builder-id".to_string());
             }
             return Some("enterprise".to_string());
+        }
+
+        if self.effective_auth_method() == "social" {
+            return Some("social".to_string());
         }
 
         Some("idc".to_string())
@@ -1276,6 +1286,27 @@ mod tests {
             builder.detected_auth_account_type().as_deref(),
             Some("enterprise")
         );
+    }
+
+    #[test]
+    fn test_legacy_enterprise_start_url_overrides_social_auth_method() {
+        let credentials = KiroCredentials {
+            auth_method: Some("social".to_string()),
+            client_id: Some("client".to_string()),
+            client_secret: Some("secret".to_string()),
+            start_url: Some("https://example.awsapps.com/start".to_string()),
+            profile_arn: Some(
+                "arn:aws:codewhisperer:us-east-1:123456789012:profile/invalid".to_string(),
+            ),
+            ..Default::default()
+        };
+
+        assert_eq!(credentials.effective_auth_method(), "idc");
+        assert_eq!(
+            credentials.detected_auth_account_type().as_deref(),
+            Some("enterprise")
+        );
+        assert_eq!(credentials.effective_profile_arn_for_kiro_requests(), None);
     }
 
     #[test]
