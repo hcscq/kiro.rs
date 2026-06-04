@@ -2,7 +2,7 @@
 //!
 //! 负责将 Anthropic API 请求格式转换为 Kiro API 请求格式
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{BufReader, Cursor};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Instant;
@@ -1801,7 +1801,7 @@ fn build_kiro_images(format: String, data: String) -> Vec<KiroImage> {
     let started_at = Instant::now();
     let source_format = format.clone();
     let input_base64_bytes = data.len();
-    let data = normalize_base64_payload(&data);
+    let data = normalize_base64_payload_owned(data);
     let normalized_base64_bytes = data.len();
     let images = if format == "gif" {
         if let Some(images) = sample_gif_frames_for_kiro(&data) {
@@ -1821,14 +1821,14 @@ fn build_kiro_images(format: String, data: String) -> Vec<KiroImage> {
         normalize_image_for_kiro(&format, &data)
     {
         vec![KiroImage::from_base64(normalized_format, normalized_data)]
-    } else if let Some((processed_format, processed_data)) =
-        resize_or_reencode_image_base64(&format, &data)
-    {
-        vec![KiroImage::from_base64(processed_format, processed_data)]
-    } else if is_decodable_static_image_for_kiro(&format, &data) {
-        vec![KiroImage::from_base64(format, data)]
     } else {
-        Vec::new()
+        match process_static_image_for_kiro(&format, &data) {
+            StaticImageProcessResult::Processed(processed_format, processed_data) => {
+                vec![KiroImage::from_base64(processed_format, processed_data)]
+            }
+            StaticImageProcessResult::PassThrough => vec![KiroImage::from_base64(format, data)],
+            StaticImageProcessResult::Invalid => Vec::new(),
+        }
     };
     let elapsed_ms = started_at.elapsed().as_millis();
     if images.is_empty() {
@@ -1854,19 +1854,42 @@ fn build_kiro_images(format: String, data: String) -> Vec<KiroImage> {
     images
 }
 
-fn normalize_base64_payload(data: &str) -> String {
-    let payload = data
-        .split_once(',')
-        .and_then(|(prefix, payload)| {
-            let prefix = prefix.trim().to_lowercase();
-            if prefix.starts_with("data:") && prefix.contains(";base64") {
-                Some(payload)
-            } else {
-                None
-            }
-        })
-        .unwrap_or(data);
+enum StaticImageProcessResult {
+    Processed(String, String),
+    PassThrough,
+    Invalid,
+}
 
+fn base64_payload_start(data: &str) -> usize {
+    let Some(comma_index) = data.find(',') else {
+        return 0;
+    };
+    let prefix = data[..comma_index].trim().to_lowercase();
+    if prefix.starts_with("data:") && prefix.contains(";base64") {
+        comma_index + 1
+    } else {
+        0
+    }
+}
+
+fn normalize_base64_payload(data: &str) -> String {
+    let payload = &data[base64_payload_start(data)..];
+    if !payload.chars().any(|ch| ch.is_whitespace()) {
+        return payload.to_string();
+    }
+    payload.chars().filter(|ch| !ch.is_whitespace()).collect()
+}
+
+fn normalize_base64_payload_owned(data: String) -> String {
+    let payload_start = base64_payload_start(&data);
+    if payload_start == 0 && !data.chars().any(|ch| ch.is_whitespace()) {
+        return data;
+    }
+
+    let payload = &data[payload_start..];
+    if !payload.chars().any(|ch| ch.is_whitespace()) {
+        return payload.to_string();
+    }
     payload.chars().filter(|ch| !ch.is_whitespace()).collect()
 }
 
@@ -2021,10 +2044,24 @@ fn encode_kiro_static_image(
 }
 
 fn resize_or_reencode_image_base64(format: &str, data: &str) -> Option<(String, String)> {
-    let image_format = image_format_for_compat(format)?;
-    let bytes = BASE64_STANDARD.decode(data).ok()?;
-    let (image, repaired_bytes) =
-        load_image_with_optional_png_crc_repair(format, image_format, &bytes)?;
+    match process_static_image_for_kiro(format, data) {
+        StaticImageProcessResult::Processed(format, data) => Some((format, data)),
+        StaticImageProcessResult::PassThrough | StaticImageProcessResult::Invalid => None,
+    }
+}
+
+fn process_static_image_for_kiro(format: &str, data: &str) -> StaticImageProcessResult {
+    let Some(image_format) = image_format_for_compat(format) else {
+        return StaticImageProcessResult::Invalid;
+    };
+    let Ok(bytes) = BASE64_STANDARD.decode(data) else {
+        return StaticImageProcessResult::Invalid;
+    };
+    let Some((image, repaired_bytes)) =
+        load_image_with_optional_png_crc_repair(format, image_format, &bytes)
+    else {
+        return StaticImageProcessResult::Invalid;
+    };
     let (width, height) = image.dimensions();
     let (target_width, target_height) = target_kiro_image_dimensions(width, height);
     let needs_resize = target_width != width || target_height != height;
@@ -2040,9 +2077,12 @@ fn resize_or_reencode_image_base64(format: &str, data: &str) -> Option<(String, 
                 repaired_bytes = repaired_bytes.len(),
                 "修复 PNG chunk CRC 以提升 Kiro 图片兼容性"
             );
-            return Some((format.to_string(), BASE64_STANDARD.encode(repaired_bytes)));
+            return StaticImageProcessResult::Processed(
+                format.to_string(),
+                BASE64_STANDARD.encode(repaired_bytes),
+            );
         }
-        return None;
+        return StaticImageProcessResult::PassThrough;
     }
 
     let processed = if needs_resize {
@@ -2053,7 +2093,11 @@ fn resize_or_reencode_image_base64(format: &str, data: &str) -> Option<(String, 
     let processed_width = processed.width();
     let processed_height = processed.height();
     let prefer_lossy = needs_reencode && !needs_resize;
-    let (processed_format, output) = encode_kiro_static_image(&processed, format, prefer_lossy)?;
+    let Some((processed_format, output)) =
+        encode_kiro_static_image(&processed, format, prefer_lossy)
+    else {
+        return StaticImageProcessResult::Invalid;
+    };
 
     tracing::info!(
         source_format = format,
@@ -2069,17 +2113,7 @@ fn resize_or_reencode_image_base64(format: &str, data: &str) -> Option<(String, 
         "处理 Kiro 图片尺寸或体积"
     );
 
-    Some((processed_format, BASE64_STANDARD.encode(output)))
-}
-
-fn is_decodable_static_image_for_kiro(format: &str, data: &str) -> bool {
-    let Some(image_format) = image_format_for_compat(format) else {
-        return false;
-    };
-    let Ok(bytes) = BASE64_STANDARD.decode(data) else {
-        return false;
-    };
-    load_image_with_optional_png_crc_repair(format, image_format, &bytes).is_some()
+    StaticImageProcessResult::Processed(processed_format, BASE64_STANDARD.encode(output))
 }
 
 fn sample_gif_frames_for_kiro(data: &str) -> Option<Vec<KiroImage>> {
@@ -2930,6 +2964,27 @@ fn collapse_history_tool_use_only(
     true
 }
 
+fn remove_history_tool_use(
+    history: &mut [Message],
+    assistant_index: usize,
+    tool_use_id: &str,
+) -> Option<ToolUseEntry> {
+    let Some(Message::Assistant(assistant_msg)) = history.get_mut(assistant_index) else {
+        return None;
+    };
+    let Some(tool_uses) = assistant_msg.assistant_response_message.tool_uses.as_mut() else {
+        return None;
+    };
+    let position = tool_uses
+        .iter()
+        .position(|tool_use| tool_use.tool_use_id == tool_use_id)?;
+    let tool_use = tool_uses.remove(position);
+    if tool_uses.is_empty() {
+        assistant_msg.assistant_response_message.tool_uses = None;
+    }
+    Some(tool_use)
+}
+
 fn repair_history_tool_result_pairing_for_kiro(
     history: &mut [Message],
     protected_current_tool_results: &[ToolResult],
@@ -3149,6 +3204,12 @@ struct HistoryToolUseRef {
     user_result_index: Option<usize>,
 }
 
+#[derive(Debug)]
+struct CollapsedToolRef {
+    tool_use_id: String,
+    user_result_index: Option<usize>,
+}
+
 fn collapse_old_structured_history_tool_pairs_for_kiro(
     history: &mut [Message],
     protected_current_tool_results: &[ToolResult],
@@ -3167,8 +3228,9 @@ fn collapse_old_structured_history_tool_pairs_for_kiro(
         .iter()
         .map(|result| result.tool_use_id.clone())
         .collect();
-    let mut structured_count = tool_refs.len();
-    let mut collapsed_count = 0usize;
+    let original_structured_count = tool_refs.len();
+    let mut structured_count = original_structured_count;
+    let mut target_refs = Vec::new();
 
     for tool_ref in tool_refs {
         if structured_count <= max_structured_pairs {
@@ -3177,16 +3239,17 @@ fn collapse_old_structured_history_tool_pairs_for_kiro(
         if protected_ids.contains(&tool_ref.tool_use_id) {
             continue;
         }
-        if collapse_history_tool_pair(history, &tool_ref) {
-            structured_count = structured_count.saturating_sub(1);
-            collapsed_count += 1;
-        }
+        structured_count = structured_count.saturating_sub(1);
+        target_refs.push(tool_ref);
     }
+
+    let collapsed_count = collapse_history_tool_pairs_batch(history, target_refs);
+    let remaining_structured_count = original_structured_count.saturating_sub(collapsed_count);
 
     if collapsed_count > 0 {
         tracing::info!(
             collapsed_tool_pairs = collapsed_count,
-            remaining_structured_tool_pairs = structured_count,
+            remaining_structured_tool_pairs = remaining_structured_count,
             max_structured_tool_pairs = max_structured_pairs,
             "将较旧的 history tool_use/tool_result 对降级为普通文本，规避 Kiro 上游结构化工具历史上限"
         );
@@ -3231,25 +3294,131 @@ fn collect_history_tool_use_refs(history: &[Message]) -> Vec<HistoryToolUseRef> 
     refs
 }
 
-fn collapse_history_tool_pair(history: &mut [Message], tool_ref: &HistoryToolUseRef) -> bool {
-    let Some(tool_use) =
-        remove_history_tool_use(history, tool_ref.assistant_index, &tool_ref.tool_use_id)
-    else {
-        return false;
-    };
-
-    if let Message::Assistant(assistant_msg) = &mut history[tool_ref.assistant_index] {
-        append_history_text(
-            &mut assistant_msg.assistant_response_message.content,
-            &collapsed_tool_use_text(&tool_use),
-        );
+fn collapse_history_tool_pairs_batch(
+    history: &mut [Message],
+    target_refs: Vec<HistoryToolUseRef>,
+) -> usize {
+    if target_refs.is_empty() {
+        return 0;
     }
 
-    if let Some(user_index) = tool_ref.user_result_index {
-        if let Some(tool_result) =
-            remove_history_tool_result(history, user_index, &tool_ref.tool_use_id)
-            && let Message::User(user_msg) = &mut history[user_index]
-        {
+    let mut target_tool_use_counts: HashMap<(usize, String), usize> = HashMap::new();
+    for tool_ref in &target_refs {
+        *target_tool_use_counts
+            .entry((tool_ref.assistant_index, tool_ref.tool_use_id.clone()))
+            .or_default() += 1;
+    }
+
+    let mut removed_tool_uses: HashMap<(usize, String), VecDeque<ToolUseEntry>> = HashMap::new();
+    for (index, message) in history.iter_mut().enumerate() {
+        let Message::Assistant(assistant_msg) = message else {
+            continue;
+        };
+        let Some(tool_uses) = assistant_msg.assistant_response_message.tool_uses.take() else {
+            continue;
+        };
+
+        let mut retained = Vec::with_capacity(tool_uses.len());
+        for tool_use in tool_uses {
+            let key = (index, tool_use.tool_use_id.clone());
+            if let Some(remaining) = target_tool_use_counts.get_mut(&key)
+                && *remaining > 0
+            {
+                *remaining -= 1;
+                removed_tool_uses
+                    .entry(key)
+                    .or_default()
+                    .push_back(tool_use);
+                continue;
+            }
+            retained.push(tool_use);
+        }
+
+        assistant_msg.assistant_response_message.tool_uses = if retained.is_empty() {
+            None
+        } else {
+            Some(retained)
+        };
+    }
+
+    let mut collapsed_refs = Vec::new();
+    for tool_ref in &target_refs {
+        let key = (tool_ref.assistant_index, tool_ref.tool_use_id.clone());
+        let Some(tool_use) = removed_tool_uses
+            .get_mut(&key)
+            .and_then(VecDeque::pop_front)
+        else {
+            continue;
+        };
+
+        if let Some(Message::Assistant(assistant_msg)) = history.get_mut(tool_ref.assistant_index) {
+            append_history_text(
+                &mut assistant_msg.assistant_response_message.content,
+                &collapsed_tool_use_text(&tool_use),
+            );
+        }
+        collapsed_refs.push(CollapsedToolRef {
+            tool_use_id: tool_ref.tool_use_id.clone(),
+            user_result_index: tool_ref.user_result_index,
+        });
+    }
+
+    if collapsed_refs.is_empty() {
+        return 0;
+    }
+
+    let mut target_result_counts: HashMap<(usize, String), usize> = HashMap::new();
+    for collapsed_ref in &collapsed_refs {
+        if let Some(user_index) = collapsed_ref.user_result_index {
+            *target_result_counts
+                .entry((user_index, collapsed_ref.tool_use_id.clone()))
+                .or_default() += 1;
+        }
+    }
+
+    let mut removed_tool_results: HashMap<(usize, String), VecDeque<ToolResult>> = HashMap::new();
+    for (index, message) in history.iter_mut().enumerate() {
+        let Message::User(user_msg) = message else {
+            continue;
+        };
+        let tool_results = &mut user_msg
+            .user_input_message
+            .user_input_message_context
+            .tool_results;
+        if tool_results.is_empty() {
+            continue;
+        }
+
+        let mut retained = Vec::with_capacity(tool_results.len());
+        for tool_result in std::mem::take(tool_results) {
+            let key = (index, tool_result.tool_use_id.clone());
+            if let Some(remaining) = target_result_counts.get_mut(&key)
+                && *remaining > 0
+            {
+                *remaining -= 1;
+                removed_tool_results
+                    .entry(key)
+                    .or_default()
+                    .push_back(tool_result);
+                continue;
+            }
+            retained.push(tool_result);
+        }
+        *tool_results = retained;
+    }
+
+    for collapsed_ref in &collapsed_refs {
+        let Some(user_index) = collapsed_ref.user_result_index else {
+            continue;
+        };
+        let key = (user_index, collapsed_ref.tool_use_id.clone());
+        let Some(tool_result) = removed_tool_results
+            .get_mut(&key)
+            .and_then(VecDeque::pop_front)
+        else {
+            continue;
+        };
+        if let Some(Message::User(user_msg)) = history.get_mut(user_index) {
             append_history_text(
                 &mut user_msg.user_input_message.content,
                 &collapsed_tool_result_text(&tool_result),
@@ -3257,46 +3426,7 @@ fn collapse_history_tool_pair(history: &mut [Message], tool_ref: &HistoryToolUse
         }
     }
 
-    true
-}
-
-fn remove_history_tool_use(
-    history: &mut [Message],
-    assistant_index: usize,
-    tool_use_id: &str,
-) -> Option<ToolUseEntry> {
-    let Some(Message::Assistant(assistant_msg)) = history.get_mut(assistant_index) else {
-        return None;
-    };
-    let Some(tool_uses) = assistant_msg.assistant_response_message.tool_uses.as_mut() else {
-        return None;
-    };
-    let position = tool_uses
-        .iter()
-        .position(|tool_use| tool_use.tool_use_id == tool_use_id)?;
-    let tool_use = tool_uses.remove(position);
-    if tool_uses.is_empty() {
-        assistant_msg.assistant_response_message.tool_uses = None;
-    }
-    Some(tool_use)
-}
-
-fn remove_history_tool_result(
-    history: &mut [Message],
-    user_index: usize,
-    tool_use_id: &str,
-) -> Option<ToolResult> {
-    let Some(Message::User(user_msg)) = history.get_mut(user_index) else {
-        return None;
-    };
-    let tool_results = &mut user_msg
-        .user_input_message
-        .user_input_message_context
-        .tool_results;
-    let position = tool_results
-        .iter()
-        .position(|result| result.tool_use_id == tool_use_id)?;
-    Some(tool_results.remove(position))
+    collapsed_refs.len()
 }
 
 fn append_history_text(content: &mut String, addition: &str) {
@@ -4535,6 +4665,64 @@ mod tests {
             )),
             "oldest structured tool_result entries should be represented as text"
         );
+    }
+
+    #[test]
+    fn test_batch_tool_pair_collapse_preserves_legacy_text_order() {
+        let mut assistant = HistoryAssistantMessage::new("assistant preface");
+        assistant.assistant_response_message.tool_uses = Some(vec![
+            ToolUseEntry::new("call_a", "tool_a").with_input(serde_json::json!({"n": 1})),
+            ToolUseEntry::new("call_b", "tool_b").with_input(serde_json::json!({"n": 2})),
+            ToolUseEntry::new("call_c", "tool_c").with_input(serde_json::json!({"n": 3})),
+        ]);
+
+        let mut user = HistoryUserMessage::new("user preface", "claude-sonnet-4.6");
+        user.user_input_message
+            .user_input_message_context
+            .tool_results = vec![
+            ToolResult::success("call_b", "result b"),
+            ToolResult::success("call_a", "result a"),
+            ToolResult::success("call_c", "result c"),
+        ];
+
+        let mut history = vec![Message::Assistant(assistant), Message::User(user)];
+
+        let collapsed = collapse_old_structured_history_tool_pairs_for_kiro(&mut history, &[], 1);
+
+        assert_eq!(collapsed, 2);
+
+        let Message::Assistant(assistant) = &history[0] else {
+            panic!("history[0] should be assistant");
+        };
+        let content = &assistant.assistant_response_message.content;
+        let call_a = content.find("Tool: tool_a").expect("call_a text exists");
+        let call_b = content.find("Tool: tool_b").expect("call_b text exists");
+        assert!(call_a < call_b);
+        let remaining_tool_uses = assistant
+            .assistant_response_message
+            .tool_uses
+            .as_ref()
+            .expect("one structured tool_use should remain");
+        assert_eq!(remaining_tool_uses.len(), 1);
+        assert_eq!(remaining_tool_uses[0].tool_use_id, "call_c");
+
+        let Message::User(user) = &history[1] else {
+            panic!("history[1] should be user");
+        };
+        let content = &user.user_input_message.content;
+        let result_a = content
+            .find("Tool use ID: call_a")
+            .expect("call_a result text exists");
+        let result_b = content
+            .find("Tool use ID: call_b")
+            .expect("call_b result text exists");
+        assert!(result_a < result_b);
+        let remaining_results = &user
+            .user_input_message
+            .user_input_message_context
+            .tool_results;
+        assert_eq!(remaining_results.len(), 1);
+        assert_eq!(remaining_results[0].tool_use_id, "call_c");
     }
 
     #[test]
