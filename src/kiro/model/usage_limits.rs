@@ -16,6 +16,10 @@ pub struct UsageLimitsResponse {
     #[serde(default)]
     pub subscription_info: Option<SubscriptionInfo>,
 
+    /// 用户信息（Enterprise 账号可能没有 email，但会返回 userId）
+    #[serde(default)]
+    pub user_info: Option<UserInfo>,
+
     /// 使用量明细列表
     #[serde(default)]
     pub usage_breakdown_list: Vec<UsageBreakdown>,
@@ -23,6 +27,19 @@ pub struct UsageLimitsResponse {
     /// 超额使用配置
     #[serde(default)]
     pub overage_configuration: Option<OverageConfiguration>,
+}
+
+/// 用户信息
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserInfo {
+    /// 用户邮箱
+    #[serde(default)]
+    pub email: Option<String>,
+
+    /// 用户 ID
+    #[serde(default)]
+    pub user_id: Option<String>,
 }
 
 /// 订阅信息
@@ -210,6 +227,20 @@ impl UsageLimitsResponse {
         self.subscription_info
             .as_ref()
             .and_then(|info| info.overage_capability.as_deref())
+    }
+
+    /// 获取用户邮箱
+    pub fn email(&self) -> Option<&str> {
+        self.user_info
+            .as_ref()
+            .and_then(|info| info.email.as_deref())
+    }
+
+    /// 获取用户 ID
+    pub fn user_id(&self) -> Option<&str> {
+        self.user_info
+            .as_ref()
+            .and_then(|info| info.user_id.as_deref())
     }
 
     /// 是否支持开启超额使用
@@ -501,5 +532,21 @@ mod tests {
         assert_eq!(response.overage_status(), Some("DISABLED"));
         assert_eq!(response.overage_enabled(), Some(false));
         assert_eq!(response.effective_usage_limit(), 10.0);
+    }
+
+    #[test]
+    fn test_usage_limits_reads_user_info() {
+        let payload = r#"{
+            "userInfo": {
+                "email": "enterprise-user@example.com",
+                "userId": "u-123"
+            }
+        }"#;
+
+        let response: UsageLimitsResponse =
+            serde_json::from_str(payload).expect("userInfo should deserialize");
+
+        assert_eq!(response.email(), Some("enterprise-user@example.com"));
+        assert_eq!(response.user_id(), Some("u-123"));
     }
 }

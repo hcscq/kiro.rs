@@ -55,12 +55,18 @@ pub struct CredentialStatusItem {
     pub expires_at: Option<String>,
     /// 认证方式
     pub auth_method: Option<String>,
+    /// 登录 Provider（Google / Github / BuilderId / Enterprise）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     /// 是否有 Profile ARN
     pub has_profile_arn: bool,
     /// refreshToken 的 SHA-256 哈希（用于前端重复检测）
     pub refresh_token_hash: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
+    /// 用户 ID（企业账号可能没有 email）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
     /// 订阅等级（KIRO PRO+ / KIRO FREE 等）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subscription_title: Option<String>,
@@ -91,6 +97,12 @@ pub struct CredentialStatusItem {
     /// 运行时探测到的临时模型限制
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub runtime_model_restrictions: Vec<RuntimeModelRestriction>,
+    /// 从 ListAvailableModels 拉取到的账号可用模型 ID 缓存
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub available_model_ids: Vec<String>,
+    /// 可用模型缓存刷新时间
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub available_models_cached_at: Option<String>,
     /// 导入时间（RFC3339 格式）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub imported_at: Option<String>,
@@ -254,6 +266,9 @@ pub struct AddCredentialRequest {
     #[serde(default = "default_auth_method")]
     pub auth_method: String,
 
+    /// 登录 Provider（Google / Github / BuilderId / Enterprise）
+    pub provider: Option<String>,
+
     /// Profile ARN（可选；BuilderID 缺省时后端会使用默认 BuilderID profile）
     pub profile_arn: Option<String>,
 
@@ -296,6 +311,9 @@ pub struct AddCredentialRequest {
     /// 用户邮箱（可选，用于前端显示）
     pub email: Option<String>,
 
+    /// 用户 ID（企业账号可能没有 email）
+    pub user_id: Option<String>,
+
     /// 账号类型（可选）
     pub account_type: Option<String>,
 
@@ -304,6 +322,9 @@ pub struct AddCredentialRequest {
 
     /// 账号级额外禁用模型
     pub blocked_models: Option<Vec<String>>,
+
+    /// 从 KAM 导入的可用模型缓存（可选）
+    pub available_model_ids: Option<Vec<String>>,
 
     /// 凭据级代理 URL（可选，特殊值 "direct" 表示不使用代理）
     pub proxy_url: Option<String>,
@@ -330,6 +351,10 @@ pub struct AddCredentialResponse {
     /// 用户邮箱（如果获取成功）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subscription_title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -1514,11 +1514,54 @@ impl KiroProvider {
         None
     }
 
-    fn request_body_for_profile_arn(
+    fn rewrite_model_ids(value: &mut serde_json::Value, model_id: &str) -> bool {
+        match value {
+            serde_json::Value::Object(map) => {
+                let mut changed = false;
+                for (key, value) in map {
+                    if key == "modelId" {
+                        if value.as_str() != Some(model_id) {
+                            *value = serde_json::Value::String(model_id.to_string());
+                            changed = true;
+                        }
+                    } else {
+                        changed |= Self::rewrite_model_ids(value, model_id);
+                    }
+                }
+                changed
+            }
+            serde_json::Value::Array(values) => values
+                .iter_mut()
+                .any(|value| Self::rewrite_model_ids(value, model_id)),
+            _ => false,
+        }
+    }
+
+    fn request_body_for_profile_arn_and_model(
         request_body: &str,
         original_body: &mut Option<Bytes>,
         profile_arn: &Option<String>,
+        model_id: &Option<String>,
+        strip_profile_arn: bool,
     ) -> Bytes {
+        if model_id.is_some() || strip_profile_arn {
+            if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(request_body) {
+                if let Some(arn) = profile_arn {
+                    json["profileArn"] = serde_json::Value::String(arn.clone());
+                } else if strip_profile_arn {
+                    if let Some(object) = json.as_object_mut() {
+                        object.remove("profileArn");
+                    }
+                }
+                if let Some(model_id) = model_id {
+                    Self::rewrite_model_ids(&mut json, model_id);
+                }
+                if let Ok(body) = serde_json::to_string(&json) {
+                    return Bytes::from(body);
+                }
+            }
+        }
+
         if let Some(body) = Self::inject_profile_arn(request_body, profile_arn) {
             return Bytes::from(body);
         }
@@ -2552,7 +2595,33 @@ impl KiroProvider {
                     return Err(err);
                 }
             };
-            let (ctx_id, credentials, token, lease) = ctx.into_parts();
+            let (ctx_id, mut credentials, token, lease) = ctx.into_parts();
+            if model.is_some() {
+                credentials = self
+                    .token_manager
+                    .ensure_available_models_cached_for_call(ctx_id, &credentials, &token)
+                    .await;
+            }
+            let effective_model_id = model.as_deref().and_then(|requested_model| {
+                credentials.effective_model_id_for_request(requested_model)
+            });
+            if let Some(requested_model) = model.as_deref() {
+                if effective_model_id.is_none() && !credentials.available_model_ids.is_empty() {
+                    request_scoped_model_unsupported_credentials.insert(ctx_id);
+                    let has_available = self
+                        .token_manager
+                        .defer_model_unsupported_credential(ctx_id, requested_model);
+                    last_error = Some(anyhow::anyhow!(
+                        "凭据 #{} 不支持模型 {}，且可用模型列表中没有可降级模型",
+                        ctx_id,
+                        requested_model
+                    ));
+                    if has_available {
+                        continue;
+                    }
+                    break;
+                }
+            }
 
             let config = self.token_manager.config();
             let machine_id = match machine_id::generate_from_credentials(&credentials, config) {
@@ -2581,10 +2650,20 @@ impl KiroProvider {
             let effective_profile_arn = credentials
                 .effective_profile_arn_for_kiro_requests()
                 .map(str::to_string);
-            let body = Self::request_body_for_profile_arn(
+            let strip_profile_arn =
+                credentials.detected_auth_account_type().as_deref() == Some("enterprise");
+            let model_rewrite = match (model.as_deref(), effective_model_id.as_deref()) {
+                (Some(requested), Some(effective)) if requested != effective => {
+                    Some(effective.to_string())
+                }
+                _ => None,
+            };
+            let body = Self::request_body_for_profile_arn_and_model(
                 request_body,
                 &mut original_request_body,
                 &effective_profile_arn,
+                &model_rewrite,
+                strip_profile_arn,
             );
             let body_inject_ms = body_inject_started_at.elapsed().as_millis();
             let request_body_bytes = body.len();
@@ -2623,6 +2702,7 @@ impl KiroProvider {
                     request_body_bytes,
                     body_inject_ms,
                     profile_arn_present = effective_profile_arn.is_some(),
+                    effective_model = effective_model_id.as_deref().unwrap_or("unknown"),
                     "Kiro provider request body prepared"
                 );
             }
@@ -2691,6 +2771,7 @@ impl KiroProvider {
                 request_id = %request_id,
                 api_type,
                 model = model.as_deref().unwrap_or("unknown"),
+                effective_model = effective_model_id.as_deref().unwrap_or("unknown"),
                 credential_id = ctx_id,
                 attempt = attempt + 1,
                 max_retries,
@@ -4347,7 +4428,13 @@ mod tests {
     fn test_inject_profile_arn_with_none() {
         let body = r#"{"conversationState":{"conversationId":"c1"}}"#;
         let mut original_body = None;
-        let result = KiroProvider::request_body_for_profile_arn(body, &mut original_body, &None);
+        let result = KiroProvider::request_body_for_profile_arn_and_model(
+            body,
+            &mut original_body,
+            &None,
+            &None,
+            false,
+        );
         // 不注入 profileArn，原样返回
         let json: serde_json::Value = serde_json::from_slice(&result).unwrap();
         assert!(json.get("profileArn").is_none());
@@ -4364,11 +4451,33 @@ mod tests {
     }
 
     #[test]
+    fn test_enterprise_request_body_strips_existing_profile_arn() {
+        let body = r#"{"conversationState":{},"profileArn":"old-arn","modelId":"claude-opus-4.7"}"#;
+        let mut original_body = None;
+        let result = KiroProvider::request_body_for_profile_arn_and_model(
+            body,
+            &mut original_body,
+            &None,
+            &Some("claude-sonnet-4.5".to_string()),
+            true,
+        );
+        let json: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        assert!(json.get("profileArn").is_none());
+        assert_eq!(json["modelId"], "claude-sonnet-4.5");
+    }
+
+    #[test]
     fn test_inject_profile_arn_invalid_json() {
         let body = "not-valid-json";
         let arn = Some("arn:test".to_string());
         let mut original_body = None;
-        let result = KiroProvider::request_body_for_profile_arn(body, &mut original_body, &arn);
+        let result = KiroProvider::request_body_for_profile_arn_and_model(
+            body,
+            &mut original_body,
+            &arn,
+            &None,
+            false,
+        );
         // 解析失败时原样返回
         assert_eq!(&result[..], body.as_bytes());
     }

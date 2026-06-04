@@ -15,8 +15,8 @@ use crate::model::account_type_preset::{
 };
 use crate::model::config::Config;
 use crate::model::model_policy::{
-    AccountTypeDispatchPolicy, ModelSupportPolicy, RuntimeModelRestriction, normalize_account_type,
-    normalize_model_entries, normalize_model_selector,
+    AccountTypeDispatchPolicy, ModelSupportPolicy, RuntimeModelRestriction, matches_model_entry,
+    normalize_account_type, normalize_model_entries, normalize_model_selector,
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
@@ -85,6 +85,11 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_method: Option<String>,
 
+    /// 登录 Provider（Google / Github / BuilderId / Enterprise）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub provider: Option<String>,
+
     /// OIDC Client ID (IdC 认证需要)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
@@ -140,6 +145,11 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
 
+    /// 用户 ID（企业账号可能没有 email，使用 userId 作为稳定标识）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub user_id: Option<String>,
+
     /// 订阅等级（KIRO PRO+ / KIRO FREE 等）
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
@@ -166,6 +176,15 @@ pub struct KiroCredentials {
     /// 运行时探测到的临时模型限制
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runtime_model_restrictions: Vec<RuntimeModelRestriction>,
+
+    /// 从 ListAvailableModels 拉取到的账号可用模型 ID 缓存
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_model_ids: Vec<String>,
+
+    /// 可用模型缓存刷新时间（RFC3339 格式）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub available_models_cached_at: Option<String>,
 
     /// 导入时间（RFC3339 格式）
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -304,6 +323,67 @@ fn is_builder_id_start_url(start_url: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn provider_auth_account_type(provider: &str) -> Option<&'static str> {
+    let normalized = provider.trim();
+    if normalized.eq_ignore_ascii_case("enterprise") {
+        return Some("enterprise");
+    }
+    if normalized.eq_ignore_ascii_case("builderid")
+        || normalized.eq_ignore_ascii_case("builder-id")
+        || normalized.eq_ignore_ascii_case("builder_id")
+    {
+        return Some("builder-id");
+    }
+    if normalized.eq_ignore_ascii_case("google") || normalized.eq_ignore_ascii_case("github") {
+        return Some("social");
+    }
+    None
+}
+
+fn normalize_provider_value(provider: &str) -> Option<String> {
+    let normalized = provider.trim();
+    if normalized.is_empty() {
+        return None;
+    }
+    if normalized.eq_ignore_ascii_case("enterprise") {
+        return Some("Enterprise".to_string());
+    }
+    if normalized.eq_ignore_ascii_case("builderid")
+        || normalized.eq_ignore_ascii_case("builder-id")
+        || normalized.eq_ignore_ascii_case("builder_id")
+    {
+        return Some("BuilderId".to_string());
+    }
+    if normalized.eq_ignore_ascii_case("google") {
+        return Some("Google".to_string());
+    }
+    if normalized.eq_ignore_ascii_case("github") {
+        return Some("Github".to_string());
+    }
+    Some(normalized.to_string())
+}
+
+fn parse_region_from_profile_arn(profile_arn: &str) -> Option<&str> {
+    let mut segments = profile_arn.trim().split(':');
+    let arn = segments.next()?;
+    let partition = segments.next()?;
+    let service = segments.next()?;
+    let region = segments.next()?;
+    if arn == "arn"
+        && !partition.is_empty()
+        && service == "codewhisperer"
+        && !region.trim().is_empty()
+    {
+        Some(region.trim())
+    } else {
+        None
+    }
+}
+
+fn non_empty_trimmed(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
 /// 凭据配置（支持单对象或数组格式）
 ///
 /// 自动识别配置文件格式：
@@ -348,6 +428,7 @@ impl CredentialsConfig {
         match self {
             CredentialsConfig::Single(mut cred) => {
                 cred.canonicalize_auth_method();
+                cred.normalize_identity_metadata();
                 cred.normalize_model_capabilities();
                 vec![cred]
             }
@@ -356,6 +437,7 @@ impl CredentialsConfig {
                 creds.sort_by_key(|c| c.priority);
                 for cred in &mut creds {
                     cred.canonicalize_auth_method();
+                    cred.normalize_identity_metadata();
                     cred.normalize_model_capabilities();
                 }
                 creds
@@ -387,12 +469,25 @@ impl KiroCredentials {
             .unwrap_or(config.effective_auth_region())
     }
 
-    /// 获取有效的 API Region（用于 API 请求）
-    /// 优先级：凭据.api_region > config.api_region > config.region
+    /// 获取有效的 API Region（用于 Kiro/Q API 请求）
+    /// 优先级：profileArn.region > 凭据.api_region > 凭据.region > config.api_region > config.region
     pub fn effective_api_region<'a>(&'a self, config: &'a Config) -> &'a str {
-        self.api_region
-            .as_deref()
-            .unwrap_or(config.effective_api_region())
+        if let Some(region) = self
+            .effective_profile_arn_for_kiro_requests()
+            .and_then(parse_region_from_profile_arn)
+        {
+            return region;
+        }
+
+        if let Some(region) = non_empty_trimmed(self.api_region.as_deref()) {
+            return region;
+        }
+
+        if let Some(region) = non_empty_trimmed(self.region.as_deref()) {
+            return region;
+        }
+
+        config.effective_api_region()
     }
 
     /// 获取有效的代理配置
@@ -415,6 +510,14 @@ impl KiroCredentials {
     }
 
     pub fn effective_auth_method(&self) -> &'static str {
+        if self
+            .provider
+            .as_deref()
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("enterprise"))
+        {
+            return "idc";
+        }
+
         match self.auth_method.as_deref() {
             Some(value)
                 if value.eq_ignore_ascii_case("idc")
@@ -431,6 +534,14 @@ impl KiroCredentials {
     }
 
     pub fn detected_auth_account_type(&self) -> Option<String> {
+        if let Some(account_type) = self
+            .provider
+            .as_deref()
+            .and_then(provider_auth_account_type)
+        {
+            return Some(account_type.to_string());
+        }
+
         if self.effective_auth_method() == "social" {
             return Some("social".to_string());
         }
@@ -456,6 +567,14 @@ impl KiroCredentials {
     }
 
     pub fn effective_profile_arn_for_kiro_requests(&self) -> Option<&str> {
+        if self
+            .detected_auth_account_type()
+            .as_deref()
+            .is_some_and(|account_type| account_type == "enterprise")
+        {
+            return None;
+        }
+
         if let Some(profile_arn) = self.profile_arn.as_deref() {
             let trimmed = profile_arn.trim();
             if !trimmed.is_empty() {
@@ -474,6 +593,52 @@ impl KiroCredentials {
         None
     }
 
+    pub fn normalize_identity_metadata(&mut self) {
+        self.provider = self.provider.as_deref().and_then(normalize_provider_value);
+        self.user_id = self
+            .user_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        self.email = self
+            .email
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        self.start_url = self
+            .start_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        self.profile_arn = self
+            .profile_arn
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        self.region = self
+            .region
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        self.auth_region = self
+            .auth_region
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        self.api_region = self
+            .api_region
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+    }
+
     pub fn canonicalize_auth_method(&mut self) {
         let auth_method = match &self.auth_method {
             Some(m) => m,
@@ -487,12 +652,14 @@ impl KiroCredentials {
     }
 
     pub fn normalize_model_capabilities(&mut self) {
+        self.normalize_identity_metadata();
         self.account_type = self
             .account_type
             .as_deref()
             .and_then(normalize_account_type);
         self.allowed_models = normalize_model_entries(&self.allowed_models);
         self.blocked_models = normalize_model_entries(&self.blocked_models);
+        self.available_model_ids = normalize_model_entries(&self.available_model_ids);
         self.runtime_model_restrictions.retain_mut(|restriction| {
             restriction.normalize() && restriction.is_active_at(Utc::now())
         });
@@ -709,7 +876,10 @@ impl KiroCredentials {
         model: &str,
         model_cooldown_enabled: bool,
     ) -> bool {
-        let Some(selector) = normalize_model_selector(model) else {
+        let Some(effective_model) = self.effective_model_id_for_request(model) else {
+            return self.available_model_ids.is_empty();
+        };
+        let Some(selector) = normalize_model_selector(&effective_model) else {
             return true;
         };
 
@@ -811,6 +981,80 @@ impl KiroCredentials {
             .cloned()
             .collect()
     }
+
+    pub fn effective_model_id_for_request(&self, model: &str) -> Option<String> {
+        let requested = normalize_model_selector(model)?;
+        if self.available_model_ids.is_empty() {
+            return Some(requested.family);
+        }
+
+        if self
+            .available_model_ids
+            .iter()
+            .any(|entry| matches_available_model_entry(entry, &requested.exact, &requested.family))
+        {
+            return Some(requested.family);
+        }
+
+        fallback_model_ids(&requested.family)
+            .iter()
+            .find(|candidate| {
+                normalize_model_selector(candidate).is_some_and(|selector| {
+                    self.available_model_ids.iter().any(|entry| {
+                        matches_available_model_entry(entry, &selector.exact, &selector.family)
+                    })
+                })
+            })
+            .map(|candidate| (*candidate).to_string())
+    }
+}
+
+fn matches_available_model_entry(entry: &str, exact: &str, family: &str) -> bool {
+    if let Some(selector) = normalize_model_selector(exact) {
+        if matches_model_entry(entry, &selector) {
+            return true;
+        }
+    }
+
+    entry == exact
+        || entry == family
+        || entry
+            .strip_prefix(family)
+            .is_some_and(|suffix| suffix.starts_with('-'))
+}
+
+fn fallback_model_ids(model_family: &str) -> &'static [&'static str] {
+    if model_family.contains("claude-opus-4.8") {
+        &[
+            "claude-opus-4.7",
+            "claude-opus-4.6",
+            "claude-opus-4.5",
+            "claude-sonnet-4.6",
+            "claude-sonnet-4.5",
+            "claude-haiku-4.5",
+        ]
+    } else if model_family.contains("claude-opus-4.7") {
+        &[
+            "claude-opus-4.6",
+            "claude-opus-4.5",
+            "claude-sonnet-4.6",
+            "claude-sonnet-4.5",
+            "claude-haiku-4.5",
+        ]
+    } else if model_family.contains("claude-opus-4.6") {
+        &[
+            "claude-opus-4.5",
+            "claude-sonnet-4.6",
+            "claude-sonnet-4.5",
+            "claude-haiku-4.5",
+        ]
+    } else if model_family.contains("claude-opus-4.5") {
+        &["claude-sonnet-4.6", "claude-sonnet-4.5", "claude-haiku-4.5"]
+    } else if model_family.contains("claude-sonnet-4.6") {
+        &["claude-sonnet-4.5", "claude-haiku-4.5"]
+    } else {
+        &[]
+    }
 }
 
 #[cfg(test)]
@@ -867,6 +1111,7 @@ mod tests {
             profile_arn: None,
             expires_at: None,
             auth_method: Some("social".to_string()),
+            provider: None,
             client_id: None,
             client_secret: None,
             start_url: None,
@@ -879,12 +1124,15 @@ mod tests {
             api_region: None,
             machine_id: None,
             email: None,
+            user_id: None,
             subscription_title: None,
             subscription_type: None,
             account_type: None,
             allowed_models: vec![],
             blocked_models: vec![],
             runtime_model_restrictions: vec![],
+            available_model_ids: vec![],
+            available_models_cached_at: None,
             imported_at: None,
             proxy_url: None,
             proxy_username: None,
@@ -1222,6 +1470,7 @@ mod tests {
             profile_arn: None,
             expires_at: None,
             auth_method: None,
+            provider: None,
             client_id: None,
             client_secret: None,
             start_url: None,
@@ -1234,12 +1483,15 @@ mod tests {
             api_region: None,
             machine_id: None,
             email: None,
+            user_id: None,
             subscription_title: None,
             subscription_type: None,
             account_type: None,
             allowed_models: vec![],
             blocked_models: vec![],
             runtime_model_restrictions: vec![],
+            available_model_ids: vec![],
+            available_models_cached_at: None,
             imported_at: None,
             proxy_url: None,
             proxy_username: None,
@@ -1271,6 +1523,7 @@ mod tests {
             profile_arn: None,
             expires_at: None,
             auth_method: None,
+            provider: None,
             client_id: None,
             client_secret: None,
             start_url: None,
@@ -1283,12 +1536,15 @@ mod tests {
             api_region: None,
             machine_id: None,
             email: None,
+            user_id: None,
             subscription_title: None,
             subscription_type: None,
             account_type: None,
             allowed_models: vec![],
             blocked_models: vec![],
             runtime_model_restrictions: vec![],
+            available_model_ids: vec![],
+            available_models_cached_at: None,
             imported_at: None,
             proxy_url: None,
             proxy_username: None,
@@ -1402,6 +1658,7 @@ mod tests {
             profile_arn: None,
             expires_at: None,
             auth_method: Some("social".to_string()),
+            provider: None,
             client_id: None,
             client_secret: None,
             start_url: None,
@@ -1414,12 +1671,15 @@ mod tests {
             api_region: None,
             machine_id: Some("c".repeat(64)),
             email: None,
+            user_id: None,
             subscription_title: None,
             subscription_type: None,
             account_type: None,
             allowed_models: vec![],
             blocked_models: vec![],
             runtime_model_restrictions: vec![],
+            available_model_ids: vec![],
+            available_models_cached_at: None,
             imported_at: Some("2025-01-01T00:00:00Z".to_string()),
             proxy_url: None,
             proxy_username: None,
@@ -1614,15 +1874,72 @@ mod tests {
     }
 
     #[test]
-    fn test_effective_api_region_ignores_credential_region() {
-        // 凭据.region 不参与 api_region 的回退链
+    fn test_effective_api_region_falls_back_to_credential_region() {
+        // 凭据.region 参与 api_region 的回退链，用于 KAM/Enterprise 导入
         let mut config = Config::default();
         config.region = "config-region".to_string();
 
         let mut creds = KiroCredentials::default();
         creds.region = Some("cred-region".to_string());
 
-        assert_eq!(creds.effective_api_region(&config), "config-region");
+        assert_eq!(creds.effective_api_region(&config), "cred-region");
+    }
+
+    #[test]
+    fn test_effective_api_region_prefers_profile_arn_region() {
+        let mut config = Config::default();
+        config.region = "config-region".to_string();
+
+        let mut creds = KiroCredentials::default();
+        creds.region = Some("cred-region".to_string());
+        creds.api_region = Some("cred-api-region".to_string());
+        creds.profile_arn =
+            Some("arn:aws:codewhisperer:eu-west-1:123456789012:profile/test".to_string());
+
+        assert_eq!(creds.effective_api_region(&config), "eu-west-1");
+    }
+
+    #[test]
+    fn test_enterprise_provider_ignores_explicit_profile_arn() {
+        let creds = KiroCredentials {
+            provider: Some("Enterprise".to_string()),
+            profile_arn: Some(
+                "arn:aws:codewhisperer:eu-west-1:123456789012:profile/test".to_string(),
+            ),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            creds.detected_auth_account_type().as_deref(),
+            Some("enterprise")
+        );
+        assert_eq!(creds.effective_profile_arn_for_kiro_requests(), None);
+    }
+
+    #[test]
+    fn test_enterprise_provider_forces_idc_auth_method() {
+        let creds = KiroCredentials {
+            provider: Some("Enterprise".to_string()),
+            auth_method: Some("social".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(creds.effective_auth_method(), "idc");
+    }
+
+    #[test]
+    fn test_available_models_downgrades_to_cached_model() {
+        let creds = KiroCredentials {
+            available_model_ids: vec!["claude-sonnet-4.5".to_string()],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            creds
+                .effective_model_id_for_request("claude-opus-4.7")
+                .as_deref(),
+            Some("claude-sonnet-4.5")
+        );
     }
 
     #[test]

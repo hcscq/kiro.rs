@@ -21,15 +21,19 @@ interface BatchImportDialogProps {
 interface CredentialInput {
   refreshToken: string
   email?: string
+  userId?: string
+  provider?: string
   clientId?: string
   clientSecret?: string
   region?: string
   authRegion?: string
   apiRegion?: string
+  profileArn?: string
   priority?: number
   machineId?: string
   startUrl?: string
   accountType?: string
+  availableModelIds?: string[]
   maxConcurrency?: number
   rateLimitBucketCapacity?: number
   rateLimitRefillPerSecond?: number
@@ -46,6 +50,21 @@ interface VerificationResult {
   rollbackError?: string
 }
 
+
+function normalizeProvider(provider?: string): string | undefined {
+  const trimmed = provider?.trim()
+  if (!trimmed) return undefined
+  const lower = trimmed.toLowerCase()
+  if (lower === 'enterprise') return 'Enterprise'
+  if (lower === 'builderid' || lower === 'builder-id' || lower === 'builder_id') return 'BuilderId'
+  if (lower === 'google') return 'Google'
+  if (lower === 'github') return 'Github'
+  return trimmed
+}
+
+function isEnterpriseProvider(provider?: string): boolean {
+  return provider?.trim().toLowerCase() === 'enterprise'
+}
 
 
 export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps) {
@@ -111,7 +130,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       const initialResults: VerificationResult[] = credentials.map((credential, i) => ({
         index: i + 1,
         status: 'pending',
-        email: credential.email?.trim() || undefined,
+        email: credential.email?.trim() || credential.userId?.trim() || undefined,
       }))
       setResults(initialResults)
 
@@ -133,6 +152,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       for (let i = 0; i < credentials.length; i++) {
         const cred = credentials[i]
         const credentialEmail = cred.email?.trim() || undefined
+        const credentialUserId = cred.userId?.trim() || undefined
         const token = cred.refreshToken.trim()
         const tokenHash = await sha256Hex(token)
 
@@ -158,7 +178,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               ...newResults[i],
               status: 'duplicate',
               error: '该凭据已存在',
-              email: existingCred?.email || credentialEmail
+              email: existingCred?.email || existingCred?.userId || credentialEmail || credentialUserId
             }
             return newResults
           })
@@ -179,11 +199,27 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           // 添加凭据
           const clientId = cred.clientId?.trim() || undefined
           const clientSecret = cred.clientSecret?.trim() || undefined
+          const provider = normalizeProvider(cred.provider)
+          const enterprise = isEnterpriseProvider(provider)
           const authMethod = clientId && clientSecret ? 'idc' : 'social'
+          const region = cred.region?.trim() || undefined
+          const authRegion = cred.authRegion?.trim() || region || undefined
+          const apiRegion = cred.apiRegion?.trim() || region || undefined
+          const startUrl = cred.startUrl?.trim() || undefined
+          const profileArn = enterprise ? undefined : cred.profileArn?.trim() || undefined
 
           // idc 模式下必须同时提供 clientId 和 clientSecret
           if (authMethod === 'social' && (clientId || clientSecret)) {
             throw new Error('idc 模式需要同时提供 clientId 和 clientSecret')
+          }
+          if (enterprise && (!clientId || !clientSecret)) {
+            throw new Error('Enterprise 账号必须包含 clientId 和 clientSecret')
+          }
+          if (enterprise && !startUrl) {
+            throw new Error('Enterprise 账号必须包含 startUrl')
+          }
+          if (enterprise && !region && !authRegion && !apiRegion) {
+            throw new Error('Enterprise 账号必须包含 region')
           }
 
           if (
@@ -209,15 +245,22 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           const addedCred = await addCredential({
             refreshToken: token,
             email: credentialEmail,
+            userId: credentialUserId,
             authMethod,
-            authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
-            apiRegion: cred.apiRegion?.trim() || undefined,
+            provider,
+            region,
+            authRegion,
+            apiRegion,
+            profileArn,
             clientId,
             clientSecret,
-            startUrl: cred.startUrl?.trim() || undefined,
+            startUrl,
             priority: cred.priority || 0,
             machineId: cred.machineId?.trim() || undefined,
             accountType: cred.accountType?.trim() || undefined,
+            availableModelIds: Array.isArray(cred.availableModelIds)
+              ? cred.availableModelIds.filter(modelId => typeof modelId === 'string' && modelId.trim())
+              : undefined,
             maxConcurrency:
               typeof cred.maxConcurrency === 'number' ? cred.maxConcurrency : undefined,
             rateLimitBucketCapacity:
@@ -241,8 +284,8 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           // 验活成功
           successCount++
           existingTokenHashes.add(tokenHash)
-          setCurrentProcessing(addedCred.email || credentialEmail
-            ? `验活成功: ${addedCred.email || credentialEmail}`
+          setCurrentProcessing(addedCred.email || addedCred.userId || credentialEmail || credentialUserId
+            ? `验活成功: ${addedCred.email || addedCred.userId || credentialEmail || credentialUserId}`
             : `验活成功: 凭据 ${i + 1}`)
           setResults(prev => {
             const newResults = [...prev]
@@ -250,7 +293,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               ...newResults[i],
               status: 'verified',
               usage: `${balance.currentUsage}/${balance.usageLimit}`,
-              email: addedCred.email || credentialEmail,
+              email: addedCred.email || addedCred.userId || credentialEmail || credentialUserId,
               credentialId: addedCred.credentialId
             }
             return newResults
@@ -281,7 +324,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               ...newResults[i],
               status: 'failed',
               error: extractErrorMessage(error),
-              email: credentialEmail,
+              email: credentialEmail || credentialUserId,
               rollbackStatus,
               rollbackError,
             }
@@ -369,14 +412,14 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               JSON 格式凭据
             </label>
             <textarea
-              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n例如: [{"email":"user@example.com","refreshToken":"...","clientId":"...","clientSecret":"...","authRegion":"us-east-1","apiRegion":"us-west-2","startUrl":"https://example.awsapps.com/start"}]\n支持 region 字段自动映射为 authRegion'}
+              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n例如: [{"email":"user@example.com","provider":"Enterprise","refreshToken":"...","clientId":"...","clientSecret":"...","region":"us-east-1","startUrl":"https://example.awsapps.com/start"}]\n支持 region 字段自动映射为 authRegion 和 apiRegion'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}
               className="flex min-h-[200px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
             />
             <p className="text-xs text-muted-foreground">
-              支持附带 `email`、`startUrl`、`accountType`、`maxConcurrency`、`rateLimitBucketCapacity`、`rateLimitRefillPerSecond`。
+              支持附带 `email`、`userId`、`provider`、`startUrl`、`accountType`、`availableModelIds`、`maxConcurrency`、`rateLimitBucketCapacity`、`rateLimitRefillPerSecond`。
               导入时会自动验活，失败的凭据会被排除。
             </p>
           </div>

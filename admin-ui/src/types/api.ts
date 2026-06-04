@@ -16,8 +16,10 @@ export interface CredentialStatusItem {
   isCurrent: boolean
   expiresAt: string | null
   authMethod: string | null
+  provider?: string | null
   hasProfileArn: boolean
   email?: string | null
+  userId?: string | null
   subscriptionTitle?: string | null
   subscriptionType?: string | null
   authAccountType?: 'social' | 'builder-id' | 'enterprise' | 'idc' | string | null
@@ -28,6 +30,8 @@ export interface CredentialStatusItem {
   allowedModels?: string[]
   blockedModels?: string[]
   runtimeModelRestrictions?: RuntimeModelRestriction[]
+  availableModelIds?: string[]
+  availableModelsCachedAt?: string | null
   importedAt?: string | null
   refreshTokenHash?: string
   successCount: number
@@ -158,6 +162,7 @@ export interface SetCredentialModelPolicyRequest {
 export interface AddCredentialRequest {
   refreshToken: string
   authMethod?: 'social' | 'idc'
+  provider?: string
   profileArn?: string
   clientId?: string
   clientSecret?: string
@@ -171,9 +176,11 @@ export interface AddCredentialRequest {
   machineId?: string
   startUrl?: string
   email?: string
+  userId?: string
   accountType?: string
   allowedModels?: string[]
   blockedModels?: string[]
+  availableModelIds?: string[]
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string
@@ -185,6 +192,8 @@ export interface AddCredentialResponse {
   message: string
   credentialId: number
   email?: string
+  userId?: string
+  provider?: string
   subscriptionTitle?: string | null
   subscriptionType?: string | null
   authAccountType?: 'social' | 'builder-id' | 'enterprise' | 'idc' | string | null

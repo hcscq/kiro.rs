@@ -21,6 +21,7 @@ use std::time::{Duration as StdDuration, Instant};
 use crate::common::logging::summarize_upstream_error;
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
+use crate::kiro::model::available_models::ListAvailableModelsResponse;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
@@ -32,7 +33,7 @@ use crate::model::config::{
 };
 use crate::model::model_policy::{
     AccountTypeDispatchPolicy, ModelSupportPolicy, normalize_account_type_dispatch_policies,
-    normalize_account_type_policies, normalize_model_selector,
+    normalize_account_type_policies, normalize_model_entries, normalize_model_selector,
 };
 use crate::state::{
     CredentialCompareAndSwapResult, CredentialHealthPatch, DispatchLeaseReservationStatus,
@@ -123,6 +124,13 @@ fn newer_timestamp(current: Option<String>, candidate: Option<String>) -> Option
             }
         }
     }
+}
+
+fn normalize_optional_metadata(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 /// 验证 refreshToken 的基本有效性
@@ -313,7 +321,15 @@ async fn refresh_social_token(
     }
 
     if let Some(profile_arn) = data.profile_arn {
-        new_credentials.profile_arn = Some(profile_arn);
+        if new_credentials.detected_auth_account_type().as_deref() == Some("enterprise") {
+            new_credentials.profile_arn = None;
+        } else {
+            new_credentials.profile_arn = Some(profile_arn);
+        }
+    }
+
+    if new_credentials.detected_auth_account_type().as_deref() == Some("enterprise") {
+        new_credentials.profile_arn = None;
     }
 
     if let Some(expires_in) = data.expires_in {
@@ -415,8 +431,10 @@ async fn refresh_idc_token(
         new_credentials.expires_at = Some(expires_at.to_rfc3339());
     }
 
-    // 同步更新 profile_arn（如果 IdC 响应中包含）
-    if let Some(profile_arn) = data.profile_arn {
+    // 同步更新 profile_arn（如果 IdC 响应中包含）；Enterprise 请求必须保持不带 profileArn。
+    if new_credentials.detected_auth_account_type().as_deref() == Some("enterprise") {
+        new_credentials.profile_arn = None;
+    } else if let Some(profile_arn) = data.profile_arn {
         new_credentials.profile_arn = Some(profile_arn);
     }
 
@@ -432,7 +450,6 @@ pub(crate) async fn get_usage_limits(
 ) -> anyhow::Result<UsageLimitsResponse> {
     tracing::debug!("正在获取使用额度信息...");
 
-    // 优先级：凭据.api_region > config.api_region > config.region
     let region = credentials.effective_api_region(config);
     let management_endpoint = config.effective_management_endpoint_base(region);
     let host = Config::endpoint_host(&management_endpoint);
@@ -444,7 +461,7 @@ pub(crate) async fn get_usage_limits(
 
     // 构建 URL
     let mut url = format!(
-        "{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST",
+        "{}/getUsageLimits?isEmailRequired=true&origin=AI_EDITOR",
         management_endpoint
     );
 
@@ -452,6 +469,8 @@ pub(crate) async fn get_usage_limits(
     if let Some(profile_arn) = credentials.effective_profile_arn_for_kiro_requests() {
         url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
     }
+
+    url.push_str("&resourceType=AGENTIC_REQUEST");
 
     // 构建 User-Agent headers
     let user_agent = format!(
@@ -490,6 +509,124 @@ pub(crate) async fn get_usage_limits(
 
     let data: UsageLimitsResponse = response.json().await?;
     Ok(data)
+}
+
+pub(crate) async fn list_available_models_page(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    model_provider: Option<&str>,
+    next_token: Option<&str>,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<ListAvailableModelsResponse> {
+    tracing::debug!("正在获取可用模型列表...");
+
+    let region = credentials.effective_api_region(config);
+    let management_endpoint = config.effective_management_endpoint_base(region);
+    let host = Config::endpoint_host(&management_endpoint);
+    let machine_id = machine_id::generate_from_credentials(credentials, config)
+        .ok_or_else(|| anyhow::anyhow!("无法生成 machineId"))?;
+    let kiro_version = &config.kiro_version;
+    let os_name = &config.system_version;
+    let node_version = &config.node_version;
+
+    let mut url = url::Url::parse(&format!(
+        "{}/ListAvailableModels",
+        management_endpoint.trim_end_matches('/')
+    ))?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("origin", "AI_EDITOR");
+        pairs.append_pair("maxResults", "50");
+        if let Some(profile_arn) = credentials.effective_profile_arn_for_kiro_requests() {
+            pairs.append_pair("profileArn", profile_arn);
+        }
+        if let Some(model_provider) = model_provider
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            pairs.append_pair("modelProvider", model_provider);
+        }
+        if let Some(next_token) = next_token.map(str::trim).filter(|value| !value.is_empty()) {
+            pairs.append_pair("nextToken", next_token);
+        }
+    }
+
+    let user_agent = format!(
+        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
+        os_name, node_version, kiro_version, machine_id
+    );
+    let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
+
+    let client = build_client(proxy, 60, config.tls_backend)?;
+
+    let response = client
+        .get(url)
+        .header("accept", "application/json")
+        .header("x-amz-user-agent", &amz_user_agent)
+        .header("user-agent", &user_agent)
+        .header("host", &host)
+        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+        .header("amz-sdk-request", "attempt=1; max=1")
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+        let error_summary =
+            summarize_upstream_error(status.as_u16(), &body_text, UPSTREAM_ERROR_EXCERPT_CHARS);
+        let error_msg = match status.as_u16() {
+            401 => "认证失败，Token 无效或已过期",
+            403 => "权限不足，无法获取可用模型列表",
+            429 => "请求过于频繁，已被限流",
+            500..=599 => "服务器错误，AWS 服务暂时不可用",
+            _ => "获取可用模型列表失败",
+        };
+        bail!("{}: {}", error_msg, error_summary);
+    }
+
+    Ok(response.json().await?)
+}
+
+pub(crate) async fn list_available_models(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    model_provider: Option<&str>,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<ListAvailableModelsResponse> {
+    let mut aggregated = ListAvailableModelsResponse {
+        available_models: Vec::new(),
+        next_token: None,
+        default_model: None,
+    };
+    let mut next_token: Option<String> = None;
+
+    loop {
+        let page = list_available_models_page(
+            credentials,
+            config,
+            token,
+            model_provider,
+            next_token.as_deref(),
+            proxy,
+        )
+        .await?;
+
+        if aggregated.default_model.is_none() {
+            aggregated.default_model = page.default_model.clone();
+        }
+        aggregated.available_models.extend(page.available_models);
+        next_token = page.next_token;
+        if next_token.is_none() {
+            break;
+        }
+    }
+
+    aggregated.next_token = None;
+    Ok(aggregated)
 }
 
 pub(crate) async fn set_user_preference_overage_status(
@@ -812,6 +949,9 @@ pub struct CredentialEntrySnapshot {
     pub failure_count: u32,
     /// 认证方式
     pub auth_method: Option<String>,
+    /// 登录 Provider（Google / Github / BuilderId / Enterprise）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     /// 是否有 Profile ARN
     pub has_profile_arn: bool,
     /// Token 过期时间
@@ -820,6 +960,9 @@ pub struct CredentialEntrySnapshot {
     pub refresh_token_hash: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
+    /// 用户 ID（企业账号可能没有 email）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
     /// 订阅等级（KIRO PRO+ / KIRO FREE 等）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subscription_title: Option<String>,
@@ -847,6 +990,12 @@ pub struct CredentialEntrySnapshot {
     /// 运行时探测到的临时模型限制
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub runtime_model_restrictions: Vec<crate::model::model_policy::RuntimeModelRestriction>,
+    /// 从 ListAvailableModels 拉取到的账号可用模型 ID 缓存
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub available_model_ids: Vec<String>,
+    /// 可用模型缓存刷新时间
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub available_models_cached_at: Option<String>,
     /// 导入时间（RFC3339 格式）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub imported_at: Option<String>,
@@ -1777,10 +1926,23 @@ impl MultiTokenManager {
         if !Self::policy_allows_model(dispatch, credentials, model) {
             return false;
         }
+        let effective_requirement = model
+            .and_then(|model| credentials.effective_model_id_for_request(model))
+            .as_deref()
+            .map(|model| Self::model_requirement(Some(model)))
+            .unwrap_or(requirement);
         match requirement {
             ModelRequirement::Any => true,
-            ModelRequirement::PaidOpus => credentials.supports_opus(),
-            ModelRequirement::RealOpus47 => credentials.supports_real_opus_4_7(),
+            ModelRequirement::PaidOpus => match effective_requirement {
+                ModelRequirement::Any => true,
+                ModelRequirement::PaidOpus => credentials.supports_opus(),
+                ModelRequirement::RealOpus47 => credentials.supports_real_opus_4_7(),
+            },
+            ModelRequirement::RealOpus47 => match effective_requirement {
+                ModelRequirement::Any => true,
+                ModelRequirement::PaidOpus => credentials.supports_opus(),
+                ModelRequirement::RealOpus47 => credentials.supports_real_opus_4_7(),
+            },
         }
     }
 
@@ -2553,7 +2715,65 @@ impl MultiTokenManager {
         subscription_title: Option<&str>,
         subscription_type: Option<&str>,
     ) {
-        if subscription_title.is_none() && subscription_type.is_none() {
+        self.apply_credential_metadata_update(
+            id,
+            subscription_title,
+            subscription_type,
+            None,
+            None,
+            None,
+            None,
+        );
+    }
+
+    fn apply_usage_limits_metadata_update(&self, id: u64, usage_limits: &UsageLimitsResponse) {
+        self.apply_credential_metadata_update(
+            id,
+            usage_limits.subscription_title(),
+            usage_limits.subscription_type(),
+            usage_limits.email(),
+            usage_limits.user_id(),
+            None,
+            None,
+        );
+    }
+
+    fn apply_available_models_update(&self, id: u64, model_ids: Vec<String>) {
+        if model_ids.is_empty() {
+            return;
+        }
+        self.apply_credential_metadata_update(
+            id,
+            None,
+            None,
+            None,
+            None,
+            Some(model_ids),
+            Some(Utc::now().to_rfc3339()),
+        );
+    }
+
+    fn apply_credential_metadata_update(
+        &self,
+        id: u64,
+        subscription_title: Option<&str>,
+        subscription_type: Option<&str>,
+        email: Option<&str>,
+        user_id: Option<&str>,
+        available_model_ids: Option<Vec<String>>,
+        available_models_cached_at: Option<String>,
+    ) {
+        let next_email = normalize_optional_metadata(email);
+        let next_user_id = normalize_optional_metadata(user_id);
+        let next_available_model_ids = available_model_ids.map(|ids| normalize_model_entries(&ids));
+
+        if subscription_title.is_none()
+            && subscription_type.is_none()
+            && next_email.is_none()
+            && next_user_id.is_none()
+            && next_available_model_ids.is_none()
+            && available_models_cached_at.is_none()
+        {
             return;
         }
 
@@ -2568,32 +2788,62 @@ impl MultiTokenManager {
 
             let old_title = entry.credentials.subscription_title.clone();
             let old_type = entry.credentials.subscription_type.clone();
+            let old_email = entry.credentials.email.clone();
+            let old_user_id = entry.credentials.user_id.clone();
+            let old_available_model_ids = entry.credentials.available_model_ids.clone();
+            let old_available_models_cached_at =
+                entry.credentials.available_models_cached_at.clone();
             let next_title = subscription_title
                 .map(str::to_string)
                 .or_else(|| old_title.clone());
             let next_type = subscription_type
                 .map(str::to_string)
                 .or_else(|| old_type.clone());
+            let next_email = next_email.clone().or_else(|| old_email.clone());
+            let next_user_id = next_user_id.clone().or_else(|| old_user_id.clone());
+            let next_available_model_ids = next_available_model_ids
+                .clone()
+                .unwrap_or_else(|| old_available_model_ids.clone());
+            let next_available_models_cached_at = available_models_cached_at
+                .clone()
+                .or_else(|| old_available_models_cached_at.clone());
 
-            if old_title == next_title && old_type == next_type {
+            if old_title == next_title
+                && old_type == next_type
+                && old_email == next_email
+                && old_user_id == next_user_id
+                && old_available_model_ids == next_available_model_ids
+                && old_available_models_cached_at == next_available_models_cached_at
+            {
                 return;
             }
 
             entry.credentials.subscription_title = next_title.clone();
             entry.credentials.subscription_type = next_type.clone();
+            entry.credentials.email = next_email.clone();
+            entry.credentials.user_id = next_user_id.clone();
+            entry.credentials.available_model_ids = next_available_model_ids.clone();
+            entry.credentials.available_models_cached_at = next_available_models_cached_at.clone();
+            entry.credentials.normalize_model_capabilities();
             Self::sync_rate_limit_bucket_runtime(entry, &dispatch, now);
 
             tracing::info!(
-                "凭据 #{} 订阅信息已更新: title {:?} -> {:?}, type {:?} -> {:?}",
+                "凭据 #{} 元数据已更新: title {:?} -> {:?}, type {:?} -> {:?}, email {:?} -> {:?}, userId {:?} -> {:?}, availableModels {} -> {}",
                 id,
                 old_title,
                 next_title,
                 old_type,
-                next_type
+                next_type,
+                old_email,
+                next_email,
+                old_user_id,
+                next_user_id,
+                old_available_model_ids.len(),
+                next_available_model_ids.len()
             );
             let credentials = Self::persisted_credentials_from_entries(&entries);
             if let Err(err) = self.persist_credentials_snapshot(&credentials) {
-                tracing::warn!("订阅信息更新后持久化失败（不影响本次请求）: {}", err);
+                tracing::warn!("凭据元数据更新后持久化失败（不影响本次请求）: {}", err);
             }
         }
 
@@ -6312,10 +6562,12 @@ impl MultiTokenManager {
                         disabled: e.disabled,
                         failure_count: e.failure_count,
                         auth_method: Some(e.credentials.effective_auth_method().to_string()),
+                        provider: e.credentials.provider.clone(),
                         has_profile_arn: e.credentials.profile_arn.is_some(),
                         expires_at: e.credentials.expires_at.clone(),
                         refresh_token_hash: e.credentials.refresh_token.as_deref().map(sha256_hex),
                         email: e.credentials.email.clone(),
+                        user_id: e.credentials.user_id.clone(),
                         subscription_title: e.credentials.subscription_title.clone(),
                         subscription_type: e.credentials.subscription_type.clone(),
                         auth_account_type: e.credentials.detected_auth_account_type(),
@@ -6332,6 +6584,11 @@ impl MultiTokenManager {
                         } else {
                             Vec::new()
                         },
+                        available_model_ids: e.credentials.available_model_ids.clone(),
+                        available_models_cached_at: e
+                            .credentials
+                            .available_models_cached_at
+                            .clone(),
                         imported_at: e.credentials.imported_at.clone(),
                         success_count: e.success_count,
                         last_used_at: e.last_used_at.clone(),
@@ -6756,6 +7013,51 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    pub(crate) async fn ensure_available_models_cached_for_call(
+        &self,
+        id: u64,
+        credentials: &KiroCredentials,
+        token: &str,
+    ) -> KiroCredentials {
+        if !credentials.available_model_ids.is_empty() {
+            return credentials.clone();
+        }
+
+        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+        let response = match list_available_models(
+            credentials,
+            &self.config,
+            token,
+            None,
+            effective_proxy.as_ref(),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                tracing::warn!(
+                    "刷新凭据 #{} 可用模型列表失败，将继续使用现有模型策略: {}",
+                    id,
+                    err
+                );
+                return credentials.clone();
+            }
+        };
+
+        let model_ids = response.model_ids();
+        if model_ids.is_empty() {
+            tracing::warn!(
+                "刷新凭据 #{} 可用模型列表返回空列表，将继续使用现有模型策略",
+                id
+            );
+            return credentials.clone();
+        }
+
+        self.apply_available_models_update(id, model_ids);
+        self.current_credentials(id)
+            .unwrap_or_else(|_| credentials.clone())
+    }
+
     /// 获取指定凭据的使用额度（Admin API）
     pub async fn get_usage_limits_for(&self, id: u64) -> anyhow::Result<UsageLimitsResponse> {
         let credentials = self.current_credentials(id)?;
@@ -6765,12 +7067,11 @@ impl MultiTokenManager {
         let usage_limits =
             get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
 
-        // 更新订阅信息到凭据（仅在发生变化时持久化）
-        self.apply_subscription_info_update(
-            id,
-            usage_limits.subscription_title(),
-            usage_limits.subscription_type(),
-        );
+        // 更新订阅和用户信息到凭据（仅在发生变化时持久化）
+        self.apply_usage_limits_metadata_update(id, &usage_limits);
+        let _ = self
+            .ensure_available_models_cached_for_call(id, &credentials, &token)
+            .await;
 
         Ok(usage_limits)
     }
@@ -6787,11 +7088,7 @@ impl MultiTokenManager {
         let mut usage_limits =
             get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
 
-        self.apply_subscription_info_update(
-            id,
-            usage_limits.subscription_title(),
-            usage_limits.subscription_type(),
-        );
+        self.apply_usage_limits_metadata_update(id, &usage_limits);
 
         if !usage_limits.is_overage_capable() {
             anyhow::bail!("此账号订阅级别不支持超额使用");
@@ -6897,6 +7194,10 @@ impl MultiTokenManager {
 
         // 4. 尝试刷新 Token 验证凭据有效性
         let effective_proxy = new_cred.effective_proxy(self.proxy.as_ref());
+        let new_cred_is_enterprise = new_cred
+            .detected_auth_account_type()
+            .as_deref()
+            .is_some_and(|account_type| account_type == "enterprise");
         let mut validated_cred =
             refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?;
 
@@ -6924,6 +7225,12 @@ impl MultiTokenManager {
 
         validated_cred.id = Some(new_id);
         validated_cred.priority = new_cred.priority;
+        validated_cred.provider = new_cred.provider;
+        if new_cred_is_enterprise {
+            validated_cred.profile_arn = None;
+        } else if let Some(profile_arn) = new_cred.profile_arn {
+            validated_cred.profile_arn = Some(profile_arn);
+        }
         validated_cred.auth_method = new_cred.auth_method.map(|m| {
             if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam") {
                 "idc".to_string()
@@ -6939,11 +7246,15 @@ impl MultiTokenManager {
         validated_cred.api_region = new_cred.api_region;
         validated_cred.machine_id = new_cred.machine_id;
         validated_cred.email = new_cred.email;
+        validated_cred.user_id = new_cred.user_id;
+        validated_cred.subscription_title = new_cred.subscription_title;
         validated_cred.subscription_type = new_cred.subscription_type;
         validated_cred.account_type = new_cred.account_type;
         validated_cred.allowed_models = new_cred.allowed_models;
         validated_cred.blocked_models = new_cred.blocked_models;
         validated_cred.runtime_model_restrictions = new_cred.runtime_model_restrictions;
+        validated_cred.available_model_ids = new_cred.available_model_ids;
+        validated_cred.available_models_cached_at = new_cred.available_models_cached_at;
         validated_cred.imported_at = new_cred
             .imported_at
             .or_else(|| Some(Utc::now().to_rfc3339()));
@@ -10478,11 +10789,11 @@ mod tests {
         let mut credentials = KiroCredentials::default();
         credentials.region = Some("eu-west-1".to_string());
 
-        // 凭据.region 不参与 api_region 回退链
+        // 凭据.region 参与 api_region 回退链，兼容 KAM/Enterprise 导入
         let api_region = credentials.effective_api_region(&config);
         let api_host = format!("q.{}.amazonaws.com", api_region);
 
-        assert_eq!(api_host, "q.us-west-2.amazonaws.com");
+        assert_eq!(api_host, "q.eu-west-1.amazonaws.com");
     }
 
     #[test]

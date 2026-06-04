@@ -22,9 +22,19 @@ interface KamImportDialogProps {
 interface KamAccount {
   email?: string
   userId?: string | null
+  provider?: string
   nickname?: string
   profileArn?: string
   accountType?: string
+  availableModelIds?: string[]
+  availableModels?: unknown[]
+  models?: unknown[]
+  availableModelsCache?: {
+    response?: unknown
+    models?: unknown[]
+    cachedAt?: number
+    modelProvider?: string | null
+  } | null
   maxConcurrency?: number
   rateLimitBucketCapacity?: number
   rateLimitRefillPerSecond?: number
@@ -33,6 +43,8 @@ interface KamAccount {
     clientId?: string
     clientSecret?: string
     region?: string
+    authRegion?: string
+    apiRegion?: string
     profileArn?: string
     authMethod?: string
     startUrl?: string
@@ -53,6 +65,70 @@ interface VerificationResult {
 }
 
 
+function getString(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined
+}
+
+function getNumber(value: unknown): number | undefined {
+  return typeof value === 'number' ? value : undefined
+}
+
+function extractModelId(value: unknown): string | undefined {
+  if (typeof value !== 'object' || value === null) return undefined
+  return getString((value as Record<string, unknown>).modelId)
+}
+
+function extractAvailableModelIds(account: Pick<KamAccount, 'availableModelIds' | 'availableModels' | 'models' | 'availableModelsCache'>): string[] {
+  const ids = new Set<string>()
+  for (const modelId of account.availableModelIds || []) {
+    const trimmed = modelId.trim()
+    if (trimmed) ids.add(trimmed)
+  }
+
+  const topLevelModels = [
+    ...(account.availableModels || []),
+    ...(account.models || []),
+    ...(account.availableModelsCache?.models || []),
+  ]
+  for (const model of topLevelModels) {
+    const modelId = extractModelId(model)?.trim()
+    if (modelId) ids.add(modelId)
+  }
+
+  const response = account.availableModelsCache?.response
+  if (typeof response === 'object' && response !== null) {
+    const obj = response as Record<string, unknown>
+    const models = Array.isArray(obj.availableModels)
+      ? obj.availableModels
+      : Array.isArray(obj.models)
+        ? obj.models
+        : []
+    for (const model of models) {
+      const modelId = extractModelId(model)?.trim()
+      if (modelId) ids.add(modelId)
+    }
+    const defaultModelId = extractModelId(obj.defaultModel)?.trim()
+    if (defaultModelId) ids.add(defaultModelId)
+  }
+
+  return [...ids]
+}
+
+function normalizeProvider(provider?: string): string | undefined {
+  const trimmed = provider?.trim()
+  if (!trimmed) return undefined
+  const lower = trimmed.toLowerCase()
+  if (lower === 'enterprise') return 'Enterprise'
+  if (lower === 'builderid' || lower === 'builder-id' || lower === 'builder_id') return 'BuilderId'
+  if (lower === 'google') return 'Google'
+  if (lower === 'github') return 'Github'
+  return trimmed
+}
+
+function isEnterpriseProvider(provider?: string): boolean {
+  return provider?.trim().toLowerCase() === 'enterprise'
+}
+
 
 // 兼容 KAM 1.8.3 新版平铺格式，统一转换为旧格式（credentials 嵌套结构）
 function normalizeKamAccount(item: unknown): unknown {
@@ -63,6 +139,7 @@ function normalizeKamAccount(item: unknown): unknown {
     const email = typeof obj.email === 'string' ? obj.email : undefined
     const userId =
       typeof obj.userId === 'string' || obj.userId === null ? (obj.userId as string | null) : undefined
+    const provider = getString(obj.provider)
     const nickname =
       typeof obj.nickname === 'string'
         ? obj.nickname
@@ -70,29 +147,40 @@ function normalizeKamAccount(item: unknown): unknown {
           ? (obj.label as string)
           : undefined
     const profileArn = typeof obj.profileArn === 'string' ? obj.profileArn : undefined
-    const accountType = typeof obj.accountType === 'string' ? obj.accountType : undefined
-    const maxConcurrency =
-      typeof obj.maxConcurrency === 'number' ? obj.maxConcurrency : undefined
-    const rateLimitBucketCapacity =
-      typeof obj.rateLimitBucketCapacity === 'number' ? obj.rateLimitBucketCapacity : undefined
-    const rateLimitRefillPerSecond =
-      typeof obj.rateLimitRefillPerSecond === 'number'
-        ? obj.rateLimitRefillPerSecond
+    const accountType = getString(obj.accountType)
+    const availableModelIds = Array.isArray(obj.availableModelIds)
+      ? obj.availableModelIds.filter((value): value is string => typeof value === 'string')
+      : undefined
+    const availableModels = Array.isArray(obj.availableModels) ? obj.availableModels : undefined
+    const models = Array.isArray(obj.models) ? obj.models : undefined
+    const availableModelsCache =
+      typeof obj.availableModelsCache === 'object' && obj.availableModelsCache !== null
+        ? obj.availableModelsCache as KamAccount['availableModelsCache']
         : undefined
-    const status = typeof obj.status === 'string' ? obj.status : undefined
-    const machineId = typeof obj.machineId === 'string' ? obj.machineId : undefined
-    const clientId = typeof obj.clientId === 'string' ? obj.clientId : undefined
-    const clientSecret = typeof obj.clientSecret === 'string' ? obj.clientSecret : undefined
-    const region = typeof obj.region === 'string' ? obj.region : undefined
-    const authMethod = typeof obj.authMethod === 'string' ? obj.authMethod : undefined
-    const startUrl = typeof obj.startUrl === 'string' ? obj.startUrl : undefined
+    const maxConcurrency = getNumber(obj.maxConcurrency)
+    const rateLimitBucketCapacity = getNumber(obj.rateLimitBucketCapacity)
+    const rateLimitRefillPerSecond = getNumber(obj.rateLimitRefillPerSecond)
+    const status = getString(obj.status)
+    const machineId = getString(obj.machineId)
+    const clientId = getString(obj.clientId)
+    const clientSecret = getString(obj.clientSecret)
+    const region = getString(obj.region)
+    const authRegion = getString(obj.authRegion)
+    const apiRegion = getString(obj.apiRegion)
+    const authMethod = getString(obj.authMethod)
+    const startUrl = getString(obj.startUrl)
 
     return {
       email,
       userId,
+      provider,
       nickname,
       profileArn,
       accountType,
+      availableModelIds,
+      availableModels,
+      models,
+      availableModelsCache,
       maxConcurrency,
       rateLimitBucketCapacity,
       rateLimitRefillPerSecond,
@@ -103,6 +191,8 @@ function normalizeKamAccount(item: unknown): unknown {
         clientId,
         clientSecret,
         region,
+        authRegion,
+        apiRegion,
         profileArn,
         authMethod,
         startUrl,
@@ -224,10 +314,11 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
 
       // 初始化结果，标记 error 状态的账号
       const initialResults: VerificationResult[] = validAccounts.map((account, i) => {
+        const displayName = account.email || account.userId || account.nickname
         if (skipErrorAccounts && account.status === 'error') {
-          return { index: i + 1, status: 'skipped' as const, email: account.email || account.nickname }
+          return { index: i + 1, status: 'skipped' as const, email: displayName }
         }
-        return { index: i + 1, status: 'pending' as const, email: account.email || account.nickname }
+        return { index: i + 1, status: 'pending' as const, email: displayName }
       })
       setResults(initialResults)
 
@@ -257,7 +348,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
         const token = cred.refreshToken.trim()
         const tokenHash = await sha256Hex(token)
 
-        setCurrentProcessing(`正在处理 ${account.email || account.nickname || `账号 ${i + 1}`}`)
+        setCurrentProcessing(`正在处理 ${account.email || account.userId || account.nickname || `账号 ${i + 1}`}`)
         setResults(prev => {
           const next = [...prev]
           next[i] = { ...next[i], status: 'checking' }
@@ -270,7 +361,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           const existingCred = existingCredentials?.credentials.find(c => c.refreshTokenHash === tokenHash)
           setResults(prev => {
             const next = [...prev]
-            next[i] = { ...next[i], status: 'duplicate', error: '该凭据已存在', email: existingCred?.email || account.email }
+            next[i] = { ...next[i], status: 'duplicate', error: '该凭据已存在', email: existingCred?.email || existingCred?.userId || account.email || account.userId || undefined }
             return next
           })
           setProgress({ current: i + 1, total: validAccounts.length })
@@ -289,14 +380,30 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
         try {
           const clientId = cred.clientId?.trim() || undefined
           const clientSecret = cred.clientSecret?.trim() || undefined
+          const provider = normalizeProvider(account.provider)
           const authMethod = clientId && clientSecret ? 'idc' : 'social'
           const kamRegion = cred.region?.trim() || undefined
-          const profileArn =
-            account.profileArn?.trim() || cred.profileArn?.trim() || undefined
+          const authRegion = cred.authRegion?.trim() || kamRegion || undefined
+          const apiRegion = cred.apiRegion?.trim() || kamRegion || undefined
+          const startUrl = cred.startUrl?.trim() || undefined
+          const enterprise = isEnterpriseProvider(provider)
+          const profileArn = enterprise
+            ? undefined
+            : account.profileArn?.trim() || cred.profileArn?.trim() || undefined
+          const availableModelIds = extractAvailableModelIds(account)
 
           // idc 模式下必须同时提供 clientId 和 clientSecret
           if (authMethod === 'social' && (clientId || clientSecret)) {
             throw new Error('idc 模式需要同时提供 clientId 和 clientSecret')
+          }
+          if (enterprise && (!clientId || !clientSecret)) {
+            throw new Error('Enterprise 账号必须包含 clientId 和 clientSecret')
+          }
+          if (enterprise && !startUrl) {
+            throw new Error('Enterprise 账号必须包含 startUrl')
+          }
+          if (enterprise && !kamRegion && !authRegion && !apiRegion) {
+            throw new Error('Enterprise 账号必须包含 region')
           }
 
           if (
@@ -323,16 +430,19 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           const addedCred = await addCredential({
             refreshToken: token,
             email: account.email?.trim() || undefined,
+            userId: account.userId?.trim() || undefined,
             authMethod,
+            provider,
             region: kamRegion,
-            authRegion: kamRegion,
-            apiRegion: kamRegion,
+            authRegion,
+            apiRegion,
             profileArn,
             clientId,
             clientSecret,
-            startUrl: cred.startUrl?.trim() || undefined,
+            startUrl,
             machineId: account.machineId?.trim() || undefined,
             accountType: account.accountType?.trim() || undefined,
+            availableModelIds: availableModelIds.length > 0 ? availableModelIds : undefined,
             maxConcurrency:
               typeof account.maxConcurrency === 'number' ? account.maxConcurrency : undefined,
             rateLimitBucketCapacity:
@@ -362,8 +472,8 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           existingTokenHashes.add(tokenHash)
           setCurrentProcessing(
             balanceError
-              ? `导入成功，额度获取失败: ${addedCred.email || account.email || `账号 ${i + 1}`}`
-              : `验活成功: ${addedCred.email || account.email || `账号 ${i + 1}`}`,
+              ? `导入成功，额度获取失败: ${addedCred.email || addedCred.userId || account.email || account.userId || `账号 ${i + 1}`}`
+              : `验活成功: ${addedCred.email || addedCred.userId || account.email || account.userId || `账号 ${i + 1}`}`,
           )
           setResults(prev => {
             const next = [...prev]
@@ -372,7 +482,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
               status: 'verified',
               usage,
               error: balanceError,
-              email: addedCred.email || account.email,
+              email: addedCred.email || addedCred.userId || account.email || account.userId || undefined,
               credentialId: addedCred.credentialId,
             }
             return next
@@ -490,7 +600,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           <div className="space-y-2">
             <label className="text-sm font-medium">KAM 导出 JSON</label>
             <textarea
-              placeholder={'粘贴 Kiro Account Manager 导出的 JSON\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "us-east-1",\n    "startUrl": "https://example.awsapps.com/start",\n    "accountType": "power",\n    "maxConcurrency": 20\n  }\n]\n\n（可选的 authMethod 字段会被忽略，系统会根据 clientId/clientSecret 自动判断）\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "us-east-1",\n        "startUrl": "https://example.awsapps.com/start"\n      }\n    }\n  ]\n}'}
+              placeholder={'粘贴 Kiro Account Manager 导出的 JSON\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "userId": "...",\n    "provider": "Enterprise",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "us-east-1",\n    "startUrl": "https://example.awsapps.com/start",\n    "accountType": "power",\n    "maxConcurrency": 20\n  }\n]\n\n（可选的 authMethod 字段会被忽略，系统会根据 clientId/clientSecret 自动判断）\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "provider": "Enterprise",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "us-east-1",\n        "startUrl": "https://example.awsapps.com/start"\n      }\n    }\n  ]\n}'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}

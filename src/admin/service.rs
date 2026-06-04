@@ -94,9 +94,11 @@ impl AdminService {
                     is_current: entry.id == current_id,
                     expires_at: entry.expires_at,
                     auth_method: entry.auth_method,
+                    provider: entry.provider,
                     has_profile_arn: entry.has_profile_arn,
                     refresh_token_hash: entry.refresh_token_hash,
                     email: entry.email,
+                    user_id: entry.user_id,
                     subscription_title: entry.subscription_title,
                     subscription_type: entry.subscription_type,
                     auth_account_type: entry.auth_account_type,
@@ -107,6 +109,8 @@ impl AdminService {
                     allowed_models: entry.allowed_models,
                     blocked_models: entry.blocked_models,
                     runtime_model_restrictions: entry.runtime_model_restrictions,
+                    available_model_ids: entry.available_model_ids,
+                    available_models_cached_at: entry.available_models_cached_at,
                     imported_at: entry.imported_at,
                     success_count: entry.success_count,
                     last_used_at: entry.last_used_at.clone(),
@@ -366,13 +370,65 @@ impl AdminService {
 
         // 构建凭据对象
         let email = req.email.clone();
+        let is_enterprise = req
+            .provider
+            .as_deref()
+            .is_some_and(|provider| provider.trim().eq_ignore_ascii_case("enterprise"));
+        if is_enterprise {
+            if req
+                .client_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none()
+                || req
+                    .client_secret
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .is_none()
+            {
+                return Err(AdminServiceError::InvalidCredential(
+                    "Enterprise 账号必须提供 clientId/clientSecret".to_string(),
+                ));
+            }
+            if req
+                .start_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none()
+            {
+                return Err(AdminServiceError::InvalidCredential(
+                    "Enterprise 账号必须提供 startUrl".to_string(),
+                ));
+            }
+            if req
+                .region
+                .as_deref()
+                .or(req.auth_region.as_deref())
+                .or(req.api_region.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none()
+            {
+                return Err(AdminServiceError::InvalidCredential(
+                    "Enterprise 账号必须提供 region/authRegion/apiRegion 之一".to_string(),
+                ));
+            }
+        }
         let new_cred = KiroCredentials {
             id: None,
             access_token: None,
             refresh_token: Some(req.refresh_token),
-            profile_arn: req.profile_arn,
+            profile_arn: if is_enterprise { None } else { req.profile_arn },
             expires_at: None,
-            auth_method: Some(req.auth_method),
+            auth_method: Some(if is_enterprise {
+                "idc".to_string()
+            } else {
+                req.auth_method
+            }),
+            provider: req.provider,
             client_id: req.client_id,
             client_secret: req.client_secret,
             start_url: req.start_url,
@@ -385,12 +441,15 @@ impl AdminService {
             api_region: req.api_region,
             machine_id: req.machine_id,
             email: req.email,
+            user_id: req.user_id,
             subscription_title: None, // 将在首次获取使用额度时自动更新
             subscription_type: None,
             account_type: req.account_type,
             allowed_models: req.allowed_models.unwrap_or_default(),
             blocked_models: req.blocked_models.unwrap_or_default(),
             runtime_model_restrictions: Vec::new(),
+            available_model_ids: req.available_model_ids.unwrap_or_default(),
+            available_models_cached_at: None,
             imported_at: None,
             proxy_url: req.proxy_url,
             proxy_username: req.proxy_username,
@@ -434,7 +493,26 @@ impl AdminService {
             success: true,
             message: format!("凭据添加成功，ID: {}", credential_id),
             credential_id,
-            email,
+            email: usage_info
+                .as_ref()
+                .and_then(|usage| usage.email().map(str::to_string))
+                .or_else(|| {
+                    credential_snapshot
+                        .as_ref()
+                        .and_then(|entry| entry.email.clone())
+                })
+                .or(email),
+            user_id: usage_info
+                .as_ref()
+                .and_then(|usage| usage.user_id().map(str::to_string))
+                .or_else(|| {
+                    credential_snapshot
+                        .as_ref()
+                        .and_then(|entry| entry.user_id.clone())
+                }),
+            provider: credential_snapshot
+                .as_ref()
+                .and_then(|entry| entry.provider.clone()),
             subscription_title: usage_info
                 .as_ref()
                 .and_then(|usage| usage.subscription_title().map(str::to_string))
