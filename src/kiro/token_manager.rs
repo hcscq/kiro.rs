@@ -423,9 +423,12 @@ async fn refresh_idc_token(
         new_credentials.expires_at = Some(expires_at.to_rfc3339());
     }
 
-    // 同步更新 profile_arn（如果 IdC 响应中包含）。Enterprise 的 profileArn
-    // 是账号特定值，不能用 BuilderID 默认值替代，也不能在刷新后丢弃。
-    if let Some(profile_arn) = data.profile_arn {
+    // 同步更新 profile_arn（如果 IdC 响应中包含）。Enterprise 与 KAM/IDE 一致，
+    // 不在 token cache 中保存 profileArn。
+    let is_enterprise = credentials.detected_auth_account_type().as_deref() == Some("enterprise");
+    if is_enterprise {
+        new_credentials.profile_arn = None;
+    } else if let Some(profile_arn) = data.profile_arn {
         new_credentials.profile_arn = Some(profile_arn);
     }
 
@@ -456,7 +459,7 @@ pub(crate) async fn get_usage_limits(
         management_endpoint
     );
 
-    // BuilderID 账号在 Kiro/KAM 中会使用固定 profileArn；Enterprise 仅使用显式 ARN。
+    // BuilderID 账号在 Kiro/KAM 中会使用固定 profileArn；Enterprise/IdC 不带 profileArn。
     if let Some(profile_arn) = credentials.effective_profile_arn_for_kiro_requests() {
         url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
     }
@@ -763,7 +766,7 @@ pub(crate) enum DisabledReason {
     AuthInvalid,
     /// 上游拒绝访问但未给出更细粒度原因
     PermissionDenied,
-    /// Enterprise 凭据缺少账号特定 profileArn
+    /// 历史禁用原因：Enterprise 凭据缺少账号特定 profileArn
     MissingProfileArn,
     /// 上游 suspicious activity 风控多次命中后自动停调
     SuspiciousActivity,
@@ -7187,6 +7190,9 @@ impl MultiTokenManager {
             anyhow::bail!("凭据已存在（refreshToken 重复）");
         }
 
+        let import_is_enterprise =
+            new_cred.detected_auth_account_type().as_deref() == Some("enterprise");
+
         // 4. 尝试刷新 Token 验证凭据有效性
         let effective_proxy = new_cred.effective_proxy(self.proxy.as_ref());
         let mut validated_cred =
@@ -7217,7 +7223,9 @@ impl MultiTokenManager {
         validated_cred.id = Some(new_id);
         validated_cred.priority = new_cred.priority;
         validated_cred.provider = new_cred.provider;
-        if let Some(profile_arn) = new_cred.profile_arn {
+        if import_is_enterprise {
+            validated_cred.profile_arn = None;
+        } else if let Some(profile_arn) = new_cred.profile_arn {
             validated_cred.profile_arn = Some(profile_arn);
         }
         validated_cred.auth_method = new_cred.auth_method.map(|m| {
