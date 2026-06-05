@@ -84,7 +84,7 @@ pub struct KiroProvider {
 
 pub struct ManagedResponse {
     body: ManagedResponseBody,
-    _lease: CallLease,
+    _lease: Option<CallLease>,
     trace: Option<ResponseTrace>,
     stream_first_chunk_already_logged: bool,
 }
@@ -287,7 +287,7 @@ impl ManagedResponse {
     fn new(response: reqwest::Response, lease: CallLease, trace: Option<ResponseTrace>) -> Self {
         Self {
             body: ManagedResponseBody::Response(response),
-            _lease: lease,
+            _lease: Some(lease),
             trace,
             stream_first_chunk_already_logged: false,
         }
@@ -295,7 +295,7 @@ impl ManagedResponse {
 
     fn new_stream(
         stream: BoxStream<'static, Result<Bytes, reqwest::Error>>,
-        lease: CallLease,
+        lease: Option<CallLease>,
         trace: Option<ResponseTrace>,
         first_chunk_already_logged: bool,
     ) -> Self {
@@ -310,7 +310,7 @@ impl ManagedResponse {
     fn new_bytes(bytes: Bytes, lease: CallLease) -> Self {
         Self {
             body: ManagedResponseBody::Bytes(bytes),
-            _lease: lease,
+            _lease: Some(lease),
             trace: None,
             stream_first_chunk_already_logged: false,
         }
@@ -2491,6 +2491,8 @@ impl KiroProvider {
         let non_stream_body_read_timeout_config = self
             .token_manager
             .non_stream_body_read_timeout_config_snapshot();
+        let stream_dispatch_lease_release_enabled =
+            is_stream && self.token_manager.stream_dispatch_lease_release_enabled();
 
         // Anthropic handlers already know the mapped Kiro model. Fall back to JSON extraction for
         // direct provider callers so large requests avoid an extra full-body parse on the hot path.
@@ -3372,9 +3374,28 @@ impl KiroProvider {
                                 ctx_id,
                             );
                             self.token_manager.report_success(ctx_id);
+                            let response_lease = if stream_dispatch_lease_release_enabled {
+                                tracing::info!(
+                                    request_id = %request_id,
+                                    api_type,
+                                    model = model.as_deref().unwrap_or("unknown"),
+                                    credential_id = ctx_id,
+                                    attempt = attempt + 1,
+                                    max_retries,
+                                    region = %region,
+                                    request_body_bytes,
+                                    prefetched_bytes,
+                                    stream_dispatch_lease_release_reason = ready_reason,
+                                    "流式请求已开始产生可转发内容，提前释放调度 lease"
+                                );
+                                drop(lease);
+                                None
+                            } else {
+                                Some(lease)
+                            };
                             return Ok(ManagedResponse::new_stream(
                                 stream,
-                                lease,
+                                response_lease,
                                 Some(trace),
                                 first_chunk_logged,
                             ));
@@ -3530,6 +3551,29 @@ impl KiroProvider {
                     ctx_id,
                 );
                 self.token_manager.report_success(ctx_id);
+                if stream_dispatch_lease_release_enabled {
+                    tracing::info!(
+                        request_id = %request_id,
+                        api_type,
+                        model = model.as_deref().unwrap_or("unknown"),
+                        credential_id = ctx_id,
+                        attempt = attempt + 1,
+                        max_retries,
+                        region = %region,
+                        request_body_bytes,
+                        stream_dispatch_lease_release_reason =
+                            "stream_headers_accepted_without_content_probe",
+                        "流式请求上游响应已建立，提前释放调度 lease"
+                    );
+                    let stream = response.bytes_stream().boxed();
+                    drop(lease);
+                    return Ok(ManagedResponse::new_stream(
+                        stream,
+                        None,
+                        Some(trace),
+                        false,
+                    ));
+                }
                 return Ok(ManagedResponse::new(response, lease, Some(trace)));
             }
 

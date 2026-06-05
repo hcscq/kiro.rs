@@ -882,6 +882,8 @@ pub struct PersistedDispatchConfig {
     pub rate_limit_refill_backoff_factor: f64,
     #[serde(default)]
     pub request_weighting: RequestWeightingConfig,
+    #[serde(default = "default_persisted_stream_dispatch_lease_release_enabled")]
+    pub stream_dispatch_lease_release_enabled: bool,
     #[serde(default)]
     pub stream_pre_sse_failover: StreamPreSseFailoverConfig,
     #[serde(default)]
@@ -942,6 +944,10 @@ fn default_persisted_model_cooldown_enabled() -> bool {
     true
 }
 
+fn default_persisted_stream_dispatch_lease_release_enabled() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateChangeKind {
     Credentials,
@@ -992,6 +998,7 @@ impl PersistedDispatchConfig {
                 .rate_limit_refill_recovery_step_per_success,
             rate_limit_refill_backoff_factor: config.rate_limit_refill_backoff_factor,
             request_weighting: config.request_weighting.clone(),
+            stream_dispatch_lease_release_enabled: config.stream_dispatch_lease_release_enabled,
             stream_pre_sse_failover: config.stream_pre_sse_failover.clone(),
             non_stream_body_read_timeout: config.non_stream_body_read_timeout.clone(),
             kiro_request_body_guard: config.kiro_request_body_guard.clone(),
@@ -1034,6 +1041,7 @@ impl PersistedDispatchConfig {
             self.rate_limit_refill_recovery_step_per_success;
         config.rate_limit_refill_backoff_factor = self.rate_limit_refill_backoff_factor;
         config.request_weighting = self.request_weighting.clone();
+        config.stream_dispatch_lease_release_enabled = self.stream_dispatch_lease_release_enabled;
         config.stream_pre_sse_failover = self.stream_pre_sse_failover.clone();
         config.non_stream_body_read_timeout = self.non_stream_body_read_timeout.clone();
         config.kiro_request_body_guard = self.kiro_request_body_guard.clone();
@@ -3904,6 +3912,7 @@ mod tests {
                 tools_bonus: 1.0,
                 ..RequestWeightingConfig::default()
             },
+            stream_dispatch_lease_release_enabled: false,
             stream_pre_sse_failover: StreamPreSseFailoverConfig::default(),
             non_stream_body_read_timeout: NonStreamBodyReadTimeoutConfig::default(),
             kiro_request_body_guard: KiroRequestBodyGuardConfig {
@@ -3943,6 +3952,7 @@ mod tests {
         .unwrap();
 
         assert!(!dispatch.rate_limit_cooldown_enabled);
+        assert!(dispatch.stream_dispatch_lease_release_enabled);
         assert!(dispatch.suspicious_activity_cooldown_enabled);
         assert_eq!(dispatch.suspicious_activity_cooldown_ms, 7_200_000);
         assert!(dispatch.suspicious_activity_prefer_clean_credentials);

@@ -270,6 +270,7 @@ export interface LoadBalancingConfigResponse {
   rateLimitRefillRecoveryStepPerSuccess: number
   rateLimitRefillBackoffFactor: number
   requestWeighting: RequestWeightingConfig
+  streamDispatchLeaseReleaseEnabled: boolean
   streamPreSseFailover: StreamPreSseFailoverConfig
   nonStreamBodyReadTimeout: NonStreamBodyReadTimeoutConfig
   kiroRequestBodyGuard: KiroRequestBodyGuardConfig
@@ -302,6 +303,7 @@ export interface UpdateLoadBalancingConfigRequest {
   rateLimitRefillRecoveryStepPerSuccess?: number
   rateLimitRefillBackoffFactor?: number
   requestWeighting?: RequestWeightingConfig
+  streamDispatchLeaseReleaseEnabled?: boolean
   streamPreSseFailover?: StreamPreSseFailoverConfig
   nonStreamBodyReadTimeout?: NonStreamBodyReadTimeoutConfig
   kiroRequestBodyGuard?: KiroRequestBodyGuardConfig

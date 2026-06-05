@@ -246,6 +246,7 @@ GitHub Actions 镜像构建：
 | `rateLimitRefillMinPerSecond` | number | `1.0` | 遭遇 `429` 后允许降到的最小回填速率（token/s） |
 | `rateLimitRefillRecoveryStepPerSuccess` | number | `0.25` | 每次成功请求后恢复的回填速率增量（token/s） |
 | `rateLimitRefillBackoffFactor` | number | `0.75` | 遭遇 `429` 时当前回填速率的衰减系数，范围 `[0.05, 1]` |
+| `streamDispatchLeaseReleaseEnabled` | boolean | `true` | 流式请求在上游已产生可转发内容后释放调度 lease，无法探测首内容时在响应建立后释放，避免长时间下游 SSE 持续占用凭据并发槽；关闭后恢复按完整响应生命周期占位 |
 | `requestWeighting` | object | 默认开启 | 轻/重请求加权配置。默认值已按单号/少号场景收敛：重请求会多消耗 bucket，但不会像旧参数那样过快把桶打空 |
 | `thinkingSignatureValidationMode` | string | `strict` | 历史 thinking signature 校验模式：`strict` 拒绝无效自签名，`warn_only` 只告警放行，`disabled` 跳过校验，`strip_invalid` 移除无效自签名后放行；也可在 Admin UI 的“调度与并发配置”页面热更新 |
 | `responseThinkingSignatureCompatEnabled` | boolean | `false` | 响应侧 thinking signature 兼容补齐；启用后，thinking 流式请求若上游先返回普通内容，会在首个非 thinking 内容块前补齐隐藏 thinking block 和动态 AWS-shaped `signature_delta` |
@@ -308,6 +309,7 @@ GitHub Actions 镜像构建：
    "rateLimitRefillMinPerSecond": 1.0,
    "rateLimitRefillRecoveryStepPerSuccess": 0.25,
    "rateLimitRefillBackoffFactor": 0.75,
+   "streamDispatchLeaseReleaseEnabled": true,
    "requestWeighting": {
       "enabled": true,
       "baseWeight": 1.0,
@@ -543,6 +545,7 @@ kiro-rs \
 - `modelCooldownEnabled` 控制“模型不支持”后的运行时模型冷却；默认开启，关闭时不会把 `INVALID_MODEL_ID` 记成账号级临时模型限制
 - `rateLimitBucketCapacity` / `rateLimitRefillPerSecond` 可限制单账号单位时间内的发放速率，适合给“真实承载能力偏弱”的账号单独降速
 - `requestWeighting` 默认开启，但默认曲线已经压平；重代码/重 thinking 请求会比轻请求多消耗一些 bucket 配额，同时默认 bucket 与 429 退避参数已同步调优
+- `streamDispatchLeaseReleaseEnabled` 默认开启；普通长流式输出在上游首内容后不再持续占用调度 lease，无法探测首内容时会在上游响应建立后释放。如遇上游真实并发过高，可关闭该项或降低 bucket/refill
 - 遭遇 `429` 时，本地会清空该账号 bucket，并按 `rateLimitRefillBackoffFactor` 下调当前回填速率；成功请求后再按 `rateLimitRefillRecoveryStepPerSuccess` 逐步恢复
 - 单凭据最多重试 3 次，单请求最多重试 9 次
 - 自动故障转移到下一个可用凭据

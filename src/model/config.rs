@@ -678,6 +678,11 @@ pub struct Config {
     #[serde(default)]
     pub request_weighting: RequestWeightingConfig,
 
+    /// 流式请求是否在上游已开始产生可转发内容后释放调度 lease。
+    /// 无法进行首内容探测时会在上游响应建立后释放，避免长时间 SSE 转发持续占用凭据槽。
+    #[serde(default = "default_stream_dispatch_lease_release_enabled")]
+    pub stream_dispatch_lease_release_enabled: bool,
+
     /// 流式请求在收到上游响应头前的自适应故障转移策略。
     #[serde(default)]
     pub stream_pre_sse_failover: StreamPreSseFailoverConfig,
@@ -896,6 +901,10 @@ fn default_request_weighting_heavy_thinking_budget_bonus() -> f64 {
     0.35
 }
 
+fn default_stream_dispatch_lease_release_enabled() -> bool {
+    true
+}
+
 fn default_stream_pre_sse_failover_enabled() -> bool {
     true
 }
@@ -1050,6 +1059,7 @@ impl Default for Config {
                 default_rate_limit_refill_recovery_step_per_success(),
             rate_limit_refill_backoff_factor: default_rate_limit_refill_backoff_factor(),
             request_weighting: RequestWeightingConfig::default(),
+            stream_dispatch_lease_release_enabled: default_stream_dispatch_lease_release_enabled(),
             stream_pre_sse_failover: StreamPreSseFailoverConfig::default(),
             non_stream_body_read_timeout: NonStreamBodyReadTimeoutConfig::default(),
             kiro_request_body_guard: KiroRequestBodyGuardConfig::default(),
@@ -1398,6 +1408,7 @@ mod tests {
         assert_eq!(config.suspicious_activity_auto_clear_after_ms, 604_800_000);
         assert!(config.model_cooldown_enabled);
         assert!(config.request_weighting.enabled);
+        assert!(config.stream_dispatch_lease_release_enabled);
         assert!((config.rate_limit_bucket_capacity - 6.0).abs() < f64::EPSILON);
         assert!((config.rate_limit_refill_per_second - 2.0).abs() < f64::EPSILON);
         assert!((config.rate_limit_refill_min_per_second - 1.0).abs() < f64::EPSILON);

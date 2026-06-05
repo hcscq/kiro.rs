@@ -35,6 +35,7 @@
   "rateLimitRefillMinPerSecond": 1.0,
   "rateLimitRefillRecoveryStepPerSuccess": 0.25,
   "rateLimitRefillBackoffFactor": 0.75,
+  "streamDispatchLeaseReleaseEnabled": true,
   "requestWeighting": {
     "enabled": true,
     "baseWeight": 1.0,

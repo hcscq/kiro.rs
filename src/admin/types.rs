@@ -473,6 +473,8 @@ pub struct LoadBalancingModeResponse {
     pub rate_limit_refill_backoff_factor: f64,
     /// 轻/重请求的本地令牌消耗权重规则
     pub request_weighting: RequestWeightingConfig,
+    /// 流式请求首内容后是否释放调度 lease，无法探测首内容时在响应建立后释放
+    pub stream_dispatch_lease_release_enabled: bool,
     /// 流式请求上游响应头前的自适应故障转移策略
     pub stream_pre_sse_failover: StreamPreSseFailoverConfig,
     /// 非流式请求上游响应体读取超时策略
@@ -537,6 +539,8 @@ pub struct SetLoadBalancingModeRequest {
     pub rate_limit_refill_backoff_factor: Option<f64>,
     /// 轻/重请求的本地令牌消耗权重规则
     pub request_weighting: Option<RequestWeightingConfig>,
+    /// 流式请求首内容后是否释放调度 lease，无法探测首内容时在响应建立后释放
+    pub stream_dispatch_lease_release_enabled: Option<bool>,
     /// 流式请求上游响应头前的自适应故障转移策略
     pub stream_pre_sse_failover: Option<StreamPreSseFailoverConfig>,
     /// 非流式请求上游响应体读取超时策略

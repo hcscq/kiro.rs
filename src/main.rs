@@ -1402,6 +1402,7 @@ mod tests {
                 tools_bonus: 1.0,
                 ..RequestWeightingConfig::default()
             },
+            stream_dispatch_lease_release_enabled: false,
             stream_pre_sse_failover: StreamPreSseFailoverConfig::default(),
             non_stream_body_read_timeout: Default::default(),
             kiro_request_body_guard: Default::default(),
@@ -1447,6 +1448,7 @@ mod tests {
         assert_eq!(rollback.rate_limit_refill_backoff_factor, 0.4);
         assert_eq!(rollback.request_weighting.max_weight, 4.0);
         assert_eq!(rollback.request_weighting.tools_bonus, 1.0);
+        assert!(!rollback.stream_dispatch_lease_release_enabled);
         assert!(rollback.stream_pre_sse_failover.enabled);
         assert_eq!(rollback.kiro_request_body_guard.max_bytes, 30 * 1024 * 1024);
         assert_eq!(

@@ -1344,7 +1344,7 @@ pub async fn post_messages(
                 model_id: Some(model_id.clone()),
                 session_affinity_key: session_affinity_key.clone(),
                 request_weight,
-                wait_for_stream_content_start: thinking_enabled,
+                wait_for_stream_content_start: true,
                 stream_thinking_enabled: thinking_enabled,
             },
         )
@@ -2776,7 +2776,7 @@ pub async fn post_messages_cc(
                 model_id: Some(model_id.clone()),
                 session_affinity_key: session_affinity_key.clone(),
                 request_weight,
-                wait_for_stream_content_start: false,
+                wait_for_stream_content_start: true,
                 stream_thinking_enabled: thinking_enabled,
             },
         )

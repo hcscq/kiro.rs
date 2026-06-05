@@ -1300,6 +1300,7 @@ pub struct LoadBalancingConfigSnapshot {
     pub rate_limit_refill_recovery_step_per_success: f64,
     pub rate_limit_refill_backoff_factor: f64,
     pub request_weighting: RequestWeightingConfig,
+    pub stream_dispatch_lease_release_enabled: bool,
     pub stream_pre_sse_failover: StreamPreSseFailoverConfig,
     pub non_stream_body_read_timeout: NonStreamBodyReadTimeoutConfig,
     pub kiro_request_body_guard: KiroRequestBodyGuardConfig,
@@ -1346,6 +1347,7 @@ struct DispatchConfig {
     rate_limit_refill_recovery_step_per_success: f64,
     rate_limit_refill_backoff_factor: f64,
     request_weighting: RequestWeightingConfig,
+    stream_dispatch_lease_release_enabled: bool,
     stream_pre_sse_failover: StreamPreSseFailoverConfig,
     non_stream_body_read_timeout: NonStreamBodyReadTimeoutConfig,
     kiro_request_body_guard: KiroRequestBodyGuardConfig,
@@ -1419,6 +1421,7 @@ impl DispatchConfig {
                 config.rate_limit_refill_backoff_factor,
             ),
             request_weighting: config.request_weighting.clone(),
+            stream_dispatch_lease_release_enabled: config.stream_dispatch_lease_release_enabled,
             stream_pre_sse_failover: config.stream_pre_sse_failover.clone(),
             non_stream_body_read_timeout: config.non_stream_body_read_timeout.clone(),
             kiro_request_body_guard: config.kiro_request_body_guard.clone(),
@@ -7685,6 +7688,7 @@ impl MultiTokenManager {
                 .rate_limit_refill_recovery_step_per_success,
             rate_limit_refill_backoff_factor: dispatch.rate_limit_refill_backoff_factor,
             request_weighting: dispatch.request_weighting.clone(),
+            stream_dispatch_lease_release_enabled: dispatch.stream_dispatch_lease_release_enabled,
             stream_pre_sse_failover: dispatch.stream_pre_sse_failover.clone(),
             non_stream_body_read_timeout: dispatch.non_stream_body_read_timeout.clone(),
             kiro_request_body_guard: dispatch.kiro_request_body_guard.clone(),
@@ -7717,6 +7721,10 @@ impl MultiTokenManager {
 
     pub fn request_weighting_config_snapshot(&self) -> RequestWeightingConfig {
         self.dispatch_config().request_weighting
+    }
+
+    pub fn stream_dispatch_lease_release_enabled(&self) -> bool {
+        self.dispatch_config().stream_dispatch_lease_release_enabled
     }
 
     pub fn stream_pre_sse_failover_config_snapshot(&self) -> StreamPreSseFailoverConfig {
@@ -7779,6 +7787,8 @@ impl MultiTokenManager {
                     .rate_limit_refill_recovery_step_per_success,
                 rate_limit_refill_backoff_factor: dispatch.rate_limit_refill_backoff_factor,
                 request_weighting: dispatch.request_weighting.clone(),
+                stream_dispatch_lease_release_enabled: dispatch
+                    .stream_dispatch_lease_release_enabled,
                 stream_pre_sse_failover: dispatch.stream_pre_sse_failover.clone(),
                 non_stream_body_read_timeout: dispatch.non_stream_body_read_timeout.clone(),
                 kiro_request_body_guard: dispatch.kiro_request_body_guard.clone(),
@@ -7796,6 +7806,7 @@ impl MultiTokenManager {
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
         self.set_load_balancing_config(
             Some(mode),
+            None,
             None,
             None,
             None,
@@ -7903,6 +7914,7 @@ impl MultiTokenManager {
         rate_limit_refill_recovery_step_per_success: Option<f64>,
         rate_limit_refill_backoff_factor: Option<f64>,
         request_weighting: Option<RequestWeightingConfig>,
+        stream_dispatch_lease_release_enabled: Option<bool>,
         stream_pre_sse_failover: Option<StreamPreSseFailoverConfig>,
         non_stream_body_read_timeout: Option<NonStreamBodyReadTimeoutConfig>,
         kiro_request_body_guard: Option<KiroRequestBodyGuardConfig>,
@@ -8005,6 +8017,9 @@ impl MultiTokenManager {
         if let Some(request_weighting) = request_weighting {
             next.request_weighting = request_weighting;
         }
+        if let Some(stream_dispatch_lease_release_enabled) = stream_dispatch_lease_release_enabled {
+            next.stream_dispatch_lease_release_enabled = stream_dispatch_lease_release_enabled;
+        }
         if let Some(stream_pre_sse_failover) = stream_pre_sse_failover {
             next.stream_pre_sse_failover = stream_pre_sse_failover;
         }
@@ -8094,7 +8109,7 @@ impl MultiTokenManager {
 
         self.availability_notify.notify_waiters();
         tracing::info!(
-            "调度配置已更新: mode={}, sessionAffinityEnabled={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, rateLimitCooldownEnabled={}, suspiciousActivityCooldownMs={}, suspiciousActivityCooldownEnabled={}, suspiciousActivityAutoClearEnabled={}, suspiciousActivityAutoClearSuccessThreshold={}, suspiciousActivityAutoClearAfterMs={}, modelCooldownEnabled={}, defaultMaxConcurrency={:?}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}, requestWeightingEnabled={}, requestWeightingBaseWeight={}, requestWeightingMaxWeight={}, streamPreSseFailoverEnabled={}, streamPreSseTotalBudgetMs={}, streamPreSseMaxFastFailovers={}, kiroRequestBodyGuardEnabled={}, kiroRequestBodyGuardMaxBytes={}, thinkingSignatureValidationMode={}, responseThinkingSignatureCompatEnabled={}",
+            "调度配置已更新: mode={}, sessionAffinityEnabled={}, queueMaxSize={}, queueMaxWaitMs={}, rateLimitCooldownMs={}, rateLimitCooldownEnabled={}, suspiciousActivityCooldownMs={}, suspiciousActivityCooldownEnabled={}, suspiciousActivityAutoClearEnabled={}, suspiciousActivityAutoClearSuccessThreshold={}, suspiciousActivityAutoClearAfterMs={}, modelCooldownEnabled={}, defaultMaxConcurrency={:?}, rateLimitBucketCapacity={}, rateLimitRefillPerSecond={}, rateLimitRefillMinPerSecond={}, rateLimitRefillRecoveryStepPerSuccess={}, rateLimitRefillBackoffFactor={}, requestWeightingEnabled={}, requestWeightingBaseWeight={}, requestWeightingMaxWeight={}, streamDispatchLeaseReleaseEnabled={}, streamPreSseFailoverEnabled={}, streamPreSseTotalBudgetMs={}, streamPreSseMaxFastFailovers={}, kiroRequestBodyGuardEnabled={}, kiroRequestBodyGuardMaxBytes={}, thinkingSignatureValidationMode={}, responseThinkingSignatureCompatEnabled={}",
             next.mode,
             next.session_affinity_enabled,
             next.queue_max_size,
@@ -8116,6 +8131,7 @@ impl MultiTokenManager {
             next.request_weighting.enabled,
             next.request_weighting.base_weight,
             next.request_weighting.max_weight,
+            next.stream_dispatch_lease_release_enabled,
             next.stream_pre_sse_failover.enabled,
             next.stream_pre_sse_failover.total_budget_ms,
             next.stream_pre_sse_failover.max_fast_failovers,
@@ -10136,6 +10152,7 @@ mod tests {
                 tools_bonus: 1.0,
                 ..RequestWeightingConfig::default()
             },
+            stream_dispatch_lease_release_enabled: false,
             stream_pre_sse_failover: StreamPreSseFailoverConfig::default(),
             non_stream_body_read_timeout: NonStreamBodyReadTimeoutConfig::default(),
             kiro_request_body_guard: KiroRequestBodyGuardConfig {
@@ -10184,6 +10201,7 @@ mod tests {
         assert_eq!(snapshot.rate_limit_refill_backoff_factor, 0.6);
         assert_eq!(snapshot.request_weighting.max_weight, 4.0);
         assert_eq!(snapshot.request_weighting.tools_bonus, 1.0);
+        assert!(!snapshot.stream_dispatch_lease_release_enabled);
         assert!(snapshot.stream_pre_sse_failover.enabled);
         assert_eq!(snapshot.kiro_request_body_guard.max_bytes, 31 * 1024 * 1024);
         assert_eq!(
@@ -10320,6 +10338,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap_err()
             .to_string();
@@ -10374,6 +10393,7 @@ mod tests {
                     tools_bonus: 1.0,
                     ..RequestWeightingConfig::default()
                 }),
+                Some(false),
                 Some(StreamPreSseFailoverConfig::default()),
                 Some(NonStreamBodyReadTimeoutConfig {
                     timeout_ms: 510_000,
@@ -10421,6 +10441,7 @@ mod tests {
         assert_eq!(persisted.rate_limit_refill_backoff_factor, 0.6);
         assert_eq!(persisted.request_weighting.max_weight, 4.0);
         assert_eq!(persisted.request_weighting.tools_bonus, 1.0);
+        assert!(!persisted.stream_dispatch_lease_release_enabled);
         assert_eq!(
             persisted.thinking_signature_validation_mode,
             ThinkingSignatureValidationMode::StripInvalid
@@ -10483,6 +10504,7 @@ mod tests {
                 None,
                 None,
                 Some(false),
+                None,
                 None,
                 None,
                 None,

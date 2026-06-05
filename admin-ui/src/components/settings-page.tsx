@@ -464,6 +464,8 @@ export function SettingsPage() {
   const [requestWeightingInputs, setRequestWeightingInputs] = useState<RequestWeightingInputState>(
     () => createRequestWeightingInputs(DEFAULT_REQUEST_WEIGHTING)
   )
+  const [streamDispatchLeaseReleaseEnabled, setStreamDispatchLeaseReleaseEnabled] =
+    useState(true)
   const [streamPreSseFailoverEnabled, setStreamPreSseFailoverEnabled] =
     useState(DEFAULT_STREAM_PRE_SSE_FAILOVER.enabled)
   const [streamPreSseFailoverInputs, setStreamPreSseFailoverInputs] =
@@ -517,6 +519,7 @@ export function SettingsPage() {
     const requestWeighting = loadBalancingData.requestWeighting ?? DEFAULT_REQUEST_WEIGHTING
     setRequestWeightingEnabled(requestWeighting.enabled)
     setRequestWeightingInputs(createRequestWeightingInputs(requestWeighting))
+    setStreamDispatchLeaseReleaseEnabled(loadBalancingData.streamDispatchLeaseReleaseEnabled ?? true)
     const streamPreSseFailover =
       loadBalancingData.streamPreSseFailover ?? DEFAULT_STREAM_PRE_SSE_FAILOVER
     setStreamPreSseFailoverEnabled(streamPreSseFailover.enabled)
@@ -800,6 +803,7 @@ export function SettingsPage() {
         rateLimitRefillRecoveryStepPerSuccess: parsedRateLimitRefillRecoveryStep,
         rateLimitRefillBackoffFactor: parsedRateLimitRefillBackoffFactor,
         requestWeighting: parsedRequestWeighting,
+        streamDispatchLeaseReleaseEnabled,
         streamPreSseFailover: parsedStreamPreSseFailover,
         nonStreamBodyReadTimeout: {
           enabled: nonStreamBodyReadTimeoutEnabled,
@@ -1411,6 +1415,19 @@ export function SettingsPage() {
                     </span>
                   </Button>
                 ))}
+              </div>
+
+              <div className="flex flex-col gap-3 rounded-lg border bg-background/70 p-4 md:flex-row md:items-center md:justify-between">
+                <div className="space-y-1">
+                  <div className="text-sm font-medium">流式响应首内容后释放调度 lease</div>
+                  <p className="text-sm text-muted-foreground">
+                    上游流已开始产生可转发内容后释放；无法探测首内容时，在响应建立后释放。
+                  </p>
+                </div>
+                <Switch
+                  checked={streamDispatchLeaseReleaseEnabled}
+                  onCheckedChange={setStreamDispatchLeaseReleaseEnabled}
+                />
               </div>
 
               <div className="flex flex-col gap-3 rounded-lg border bg-background/70 p-4 md:flex-row md:items-center md:justify-between">

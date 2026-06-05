@@ -590,6 +590,7 @@ impl AdminService {
                 .rate_limit_refill_recovery_step_per_success,
             rate_limit_refill_backoff_factor: snapshot.rate_limit_refill_backoff_factor,
             request_weighting: snapshot.request_weighting,
+            stream_dispatch_lease_release_enabled: snapshot.stream_dispatch_lease_release_enabled,
             stream_pre_sse_failover: snapshot.stream_pre_sse_failover,
             non_stream_body_read_timeout: snapshot.non_stream_body_read_timeout,
             kiro_request_body_guard: snapshot.kiro_request_body_guard,
@@ -672,6 +673,7 @@ impl AdminService {
             && req.rate_limit_refill_recovery_step_per_success.is_none()
             && req.rate_limit_refill_backoff_factor.is_none()
             && req.request_weighting.is_none()
+            && req.stream_dispatch_lease_release_enabled.is_none()
             && req.stream_pre_sse_failover.is_none()
             && req.non_stream_body_read_timeout.is_none()
             && req.kiro_request_body_guard.is_none()
@@ -712,6 +714,7 @@ impl AdminService {
                 req.rate_limit_refill_recovery_step_per_success,
                 req.rate_limit_refill_backoff_factor,
                 req.request_weighting,
+                req.stream_dispatch_lease_release_enabled,
                 req.stream_pre_sse_failover,
                 req.non_stream_body_read_timeout,
                 req.kiro_request_body_guard,
