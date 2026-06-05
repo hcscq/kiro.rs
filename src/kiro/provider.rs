@@ -2131,6 +2131,7 @@ impl KiroProvider {
         let mut max_retries = Self::base_retry_cap(total_credentials);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        let mut profile_rediscovered: HashSet<u64> = HashSet::new();
         let mut request_scoped_rate_limited_credentials: HashSet<u64> = HashSet::new();
         let mut request_scoped_transient_error_credentials: HashSet<u64> = HashSet::new();
         let mut priority_rate_limit_hits: HashMap<u32, usize> = HashMap::new();
@@ -2311,6 +2312,43 @@ impl KiroProvider {
 
             // 401/403 凭据问题
             if matches!(status.as_u16(), 401 | 403) {
+                if Self::should_rediscover_enterprise_profile(
+                    &credentials,
+                    status,
+                    &body,
+                    &error_summary,
+                ) && !profile_rediscovered.contains(&ctx_id)
+                {
+                    profile_rediscovered.insert(ctx_id);
+                    tracing::info!(
+                        credential_id = ctx_id,
+                        attempt = attempt + 1,
+                        max_retries,
+                        error_summary = %error_summary,
+                        "MCP 请求遇到 Enterprise profileArn 授权失败，尝试重新发现 profileArn 后重试"
+                    );
+                    match self
+                        .token_manager
+                        .rediscover_enterprise_profile_for(ctx_id, &credentials, &token)
+                        .await
+                    {
+                        Ok(Some(_)) => continue,
+                        Ok(None) => {
+                            tracing::warn!(
+                                credential_id = ctx_id,
+                                "MCP 请求重新发现 Enterprise profileArn 未得到新可用 profileArn"
+                            );
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                credential_id = ctx_id,
+                                "MCP 请求重新发现 Enterprise profileArn 失败: {}",
+                                err
+                            );
+                        }
+                    }
+                }
+
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
                 if Self::is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx_id) {
                     force_refreshed.insert(ctx_id);
@@ -2468,6 +2506,7 @@ impl KiroProvider {
         let total_credentials = self.token_manager.total_count();
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        let mut profile_rediscovered: HashSet<u64> = HashSet::new();
         let mut request_scoped_model_unsupported_credentials: HashSet<u64> = HashSet::new();
         let mut request_scoped_rate_limited_credentials: HashSet<u64> = HashSet::new();
         let mut request_scoped_slow_first_content_credentials: HashSet<u64> = HashSet::new();
@@ -3853,6 +3892,53 @@ impl KiroProvider {
                     "API 请求失败（可能为凭据错误）"
                 );
 
+                // Enterprise profileArn 被上游判为不可用时，先重新发现可用 profile 并重试一次。
+                if Self::should_rediscover_enterprise_profile(
+                    &credentials,
+                    status,
+                    &body,
+                    &error_summary,
+                ) && !profile_rediscovered.contains(&ctx_id)
+                {
+                    profile_rediscovered.insert(ctx_id);
+                    tracing::info!(
+                        request_id = %request_id,
+                        api_type,
+                        model = model.as_deref().unwrap_or("unknown"),
+                        credential_id = ctx_id,
+                        attempt = attempt + 1,
+                        max_retries,
+                        region = %region,
+                        stream = is_stream,
+                        request_body_bytes,
+                        error_summary = %error_summary,
+                        total_elapsed_ms = overall_started_at.elapsed().as_millis(),
+                        "API 请求遇到 Enterprise profileArn 授权失败，尝试重新发现 profileArn 后重试"
+                    );
+                    match self
+                        .token_manager
+                        .rediscover_enterprise_profile_for(ctx_id, &credentials, &token)
+                        .await
+                    {
+                        Ok(Some(_)) => continue,
+                        Ok(None) => {
+                            tracing::warn!(
+                                request_id = %request_id,
+                                credential_id = ctx_id,
+                                "API 请求重新发现 Enterprise profileArn 未得到新可用 profileArn"
+                            );
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                request_id = %request_id,
+                                credential_id = ctx_id,
+                                "API 请求重新发现 Enterprise profileArn 失败: {}",
+                                err
+                            );
+                        }
+                    }
+                }
+
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
                 if Self::is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx_id) {
                     force_refreshed.insert(ctx_id);
@@ -4318,6 +4404,28 @@ impl KiroProvider {
             && Self::is_profile_arn_required_error(body, error_summary)
     }
 
+    fn is_enterprise_profile_unauthorized_error(body: &str, error_summary: &str) -> bool {
+        let body = body.to_ascii_lowercase();
+        let error_summary = error_summary.to_ascii_lowercase();
+        body.contains("user is not authorized to make this call")
+            || body.contains("not authorized to make this call")
+            || error_summary.contains("user is not authorized to make this call")
+            || error_summary.contains("not authorized to make this call")
+    }
+
+    fn should_rediscover_enterprise_profile(
+        credentials: &KiroCredentials,
+        status: reqwest::StatusCode,
+        body: &str,
+        error_summary: &str,
+    ) -> bool {
+        credentials.detected_auth_account_type().as_deref() == Some("enterprise")
+            && status.as_u16() == 403
+            && !Self::is_bearer_token_invalid(body)
+            && !Self::is_account_suspended(body)
+            && Self::is_enterprise_profile_unauthorized_error(body, error_summary)
+    }
+
     fn is_quota_exhausted(body: &str) -> bool {
         const QUOTA_EXHAUSTED_REASONS: &[&str] =
             &["MONTHLY_REQUEST_COUNT", "OVERAGE_REQUEST_LIMIT_EXCEEDED"];
@@ -4582,6 +4690,111 @@ mod tests {
             &credentials,
             body,
             "400 Bad Request"
+        ));
+    }
+
+    #[test]
+    fn test_should_rediscover_enterprise_profile_on_unauthorized_403() {
+        let credentials = KiroCredentials {
+            provider: Some("Enterprise".to_string()),
+            start_url: Some("https://example.awsapps.com/start".to_string()),
+            profile_arn: Some("arn:aws:codewhisperer:us-east-1:123:profile/old".to_string()),
+            ..Default::default()
+        };
+        let body = r#"{"message":"User is not authorized to make this call."}"#;
+
+        assert!(KiroProvider::should_rediscover_enterprise_profile(
+            &credentials,
+            reqwest::StatusCode::FORBIDDEN,
+            body,
+            "status=403 message=\"User is not authorized to make this call.\""
+        ));
+    }
+
+    #[test]
+    fn test_should_rediscover_enterprise_profile_without_existing_arn() {
+        let credentials = KiroCredentials {
+            provider: Some("Enterprise".to_string()),
+            start_url: Some("https://example.awsapps.com/start".to_string()),
+            ..Default::default()
+        };
+        let body = r#"{"message":"User is not authorized to make this call."}"#;
+
+        assert!(KiroProvider::should_rediscover_enterprise_profile(
+            &credentials,
+            reqwest::StatusCode::FORBIDDEN,
+            body,
+            "status=403"
+        ));
+    }
+
+    #[test]
+    fn test_should_not_rediscover_enterprise_profile_for_builder_id() {
+        let credentials = KiroCredentials {
+            provider: Some("BuilderId".to_string()),
+            start_url: Some("https://view.awsapps.com/start/".to_string()),
+            ..Default::default()
+        };
+        let body = r#"{"message":"User is not authorized to make this call."}"#;
+
+        assert!(!KiroProvider::should_rediscover_enterprise_profile(
+            &credentials,
+            reqwest::StatusCode::FORBIDDEN,
+            body,
+            "status=403"
+        ));
+    }
+
+    #[test]
+    fn test_should_not_rediscover_enterprise_profile_for_social() {
+        let credentials = KiroCredentials {
+            provider: Some("Google".to_string()),
+            auth_method: Some("social".to_string()),
+            ..Default::default()
+        };
+        let body = r#"{"message":"User is not authorized to make this call."}"#;
+
+        assert!(!KiroProvider::should_rediscover_enterprise_profile(
+            &credentials,
+            reqwest::StatusCode::FORBIDDEN,
+            body,
+            "status=403"
+        ));
+    }
+
+    #[test]
+    fn test_should_not_rediscover_enterprise_profile_for_invalid_bearer_token() {
+        let credentials = KiroCredentials {
+            provider: Some("Enterprise".to_string()),
+            start_url: Some("https://example.awsapps.com/start".to_string()),
+            profile_arn: Some("arn:aws:codewhisperer:us-east-1:123:profile/old".to_string()),
+            ..Default::default()
+        };
+        let body = "The bearer token included in the request is invalid";
+
+        assert!(!KiroProvider::should_rediscover_enterprise_profile(
+            &credentials,
+            reqwest::StatusCode::FORBIDDEN,
+            body,
+            "status=403"
+        ));
+    }
+
+    #[test]
+    fn test_should_not_rediscover_enterprise_profile_for_suspended_account() {
+        let credentials = KiroCredentials {
+            provider: Some("Enterprise".to_string()),
+            start_url: Some("https://example.awsapps.com/start".to_string()),
+            profile_arn: Some("arn:aws:codewhisperer:us-east-1:123:profile/old".to_string()),
+            ..Default::default()
+        };
+        let body = r#"{"message":"Your User ID temporarily is suspended. We've locked your account as a security precaution. User is not authorized to make this call."}"#;
+
+        assert!(!KiroProvider::should_rediscover_enterprise_profile(
+            &credentials,
+            reqwest::StatusCode::FORBIDDEN,
+            body,
+            "status=403"
         ));
     }
 

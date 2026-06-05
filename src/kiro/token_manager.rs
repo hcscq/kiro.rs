@@ -7283,19 +7283,164 @@ impl MultiTokenManager {
             .unwrap_or_else(|_| credentials.clone())
     }
 
+    fn is_enterprise_profile_unauthorized_message(message: &str) -> bool {
+        let lower = message.to_ascii_lowercase();
+        lower.contains("user is not authorized to make this call")
+            || lower.contains("not authorized to make this call")
+    }
+
+    fn should_retry_management_call_after_profile_rediscovery(
+        credentials: &KiroCredentials,
+        err: &anyhow::Error,
+    ) -> bool {
+        if credentials.detected_auth_account_type().as_deref() != Some("enterprise") {
+            return false;
+        }
+
+        if let Some(api_err) = err.downcast_ref::<KiroManagementApiError>() {
+            return api_err.status_code == 403
+                && Self::is_enterprise_profile_unauthorized_message(&api_err.message);
+        }
+
+        Self::is_enterprise_profile_unauthorized_message(&err.to_string())
+    }
+
+    pub(crate) async fn rediscover_enterprise_profile_for(
+        &self,
+        id: u64,
+        credentials: &KiroCredentials,
+        token: &str,
+    ) -> anyhow::Result<Option<KiroCredentials>> {
+        if credentials.detected_auth_account_type().as_deref() != Some("enterprise") {
+            return Ok(None);
+        }
+
+        let previous_profile_arn = credentials
+            .effective_profile_arn_for_kiro_requests()
+            .map(str::to_string);
+        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+        let Some(discovered_profile_arn) = discover_available_profile_arn(
+            credentials,
+            &self.config,
+            token,
+            effective_proxy.as_ref(),
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+
+        let discovered_profile_arn = discovered_profile_arn.trim();
+        if discovered_profile_arn.is_empty() {
+            return Ok(None);
+        }
+
+        if previous_profile_arn.as_deref() == Some(discovered_profile_arn) {
+            return Ok(None);
+        }
+
+        if self.state_store.is_external() {
+            if let Err(err) = self.sync_from_state() {
+                tracing::warn!(
+                    "凭据 #{} 重新发现 profileArn 前同步共享状态失败，将继续使用本地状态: {}",
+                    id,
+                    err
+                );
+            }
+        }
+
+        let current = self.current_credentials(id)?;
+        if current.detected_auth_account_type().as_deref() != Some("enterprise") {
+            return Ok(None);
+        }
+
+        if current.effective_profile_arn_for_kiro_requests() == Some(discovered_profile_arn) {
+            return Ok(Some(current));
+        }
+
+        let mut updated = current.clone();
+        updated.profile_arn = Some(discovered_profile_arn.to_string());
+        let committed =
+            self.commit_refreshed_credential(id, current.refresh_token.as_deref(), updated)?;
+
+        if committed
+            .effective_profile_arn_for_kiro_requests()
+            .is_some_and(|profile_arn| profile_arn != previous_profile_arn.as_deref().unwrap_or(""))
+        {
+            tracing::info!("Enterprise 凭据 #{} 已重新发现并更新可用 profileArn", id);
+            self.availability_notify.notify_waiters();
+            Ok(Some(committed))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn get_usage_limits_with_enterprise_profile_retry(
+        &self,
+        id: u64,
+        credentials: &KiroCredentials,
+        token: &str,
+    ) -> anyhow::Result<(UsageLimitsResponse, KiroCredentials)> {
+        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+        match get_usage_limits(credentials, &self.config, token, effective_proxy.as_ref()).await {
+            Ok(usage_limits) => Ok((usage_limits, credentials.clone())),
+            Err(err)
+                if Self::should_retry_management_call_after_profile_rediscovery(
+                    credentials,
+                    &err,
+                ) =>
+            {
+                tracing::info!(
+                    "凭据 #{} 使用额度查询遇到 Enterprise profileArn 授权失败，尝试重新发现 profileArn",
+                    id
+                );
+                match self
+                    .rediscover_enterprise_profile_for(id, credentials, token)
+                    .await
+                {
+                    Ok(Some(updated_credentials)) => {
+                        let retry_token =
+                            updated_credentials.access_token.as_deref().unwrap_or(token);
+                        let effective_proxy =
+                            updated_credentials.effective_proxy(self.proxy.as_ref());
+                        let usage_limits = get_usage_limits(
+                            &updated_credentials,
+                            &self.config,
+                            retry_token,
+                            effective_proxy.as_ref(),
+                        )
+                        .await?;
+                        Ok((usage_limits, updated_credentials))
+                    }
+                    Ok(None) => Err(err),
+                    Err(rediscover_err) => {
+                        tracing::warn!(
+                            "凭据 #{} 重新发现 Enterprise profileArn 失败，保留原使用额度错误: {}",
+                            id,
+                            rediscover_err
+                        );
+                        Err(err)
+                    }
+                }
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     /// 获取指定凭据的使用额度（Admin API）
     pub async fn get_usage_limits_for(&self, id: u64) -> anyhow::Result<UsageLimitsResponse> {
         let credentials = self.current_credentials(id)?;
         let (credentials, token) = self.try_ensure_token(id, &credentials).await?;
 
-        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let usage_limits =
-            get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
+        let (usage_limits, credentials) = self
+            .get_usage_limits_with_enterprise_profile_retry(id, &credentials, &token)
+            .await?;
 
         // 更新订阅和用户信息到凭据（仅在发生变化时持久化）
         self.apply_usage_limits_metadata_update(id, &usage_limits);
+        let token = credentials.access_token.as_deref().unwrap_or(&token);
         let _ = self
-            .ensure_available_models_cached_for_call(id, &credentials, &token)
+            .ensure_available_models_cached_for_call(id, &credentials, token)
             .await;
 
         Ok(usage_limits)
@@ -7309,9 +7454,14 @@ impl MultiTokenManager {
     ) -> anyhow::Result<UsageLimitsResponse> {
         let credentials = self.current_credentials(id)?;
         let (mut credentials, mut token) = self.try_ensure_token(id, &credentials).await?;
+        let (mut usage_limits, updated_credentials) = self
+            .get_usage_limits_with_enterprise_profile_retry(id, &credentials, &token)
+            .await?;
+        credentials = updated_credentials;
+        if let Some(updated_token) = credentials.access_token.clone() {
+            token = updated_token;
+        }
         let mut effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let mut usage_limits =
-            get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
 
         self.apply_usage_limits_metadata_update(id, &usage_limits);
 
@@ -7331,6 +7481,43 @@ impl MultiTokenManager {
             effective_proxy.as_ref(),
         )
         .await;
+
+        if result.as_ref().err().is_some_and(|err| {
+            Self::should_retry_management_call_after_profile_rediscovery(&credentials, err)
+        }) {
+            tracing::info!(
+                "设置凭据 #{} 超额使用开关遇到 Enterprise profileArn 授权失败，尝试重新发现 profileArn",
+                id
+            );
+            match self
+                .rediscover_enterprise_profile_for(id, &credentials, &token)
+                .await
+            {
+                Ok(Some(updated_credentials)) => {
+                    credentials = updated_credentials;
+                    if let Some(updated_token) = credentials.access_token.clone() {
+                        token = updated_token;
+                    }
+                    effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+                    result = set_user_preference_overage_status(
+                        &credentials,
+                        &self.config,
+                        &token,
+                        enabled,
+                        effective_proxy.as_ref(),
+                    )
+                    .await;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        "凭据 #{} 设置超额使用开关前重新发现 Enterprise profileArn 失败: {}",
+                        id,
+                        err
+                    );
+                }
+            }
+        }
 
         let should_refresh_and_retry = result
             .as_ref()
@@ -10902,6 +11089,69 @@ mod tests {
         assert_eq!(persisted.last_error_status, Some(403));
         assert_eq!(persisted.last_error_summary.as_deref(), Some(error_summary));
         assert!(persisted.disabled_at.is_some());
+    }
+
+    #[test]
+    fn test_management_profile_unauthorized_retry_only_for_enterprise() {
+        let enterprise = KiroCredentials {
+            provider: Some("Enterprise".to_string()),
+            start_url: Some("https://example.awsapps.com/start".to_string()),
+            profile_arn: Some("arn:aws:codewhisperer:us-east-1:123:profile/old".to_string()),
+            ..Default::default()
+        };
+        let social = KiroCredentials {
+            provider: Some("Google".to_string()),
+            auth_method: Some("social".to_string()),
+            ..Default::default()
+        };
+        let err = anyhow::anyhow!(
+            "权限不足，无法获取使用额度: status=403 body_len=69 message=\"User is not authorized to make this call.\""
+        );
+
+        assert!(
+            MultiTokenManager::should_retry_management_call_after_profile_rediscovery(
+                &enterprise,
+                &err
+            )
+        );
+        assert!(
+            !MultiTokenManager::should_retry_management_call_after_profile_rediscovery(
+                &social, &err
+            )
+        );
+    }
+
+    #[test]
+    fn test_management_profile_unauthorized_retry_requires_forbidden_api_error() {
+        let enterprise = KiroCredentials {
+            provider: Some("Enterprise".to_string()),
+            start_url: Some("https://example.awsapps.com/start".to_string()),
+            profile_arn: Some("arn:aws:codewhisperer:us-east-1:123:profile/old".to_string()),
+            ..Default::default()
+        };
+        let forbidden = anyhow::Error::new(KiroManagementApiError {
+            api: "setUserPreference",
+            status_code: 403,
+            message: "User is not authorized to make this call.".to_string(),
+        });
+        let unauthorized = anyhow::Error::new(KiroManagementApiError {
+            api: "setUserPreference",
+            status_code: 401,
+            message: "User is not authorized to make this call.".to_string(),
+        });
+
+        assert!(
+            MultiTokenManager::should_retry_management_call_after_profile_rediscovery(
+                &enterprise,
+                &forbidden
+            )
+        );
+        assert!(
+            !MultiTokenManager::should_retry_management_call_after_profile_rediscovery(
+                &enterprise,
+                &unauthorized
+            )
+        );
     }
 
     #[tokio::test]
