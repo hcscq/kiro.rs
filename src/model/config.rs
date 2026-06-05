@@ -1089,7 +1089,7 @@ impl Config {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(|value| value.trim_end_matches('/').to_string())
-            .unwrap_or_else(|| format!("https://q.{}.amazonaws.com", api_region))
+            .unwrap_or_else(|| Self::q_endpoint_base(api_region))
     }
 
     /// 获取有效的 Management API base URL（用于管理/额度查询请求）
@@ -1099,7 +1099,11 @@ impl Config {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(|value| value.trim_end_matches('/').to_string())
-            .unwrap_or_else(|| format!("https://q.{}.amazonaws.com", api_region))
+            .unwrap_or_else(|| Self::q_endpoint_base(api_region))
+    }
+
+    pub fn q_endpoint_base(api_region: &str) -> String {
+        format!("https://q.{}.amazonaws.com", api_region)
     }
 
     /// 从 endpoint base URL 中提取 Host header 使用的域名

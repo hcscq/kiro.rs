@@ -435,6 +435,18 @@ async fn refresh_idc_token(
     Ok(new_credentials)
 }
 
+fn effective_management_endpoint_base_for_credentials(
+    credentials: &KiroCredentials,
+    config: &Config,
+    region: &str,
+) -> String {
+    if credentials.detected_auth_account_type().as_deref() == Some("enterprise") {
+        Config::q_endpoint_base(region)
+    } else {
+        config.effective_management_endpoint_base(region)
+    }
+}
+
 /// 获取使用额度信息
 pub(crate) async fn get_usage_limits(
     credentials: &KiroCredentials,
@@ -445,7 +457,8 @@ pub(crate) async fn get_usage_limits(
     tracing::debug!("正在获取使用额度信息...");
 
     let region = credentials.effective_api_region(config);
-    let management_endpoint = config.effective_management_endpoint_base(region);
+    let management_endpoint =
+        effective_management_endpoint_base_for_credentials(credentials, config, region);
     let host = Config::endpoint_host(&management_endpoint);
     let machine_id = machine_id::generate_from_credentials(credentials, config)
         .ok_or_else(|| anyhow::anyhow!("无法生成 machineId"))?;
@@ -516,7 +529,8 @@ pub(crate) async fn list_available_models_page(
     tracing::debug!("正在获取可用模型列表...");
 
     let region = credentials.effective_api_region(config);
-    let management_endpoint = config.effective_management_endpoint_base(region);
+    let management_endpoint =
+        effective_management_endpoint_base_for_credentials(credentials, config, region);
     let host = Config::endpoint_host(&management_endpoint);
     let machine_id = machine_id::generate_from_credentials(credentials, config)
         .ok_or_else(|| anyhow::anyhow!("无法生成 machineId"))?;
@@ -633,7 +647,8 @@ pub(crate) async fn set_user_preference_overage_status(
     tracing::debug!("正在设置超额使用开关...");
 
     let region = credentials.effective_api_region(config);
-    let management_endpoint = config.effective_management_endpoint_base(region);
+    let management_endpoint =
+        effective_management_endpoint_base_for_credentials(credentials, config, region);
     let host = Config::endpoint_host(&management_endpoint);
     let machine_id = machine_id::generate_from_credentials(credentials, config)
         .ok_or_else(|| anyhow::anyhow!("无法生成 machineId"))?;
@@ -10806,6 +10821,46 @@ mod tests {
         let api_host = format!("q.{}.amazonaws.com", api_region);
 
         assert_eq!(api_host, "q.eu-central-1.amazonaws.com");
+    }
+
+    #[test]
+    fn test_enterprise_management_endpoint_ignores_configured_kiro_management() {
+        let mut config = Config::default();
+        config.management_endpoint = Some("https://management.us-east-1.kiro.dev/".to_string());
+        let credentials = KiroCredentials {
+            provider: Some("Enterprise".to_string()),
+            api_region: Some("us-east-1".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            effective_management_endpoint_base_for_credentials(
+                &credentials,
+                &config,
+                credentials.effective_api_region(&config)
+            ),
+            "https://q.us-east-1.amazonaws.com"
+        );
+    }
+
+    #[test]
+    fn test_builder_id_management_endpoint_uses_configured_kiro_management() {
+        let mut config = Config::default();
+        config.management_endpoint = Some("https://management.us-east-1.kiro.dev/".to_string());
+        let credentials = KiroCredentials {
+            provider: Some("BuilderId".to_string()),
+            api_region: Some("us-east-1".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            effective_management_endpoint_base_for_credentials(
+                &credentials,
+                &config,
+                credentials.effective_api_region(&config)
+            ),
+            "https://management.us-east-1.kiro.dev"
+        );
     }
 
     #[test]

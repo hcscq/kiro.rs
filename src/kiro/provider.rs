@@ -1233,25 +1233,29 @@ impl KiroProvider {
 
     /// 获取凭据级 API 基础 URL
     fn base_url_for(&self, credentials: &KiroCredentials) -> String {
+        let base = self.runtime_endpoint_base_for(credentials);
+        format!("{}/generateAssistantResponse", base)
+    }
+
+    fn runtime_endpoint_base_for(&self, credentials: &KiroCredentials) -> String {
         let config = self.token_manager.config();
         let api_region = credentials.effective_api_region(config);
-        let base = config.effective_runtime_endpoint_base(api_region);
-        format!("{}/generateAssistantResponse", base)
+        if credentials.detected_auth_account_type().as_deref() == Some("enterprise") {
+            Config::q_endpoint_base(api_region)
+        } else {
+            config.effective_runtime_endpoint_base(api_region)
+        }
     }
 
     /// 获取凭据级 MCP API URL
     fn mcp_url_for(&self, credentials: &KiroCredentials) -> String {
-        let config = self.token_manager.config();
-        let api_region = credentials.effective_api_region(config);
-        let base = config.effective_runtime_endpoint_base(api_region);
+        let base = self.runtime_endpoint_base_for(credentials);
         format!("{}/mcp", base)
     }
 
     /// 获取凭据级 API 基础域名
     fn base_domain_for(&self, credentials: &KiroCredentials) -> String {
-        let config = self.token_manager.config();
-        let api_region = credentials.effective_api_region(config);
-        let base = config.effective_runtime_endpoint_base(api_region);
+        let base = self.runtime_endpoint_base_for(credentials);
         Config::endpoint_host(&base)
     }
 
@@ -4338,6 +4342,56 @@ mod tests {
     fn create_test_provider(config: Config, credentials: KiroCredentials) -> KiroProvider {
         let tm = MultiTokenManager::new(config, vec![credentials], None, None, false).unwrap();
         KiroProvider::with_proxy(Arc::new(tm), None)
+    }
+
+    #[test]
+    fn test_enterprise_runtime_endpoint_ignores_configured_kiro_runtime() {
+        let mut config = Config::default();
+        config.runtime_endpoint = Some("https://runtime.us-east-1.kiro.dev/".to_string());
+        let credentials = KiroCredentials {
+            provider: Some("Enterprise".to_string()),
+            api_region: Some("us-east-1".to_string()),
+            ..Default::default()
+        };
+        let provider = create_test_provider(config, credentials.clone());
+
+        assert_eq!(
+            provider.base_url_for(&credentials),
+            "https://q.us-east-1.amazonaws.com/generateAssistantResponse"
+        );
+        assert_eq!(
+            provider.mcp_url_for(&credentials),
+            "https://q.us-east-1.amazonaws.com/mcp"
+        );
+        assert_eq!(
+            provider.base_domain_for(&credentials),
+            "q.us-east-1.amazonaws.com"
+        );
+    }
+
+    #[test]
+    fn test_builder_id_runtime_endpoint_uses_configured_kiro_runtime() {
+        let mut config = Config::default();
+        config.runtime_endpoint = Some("https://runtime.us-east-1.kiro.dev/".to_string());
+        let credentials = KiroCredentials {
+            provider: Some("BuilderId".to_string()),
+            api_region: Some("us-east-1".to_string()),
+            ..Default::default()
+        };
+        let provider = create_test_provider(config, credentials.clone());
+
+        assert_eq!(
+            provider.base_url_for(&credentials),
+            "https://runtime.us-east-1.kiro.dev/generateAssistantResponse"
+        );
+        assert_eq!(
+            provider.mcp_url_for(&credentials),
+            "https://runtime.us-east-1.kiro.dev/mcp"
+        );
+        assert_eq!(
+            provider.base_domain_for(&credentials),
+            "runtime.us-east-1.kiro.dev"
+        );
     }
 
     fn test_response_trace(content_type: Option<&str>) -> ResponseTrace {
