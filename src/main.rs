@@ -20,7 +20,15 @@ use std::{
 };
 
 use anyhow::Context;
-use axum::{Json, Router, http::StatusCode, routing::get};
+use axum::{
+    Json, Router,
+    body::Body,
+    extract::Query,
+    http::{Method, Request, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::get,
+};
 use chrono::Utc;
 use clap::Parser;
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
@@ -29,7 +37,7 @@ use kiro::token_manager::MultiTokenManager;
 use model::arg::{Args, Command as CliCommand, ExportFileStateArgs};
 use model::config::{Config, StateBackendKind};
 use parking_lot::Mutex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use state::{
     CachedBalanceRecord, PersistedCredentials, PersistedDispatchConfig, RuntimeCoordinationStatus,
@@ -38,11 +46,14 @@ use state::{
 use tokio::{
     sync::watch,
     task::JoinHandle,
-    time::{Duration, sleep},
+    time::{Duration, Instant as TokioInstant, sleep},
 };
 
 const READINESS_DRAIN_FILE: &str = "/tmp/kiro-rs-drain";
 const SHUTDOWN_DRAIN_DELAY: Duration = Duration::from_secs(5);
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(720);
+const MAX_DRAIN_WAIT_TIMEOUT: Duration = Duration::from_secs(720);
+const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const BACKGROUND_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const READINESS_SNAPSHOT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -91,8 +102,8 @@ struct ReadinessSnapshot {
 }
 
 impl RuntimeHealth {
-    fn mark_draining(&self) {
-        self.draining.store(true, Ordering::SeqCst);
+    fn mark_draining(&self) -> bool {
+        !self.draining.swap(true, Ordering::SeqCst)
     }
 
     fn is_draining(&self) -> bool {
@@ -114,6 +125,34 @@ impl RuntimeHealth {
             dispatchable: self.credentials_dispatchable.load(Ordering::Relaxed),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DrainSnapshot {
+    active_requests: usize,
+    waiting_requests: usize,
+    conversion_in_flight: usize,
+    conversion_waiting: usize,
+}
+
+impl DrainSnapshot {
+    fn total_in_flight(&self) -> usize {
+        self.active_requests
+            .saturating_add(self.waiting_requests)
+            .saturating_add(self.conversion_in_flight)
+            .saturating_add(self.conversion_waiting)
+    }
+
+    fn is_drained(&self) -> bool {
+        self.total_in_flight() == 0
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DrainQuery {
+    #[serde(default)]
+    wait_seconds: Option<u64>,
 }
 
 struct BackgroundTask {
@@ -442,16 +481,114 @@ fn clear_drain_signal() -> std::io::Result<()> {
     }
 }
 
+fn mark_draining(health: &RuntimeHealth, reason: &str) {
+    if health.mark_draining() {
+        tracing::info!(reason, "marking runtime as draining");
+    }
+    if let Err(err) = std::fs::write(READINESS_DRAIN_FILE, b"draining\n") {
+        tracing::warn!("写入 readiness drain 标记失败: {}", err);
+    }
+}
+
+fn drain_snapshot(
+    token_manager: &MultiTokenManager,
+    conversion_runtime: &anthropic::ConversionRuntime,
+) -> DrainSnapshot {
+    let requests = token_manager.local_request_counts();
+    let conversion = conversion_runtime.stats();
+    DrainSnapshot {
+        active_requests: requests.active_requests,
+        waiting_requests: requests.waiting_requests,
+        conversion_in_flight: conversion.in_flight,
+        conversion_waiting: conversion.waiting,
+    }
+}
+
+async fn wait_for_drain(
+    token_manager: Arc<MultiTokenManager>,
+    conversion_runtime: Arc<anthropic::ConversionRuntime>,
+    timeout_duration: Duration,
+    reason: &'static str,
+) -> DrainSnapshot {
+    let started_at = TokioInstant::now();
+    let deadline = started_at + timeout_duration;
+    let mut last_logged_total: Option<usize> = None;
+
+    loop {
+        let snapshot = drain_snapshot(&token_manager, &conversion_runtime);
+        if snapshot.is_drained() {
+            tracing::info!(
+                reason,
+                elapsed_ms = started_at.elapsed().as_millis(),
+                "drain wait completed: no local in-flight requests remain"
+            );
+            return snapshot;
+        }
+
+        let total = snapshot.total_in_flight();
+        if last_logged_total != Some(total) {
+            tracing::info!(
+                reason,
+                active_requests = snapshot.active_requests,
+                waiting_requests = snapshot.waiting_requests,
+                conversion_in_flight = snapshot.conversion_in_flight,
+                conversion_waiting = snapshot.conversion_waiting,
+                total_in_flight = total,
+                elapsed_ms = started_at.elapsed().as_millis(),
+                timeout_ms = timeout_duration.as_millis(),
+                "waiting for local in-flight requests before shutdown"
+            );
+            last_logged_total = Some(total);
+        }
+
+        if TokioInstant::now() >= deadline {
+            tracing::warn!(
+                reason,
+                active_requests = snapshot.active_requests,
+                waiting_requests = snapshot.waiting_requests,
+                conversion_in_flight = snapshot.conversion_in_flight,
+                conversion_waiting = snapshot.conversion_waiting,
+                total_in_flight = total,
+                elapsed_ms = started_at.elapsed().as_millis(),
+                timeout_ms = timeout_duration.as_millis(),
+                "drain wait timed out with local requests still in flight"
+            );
+            return snapshot;
+        }
+
+        sleep(DRAIN_POLL_INTERVAL).await;
+    }
+}
+
+fn drain_status_json(
+    snapshot: DrainSnapshot,
+    draining: bool,
+    elapsed_ms: u128,
+) -> serde_json::Value {
+    json!({
+        "status": if snapshot.is_drained() { "drained" } else { "draining" },
+        "draining": draining,
+        "activeRequests": snapshot.active_requests,
+        "waitingRequests": snapshot.waiting_requests,
+        "conversionInFlight": snapshot.conversion_in_flight,
+        "conversionWaiting": snapshot.conversion_waiting,
+        "totalInFlight": snapshot.total_in_flight(),
+        "elapsedMs": elapsed_ms,
+    })
+}
+
 async fn live_handler() -> (StatusCode, Json<serde_json::Value>) {
     (StatusCode::OK, Json(json!({ "status": "ok" })))
 }
 
 async fn ready_handler(
     health: Arc<RuntimeHealth>,
+    token_manager: Arc<MultiTokenManager>,
     conversion_runtime: Arc<anthropic::ConversionRuntime>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let snapshot = health.readiness_snapshot();
     let draining = health.is_draining() || drain_file_present();
+    let drain = drain_snapshot(&token_manager, &conversion_runtime);
     let conversion = conversion_runtime.stats();
     let conversion_metrics = conversion.metrics;
     let conversion_wait_ms = conversion_metrics.wait_ms;
@@ -491,6 +628,13 @@ async fn ready_handler(
             "conversion_queue_wait_ms": conversion.queue_wait_ms,
             "conversion_max_request_weight": conversion.max_request_weight,
             "conversion_status": if conversion_saturated { "saturated" } else { "available" },
+            "drain": {
+                "active_requests": drain.active_requests,
+                "waiting_requests": drain.waiting_requests,
+                "conversion_in_flight": drain.conversion_in_flight,
+                "conversion_waiting": drain.conversion_waiting,
+                "total_in_flight": drain.total_in_flight(),
+            },
             "conversion_metrics": {
                 "accepted_total": conversion_metrics.accepted_total,
                 "completed_total": conversion_metrics.completed_total,
@@ -523,26 +667,139 @@ async fn ready_handler(
     )
 }
 
+async fn drain_handler(
+    runtime_health: Arc<RuntimeHealth>,
+    token_manager: Arc<MultiTokenManager>,
+    conversion_runtime: Arc<anthropic::ConversionRuntime>,
+    Query(query): Query<DrainQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let started_at = TokioInstant::now();
+    mark_draining(&runtime_health, "drain endpoint requested");
+    let wait_duration = query
+        .wait_seconds
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::ZERO)
+        .min(MAX_DRAIN_WAIT_TIMEOUT);
+
+    let snapshot = if wait_duration.is_zero() {
+        drain_snapshot(&token_manager, &conversion_runtime)
+    } else {
+        wait_for_drain(
+            token_manager,
+            conversion_runtime,
+            wait_duration,
+            "drain_endpoint",
+        )
+        .await
+    };
+
+    let status = if snapshot.is_drained() {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
+
+    (
+        status,
+        Json(drain_status_json(
+            snapshot,
+            runtime_health.is_draining() || drain_file_present(),
+            started_at.elapsed().as_millis(),
+        )),
+    )
+}
+
 fn health_router(
     runtime_health: Arc<RuntimeHealth>,
+    token_manager: Arc<MultiTokenManager>,
     conversion_runtime: Arc<anthropic::ConversionRuntime>,
+    include_drain_endpoint: bool,
 ) -> Router {
-    Router::new()
-        .route("/health", get(live_handler))
-        .route("/healthz", get(live_handler))
-        .route("/livez", get(live_handler))
-        .route(
-            "/readyz",
+    let router =
+        Router::new()
+            .route("/health", get(live_handler))
+            .route("/healthz", get(live_handler))
+            .route("/livez", get(live_handler))
+            .route(
+                "/readyz",
+                get({
+                    let runtime_health = runtime_health.clone();
+                    let token_manager = token_manager.clone();
+                    let conversion_runtime = conversion_runtime.clone();
+                    move || {
+                        let runtime_health = runtime_health.clone();
+                        let token_manager = token_manager.clone();
+                        let conversion_runtime = conversion_runtime.clone();
+                        async move {
+                            ready_handler(runtime_health, token_manager, conversion_runtime).await
+                        }
+                    }
+                }),
+            );
+
+    if include_drain_endpoint {
+        router.route(
+            "/drainz",
             get({
                 let runtime_health = runtime_health.clone();
+                let token_manager = token_manager.clone();
                 let conversion_runtime = conversion_runtime.clone();
-                move || {
-                    let runtime_health = runtime_health.clone();
-                    let conversion_runtime = conversion_runtime.clone();
-                    async move { ready_handler(runtime_health, conversion_runtime).await }
+                move |query| {
+                    drain_handler(
+                        runtime_health.clone(),
+                        token_manager.clone(),
+                        conversion_runtime.clone(),
+                        query,
+                    )
+                }
+            })
+            .post({
+                let runtime_health = runtime_health.clone();
+                let token_manager = token_manager.clone();
+                let conversion_runtime = conversion_runtime.clone();
+                move |query| {
+                    drain_handler(
+                        runtime_health.clone(),
+                        token_manager.clone(),
+                        conversion_runtime.clone(),
+                        query,
+                    )
                 }
             }),
         )
+    } else {
+        router
+    }
+}
+
+fn is_message_request(method: &Method, path: &str) -> bool {
+    *method == Method::POST
+        && matches!(
+            path.trim_end_matches('/'),
+            "/v1/messages" | "/cc/v1/messages"
+        )
+}
+
+async fn drain_gate_middleware(
+    axum::extract::State(runtime_health): axum::extract::State<Arc<RuntimeHealth>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let path = request.uri().path().to_string();
+    if is_message_request(request.method(), &path)
+        && (runtime_health.is_draining() || drain_file_present())
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "type": "service_unavailable",
+                "message": "This instance is draining and no longer accepts new message requests. Retry on another instance.",
+            })),
+        )
+            .into_response();
+    }
+
+    next.run(request).await
 }
 
 async fn server_shutdown_signal(mut shutdown: watch::Receiver<bool>) {
@@ -558,6 +815,8 @@ async fn server_shutdown_signal(mut shutdown: watch::Receiver<bool>) {
 
 async fn shutdown_signal(
     health: Arc<RuntimeHealth>,
+    token_manager: Arc<MultiTokenManager>,
+    conversion_runtime: Arc<anthropic::ConversionRuntime>,
     state_store: StateStore,
     background_tasks: BackgroundTasks,
     shutdown_tx: watch::Sender<bool>,
@@ -585,10 +844,14 @@ async fn shutdown_signal(
     }
 
     tracing::info!("shutdown signal received, marking readiness false");
-    health.mark_draining();
-    if let Err(err) = std::fs::write(READINESS_DRAIN_FILE, b"draining\n") {
-        tracing::warn!("写入 readiness drain 标记失败: {}", err);
-    }
+    mark_draining(&health, "shutdown signal received");
+    let _ = wait_for_drain(
+        token_manager,
+        conversion_runtime,
+        SHUTDOWN_DRAIN_TIMEOUT,
+        "shutdown_signal",
+    )
+    .await;
     background_tasks.shutdown().await;
     match state_store.runtime_coordination_release() {
         Ok(Some(status)) => {
@@ -968,8 +1231,24 @@ async fn main() {
         anthropic_app
     };
 
-    let health_app = health_router(runtime_health.clone(), conversion_runtime.clone());
-    let app = health_app.clone().merge(base_app);
+    let public_health_app = health_router(
+        runtime_health.clone(),
+        token_manager.clone(),
+        conversion_runtime.clone(),
+        false,
+    );
+    let health_app = health_router(
+        runtime_health.clone(),
+        token_manager.clone(),
+        conversion_runtime.clone(),
+        true,
+    );
+    let app = public_health_app
+        .merge(base_app)
+        .layer(middleware::from_fn_with_state(
+            runtime_health.clone(),
+            drain_gate_middleware,
+        ));
 
     // 启动服务器
     let addr = format!("{}:{}", config.host, config.port);
@@ -1008,6 +1287,8 @@ async fn main() {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let shutdown_task = tokio::spawn(shutdown_signal(
         runtime_health,
+        token_manager,
+        conversion_runtime,
         state_store,
         background_tasks,
         shutdown_tx,
@@ -1173,5 +1454,38 @@ mod tests {
             ThinkingSignatureValidationMode::WarnOnly
         );
         assert!(rollback.response_thinking_signature_compat_enabled);
+    }
+
+    #[test]
+    fn drain_gate_only_matches_message_create_requests() {
+        assert!(is_message_request(&Method::POST, "/v1/messages"));
+        assert!(is_message_request(&Method::POST, "/cc/v1/messages/"));
+        assert!(!is_message_request(&Method::GET, "/v1/messages"));
+        assert!(!is_message_request(
+            &Method::POST,
+            "/v1/messages/count_tokens"
+        ));
+        assert!(!is_message_request(&Method::GET, "/readyz"));
+    }
+
+    #[test]
+    fn drain_snapshot_total_counts_all_local_work() {
+        let snapshot = DrainSnapshot {
+            active_requests: 2,
+            waiting_requests: 3,
+            conversion_in_flight: 5,
+            conversion_waiting: 7,
+        };
+
+        assert_eq!(snapshot.total_in_flight(), 17);
+        assert!(!snapshot.is_drained());
+
+        let drained = DrainSnapshot {
+            active_requests: 0,
+            waiting_requests: 0,
+            conversion_in_flight: 0,
+            conversion_waiting: 0,
+        };
+        assert!(drained.is_drained());
     }
 }

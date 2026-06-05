@@ -1144,6 +1144,12 @@ pub struct LoadBalancingConfigSnapshot {
     pub waiting_requests: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct LocalRequestCounts {
+    pub active_requests: usize,
+    pub waiting_requests: usize,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExternalStateSyncReport {
     pub credentials_reloaded: bool,
@@ -1895,6 +1901,20 @@ impl MultiTokenManager {
 
     fn queue_depth(&self) -> usize {
         self.waiting_requests.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn local_request_counts(&self) -> LocalRequestCounts {
+        let active_requests = self
+            .entries
+            .lock()
+            .iter()
+            .map(|entry| entry.active_requests)
+            .sum();
+
+        LocalRequestCounts {
+            active_requests,
+            waiting_requests: self.queue_depth(),
+        }
     }
 
     fn model_requirement(model: Option<&str>) -> ModelRequirement {
