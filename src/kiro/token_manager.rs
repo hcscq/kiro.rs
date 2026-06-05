@@ -480,10 +480,26 @@ fn effective_management_endpoint_base_for_credentials(
     }
 }
 
-async fn list_available_profiles(
+fn normalized_next_token(next_token: Option<String>) -> Option<String> {
+    next_token
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+}
+
+fn append_available_profiles_page(
+    aggregated: &mut ListAvailableProfilesResponse,
+    page: ListAvailableProfilesResponse,
+) -> Option<String> {
+    let next_token = normalized_next_token(page.next_token);
+    aggregated.profiles.extend(page.profiles);
+    next_token
+}
+
+async fn list_available_profiles_page(
     credentials: &KiroCredentials,
     config: &Config,
     token: &str,
+    next_token: Option<&str>,
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<ListAvailableProfilesResponse> {
     tracing::debug!("正在获取可用 Profile 列表...");
@@ -509,6 +525,13 @@ async fn list_available_profiles(
     let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
 
     let client = build_client(proxy, 60, config.tls_backend)?;
+    let mut body = serde_json::Map::new();
+    if let Some(next_token) = next_token.map(str::trim).filter(|value| !value.is_empty()) {
+        body.insert(
+            "nextToken".to_string(),
+            serde_json::Value::String(next_token.to_string()),
+        );
+    }
     let response = client
         .post(&url)
         .header("content-type", "application/json")
@@ -519,7 +542,7 @@ async fn list_available_profiles(
         .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
         .header("amz-sdk-request", "attempt=1; max=1")
         .header("Authorization", format!("Bearer {}", token))
-        .json(&serde_json::json!({}))
+        .json(&body)
         .send()
         .await?;
 
@@ -539,6 +562,38 @@ async fn list_available_profiles(
     }
 
     Ok(response.json().await?)
+}
+
+async fn list_available_profiles(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<ListAvailableProfilesResponse> {
+    let mut aggregated = ListAvailableProfilesResponse {
+        profiles: Vec::new(),
+        next_token: None,
+    };
+    let mut next_token: Option<String> = None;
+    let mut seen_next_tokens = HashSet::new();
+
+    loop {
+        let page =
+            list_available_profiles_page(credentials, config, token, next_token.as_deref(), proxy)
+                .await?;
+        next_token = append_available_profiles_page(&mut aggregated, page);
+
+        let Some(token) = next_token.as_deref() else {
+            break;
+        };
+        if !seen_next_tokens.insert(token.to_string()) {
+            tracing::warn!("ListAvailableProfiles 返回重复 nextToken，已停止分页避免循环");
+            break;
+        }
+    }
+
+    aggregated.next_token = None;
+    Ok(aggregated)
 }
 
 async fn discover_available_profile_arn(
@@ -11019,6 +11074,47 @@ mod tests {
         assert_eq!(
             configured_api_region_for_profile_discovery(&credentials, &config),
             "ap-southeast-1"
+        );
+    }
+
+    #[test]
+    fn test_available_profile_pagination_aggregates_before_selection() {
+        let page1: ListAvailableProfilesResponse = serde_json::from_str(
+            r#"{
+                "profiles": [
+                    {
+                        "arn": "arn:aws:codewhisperer:eu-west-1:123:profile/OTHER",
+                        "profileName": "OtherProfile-eu-west-1"
+                    }
+                ],
+                "nextToken": " page-2 "
+            }"#,
+        )
+        .unwrap();
+        let page2: ListAvailableProfilesResponse = serde_json::from_str(
+            r#"{
+                "profiles": [
+                    {
+                        "arn": "arn:aws:codewhisperer:us-east-1:123:profile/KIRO",
+                        "profileName": "KiroProfile-us-east-1"
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let mut aggregated = ListAvailableProfilesResponse {
+            profiles: Vec::new(),
+            next_token: None,
+        };
+        let next_token = append_available_profiles_page(&mut aggregated, page1);
+        assert_eq!(next_token.as_deref(), Some("page-2"));
+
+        let next_token = append_available_profiles_page(&mut aggregated, page2);
+        assert_eq!(next_token, None);
+        assert_eq!(
+            aggregated.selected_profile_arn("us-east-1").as_deref(),
+            Some("arn:aws:codewhisperer:us-east-1:123:profile/KIRO")
         );
     }
 

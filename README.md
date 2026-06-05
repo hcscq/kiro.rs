@@ -462,8 +462,8 @@ kiro-rs \
 说明：
 - IdC / Builder-ID / IAM 在本项目里属于同一种登录方式，配置时统一使用 `authMethod: "idc"`
 - 为兼容旧配置，`builder-id` / `iam` 仍可被识别，但会按 `idc` 处理
-- `provider: "Enterprise"` 会强制按 IdC 刷新，并在请求 Kiro 上游时移除/避免注入 `profileArn`
-- BuilderId 账号未显式配置 `profileArn` 时会使用 Kiro 默认 BuilderId profile；Enterprise 不会补默认 profile
+- `provider: "Enterprise"` 会强制按 IdC 刷新，并在请求 Kiro 上游时使用导入或自动发现到的账号专属 `profileArn`
+- BuilderId 账号未显式配置 `profileArn` 时会使用 Kiro 默认 BuilderId profile；Enterprise 不会补默认 BuilderId profile
 
 #### 单凭据格式（旧格式，向后兼容）
 
@@ -556,7 +556,7 @@ kiro-rs \
 `凭据.authRegion` > `凭据.region` > `config.authRegion` > `config.region`
 
 **API Region**（API 请求）优先级：
-`profileArn` 中的 Region（Enterprise 不使用） > `凭据.apiRegion` > `凭据.region` > `config.apiRegion` > `config.region`
+`profileArn` 中的 Region（Enterprise 仅在已导入或自动发现 `profileArn` 后使用） > `凭据.apiRegion` > `凭据.region` > `config.apiRegion` > `config.region`
 
 ### 代理配置
 
