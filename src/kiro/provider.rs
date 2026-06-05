@@ -2234,7 +2234,7 @@ impl KiroProvider {
                 .header("content-type", "application/json");
 
             // MCP 请求按账号类型携带 profile ARN。BuilderID 缺省时使用 Kiro 默认值；
-            // Enterprise/IdC 与 KAM/IDE token cache 一致，不携带 profileArn。
+            // Enterprise 仅使用导入或 ListAvailableProfiles 发现到的 profileArn。
             if let Some(arn) = credentials.effective_profile_arn_for_kiro_requests() {
                 request = request.header("x-amzn-kiro-profile-arn", arn);
             }
@@ -2664,7 +2664,7 @@ impl KiroProvider {
             let acquire_context_ms = attempt_started_at.elapsed().as_millis();
             let invocation_id = Uuid::new_v4().to_string();
 
-            // BuilderID 缺省时使用 Kiro 默认 profileArn；Enterprise/IdC 不携带 profileArn。
+            // BuilderID 缺省时使用 Kiro 默认 profileArn；Enterprise 仅使用导入或发现到的 profileArn。
             let body_inject_started_at = Instant::now();
             let effective_profile_arn = credentials
                 .effective_profile_arn_for_kiro_requests()
@@ -4493,7 +4493,7 @@ mod tests {
     }
 
     #[test]
-    fn test_should_failover_missing_profile_arn_for_enterprise_with_imported_arn() {
+    fn test_should_not_failover_missing_profile_arn_for_enterprise_with_profile_arn() {
         let credentials = KiroCredentials {
             provider: Some("Enterprise".to_string()),
             start_url: Some("https://example.awsapps.com/start".to_string()),
@@ -4502,7 +4502,7 @@ mod tests {
         };
         let body = r#"{"message":"profileArn is required for this request."}"#;
 
-        assert!(KiroProvider::should_failover_missing_profile_arn(
+        assert!(!KiroProvider::should_failover_missing_profile_arn(
             &credentials,
             body,
             "400 Bad Request"

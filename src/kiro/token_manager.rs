@@ -22,6 +22,7 @@ use crate::common::logging::summarize_upstream_error;
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
 use crate::kiro::model::available_models::ListAvailableModelsResponse;
+use crate::kiro::model::available_profiles::ListAvailableProfilesResponse;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
@@ -411,8 +412,9 @@ async fn refresh_idc_token(
 
     let data: IdcRefreshResponse = response.json().await?;
 
+    let access_token = data.access_token;
     let mut new_credentials = credentials.clone();
-    new_credentials.access_token = Some(data.access_token);
+    new_credentials.access_token = Some(access_token.clone());
 
     if let Some(new_refresh_token) = data.refresh_token {
         new_credentials.refresh_token = Some(new_refresh_token);
@@ -423,16 +425,47 @@ async fn refresh_idc_token(
         new_credentials.expires_at = Some(expires_at.to_rfc3339());
     }
 
-    // 同步更新 profile_arn（如果 IdC 响应中包含）。Enterprise 与 KAM/IDE 一致，
-    // 不在 token cache 中保存 profileArn。
     let is_enterprise = credentials.detected_auth_account_type().as_deref() == Some("enterprise");
     if is_enterprise {
-        new_credentials.profile_arn = None;
+        match discover_available_profile_arn(&new_credentials, config, &access_token, proxy).await {
+            Ok(Some(profile_arn)) => {
+                tracing::info!("Enterprise 凭据已通过 ListAvailableProfiles 发现可用 profileArn");
+                new_credentials.profile_arn = Some(profile_arn);
+            }
+            Ok(None) => {
+                tracing::warn!("Enterprise 凭据 ListAvailableProfiles 未返回可用 profileArn");
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Enterprise 凭据 ListAvailableProfiles 发现 profileArn 失败: {}",
+                    err
+                );
+            }
+        }
     } else if let Some(profile_arn) = data.profile_arn {
         new_credentials.profile_arn = Some(profile_arn);
     }
 
     Ok(new_credentials)
+}
+
+fn configured_api_region_for_profile_discovery<'a>(
+    credentials: &'a KiroCredentials,
+    config: &'a Config,
+) -> &'a str {
+    credentials
+        .api_region
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            credentials
+                .region
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or(config.effective_api_region())
 }
 
 fn effective_management_endpoint_base_for_credentials(
@@ -445,6 +478,82 @@ fn effective_management_endpoint_base_for_credentials(
     } else {
         config.effective_management_endpoint_base(region)
     }
+}
+
+async fn list_available_profiles(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<ListAvailableProfilesResponse> {
+    tracing::debug!("正在获取可用 Profile 列表...");
+
+    let region = configured_api_region_for_profile_discovery(credentials, config);
+    let management_endpoint =
+        effective_management_endpoint_base_for_credentials(credentials, config, region);
+    let host = Config::endpoint_host(&management_endpoint);
+    let machine_id = machine_id::generate_from_credentials(credentials, config)
+        .ok_or_else(|| anyhow::anyhow!("无法生成 machineId"))?;
+    let kiro_version = &config.kiro_version;
+    let os_name = &config.system_version;
+    let node_version = &config.node_version;
+
+    let url = format!(
+        "{}/ListAvailableProfiles",
+        management_endpoint.trim_end_matches('/')
+    );
+    let user_agent = format!(
+        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
+        os_name, node_version, kiro_version, machine_id
+    );
+    let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
+
+    let client = build_client(proxy, 60, config.tls_backend)?;
+    let response = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .header("accept", "application/json")
+        .header("x-amz-user-agent", &amz_user_agent)
+        .header("user-agent", &user_agent)
+        .header("host", &host)
+        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+        .header("amz-sdk-request", "attempt=1; max=1")
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({}))
+        .send()
+        .await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+        let error_summary =
+            summarize_upstream_error(status.as_u16(), &body_text, UPSTREAM_ERROR_EXCERPT_CHARS);
+        let error_msg = match status.as_u16() {
+            401 => "认证失败，Token 无效或已过期",
+            403 => "权限不足，无法获取可用 Profile 列表",
+            429 => "请求过于频繁，已被限流",
+            500..=599 => "服务器错误，AWS 服务暂时不可用",
+            _ => "获取可用 Profile 列表失败",
+        };
+        bail!("{}: {}", error_msg, error_summary);
+    }
+
+    Ok(response.json().await?)
+}
+
+async fn discover_available_profile_arn(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<Option<String>> {
+    if credentials.detected_auth_account_type().as_deref() != Some("enterprise") {
+        return Ok(None);
+    }
+
+    let response = list_available_profiles(credentials, config, token, proxy).await?;
+    let region = configured_api_region_for_profile_discovery(credentials, config);
+    Ok(response.selected_profile_arn(region))
 }
 
 /// 获取使用额度信息
@@ -472,7 +581,7 @@ pub(crate) async fn get_usage_limits(
         management_endpoint
     );
 
-    // BuilderID 账号在 Kiro/KAM 中会使用固定 profileArn；Enterprise/IdC 不带 profileArn。
+    // BuilderID 账号在 Kiro/KAM 中会使用固定 profileArn；Enterprise 仅使用导入或发现到的 profileArn。
     if let Some(profile_arn) = credentials.effective_profile_arn_for_kiro_requests() {
         url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
     }
@@ -7284,7 +7393,9 @@ impl MultiTokenManager {
         validated_cred.priority = new_cred.priority;
         validated_cred.provider = new_cred.provider;
         if import_is_enterprise {
-            validated_cred.profile_arn = None;
+            if validated_cred.profile_arn.is_none() {
+                validated_cred.profile_arn = new_cred.profile_arn;
+            }
         } else if let Some(profile_arn) = new_cred.profile_arn {
             validated_cred.profile_arn = Some(profile_arn);
         }
@@ -10866,6 +10977,49 @@ mod tests {
         let api_host = format!("q.{}.amazonaws.com", api_region);
 
         assert_eq!(api_host, "q.eu-central-1.amazonaws.com");
+    }
+
+    #[test]
+    fn test_profile_discovery_region_ignores_existing_profile_arn_region() {
+        let mut config = Config::default();
+        config.region = "us-west-2".to_string();
+
+        let credentials = KiroCredentials {
+            provider: Some("Enterprise".to_string()),
+            api_region: Some("us-east-1".to_string()),
+            profile_arn: Some(
+                "arn:aws:codewhisperer:eu-west-1:123456789012:profile/stale".to_string(),
+            ),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            credentials.effective_api_region(&config),
+            "eu-west-1",
+            "normal requests should still follow the stored profile ARN region"
+        );
+        assert_eq!(
+            configured_api_region_for_profile_discovery(&credentials, &config),
+            "us-east-1",
+            "profile discovery must use configured API region, not a stale profile ARN"
+        );
+    }
+
+    #[test]
+    fn test_profile_discovery_region_falls_back_to_credential_region() {
+        let mut config = Config::default();
+        config.region = "us-west-2".to_string();
+
+        let credentials = KiroCredentials {
+            provider: Some("Enterprise".to_string()),
+            region: Some("ap-southeast-1".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            configured_api_region_for_profile_discovery(&credentials, &config),
+            "ap-southeast-1"
+        );
     }
 
     #[test]

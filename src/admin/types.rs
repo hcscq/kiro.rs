@@ -269,7 +269,7 @@ pub struct AddCredentialRequest {
     /// 登录 Provider（Google / Github / BuilderId / Enterprise）
     pub provider: Option<String>,
 
-    /// Profile ARN（可选；BuilderID 缺省时后端会使用默认 BuilderID profile，Enterprise 导入时会忽略）
+    /// Profile ARN（可选；BuilderID 缺省时后端会使用默认 BuilderID profile，Enterprise 会优先自动发现可用 profile）
     pub profile_arn: Option<String>,
 
     /// OIDC Client ID（IdC 认证需要）

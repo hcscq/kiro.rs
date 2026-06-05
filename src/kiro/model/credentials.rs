@@ -577,22 +577,22 @@ impl KiroCredentials {
     }
 
     pub fn effective_profile_arn_for_kiro_requests(&self) -> Option<&str> {
-        // Enterprise/IdC token cache in Kiro/KAM does not carry profileArn. Passing
-        // imported or default ARNs to Q APIs makes Enterprise tokens fail ownership
-        // checks, so Enterprise accounts always omit profileArn.
+        if let Some(profile_arn) = self.profile_arn.as_deref() {
+            let trimmed = profile_arn.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed);
+            }
+        }
+
+        // Enterprise profiles are account-specific. Only use an ARN that was
+        // imported explicitly or discovered from ListAvailableProfiles; never
+        // fall back to the BuilderID default profile.
         if self
             .detected_auth_account_type()
             .as_deref()
             .is_some_and(|account_type| account_type == "enterprise")
         {
             return None;
-        }
-
-        if let Some(profile_arn) = self.profile_arn.as_deref() {
-            let trimmed = profile_arn.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed);
-            }
         }
 
         // BuilderID uses Kiro's default profile when the credential does not carry one.
@@ -1310,7 +1310,10 @@ mod tests {
             credentials.detected_auth_account_type().as_deref(),
             Some("enterprise")
         );
-        assert_eq!(credentials.effective_profile_arn_for_kiro_requests(), None);
+        assert_eq!(
+            credentials.effective_profile_arn_for_kiro_requests(),
+            Some("arn:aws:codewhisperer:us-east-1:123456789012:profile/test")
+        );
     }
 
     #[test]
@@ -1949,7 +1952,7 @@ mod tests {
     }
 
     #[test]
-    fn test_enterprise_provider_ignores_imported_profile_arn() {
+    fn test_enterprise_provider_uses_imported_or_discovered_profile_arn() {
         let creds = KiroCredentials {
             provider: Some("Enterprise".to_string()),
             profile_arn: Some(
@@ -1962,7 +1965,10 @@ mod tests {
             creds.detected_auth_account_type().as_deref(),
             Some("enterprise")
         );
-        assert_eq!(creds.effective_profile_arn_for_kiro_requests(), None);
+        assert_eq!(
+            creds.effective_profile_arn_for_kiro_requests(),
+            Some("arn:aws:codewhisperer:eu-west-1:123456789012:profile/test")
+        );
     }
 
     #[test]

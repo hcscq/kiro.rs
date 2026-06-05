@@ -387,9 +387,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           const apiRegion = cred.apiRegion?.trim() || kamRegion || undefined
           const startUrl = cred.startUrl?.trim() || undefined
           const enterprise = isEnterpriseProvider(provider)
-          const profileArn = enterprise
-            ? undefined
-            : account.profileArn?.trim() || cred.profileArn?.trim() || undefined
+          const profileArn = account.profileArn?.trim() || cred.profileArn?.trim() || undefined
           const availableModelIds = extractAvailableModelIds(account)
 
           // idc 模式下必须同时提供 clientId 和 clientSecret
