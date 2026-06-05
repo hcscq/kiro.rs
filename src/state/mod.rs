@@ -700,6 +700,40 @@ impl CredentialHealthPatch {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct CredentialMetadataPatch {
+    pub subscription_title: Option<Option<String>>,
+    pub subscription_type: Option<Option<String>>,
+    pub email: Option<Option<String>>,
+    pub user_id: Option<Option<String>>,
+    pub available_model_ids: Option<Vec<String>>,
+    pub available_models_cached_at: Option<Option<String>>,
+}
+
+impl CredentialMetadataPatch {
+    fn apply_to(&self, credential: &mut KiroCredentials) {
+        if let Some(subscription_title) = &self.subscription_title {
+            credential.subscription_title = subscription_title.clone();
+        }
+        if let Some(subscription_type) = &self.subscription_type {
+            credential.subscription_type = subscription_type.clone();
+        }
+        if let Some(email) = &self.email {
+            credential.email = email.clone();
+        }
+        if let Some(user_id) = &self.user_id {
+            credential.user_id = user_id.clone();
+        }
+        if let Some(available_model_ids) = &self.available_model_ids {
+            credential.available_model_ids = available_model_ids.clone();
+        }
+        if let Some(available_models_cached_at) = &self.available_models_cached_at {
+            credential.available_models_cached_at = available_models_cached_at.clone();
+        }
+        credential.normalize_model_capabilities();
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatsEntryRecord {
     pub success_count: u64,
@@ -1117,6 +1151,23 @@ trait StateBackend: Send + Sync {
         patch.apply_to(credential);
         self.persist_credentials(&persisted.credentials, persisted.is_multiple_format)
     }
+    fn patch_credential_metadata(
+        &self,
+        id: u64,
+        patch: &CredentialMetadataPatch,
+    ) -> anyhow::Result<bool> {
+        let mut persisted = self.load_credentials()?;
+        let Some(credential) = persisted
+            .credentials
+            .iter_mut()
+            .find(|credential| credential.id == Some(id))
+        else {
+            anyhow::bail!("凭据不存在: {}", id);
+        };
+
+        patch.apply_to(credential);
+        self.persist_credentials(&persisted.credentials, persisted.is_multiple_format)
+    }
     fn load_stats(&self) -> anyhow::Result<HashMap<String, StatsEntryRecord>>;
     fn save_stats(&self, stats: &HashMap<String, StatsEntryRecord>) -> anyhow::Result<()>;
     fn merge_stats(
@@ -1263,6 +1314,14 @@ impl StateStore {
         patch: &CredentialHealthPatch,
     ) -> anyhow::Result<bool> {
         self.primary_backend.patch_credential_health(id, patch)
+    }
+
+    pub fn patch_credential_metadata(
+        &self,
+        id: u64,
+        patch: &CredentialMetadataPatch,
+    ) -> anyhow::Result<bool> {
+        self.primary_backend.patch_credential_metadata(id, patch)
     }
 
     pub fn load_stats(&self) -> anyhow::Result<HashMap<String, StatsEntryRecord>> {
@@ -2145,6 +2204,68 @@ impl StateBackend for PostgresStateBackend {
                 transaction
                     .commit()
                     .context("提交 PostgreSQL 凭据健康状态事务失败")?;
+                Ok(true)
+            })
+        })
+    }
+
+    fn patch_credential_metadata(
+        &self,
+        id: u64,
+        patch: &CredentialMetadataPatch,
+    ) -> anyhow::Result<bool> {
+        let client = Arc::clone(&self.client);
+        let patch = patch.clone();
+
+        run_blocking_state_op(move || {
+            client.with_client(|client| {
+                let mut transaction = client
+                .transaction()
+                .context("开启 PostgreSQL 凭据元数据事务失败")?;
+                let row = transaction
+                    .query_opt(
+                        "SELECT value FROM kiro_state_store WHERE namespace = $1 AND key = $2 FOR UPDATE",
+                        &[&POSTGRES_NAMESPACE, &POSTGRES_CREDENTIALS_KEY],
+                    )
+                    .context("锁定 PostgreSQL 凭据列表失败")?;
+
+                let Some(row) = row else {
+                    transaction
+                        .commit()
+                        .context("提交空 PostgreSQL 凭据元数据事务失败")?;
+                    anyhow::bail!("凭据不存在: {}", id);
+                };
+
+                let payload: String = row.get(0);
+                let mut credentials: Vec<KiroCredentials> =
+                    serde_json::from_str(&payload).context("解析 PostgreSQL 凭据列表失败")?;
+                let Some(credential) = credentials
+                    .iter_mut()
+                    .find(|credential| credential.id == Some(id))
+                else {
+                    transaction
+                        .commit()
+                        .context("提交未命中 PostgreSQL 凭据元数据事务失败")?;
+                    anyhow::bail!("凭据不存在: {}", id);
+                };
+
+                patch.apply_to(credential);
+                let payload =
+                    serde_json::to_string(&credentials).context("序列化 PostgreSQL 凭据列表失败")?;
+                transaction
+                    .execute(
+                        r#"
+                        UPDATE kiro_state_store
+                        SET value = $3, updated_at = NOW()
+                        WHERE namespace = $1 AND key = $2
+                        "#,
+                        &[&POSTGRES_NAMESPACE, &POSTGRES_CREDENTIALS_KEY, &payload],
+                    )
+                    .context("更新 PostgreSQL 凭据元数据失败")?;
+
+                transaction
+                    .commit()
+                    .context("提交 PostgreSQL 凭据元数据事务失败")?;
                 Ok(true)
             })
         })
@@ -3613,6 +3734,88 @@ mod tests {
             }
             other => panic!("expected CAS conflict, got {:?}", other),
         }
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn file_state_store_patch_credential_metadata_updates_only_target_metadata() {
+        let dir = temp_test_dir("credential-metadata-patch");
+        let credentials_path = dir.join("credentials.json");
+        let store = StateStore::file(None, Some(credentials_path.clone()));
+
+        let target = KiroCredentials {
+            id: Some(7),
+            refresh_token: Some("refresh-current".to_string()),
+            access_token: Some("access-current".to_string()),
+            expires_at: Some("2026-04-15T01:00:00Z".to_string()),
+            disabled: true,
+            disabled_reason: Some("Manual".to_string()),
+            ..KiroCredentials::default()
+        };
+        let other = KiroCredentials {
+            id: Some(8),
+            refresh_token: Some("refresh-other".to_string()),
+            access_token: Some("access-other".to_string()),
+            subscription_title: Some("KIRO PRO".to_string()),
+            ..KiroCredentials::default()
+        };
+        assert!(
+            store
+                .persist_credentials(&[target.clone(), other.clone()], true)
+                .unwrap()
+        );
+
+        assert!(
+            store
+                .patch_credential_metadata(
+                    7,
+                    &CredentialMetadataPatch {
+                        subscription_title: Some(Some("KIRO POWER".to_string())),
+                        subscription_type: Some(Some("Q_DEVELOPER_STANDALONE_POWER".to_string())),
+                        email: Some(Some("enterprise@example.com".to_string())),
+                        user_id: Some(Some("enterprise-user".to_string())),
+                        available_model_ids: Some(vec![
+                            "claude-sonnet-4.5".to_string(),
+                            "claude-opus-4.1".to_string()
+                        ]),
+                        available_models_cached_at: Some(Some("2026-04-15T02:00:00Z".to_string())),
+                    }
+                )
+                .unwrap()
+        );
+
+        let reloaded = store.load_credentials().unwrap();
+        let updated = reloaded
+            .credentials
+            .iter()
+            .find(|credential| credential.id == Some(7))
+            .unwrap();
+        assert_eq!(updated.subscription_title.as_deref(), Some("KIRO POWER"));
+        assert_eq!(
+            updated.subscription_type.as_deref(),
+            Some("Q_DEVELOPER_STANDALONE_POWER")
+        );
+        assert_eq!(updated.email.as_deref(), Some("enterprise@example.com"));
+        assert_eq!(updated.user_id.as_deref(), Some("enterprise-user"));
+        assert_eq!(
+            updated.available_models_cached_at.as_deref(),
+            Some("2026-04-15T02:00:00Z")
+        );
+        assert_eq!(updated.refresh_token, target.refresh_token);
+        assert_eq!(updated.access_token, target.access_token);
+        assert_eq!(updated.expires_at, target.expires_at);
+        assert!(updated.disabled);
+        assert_eq!(updated.disabled_reason, target.disabled_reason);
+
+        let untouched = reloaded
+            .credentials
+            .iter()
+            .find(|credential| credential.id == Some(8))
+            .unwrap();
+        assert_eq!(untouched.refresh_token, other.refresh_token);
+        assert_eq!(untouched.access_token, other.access_token);
+        assert_eq!(untouched.subscription_title, other.subscription_title);
 
         fs::remove_dir_all(&dir).unwrap();
     }

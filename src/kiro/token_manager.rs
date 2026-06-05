@@ -36,11 +36,11 @@ use crate::model::model_policy::{
     normalize_account_type_policies, normalize_model_entries, normalize_model_selector,
 };
 use crate::state::{
-    CredentialCompareAndSwapResult, CredentialHealthPatch, DispatchLeaseReservationStatus,
-    DispatchRuntimeBucketPolicy, DispatchRuntimeCredential, DispatchRuntimeSnapshot,
-    PersistedDispatchConfig, RuntimeCoordinationStatus, RuntimeRefreshLeaseAcquisition,
-    StateChangeKind, StateChangeRevisions, StateStore, StatsEntryRecord, StatsMergeRecord,
-    current_epoch_ms,
+    CredentialCompareAndSwapResult, CredentialHealthPatch, CredentialMetadataPatch,
+    DispatchLeaseReservationStatus, DispatchRuntimeBucketPolicy, DispatchRuntimeCredential,
+    DispatchRuntimeSnapshot, PersistedDispatchConfig, RuntimeCoordinationStatus,
+    RuntimeRefreshLeaseAcquisition, StateChangeKind, StateChangeRevisions, StateStore,
+    StatsEntryRecord, StatsMergeRecord, current_epoch_ms,
 };
 
 const DEFAULT_REQUEST_WEIGHT: f64 = 1.0;
@@ -2854,9 +2854,34 @@ impl MultiTokenManager {
                 old_available_model_ids.len(),
                 next_available_model_ids.len()
             );
-            let credentials = Self::persisted_credentials_from_entries(&entries);
-            if let Err(err) = self.persist_credentials_snapshot(&credentials) {
-                tracing::warn!("凭据元数据更新后持久化失败（不影响本次请求）: {}", err);
+            let metadata_patch = CredentialMetadataPatch {
+                subscription_title: (old_title != next_title).then(|| next_title.clone()),
+                subscription_type: (old_type != next_type).then(|| next_type.clone()),
+                email: (old_email != next_email).then(|| next_email.clone()),
+                user_id: (old_user_id != next_user_id).then(|| next_user_id.clone()),
+                available_model_ids: (old_available_model_ids != next_available_model_ids)
+                    .then(|| next_available_model_ids.clone()),
+                available_models_cached_at: (old_available_models_cached_at
+                    != next_available_models_cached_at)
+                    .then(|| next_available_models_cached_at.clone()),
+            };
+
+            if self.state_store.is_external() {
+                match self
+                    .state_store
+                    .patch_credential_metadata(id, &metadata_patch)
+                {
+                    Ok(true) => self.try_bump_state_change_revision(StateChangeKind::Credentials),
+                    Ok(false) => {}
+                    Err(err) => {
+                        tracing::warn!("凭据元数据更新后持久化失败（不影响本次请求）: {}", err)
+                    }
+                }
+            } else {
+                let credentials = Self::persisted_credentials_from_entries(&entries);
+                if let Err(err) = self.persist_credentials_snapshot(&credentials) {
+                    tracing::warn!("凭据元数据更新后持久化失败（不影响本次请求）: {}", err);
+                }
             }
         }
 
