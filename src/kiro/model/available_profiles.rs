@@ -1,9 +1,9 @@
 //! Kiro ListAvailableProfiles API response model.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Single profile entry returned by ListAvailableProfiles.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 pub struct AvailableProfile {

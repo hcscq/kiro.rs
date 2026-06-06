@@ -9,10 +9,10 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetCredentialModelPolicyRequest, SetCredentialRateLimitConfigRequest,
-        SetDisabledRequest, SetLoadBalancingModeRequest, SetMaxConcurrencyRequest,
-        SetModelCapabilitiesConfigRequest, SetOverageStatusRequest, SetPriorityRequest,
-        SuccessResponse,
+        AddCredentialRequest, SetCredentialModelPolicyRequest, SetCredentialProfileRequest,
+        SetCredentialRateLimitConfigRequest, SetDisabledRequest, SetLoadBalancingModeRequest,
+        SetMaxConcurrencyRequest, SetModelCapabilitiesConfigRequest, SetOverageStatusRequest,
+        SetPriorityRequest, SuccessResponse,
     },
 };
 
@@ -113,6 +113,31 @@ pub async fn set_credential_model_policy(
 ) -> impl IntoResponse {
     match state.service.set_model_policy(id, payload) {
         Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 模型策略已更新", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/credentials/:id/profiles
+/// 获取指定凭据可用的 Profile
+pub async fn get_credential_profiles(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.get_profiles(id).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/profile
+/// 设置指定凭据当前使用的 Profile
+pub async fn set_credential_profile(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetCredentialProfileRequest>,
+) -> impl IntoResponse {
+    match state.service.set_profile(id, payload) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} profile 已更新", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

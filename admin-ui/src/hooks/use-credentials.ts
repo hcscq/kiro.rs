@@ -5,6 +5,8 @@ import {
   setCredentialMaxConcurrency,
   setCredentialRateLimitConfig,
   setCredentialModelPolicy,
+  getCredentialProfiles,
+  setCredentialProfile,
   clearCredentialRuntimeModelRestrictions,
   clearCredentialSuspiciousActivity,
   setCredentialPriority,
@@ -22,6 +24,7 @@ import {
 import type {
   AddCredentialRequest,
   SetCredentialModelPolicyRequest,
+  SetCredentialProfileRequest,
   UpdateLoadBalancingConfigRequest,
   UpdateModelCapabilitiesConfigRequest,
 } from '@/types/api'
@@ -42,6 +45,16 @@ export function useCredentialBalance(id: number | null) {
     queryFn: () => getCredentialBalance(id!),
     enabled: id !== null,
     retry: false, // 余额查询失败时不重试（避免重复请求被封禁的账号）
+  })
+}
+
+// 查询凭据可用 Profile
+export function useCredentialProfiles(id: number | null, enabled = true) {
+  return useQuery({
+    queryKey: ['credential-profiles', id],
+    queryFn: () => getCredentialProfiles(id!),
+    enabled: enabled && id !== null,
+    retry: false,
   })
 }
 
@@ -113,6 +126,25 @@ export function useSetCredentialModelPolicy() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
       queryClient.invalidateQueries({ queryKey: ['modelCapabilities'] })
+    },
+  })
+}
+
+// 设置凭据当前 Profile
+export function useSetCredentialProfile() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      id,
+      payload,
+    }: {
+      id: number
+      payload: SetCredentialProfileRequest
+    }) => setCredentialProfile(id, payload),
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      queryClient.invalidateQueries({ queryKey: ['credential-profiles', variables.id] })
+      queryClient.invalidateQueries({ queryKey: ['credential-balance', variables.id] })
     },
   })
 }

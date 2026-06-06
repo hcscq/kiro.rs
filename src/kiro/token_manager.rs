@@ -22,7 +22,7 @@ use crate::common::logging::summarize_upstream_error;
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
 use crate::kiro::model::available_models::ListAvailableModelsResponse;
-use crate::kiro::model::available_profiles::ListAvailableProfilesResponse;
+use crate::kiro::model::available_profiles::{AvailableProfile, ListAvailableProfilesResponse};
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
@@ -426,7 +426,13 @@ async fn refresh_idc_token(
     }
 
     let is_enterprise = credentials.detected_auth_account_type().as_deref() == Some("enterprise");
-    if is_enterprise {
+    let has_saved_profile_arn = new_credentials
+        .profile_arn
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some();
+    if is_enterprise && !has_saved_profile_arn {
         match discover_available_profile_arn(&new_credentials, config, &access_token, proxy).await {
             Ok(Some(profile_arn)) => {
                 tracing::info!("Enterprise 凭据已通过 ListAvailableProfiles 发现可用 profileArn");
@@ -442,6 +448,8 @@ async fn refresh_idc_token(
                 );
             }
         }
+    } else if is_enterprise {
+        tracing::debug!("Enterprise 凭据已有保存的 profileArn，跳过自动发现");
     } else if let Some(profile_arn) = data.profile_arn {
         new_credentials.profile_arn = Some(profile_arn);
     }
@@ -1129,8 +1137,11 @@ pub struct CredentialEntrySnapshot {
     /// 登录 Provider（Google / Github / BuilderId / Enterprise）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
-    /// 是否有 Profile ARN
+    /// 是否有当前生效的 Profile ARN
     pub has_profile_arn: bool,
+    /// 当前生效的 Profile ARN（显式保存、发现得到或账号类型默认值）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_arn: Option<String>,
     /// Token 过期时间
     pub expires_at: Option<String>,
     /// refreshToken 的 SHA-256 哈希（用于前端重复检测）
@@ -6781,6 +6792,11 @@ impl MultiTokenManager {
                         .chain(suspicious_activity_quarantine_remaining_ms)
                         .max();
 
+                    let effective_profile_arn = e
+                        .credentials
+                        .effective_profile_arn_for_kiro_requests()
+                        .map(str::to_string);
+
                     CredentialEntrySnapshot {
                         id: e.id,
                         priority: e.credentials.priority,
@@ -6788,7 +6804,8 @@ impl MultiTokenManager {
                         failure_count: e.failure_count,
                         auth_method: Some(e.credentials.effective_auth_method().to_string()),
                         provider: e.credentials.provider.clone(),
-                        has_profile_arn: e.credentials.profile_arn.is_some(),
+                        has_profile_arn: effective_profile_arn.is_some(),
+                        profile_arn: effective_profile_arn,
                         expires_at: e.credentials.expires_at.clone(),
                         refresh_token_hash: e.credentials.refresh_token.as_deref().map(sha256_hex),
                         email: e.credentials.email.clone(),
@@ -7110,6 +7127,43 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 设置凭据当前使用的 Profile ARN（Admin API）
+    pub fn set_profile_arn(&self, id: u64, profile_arn: String) -> anyhow::Result<()> {
+        let profile_arn = profile_arn.trim();
+        if profile_arn.is_empty() {
+            anyhow::bail!("profileArn 不能为空");
+        }
+
+        let _state_write_guard = self.state_write_lock.lock();
+        let mut persisted = self.persisted_credentials_snapshot();
+        let credential = Self::persisted_credential_mut(&mut persisted, id)?;
+        let previous_profile_arn = credential.profile_arn.as_deref().map(str::trim);
+
+        if previous_profile_arn == Some(profile_arn) {
+            return Ok(());
+        }
+
+        credential.profile_arn = Some(profile_arn.to_string());
+        credential.available_model_ids.clear();
+        credential.available_models_cached_at = None;
+        credential.clear_runtime_model_restrictions();
+        credential.normalize_model_capabilities();
+        let updated_credential = credential.clone();
+        self.persist_credentials_snapshot(&persisted)?;
+
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials = updated_credential;
+        }
+
+        self.availability_notify.notify_waiters();
+        Ok(())
+    }
+
     /// 清除单个凭据的运行时模型限制（Admin API）
     pub fn clear_runtime_model_restrictions_for_credential(&self, id: u64) -> anyhow::Result<bool> {
         let _state_write_guard = self.state_write_lock.lock();
@@ -7315,6 +7369,20 @@ impl MultiTokenManager {
             return Ok(None);
         }
 
+        if credentials
+            .profile_arn
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some()
+        {
+            tracing::debug!(
+                "凭据 #{} 已保存 profileArn，跳过 Enterprise profileArn 自动重新发现",
+                id
+            );
+            return Ok(None);
+        }
+
         let previous_profile_arn = credentials
             .effective_profile_arn_for_kiro_requests()
             .map(str::to_string);
@@ -7425,6 +7493,35 @@ impl MultiTokenManager {
             }
             Err(err) => Err(err),
         }
+    }
+
+    /// 获取指定凭据当前生效的 Profile ARN（用于额度缓存隔离）
+    pub fn effective_profile_arn_for(&self, id: u64) -> anyhow::Result<Option<String>> {
+        Ok(self
+            .current_credentials(id)?
+            .effective_profile_arn_for_kiro_requests()
+            .map(str::to_string))
+    }
+
+    /// 列出指定凭据可用的 Profile（Admin API）
+    pub async fn list_available_profiles_for(
+        &self,
+        id: u64,
+    ) -> anyhow::Result<(Vec<AvailableProfile>, Option<String>)> {
+        let credentials = self.current_credentials(id)?;
+        let (credentials, token) = self.try_ensure_token(id, &credentials).await?;
+        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+        let response =
+            list_available_profiles(&credentials, &self.config, &token, effective_proxy.as_ref())
+                .await?;
+        let selected_profile_arn = credentials
+            .profile_arn
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+
+        Ok((response.profiles, selected_profile_arn))
     }
 
     /// 获取指定凭据的使用额度（Admin API）
@@ -8364,6 +8461,79 @@ mod tests {
         credentials.access_token = Some(format!("token-{priority}"));
         credentials.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
         credentials
+    }
+
+    #[test]
+    fn snapshot_exposes_effective_builder_id_profile_arn() {
+        let mut credential = available_credential(0);
+        credential.auth_method = Some("idc".to_string());
+        credential.client_id = Some("client".to_string());
+        credential.client_secret = Some("secret".to_string());
+        credential.start_url = Some("https://view.awsapps.com/start/".to_string());
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
+
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert!(entry.has_profile_arn);
+        assert_eq!(
+            entry.profile_arn.as_deref(),
+            Some(crate::kiro::model::credentials::KIRO_BUILDER_ID_PROFILE_ARN)
+        );
+
+        let persisted = manager.current_credentials(1).unwrap();
+        assert!(persisted.profile_arn.is_none());
+    }
+
+    #[test]
+    fn set_profile_arn_persists_and_clears_profile_scoped_model_cache() {
+        let credentials_path = temp_credentials_path("set-profile-arn");
+        let mut credential = available_credential(0);
+        credential.id = Some(1);
+        credential.profile_arn =
+            Some("arn:aws:codewhisperer:us-east-1:123:profile/old".to_string());
+        credential.available_model_ids = vec!["old-model".to_string()];
+        credential.available_models_cached_at = Some("2026-06-06T00:00:00Z".to_string());
+        credential.runtime_model_restrictions =
+            vec![crate::model::model_policy::RuntimeModelRestriction {
+                model: "old-model".to_string(),
+                expires_at: "2026-06-07T00:00:00Z".to_string(),
+            }];
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![credential],
+            None,
+            Some(credentials_path.clone()),
+            true,
+        )
+        .unwrap();
+
+        manager
+            .set_profile_arn(
+                1,
+                "arn:aws:codewhisperer:us-east-1:123:profile/new".to_string(),
+            )
+            .unwrap();
+
+        let updated = manager.current_credentials(1).unwrap();
+        assert_eq!(
+            updated.profile_arn.as_deref(),
+            Some("arn:aws:codewhisperer:us-east-1:123:profile/new")
+        );
+        assert!(updated.available_model_ids.is_empty());
+        assert!(updated.available_models_cached_at.is_none());
+        assert!(updated.runtime_model_restrictions.is_empty());
+
+        let persisted: Vec<KiroCredentials> =
+            serde_json::from_slice(&std::fs::read(credentials_path).unwrap()).unwrap();
+        assert_eq!(
+            persisted[0].profile_arn.as_deref(),
+            Some("arn:aws:codewhisperer:us-east-1:123:profile/new")
+        );
+        assert!(persisted[0].available_model_ids.is_empty());
+        assert!(persisted[0].available_models_cached_at.is_none());
     }
 
     fn shared_runtime_test_config() -> Option<Config> {

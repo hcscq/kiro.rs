@@ -17,11 +17,11 @@ use crate::state::{CachedBalanceRecord, RuntimeCoordinationStatus, StateChangeKi
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, ModelCapabilitiesConfigResponse,
-    ModelCatalogItemResponse, ModelCatalogResponse, SetCredentialModelPolicyRequest,
-    SetLoadBalancingModeRequest, SetModelCapabilitiesConfigRequest,
-    StandardAccountTypePresetResponse,
+    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialProfilesResponse,
+    CredentialStatusItem, CredentialsStatusResponse, LoadBalancingModeResponse,
+    ModelCapabilitiesConfigResponse, ModelCatalogItemResponse, ModelCatalogResponse,
+    SetCredentialModelPolicyRequest, SetCredentialProfileRequest, SetLoadBalancingModeRequest,
+    SetModelCapabilitiesConfigRequest, StandardAccountTypePresetResponse,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -96,6 +96,7 @@ impl AdminService {
                     auth_method: entry.auth_method,
                     provider: entry.provider,
                     has_profile_arn: entry.has_profile_arn,
+                    profile_arn: entry.profile_arn,
                     refresh_token_hash: entry.refresh_token_hash,
                     email: entry.email,
                     user_id: entry.user_id,
@@ -235,6 +236,40 @@ impl AdminService {
             .map_err(|e| self.classify_error(e, id))
     }
 
+    pub async fn get_profiles(
+        &self,
+        id: u64,
+    ) -> Result<CredentialProfilesResponse, AdminServiceError> {
+        self.sync_runtime_state_for_read()?;
+
+        let (profiles, selected_profile_arn) = self
+            .token_manager
+            .list_available_profiles_for(id)
+            .await
+            .map_err(|e| self.classify_balance_error(e, id))?;
+
+        Ok(CredentialProfilesResponse {
+            id,
+            selected_profile_arn,
+            profiles,
+        })
+    }
+
+    pub fn set_profile(
+        &self,
+        id: u64,
+        req: SetCredentialProfileRequest,
+    ) -> Result<(), AdminServiceError> {
+        self.ensure_runtime_write_leader()?;
+
+        self.token_manager
+            .set_profile_arn(id, req.profile_arn)
+            .map_err(|e| self.classify_error(e, id))?;
+        self.invalidate_balance_cache(id);
+
+        Ok(())
+    }
+
     pub fn clear_runtime_model_restrictions(&self, id: u64) -> Result<bool, AdminServiceError> {
         self.ensure_runtime_write_leader()?;
 
@@ -265,15 +300,19 @@ impl AdminService {
         self.sync_runtime_state_for_read()?;
         self.sync_balance_cache_if_changed()
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        let profile_arn = self
+            .token_manager
+            .effective_profile_arn_for(id)
+            .map_err(|e| self.classify_error(e, id))?;
 
-        if let Some(cached) = self.cached_balance(id) {
+        if let Some(cached) = self.cached_balance(id, profile_arn.as_deref()) {
             tracing::debug!("凭据 #{} 余额命中本地缓存", id);
             return Ok(cached);
         }
 
         if let Err(e) = self.sync_balance_cache_from_state() {
             tracing::warn!("同步共享余额缓存失败，将直接回源查询: {}", e);
-        } else if let Some(cached) = self.cached_balance(id) {
+        } else if let Some(cached) = self.cached_balance(id, profile_arn.as_deref()) {
             tracing::debug!("凭据 #{} 余额命中共享缓存", id);
             return Ok(cached);
         }
@@ -288,6 +327,7 @@ impl AdminService {
                 id,
                 CachedBalanceRecord {
                     cached_at: Utc::now().timestamp() as f64,
+                    profile_arn: balance.profile_arn.clone(),
                     data: balance.clone(),
                 },
             );
@@ -305,7 +345,12 @@ impl AdminService {
             .await
             .map_err(|e| self.classify_balance_error(e, id))?;
 
-        Ok(Self::balance_from_usage(id, &usage))
+        let profile_arn = self
+            .token_manager
+            .effective_profile_arn_for(id)
+            .map_err(|e| self.classify_error(e, id))?;
+
+        Ok(Self::balance_from_usage(id, profile_arn, &usage))
     }
 
     /// 设置凭据超额使用开关
@@ -321,14 +366,22 @@ impl AdminService {
             .set_overage_status_for(id, enabled)
             .await
             .map_err(|e| self.classify_balance_error(e, id))?;
-        let balance = Self::balance_from_usage(id, &usage);
+        let profile_arn = self
+            .token_manager
+            .effective_profile_arn_for(id)
+            .map_err(|e| self.classify_error(e, id))?;
+        let balance = Self::balance_from_usage(id, profile_arn, &usage);
 
         self.cache_balance(id, balance.clone());
 
         Ok(balance)
     }
 
-    fn balance_from_usage(id: u64, usage: &UsageLimitsResponse) -> BalanceResponse {
+    fn balance_from_usage(
+        id: u64,
+        profile_arn: Option<String>,
+        usage: &UsageLimitsResponse,
+    ) -> BalanceResponse {
         let current_usage = usage.current_usage();
         let usage_limit = usage.usage_limit();
         let effective_usage_limit = usage.effective_usage_limit();
@@ -341,6 +394,7 @@ impl AdminService {
 
         BalanceResponse {
             id,
+            profile_arn,
             subscription_title: usage.subscription_title().map(|s| s.to_string()),
             subscription_type: usage.subscription_type().map(|s| s.to_string()),
             current_usage,
@@ -785,6 +839,12 @@ impl AdminService {
         let mut cache = state_store.load_balance_cache()?;
         for entry in cache.values_mut() {
             entry.data.normalize_cached_compat();
+            if entry.data.profile_arn.is_none() {
+                entry.data.profile_arn = entry.profile_arn.clone();
+            }
+            if entry.profile_arn.is_none() {
+                entry.profile_arn = entry.data.profile_arn.clone();
+            }
         }
         let original_len = cache.len();
         let pruned = Self::prune_expired_balance_cache(cache);
@@ -798,11 +858,12 @@ impl AdminService {
         Ok(pruned)
     }
 
-    fn cached_balance(&self, id: u64) -> Option<BalanceResponse> {
+    fn cached_balance(&self, id: u64, profile_arn: Option<&str>) -> Option<BalanceResponse> {
         let cache = self.balance_cache.lock();
         cache
             .get(&id)
             .filter(|cached| Self::is_balance_cache_fresh(cached))
+            .filter(|cached| cached.profile_arn.as_deref() == profile_arn)
             .map(|cached| cached.data.clone())
     }
 
@@ -813,11 +874,22 @@ impl AdminService {
                 id,
                 CachedBalanceRecord {
                     cached_at: Utc::now().timestamp() as f64,
+                    profile_arn: balance.profile_arn.clone(),
                     data: balance,
                 },
             );
         }
         self.save_balance_cache();
+    }
+
+    fn invalidate_balance_cache(&self, id: u64) {
+        let removed = {
+            let mut cache = self.balance_cache.lock();
+            cache.remove(&id).is_some()
+        };
+        if removed {
+            self.save_balance_cache();
+        }
     }
 
     fn is_balance_cache_fresh(cached: &CachedBalanceRecord) -> bool {
@@ -1081,6 +1153,7 @@ mod tests {
 
         let shared_balance = BalanceResponse {
             id: 1,
+            profile_arn: None,
             subscription_title: Some("KIRO PRO+".to_string()),
             subscription_type: Some("Q_DEVELOPER_STANDALONE_PRO_PLUS".to_string()),
             current_usage: 12.5,
@@ -1104,6 +1177,7 @@ mod tests {
             1,
             CachedBalanceRecord {
                 cached_at: Utc::now().timestamp() as f64,
+                profile_arn: None,
                 data: shared_balance.clone(),
             },
         );

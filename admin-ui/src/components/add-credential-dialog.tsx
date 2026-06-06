@@ -35,6 +35,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [authMethod, setAuthMethod] = useState<AuthMethod>('social')
   const [authRegion, setAuthRegion] = useState('')
   const [apiRegion, setApiRegion] = useState('')
+  const [profileArn, setProfileArn] = useState('')
   const [clientId, setClientId] = useState('')
   const [clientSecret, setClientSecret] = useState('')
   const [startUrl, setStartUrl] = useState('')
@@ -79,6 +80,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setAuthMethod('social')
     setAuthRegion('')
     setApiRegion('')
+    setProfileArn('')
     setClientId('')
     setClientSecret('')
     setStartUrl('')
@@ -149,6 +151,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         authMethod,
         authRegion: authRegion.trim() || undefined,
         apiRegion: apiRegion.trim() || undefined,
+        profileArn: profileArn.trim() || undefined,
         clientId: clientId.trim() || undefined,
         clientSecret: clientSecret.trim() || undefined,
         startUrl: startUrl.trim() || undefined,
@@ -258,6 +261,19 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               <p className="text-xs text-muted-foreground">
                 均可留空使用全局配置。Auth Region 用于 Token 刷新，API Region 用于 API 请求
               </p>
+            </div>
+
+            <div className="space-y-2">
+              <label htmlFor="profileArn" className="text-sm font-medium">
+                Profile ARN
+              </label>
+              <Input
+                id="profileArn"
+                placeholder="可选；Enterprise 可留空由后端自动发现"
+                value={profileArn}
+                onChange={(e) => setProfileArn(e.target.value)}
+                disabled={isPending}
+              />
             </div>
 
             {/* IdC/Builder-ID/IAM 额外字段 */}

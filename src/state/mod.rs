@@ -748,6 +748,8 @@ pub struct StatsMergeRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedBalanceRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_arn: Option<String>,
     pub cached_at: f64,
     pub data: BalanceResponse,
 }
@@ -3631,8 +3633,10 @@ mod tests {
             7,
             CachedBalanceRecord {
                 cached_at: 1234.0,
+                profile_arn: None,
                 data: BalanceResponse {
                     id: 7,
+                    profile_arn: None,
                     subscription_title: Some("KIRO PRO+".to_string()),
                     subscription_type: Some("Q_DEVELOPER_STANDALONE_PRO_PLUS".to_string()),
                     current_usage: 1.0,
@@ -4032,8 +4036,10 @@ mod tests {
             9,
             CachedBalanceRecord {
                 cached_at: 2345.0,
+                profile_arn: None,
                 data: BalanceResponse {
                     id: 9,
+                    profile_arn: None,
                     subscription_title: Some("KIRO MAX".to_string()),
                     subscription_type: Some("Q_DEVELOPER_STANDALONE_MAX".to_string()),
                     current_usage: 2.0,

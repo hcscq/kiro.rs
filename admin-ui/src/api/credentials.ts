@@ -8,6 +8,8 @@ import type {
   SetPriorityRequest,
   SetCredentialRateLimitConfigRequest,
   SetCredentialModelPolicyRequest,
+  SetCredentialProfileRequest,
+  CredentialProfilesResponse,
   AddCredentialRequest,
   AddCredentialResponse,
   LoadBalancingConfigResponse,
@@ -180,6 +182,23 @@ export async function setCredentialModelPolicy(
     `/credentials/${id}/model-policy`,
     payload
   )
+  return data
+}
+
+// 获取凭据可用 Profile
+export async function getCredentialProfiles(
+  id: number
+): Promise<CredentialProfilesResponse> {
+  const { data } = await api.get<CredentialProfilesResponse>(`/credentials/${id}/profiles`)
+  return data
+}
+
+// 设置凭据当前 Profile
+export async function setCredentialProfile(
+  id: number,
+  payload: SetCredentialProfileRequest
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/profile`, payload)
   return data
 }
 

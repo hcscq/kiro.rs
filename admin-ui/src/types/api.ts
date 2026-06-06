@@ -18,6 +18,7 @@ export interface CredentialStatusItem {
   authMethod: string | null
   provider?: string | null
   hasProfileArn: boolean
+  profileArn?: string | null
   email?: string | null
   userId?: string | null
   subscriptionTitle?: string | null
@@ -69,6 +70,7 @@ export interface CredentialStatusItem {
 // 余额响应
 export interface BalanceResponse {
   id: number
+  profileArn?: string | null
   subscriptionTitle: string | null
   subscriptionType?: string | null
   currentUsage: number
@@ -156,6 +158,22 @@ export interface SetCredentialModelPolicyRequest {
   allowedModels?: string[] | null
   blockedModels?: string[] | null
   clearRuntimeModelRestrictions?: boolean
+}
+
+export interface AvailableProfile {
+  arn: string
+  profileName?: string | null
+  profileType?: string | null
+}
+
+export interface CredentialProfilesResponse {
+  id: number
+  selectedProfileArn?: string | null
+  profiles: AvailableProfile[]
+}
+
+export interface SetCredentialProfileRequest {
+  profileArn: string
 }
 
 // 添加凭据请求

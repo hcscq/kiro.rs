@@ -9,11 +9,12 @@ use super::{
     handlers::{
         add_credential, clear_credential_runtime_model_restrictions,
         clear_credential_suspicious_activity, delete_credential, force_refresh_token,
-        get_all_credentials, get_credential_balance, get_load_balancing_mode,
-        get_model_capabilities_config, get_model_catalog, reset_failure_count,
-        set_credential_disabled, set_credential_max_concurrency, set_credential_model_policy,
-        set_credential_overage_status, set_credential_priority, set_credential_rate_limit_config,
-        set_load_balancing_mode, set_model_capabilities_config,
+        get_all_credentials, get_credential_balance, get_credential_profiles,
+        get_load_balancing_mode, get_model_capabilities_config, get_model_catalog,
+        reset_failure_count, set_credential_disabled, set_credential_max_concurrency,
+        set_credential_model_policy, set_credential_overage_status, set_credential_priority,
+        set_credential_profile, set_credential_rate_limit_config, set_load_balancing_mode,
+        set_model_capabilities_config,
     },
     middleware::{AdminState, admin_auth_middleware, admin_write_routing_middleware},
 };
@@ -29,6 +30,8 @@ use super::{
 /// - `POST /credentials/:id/max-concurrency` - 设置凭据并发上限
 /// - `POST /credentials/:id/rate-limit-config` - 设置凭据级 token bucket 参数
 /// - `POST /credentials/:id/model-policy` - 设置凭据级模型策略
+/// - `GET /credentials/:id/profiles` - 获取可用 Profile 列表
+/// - `POST /credentials/:id/profile` - 设置凭据当前 Profile
 /// - `POST /credentials/:id/overage` - 设置凭据超额使用开关
 /// - `POST /credentials/:id/runtime-model-restrictions/clear` - 清除运行时模型限制
 /// - `POST /credentials/:id/suspicious-activity/clear` - 清除 suspicious activity 标记与隔离
@@ -66,6 +69,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/credentials/{id}/model-policy",
             post(set_credential_model_policy),
         )
+        .route("/credentials/{id}/profiles", get(get_credential_profiles))
+        .route("/credentials/{id}/profile", post(set_credential_profile))
         .route(
             "/credentials/{id}/overage",
             post(set_credential_overage_status),

@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::kiro::model::available_profiles::AvailableProfile;
 use crate::model::config::{
     KiroRequestBodyGuardConfig, NonStreamBodyReadTimeoutConfig, RequestWeightingConfig,
     StreamPreSseFailoverConfig, ThinkingSignatureValidationMode,
@@ -58,8 +59,11 @@ pub struct CredentialStatusItem {
     /// 登录 Provider（Google / Github / BuilderId / Enterprise）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
-    /// 是否有 Profile ARN
+    /// 是否有当前生效的 Profile ARN
     pub has_profile_arn: bool,
+    /// 当前生效的 Profile ARN（显式保存、发现得到或账号类型默认值）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_arn: Option<String>,
     /// refreshToken 的 SHA-256 哈希（用于前端重复检测）
     pub refresh_token_hash: Option<String>,
     /// 用户邮箱（用于前端显示）
@@ -255,6 +259,26 @@ pub struct SetOverageStatusRequest {
     pub enabled: bool,
 }
 
+/// 设置凭据 Profile ARN 请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCredentialProfileRequest {
+    /// 要选择的 Profile ARN
+    pub profile_arn: String,
+}
+
+/// 凭据可用 Profile 列表响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialProfilesResponse {
+    /// 凭据 ID
+    pub id: u64,
+    /// 当前显式选择/保存的 Profile ARN
+    pub selected_profile_arn: Option<String>,
+    /// 上游返回的可用 Profile 列表
+    pub profiles: Vec<AvailableProfile>,
+}
+
 /// 添加凭据请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -373,6 +397,9 @@ pub struct AddCredentialResponse {
 pub struct BalanceResponse {
     /// 凭据 ID
     pub id: u64,
+    /// 查询额度时使用的 Profile ARN
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_arn: Option<String>,
     /// 订阅类型
     pub subscription_title: Option<String>,
     /// 订阅内部类型
