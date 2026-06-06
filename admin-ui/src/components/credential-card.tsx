@@ -1,4 +1,4 @@
-import { useState, type ComponentType, type ReactNode } from 'react'
+import { useState, type ComponentType } from 'react'
 import { toast } from 'sonner'
 import {
   BadgeCheck,
@@ -29,6 +29,7 @@ import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
 import { Input } from '@/components/ui/input'
 import { Checkbox } from '@/components/ui/checkbox'
+import { Progress } from '@/components/ui/progress'
 import {
   Dialog,
   DialogContent,
@@ -134,23 +135,6 @@ function splitEmailLabel(value: string): { localPart: string; domain: string } |
     localPart: value.slice(0, atIndex),
     domain: value.slice(atIndex + 1),
   }
-}
-
-function InfoTile({
-  label,
-  className,
-  children,
-}: {
-  label: string
-  className?: string
-  children: ReactNode
-}) {
-  return (
-    <div className={cn('min-w-0 overflow-hidden rounded-lg border bg-muted/20 px-3 py-2.5', className)}>
-      <div className="truncate text-xs text-muted-foreground">{label}</div>
-      <div className="mt-1 min-w-0 text-sm font-medium leading-snug">{children}</div>
-    </div>
-  )
 }
 
 function CompactPill({
@@ -775,77 +759,68 @@ export function CredentialCard({
           </div>
         </CardHeader>
         <CardContent className="space-y-3">
-          {/* 信息摘要 */}
-          <div className="grid grid-cols-1 gap-2 [grid-template-columns:repeat(auto-fit,minmax(min(100%,11rem),1fr))]">
-            <InfoTile label="优先级">
-              <span>{credential.priority}</span>
-            </InfoTile>
-
-            <InfoTile label="并发上限">
-              <span title="当前并发 / 并发上限">{credential.inFlight} / {credential.maxConcurrency ?? '不限'}</span>
-              {maxConcurrencySourceLabel && (
-                <div
-                  className="mt-0.5 truncate text-[10px] font-normal text-muted-foreground"
-                  title={`来源：${maxConcurrencySourceLabel}`}
-                >
-                  {maxConcurrencySourceLabel}
-                </div>
-              )}
-            </InfoTile>
-
-            <InfoTile label="订阅与用量">
-              <div className="space-y-0.5">
-                <div className="flex min-w-0 items-center gap-1.5">
-                  {loadingBalance && !credential.subscriptionTitle ? (
-                    <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
-                  ) : (
-                    <span className="min-w-0 flex-1 truncate" title={subscriptionLabel}>
-                      {subscriptionLabel}
-                    </span>
-                  )}
-                  {subscriptionTypeCompactLabel && subscriptionTypeLabel !== subscriptionLabel && (
-                    <CompactPill
-                      icon={Layers}
-                      label={subscriptionTypeCompactLabel}
-                      title={`内部订阅类型：${subscriptionTypeLabel}`}
-                      tone="accent"
-                    />
-                  )}
-                  {overageEnabled && (
-                    <Badge variant="warning" className="shrink-0 px-1.5 py-0 text-[10px]">
-                      <Zap className="mr-1 h-3 w-3" />
-                      超额
-                    </Badge>
-                  )}
-                </div>
-                <div className="flex min-w-0 items-center gap-1 text-[11px] font-normal text-muted-foreground">
-                  <Wallet className="h-3.5 w-3.5 shrink-0" />
-                  {loadingBalance ? (
-                    <Loader2 className="h-3 w-3 animate-spin" />
-                  ) : (
-                    <span
-                      className="min-w-0 truncate"
-                      title={balancePercentRemaining ? `${balanceSummary} (${balancePercentRemaining})` : balanceSummary ?? undefined}
-                    >
-                      {balanceSummary}
-                      {balancePercentRemaining && <span className="ml-1">({balancePercentRemaining})</span>}
-                    </span>
-                  )}
-                </div>
+          {/* 订阅用量与进度条 */}
+          <div className="space-y-1.5">
+            <div className="flex items-center justify-between text-xs">
+              <div className="flex items-center gap-1.5 font-medium text-foreground min-w-0">
+                <Wallet className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                {loadingBalance && !credential.subscriptionTitle ? (
+                  <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
+                ) : (
+                  <span className="truncate" title={subscriptionLabel}>
+                    {subscriptionLabel}
+                  </span>
+                )}
+                {subscriptionTypeCompactLabel && subscriptionTypeLabel !== subscriptionLabel && (
+                  <CompactPill
+                    icon={Layers}
+                    label={subscriptionTypeCompactLabel}
+                    title={`内部订阅类型：${subscriptionTypeLabel}`}
+                    tone="accent"
+                  />
+                )}
+                {overageEnabled && (
+                  <Badge variant="warning" className="shrink-0 px-1.5 py-0 text-[10px] h-4 leading-none">
+                    <Zap className="mr-0.5 h-2.5 w-2.5" />
+                    超额
+                  </Badge>
+                )}
               </div>
-            </InfoTile>
+              <div className="text-muted-foreground font-mono text-right shrink-0">
+                {loadingBalance ? (
+                  <Loader2 className="h-3 w-3 animate-spin inline" />
+                ) : balance ? (
+                  <span title={balancePercentRemaining ? `${balanceSummary} (${balancePercentRemaining})` : balanceSummary ?? undefined}>
+                    {balanceSummary}
+                    {balancePercentRemaining && <span className="ml-1 text-[10px] text-primary">({balancePercentRemaining})</span>}
+                  </span>
+                ) : (
+                  '未知余额'
+                )}
+              </div>
+            </div>
+            {balance && (
+              <Progress value={balance.usagePercentage} className="h-1.5 bg-muted" />
+            )}
+          </div>
 
-            <InfoTile label="生效账号类型">
-              <div className="space-y-0.5">
-                <div className="flex min-w-0 items-center gap-1.5">
+          {/* 双列无边框网格 */}
+          <div className="grid grid-cols-2 gap-x-4 gap-y-2 text-xs py-2 border-y border-muted-foreground/10">
+            {/* 左列：配置与类型 (Configs) */}
+            <div className="space-y-2 min-w-0">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-muted-foreground shrink-0">优先级</span>
+                <span className="font-semibold text-foreground truncate">{credential.priority}</span>
+              </div>
+              <div className="space-y-1">
+                <div className="text-muted-foreground">生效与认证</div>
+                <div className="flex flex-wrap gap-1">
                   <CompactPill
                     icon={ShieldCheck}
                     label={resolvedAccountTypeCompactLabel}
                     title={`生效账号类型：${resolvedAccountTypeLabel}`}
                     tone={credential.resolvedAccountType ? 'success' : 'muted'}
                   />
-                </div>
-                <div className="flex min-w-0 flex-wrap gap-1">
                   <CompactPill
                     icon={AuthAccountTypeIcon}
                     label={authAccountTypeLabel}
@@ -860,23 +835,43 @@ export function CredentialCard({
                   )}
                 </div>
               </div>
-            </InfoTile>
+            </div>
 
-            <InfoTile label="最后调用" className="flex flex-col justify-between">
-              <div className="truncate text-xs text-muted-foreground">最后调用</div>
-              <div className="flex min-w-0 items-center gap-1 mt-1 font-medium leading-snug">
-                <Clock3 className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                <span className="min-w-0 truncate text-sm" title={formatLastUsed(credential.lastUsedAt)}>
-                  {formatLastUsed(credential.lastUsedAt)}
-                </span>
+            {/* 右列：运行指标与状态 (Metrics) */}
+            <div className="space-y-2 min-w-0 border-l pl-4 border-muted-foreground/10">
+              <div className="space-y-1">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-muted-foreground shrink-0">并发状态</span>
+                  <span className="font-semibold text-foreground truncate" title="当前并发 / 并发上限">
+                    {credential.inFlight} / {credential.maxConcurrency ?? '不限'}
+                  </span>
+                </div>
+                {maxConcurrencySourceLabel && (
+                  <div
+                    className="truncate text-[10px] text-muted-foreground text-right"
+                    title={`并发上限来源：${maxConcurrencySourceLabel}`}
+                  >
+                    ({maxConcurrencySourceLabel})
+                  </div>
+                )}
               </div>
-            </InfoTile>
+
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-muted-foreground shrink-0">最近调用</span>
+                <div className="flex items-center gap-1 font-semibold text-foreground truncate">
+                  <Clock3 className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                  <span title={formatLastUsed(credential.lastUsedAt)} className="truncate">
+                    {formatLastUsed(credential.lastUsedAt)}
+                  </span>
+                </div>
+              </div>
+            </div>
           </div>
 
           {/* 限速覆盖区域 */}
-          <div className="rounded-lg border border-dashed px-3 py-2 text-xs bg-muted/5">
-            <div className="text-muted-foreground font-medium">限速规则覆盖</div>
-            <div className="mt-1 font-medium text-foreground leading-normal break-all">
+          <div className="rounded-md bg-muted/30 px-2.5 py-1.5 text-xs text-muted-foreground">
+            <div className="font-semibold text-[10px] uppercase tracking-wider text-muted-foreground/80">限速规则覆盖</div>
+            <div className="mt-0.5 font-medium text-foreground break-all leading-normal">
               {rateLimitOverrideSummary}
             </div>
           </div>
