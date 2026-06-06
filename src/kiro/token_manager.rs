@@ -7369,20 +7369,6 @@ impl MultiTokenManager {
             return Ok(None);
         }
 
-        if credentials
-            .profile_arn
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .is_some()
-        {
-            tracing::debug!(
-                "凭据 #{} 已保存 profileArn，跳过 Enterprise profileArn 自动重新发现",
-                id
-            );
-            return Ok(None);
-        }
-
         let previous_profile_arn = credentials
             .effective_profile_arn_for_kiro_requests()
             .map(str::to_string);
@@ -11321,6 +11307,29 @@ mod tests {
                 &enterprise,
                 &unauthorized
             )
+        );
+    }
+
+    #[test]
+    fn test_management_profile_unauthorized_retry_allows_saved_profile_arn() {
+        let enterprise = KiroCredentials {
+            provider: Some("Enterprise".to_string()),
+            start_url: Some("https://example.awsapps.com/start".to_string()),
+            profile_arn: Some("arn:aws:codewhisperer:us-east-1:123:profile/stale".to_string()),
+            ..Default::default()
+        };
+        let forbidden = anyhow::Error::new(KiroManagementApiError {
+            api: "getUsageLimits",
+            status_code: 403,
+            message: "User is not authorized to make this call.".to_string(),
+        });
+
+        assert!(
+            MultiTokenManager::should_retry_management_call_after_profile_rediscovery(
+                &enterprise,
+                &forbidden
+            ),
+            "a saved Enterprise profileArn can be stale and must not suppress rediscovery"
         );
     }
 
