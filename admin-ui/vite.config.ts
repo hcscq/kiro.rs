@@ -2,6 +2,8 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react-swc'
 import path from 'path'
 
+const apiProxyTarget = process.env.VITE_API_PROXY_TARGET || 'http://localhost:8990'
+
 export default defineConfig({
   plugins: [react()],
   base: '/admin/',
@@ -13,7 +15,7 @@ export default defineConfig({
   server: {
     proxy: {
       '/api': {
-        target: 'http://localhost:8080',
+        target: apiProxyTarget,
         changeOrigin: true,
       },
     },

@@ -22,7 +22,7 @@ import {
   findStandardAccountTypePreset,
   ModelSelector,
 } from '@/components/model-policy-controls'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Card, CardContent, CardHeader } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
@@ -111,6 +111,18 @@ function summarizeSelectedModels(
   }
 
   return `${labels.join('、')} 等 ${values.length} 项`
+}
+
+function splitEmailLabel(value: string): { localPart: string; domain: string } | null {
+  const atIndex = value.lastIndexOf('@')
+  if (atIndex <= 0 || atIndex >= value.length - 1) {
+    return null
+  }
+
+  return {
+    localPart: value.slice(0, atIndex),
+    domain: value.slice(atIndex + 1),
+  }
 }
 
 function InfoTile({
@@ -585,39 +597,75 @@ export function CredentialCard({
     : null
   const credentialLabel = getCredentialLabel(credential)
   const credentialLabelWithId = getCredentialLabelWithId(credential)
+  const credentialEmail = credential.email?.trim()
+  const credentialEmailParts = credentialEmail ? splitEmailLabel(credentialEmail) : null
+  const shouldShowCredentialId = credentialLabel !== `凭据 #${credential.id}`
 
   return (
     <>
-      <Card className={credential.isCurrent ? 'ring-2 ring-primary' : ''}>
+      <Card
+        className={cn('min-w-0 overflow-hidden', credential.isCurrent && 'ring-2 ring-primary')}
+      >
         <CardHeader className="pb-2">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
+          <div className="space-y-2">
+            <div className="flex min-w-0 items-center gap-2">
               <Checkbox
                 checked={selected}
                 onCheckedChange={onToggleSelect}
+                className="shrink-0"
               />
-              <CardTitle className="text-lg flex min-w-0 flex-wrap items-center gap-2">
-                <span className="min-w-0 break-all">{credentialLabel}</span>
-                {credential.email?.trim() && (
-                  <Badge variant="outline">#{credential.id}</Badge>
+              <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden text-lg font-semibold leading-tight tracking-tight">
+                {credentialEmailParts ? (
+                  <span
+                    className="flex min-w-0 flex-1 items-baseline whitespace-nowrap"
+                    title={credentialLabelWithId}
+                  >
+                    <span className="min-w-0 truncate">{credentialEmailParts.localPart}</span>
+                    <span className="shrink-0 text-muted-foreground">@</span>
+                    <span className="max-w-[45%] shrink-0 truncate text-muted-foreground">
+                      {credentialEmailParts.domain}
+                    </span>
+                  </span>
+                ) : (
+                  <span className="block min-w-0 flex-1 truncate" title={credentialLabelWithId}>
+                    {credentialLabel}
+                  </span>
                 )}
-                {credential.isCurrent && (
-                  <Badge variant="success">当前</Badge>
-                )}
-                {credential.disabled && (
-                  <Badge variant="destructive">已禁用</Badge>
-                )}
-                {credential.disabled && credential.disabledReason && (
-                  <Badge variant="outline">{credential.disabledReason}</Badge>
-                )}
-                {hasSuspiciousActivity && (
-                  <Badge variant={suspiciousQuarantineSummary ? 'warning' : 'outline'}>
-                    Suspicious {credential.suspiciousActivityCount}
+                {shouldShowCredentialId && (
+                  <Badge variant="outline" className="shrink-0">
+                    #{credential.id}
                   </Badge>
                 )}
-              </CardTitle>
+                {credential.isCurrent && (
+                  <Badge variant="success" className="shrink-0">
+                    当前
+                  </Badge>
+                )}
+                {credential.disabled && (
+                  <Badge
+                    variant="destructive"
+                    className="shrink-0"
+                    title={
+                      credential.disabledReason
+                        ? `已禁用：${credential.disabledReason}`
+                        : '已禁用'
+                    }
+                  >
+                    禁用
+                  </Badge>
+                )}
+                {hasSuspiciousActivity && (
+                  <Badge
+                    variant={suspiciousQuarantineSummary ? 'warning' : 'outline'}
+                    className="shrink-0"
+                    title={`Suspicious activity ${credential.suspiciousActivityCount}`}
+                  >
+                    S{credential.suspiciousActivityCount}
+                  </Badge>
+                )}
+              </div>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center justify-end gap-2">
               <span className="text-sm text-muted-foreground">启用</span>
               <Switch
                 checked={!credential.disabled}
@@ -629,7 +677,7 @@ export function CredentialCard({
         </CardHeader>
         <CardContent className="space-y-4">
           {/* 信息摘要 */}
-          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-5">
+          <div className="grid grid-cols-1 gap-2 [grid-template-columns:repeat(auto-fit,minmax(min(100%,11rem),1fr))]">
             <InfoTile label="优先级">
               {editingPriority ? (
                 <div className="flex flex-wrap items-center gap-1">
@@ -663,11 +711,11 @@ export function CredentialCard({
                 </div>
               ) : (
                 <span
-                  className="cursor-pointer hover:underline"
+                  className="cursor-pointer whitespace-nowrap hover:underline"
                   onClick={() => setEditingPriority(true)}
+                  title="点击编辑优先级"
                 >
                   {credential.priority}
-                  <span className="ml-1 text-xs text-muted-foreground">(点击编辑)</span>
                 </span>
               )}
             </InfoTile>
@@ -711,14 +759,22 @@ export function CredentialCard({
               ) : (
                 <>
                   <span
-                    className="cursor-pointer hover:underline"
+                    className="cursor-pointer whitespace-nowrap hover:underline"
                     onClick={() => setEditingMaxConcurrency(true)}
+                    title="点击编辑并发上限"
                   >
                     {credential.maxConcurrency ?? '不限'}
-                    <span className="ml-1 text-xs text-muted-foreground">(点击编辑)</span>
                   </span>
                   {maxConcurrencySourceLabel && (
-                    <div className="mt-1 text-xs font-normal text-muted-foreground">
+                    <div
+                      className="mt-1 truncate text-xs font-normal text-muted-foreground"
+                      title={
+                        credential.maxConcurrencyOverride !== undefined &&
+                        credential.maxConcurrencyOverride !== null
+                          ? `显式覆盖：${credential.maxConcurrencyOverride}`
+                          : `来源：${maxConcurrencySourceLabel}`
+                      }
+                    >
                       {credential.maxConcurrencyOverride !== undefined &&
                       credential.maxConcurrencyOverride !== null
                         ? `显式覆盖：${credential.maxConcurrencyOverride}`
