@@ -2655,18 +2655,19 @@ impl KiroProvider {
                     return Err(err);
                 }
             };
-            let (ctx_id, mut credentials, token, lease) = ctx.into_parts();
-            if model.is_some() {
-                credentials = self
-                    .token_manager
-                    .ensure_available_models_cached_for_call(ctx_id, &credentials, &token)
-                    .await;
-            }
+            let (ctx_id, credentials, token, lease) = ctx.into_parts();
             let effective_model_id = model.as_deref().and_then(|requested_model| {
                 credentials.effective_model_id_for_request(requested_model)
             });
             if let Some(requested_model) = model.as_deref() {
                 if effective_model_id.is_none() && !credentials.available_model_ids.is_empty() {
+                    self.token_manager
+                        .trigger_available_models_refresh_after_model_signal(
+                            ctx_id,
+                            &token,
+                            requested_model,
+                            "cached-model-miss",
+                        );
                     request_scoped_model_unsupported_credentials.insert(ctx_id);
                     let has_available = self
                         .token_manager
@@ -3683,6 +3684,14 @@ impl KiroProvider {
                         total_elapsed_ms = overall_started_at.elapsed().as_millis(),
                         "API 请求失败（当前凭据不支持该模型）"
                     );
+
+                    self.token_manager
+                        .trigger_available_models_refresh_after_model_signal(
+                            ctx_id,
+                            &token,
+                            model.as_deref().unwrap_or("unknown"),
+                            "invalid-model-id",
+                        );
 
                     let has_available = self.token_manager.defer_model_unsupported_credential(
                         ctx_id,

@@ -922,6 +922,10 @@ struct CredentialEntry {
     rate_limit_hit_streak: u32,
     /// 本实例是否已经为该凭据启动后台刷新
     background_refresh_in_progress: bool,
+    /// 是否正在后台刷新该凭据的可用模型列表
+    available_models_refresh_in_progress: bool,
+    /// 可用模型列表刷新失败后的本地冷却到期时间
+    available_models_refresh_cooldown_until: Option<Instant>,
     /// 凭据级刷新锁，避免不同账号刷新 token 时互相串行阻塞
     refresh_lock: Arc<TokioMutex<()>>,
 }
@@ -1638,6 +1642,10 @@ const BACKGROUND_REFRESH_IN_PROGRESS_COOLDOWN: StdDuration = RUNTIME_REFRESH_LEA
 ///
 /// 后台刷新不服务当前请求，失败通常是 429/网络抖动，使用较长冷却避免把刷新端点打成重试风暴。
 const BACKGROUND_REFRESH_RETRY_COOLDOWN: StdDuration = StdDuration::from_secs(5 * 60);
+/// 可用模型列表刷新失败后的重试冷却。
+///
+/// 该刷新只用于调度优化，失败不应阻塞请求热路径，也不应在响应结构变化时反复打管理接口。
+const AVAILABLE_MODELS_REFRESH_RETRY_COOLDOWN: StdDuration = StdDuration::from_secs(10 * 60);
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 
@@ -1737,6 +1745,12 @@ enum BackgroundRefreshOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AvailableModelsRefreshOutcome {
+    Success,
+    RetryLater,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelRequirement {
     Any,
     PaidOpus,
@@ -1823,6 +1837,8 @@ impl MultiTokenManager {
                         .map(|policy| AdaptiveTokenBucket::new(policy, now)),
                     rate_limit_hit_streak: 0,
                     background_refresh_in_progress: false,
+                    available_models_refresh_in_progress: false,
+                    available_models_refresh_cooldown_until: None,
                     refresh_lock: Arc::new(TokioMutex::new(())),
                 }
             })
@@ -2906,6 +2922,8 @@ impl MultiTokenManager {
     ) {
         entry.rate_limit_cooldown_until = None;
         entry.background_refresh_cooldown_until = None;
+        entry.available_models_refresh_in_progress = false;
+        entry.available_models_refresh_cooldown_until = None;
         entry.rate_limit_hit_streak = 0;
         entry.rate_limit_bucket = dispatch
             .bucket_policy_for(&entry.credentials)
@@ -3036,6 +3054,10 @@ impl MultiTokenManager {
             entry.credentials.available_model_ids = next_available_model_ids.clone();
             entry.credentials.available_models_cached_at = next_available_models_cached_at.clone();
             entry.credentials.normalize_model_capabilities();
+            if !entry.credentials.available_model_ids.is_empty() {
+                entry.available_models_refresh_in_progress = false;
+                entry.available_models_refresh_cooldown_until = None;
+            }
             Self::sync_rate_limit_bucket_runtime(entry, &dispatch, now);
 
             tracing::info!(
@@ -4895,6 +4917,165 @@ impl MultiTokenManager {
         self.availability_notify.notify_waiters();
     }
 
+    pub(crate) fn trigger_available_models_refresh_after_model_signal(
+        self: &Arc<Self>,
+        id: u64,
+        token: &str,
+        model: &str,
+        reason: &'static str,
+    ) {
+        if !self.try_start_available_models_refresh(id) {
+            return;
+        }
+
+        let manager = Arc::clone(self);
+        let token = token.to_string();
+        let model = model.to_string();
+        tokio::spawn(async move {
+            manager
+                .run_available_models_refresh(id, token, model, reason)
+                .await;
+        });
+    }
+
+    fn try_start_available_models_refresh(&self, id: u64) -> bool {
+        let now = Instant::now();
+        let mut entries = self.entries.lock();
+        let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) else {
+            return false;
+        };
+
+        if entry.disabled || entry.available_models_refresh_in_progress {
+            return false;
+        }
+        if entry
+            .available_models_refresh_cooldown_until
+            .is_some_and(|until| until > now)
+        {
+            return false;
+        }
+
+        entry.available_models_refresh_in_progress = true;
+        true
+    }
+
+    async fn run_available_models_refresh(
+        self: Arc<Self>,
+        id: u64,
+        request_token: String,
+        model: String,
+        reason: &'static str,
+    ) {
+        let started_at = Instant::now();
+
+        if self.state_store.is_external() {
+            if let Err(err) = self.sync_external_state_if_changed() {
+                tracing::warn!(
+                    credential_id = id,
+                    model = %model,
+                    reason,
+                    error = %err,
+                    "刷新可用模型列表前同步共享状态失败，将继续使用本地状态"
+                );
+            }
+        }
+
+        let credentials = match self.current_credentials(id) {
+            Ok(credentials) => credentials,
+            Err(err) => {
+                tracing::warn!(
+                    credential_id = id,
+                    model = %model,
+                    reason,
+                    error = %err,
+                    "刷新可用模型列表读取凭据失败"
+                );
+                self.finish_available_models_refresh(id, AvailableModelsRefreshOutcome::RetryLater);
+                return;
+            }
+        };
+
+        let token = credentials
+            .access_token
+            .as_deref()
+            .filter(|token| !token.trim().is_empty())
+            .unwrap_or(&request_token);
+        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+
+        let response = match list_available_models(
+            &credentials,
+            &self.config,
+            token,
+            None,
+            effective_proxy.as_ref(),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                tracing::warn!(
+                    credential_id = id,
+                    model = %model,
+                    reason,
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    error = %err,
+                    "后台刷新可用模型列表失败，进入冷却"
+                );
+                self.finish_available_models_refresh(id, AvailableModelsRefreshOutcome::RetryLater);
+                return;
+            }
+        };
+
+        let model_ids = response.model_ids();
+        if model_ids.is_empty() {
+            tracing::warn!(
+                credential_id = id,
+                model = %model,
+                reason,
+                elapsed_ms = started_at.elapsed().as_millis(),
+                "后台刷新可用模型列表返回空列表，进入冷却"
+            );
+            self.finish_available_models_refresh(id, AvailableModelsRefreshOutcome::RetryLater);
+            return;
+        }
+
+        let model_count = model_ids.len();
+        self.apply_available_models_update(id, model_ids);
+        tracing::info!(
+            credential_id = id,
+            model = %model,
+            reason,
+            model_count,
+            elapsed_ms = started_at.elapsed().as_millis(),
+            "后台刷新可用模型列表成功"
+        );
+        self.finish_available_models_refresh(id, AvailableModelsRefreshOutcome::Success);
+    }
+
+    fn finish_available_models_refresh(&self, id: u64, outcome: AvailableModelsRefreshOutcome) {
+        let retry_cooldown_until = Instant::now() + AVAILABLE_MODELS_REFRESH_RETRY_COOLDOWN;
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+                entry.available_models_refresh_in_progress = false;
+                match outcome {
+                    AvailableModelsRefreshOutcome::Success => {
+                        entry.available_models_refresh_cooldown_until = None;
+                    }
+                    AvailableModelsRefreshOutcome::RetryLater => {
+                        if !entry.disabled {
+                            entry.available_models_refresh_cooldown_until =
+                                Some(retry_cooldown_until);
+                        } else {
+                            entry.available_models_refresh_cooldown_until = None;
+                        }
+                    }
+                }
+            }
+        }
+        self.availability_notify.notify_waiters();
+    }
+
     fn refresh_token_still_current_in_shared_state(
         &self,
         id: u64,
@@ -5094,6 +5275,8 @@ impl MultiTokenManager {
                     entry.disabled_reason = Some(persisted_disabled_reason(&persisted));
                     entry.background_refresh_in_progress = false;
                     entry.background_refresh_cooldown_until = None;
+                    entry.available_models_refresh_in_progress = false;
+                    entry.available_models_refresh_cooldown_until = None;
                 } else {
                     entry.disabled_reason = None;
                     if was_disabled {
@@ -5106,6 +5289,10 @@ impl MultiTokenManager {
                     if !Self::needs_token_refresh(&entry.credentials) {
                         entry.background_refresh_in_progress = false;
                         entry.background_refresh_cooldown_until = None;
+                    }
+                    if !entry.credentials.available_model_ids.is_empty() {
+                        entry.available_models_refresh_in_progress = false;
+                        entry.available_models_refresh_cooldown_until = None;
                     }
                 }
             }
@@ -5133,6 +5320,8 @@ impl MultiTokenManager {
                         .map(|policy| AdaptiveTokenBucket::new(policy, now)),
                     rate_limit_hit_streak: 0,
                     background_refresh_in_progress: false,
+                    available_models_refresh_in_progress: false,
+                    available_models_refresh_cooldown_until: None,
                     refresh_lock: Arc::new(TokioMutex::new(())),
                 });
             }
@@ -7292,51 +7481,6 @@ impl MultiTokenManager {
         Ok(())
     }
 
-    pub(crate) async fn ensure_available_models_cached_for_call(
-        &self,
-        id: u64,
-        credentials: &KiroCredentials,
-        token: &str,
-    ) -> KiroCredentials {
-        if !credentials.available_model_ids.is_empty() {
-            return credentials.clone();
-        }
-
-        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let response = match list_available_models(
-            credentials,
-            &self.config,
-            token,
-            None,
-            effective_proxy.as_ref(),
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err(err) => {
-                tracing::warn!(
-                    "刷新凭据 #{} 可用模型列表失败，将继续使用现有模型策略: {}",
-                    id,
-                    err
-                );
-                return credentials.clone();
-            }
-        };
-
-        let model_ids = response.model_ids();
-        if model_ids.is_empty() {
-            tracing::warn!(
-                "刷新凭据 #{} 可用模型列表返回空列表，将继续使用现有模型策略",
-                id
-            );
-            return credentials.clone();
-        }
-
-        self.apply_available_models_update(id, model_ids);
-        self.current_credentials(id)
-            .unwrap_or_else(|_| credentials.clone())
-    }
-
     fn is_enterprise_profile_unauthorized_message(message: &str) -> bool {
         let lower = message.to_ascii_lowercase();
         lower.contains("user is not authorized to make this call")
@@ -7515,17 +7659,12 @@ impl MultiTokenManager {
         let credentials = self.current_credentials(id)?;
         let (credentials, token) = self.try_ensure_token(id, &credentials).await?;
 
-        let (usage_limits, credentials) = self
+        let (usage_limits, _credentials) = self
             .get_usage_limits_with_enterprise_profile_retry(id, &credentials, &token)
             .await?;
 
         // 更新订阅和用户信息到凭据（仅在发生变化时持久化）
         self.apply_usage_limits_metadata_update(id, &usage_limits);
-        let token = credentials.access_token.as_deref().unwrap_or(&token);
-        let _ = self
-            .ensure_available_models_cached_for_call(id, &credentials, token)
-            .await;
-
         Ok(usage_limits)
     }
 
@@ -7789,6 +7928,8 @@ impl MultiTokenManager {
                 rate_limit_bucket,
                 rate_limit_hit_streak: 0,
                 background_refresh_in_progress: false,
+                available_models_refresh_in_progress: false,
+                available_models_refresh_cooldown_until: None,
                 refresh_lock: Arc::new(TokioMutex::new(())),
             });
         }
@@ -8520,6 +8661,86 @@ mod tests {
         );
         assert!(persisted[0].available_model_ids.is_empty());
         assert!(persisted[0].available_models_cached_at.is_none());
+    }
+
+    #[test]
+    fn available_models_refresh_uses_singleflight_and_failure_cooldown() {
+        let mut credential = available_credential(0);
+        credential.id = Some(1);
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
+
+        assert!(manager.try_start_available_models_refresh(1));
+        assert!(
+            !manager.try_start_available_models_refresh(1),
+            "同一凭据刷新进行中时不应重复启动"
+        );
+
+        manager.finish_available_models_refresh(1, AvailableModelsRefreshOutcome::RetryLater);
+        assert!(
+            !manager.try_start_available_models_refresh(1),
+            "失败冷却期内不应重复启动"
+        );
+
+        {
+            let mut entries = manager.entries.lock();
+            let entry = entries.iter_mut().find(|entry| entry.id == 1).unwrap();
+            entry.available_models_refresh_cooldown_until =
+                Some(Instant::now() - StdDuration::from_secs(1));
+        }
+
+        assert!(
+            manager.try_start_available_models_refresh(1),
+            "冷却结束后应允许再次启动"
+        );
+        manager.finish_available_models_refresh(1, AvailableModelsRefreshOutcome::Success);
+        assert!(manager.try_start_available_models_refresh(1));
+    }
+
+    #[test]
+    fn available_models_update_persists_and_clears_refresh_cooldown() {
+        let credentials_path = temp_credentials_path("available-models-update");
+        let mut credential = available_credential(0);
+        credential.id = Some(1);
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![credential],
+            None,
+            Some(credentials_path.clone()),
+            true,
+        )
+        .unwrap();
+
+        assert!(manager.try_start_available_models_refresh(1));
+        manager.finish_available_models_refresh(1, AvailableModelsRefreshOutcome::RetryLater);
+
+        manager.apply_available_models_update(
+            1,
+            vec![
+                "claude-sonnet-4.5".to_string(),
+                "claude-opus-4.7".to_string(),
+            ],
+        );
+
+        {
+            let entries = manager.entries.lock();
+            let entry = entries.iter().find(|entry| entry.id == 1).unwrap();
+            assert!(!entry.available_models_refresh_in_progress);
+            assert!(entry.available_models_refresh_cooldown_until.is_none());
+            assert_eq!(entry.credentials.available_model_ids.len(), 2);
+            assert!(entry.credentials.available_models_cached_at.is_some());
+        }
+
+        let persisted: Vec<KiroCredentials> =
+            serde_json::from_slice(&std::fs::read(credentials_path).unwrap()).unwrap();
+        assert_eq!(
+            persisted[0].available_model_ids,
+            vec![
+                "claude-opus-4.7".to_string(),
+                "claude-sonnet-4.5".to_string()
+            ]
+        );
+        assert!(persisted[0].available_models_cached_at.is_some());
     }
 
     fn shared_runtime_test_config() -> Option<Config> {

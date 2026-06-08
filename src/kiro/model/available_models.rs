@@ -31,7 +31,8 @@ pub struct AvailableModelTokenLimits {
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 pub struct AvailableModel {
-    pub model_id: String,
+    #[serde(default, alias = "id")]
+    pub model_id: Option<String>,
     #[serde(default)]
     pub model_name: Option<String>,
     #[serde(default)]
@@ -75,15 +76,18 @@ impl ListAvailableModelsResponse {
         let mut ids: Vec<String> = self
             .available_models
             .iter()
-            .map(|model| model.model_id.trim())
+            .filter_map(|model| model.model_id.as_deref())
+            .map(str::trim)
             .filter(|model_id| !model_id.is_empty())
             .map(str::to_string)
             .collect();
 
         if let Some(default_model) = &self.default_model {
-            let model_id = default_model.model_id.trim();
-            if !model_id.is_empty() {
-                ids.push(model_id.to_string());
+            if let Some(model_id) = default_model.model_id.as_deref() {
+                let model_id = model_id.trim();
+                if !model_id.is_empty() {
+                    ids.push(model_id.to_string());
+                }
             }
         }
 
@@ -131,5 +135,21 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.model_ids(), vec!["claude-opus-4.6".to_string()]);
+    }
+
+    #[test]
+    fn skips_models_without_model_id() {
+        let response: ListAvailableModelsResponse = serde_json::from_str(
+            r#"{
+                "availableModels": [
+                    {"modelName": "metadata-only entry"},
+                    {"modelId": "claude-sonnet-4.5"}
+                ],
+                "defaultModel": {"modelName": "missing id"}
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(response.model_ids(), vec!["claude-sonnet-4.5".to_string()]);
     }
 }
