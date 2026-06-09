@@ -728,6 +728,8 @@ struct NonStreamEventStreamReadDiagnostics {
     event_frames: usize,
     assistant_events: usize,
     assistant_content_bytes: usize,
+    reasoning_events: usize,
+    reasoning_text_bytes: usize,
     tool_use_events: usize,
     tool_use_stop_events: usize,
     metering_events: usize,
@@ -756,6 +758,12 @@ impl NonStreamEventStreamReadDiagnostics {
                 self.assistant_content_bytes = self
                     .assistant_content_bytes
                     .saturating_add(resp.content.len());
+            }
+            Ok(Event::ReasoningContent(reasoning)) => {
+                self.reasoning_events = self.reasoning_events.saturating_add(1);
+                self.reasoning_text_bytes = self
+                    .reasoning_text_bytes
+                    .saturating_add(reasoning.text.len());
             }
             Ok(Event::ToolUse(tool_use)) => {
                 self.tool_use_events = self.tool_use_events.saturating_add(1);
@@ -789,7 +797,9 @@ impl NonStreamEventStreamReadDiagnostics {
     }
 
     fn has_usable_output(&self) -> bool {
-        self.assistant_content_bytes > 0 || self.tool_use_events > 0
+        self.assistant_content_bytes > 0
+            || self.reasoning_text_bytes > 0
+            || self.tool_use_events > 0
     }
 
     fn safe_to_retry_stall(&self) -> bool {
@@ -946,6 +956,8 @@ async fn read_response_body_with_trace_timeout(
                         eventstream_event_frames = diagnostics.event_frames,
                         eventstream_assistant_events = diagnostics.assistant_events,
                         eventstream_assistant_content_bytes = diagnostics.assistant_content_bytes,
+                        eventstream_reasoning_events = diagnostics.reasoning_events,
+                        eventstream_reasoning_text_bytes = diagnostics.reasoning_text_bytes,
                         eventstream_tool_use_events = diagnostics.tool_use_events,
                         eventstream_tool_use_stop_events = diagnostics.tool_use_stop_events,
                         eventstream_metering_events = diagnostics.metering_events,
@@ -988,6 +1000,8 @@ struct StreamContentStartProbe {
     non_error_events: usize,
     assistant_events: usize,
     assistant_content_bytes: usize,
+    reasoning_events: usize,
+    reasoning_text_bytes: usize,
     tool_use_events: usize,
     error_events: usize,
 }
@@ -1001,6 +1015,8 @@ impl StreamContentStartProbe {
             non_error_events: 0,
             assistant_events: 0,
             assistant_content_bytes: 0,
+            reasoning_events: 0,
+            reasoning_text_bytes: 0,
             tool_use_events: 0,
             error_events: 0,
         }
@@ -1021,6 +1037,15 @@ impl StreamContentStartProbe {
                     .assistant_content_bytes
                     .saturating_add(resp.content.len());
                 self.observe_assistant_content(&resp.content)
+            }
+            Event::ReasoningContent(reasoning) => {
+                self.non_error_events = self.non_error_events.saturating_add(1);
+                self.reasoning_events = self.reasoning_events.saturating_add(1);
+                self.reasoning_text_bytes = self
+                    .reasoning_text_bytes
+                    .saturating_add(reasoning.text.len());
+                self.thinking_enabled
+                    && (!reasoning.text.is_empty() || reasoning.signature.is_some())
             }
             Event::Error { .. } | Event::Exception { .. } => {
                 self.error_events = self.error_events.saturating_add(1);
@@ -1070,6 +1095,8 @@ impl StreamContentStartProbe {
             non_error_events: self.non_error_events,
             assistant_events: self.assistant_events,
             assistant_content_bytes: self.assistant_content_bytes,
+            reasoning_events: self.reasoning_events,
+            reasoning_text_bytes: self.reasoning_text_bytes,
             tool_use_events: self.tool_use_events,
             error_events: self.error_events,
         }
@@ -1090,6 +1117,8 @@ struct StreamContentStartProbeDiagnostics {
     non_error_events: usize,
     assistant_events: usize,
     assistant_content_bytes: usize,
+    reasoning_events: usize,
+    reasoning_text_bytes: usize,
     tool_use_events: usize,
     error_events: usize,
 }
@@ -3556,6 +3585,14 @@ impl KiroProvider {
                                 .as_ref()
                                 .map(|diagnostics| diagnostics.assistant_content_bytes)
                                 .unwrap_or(0);
+                            let eventstream_reasoning_events = eventstream_diagnostics
+                                .as_ref()
+                                .map(|diagnostics| diagnostics.reasoning_events)
+                                .unwrap_or(0);
+                            let eventstream_reasoning_text_bytes = eventstream_diagnostics
+                                .as_ref()
+                                .map(|diagnostics| diagnostics.reasoning_text_bytes)
+                                .unwrap_or(0);
                             let eventstream_tool_use_events = eventstream_diagnostics
                                 .as_ref()
                                 .map(|diagnostics| diagnostics.tool_use_events)
@@ -3626,6 +3663,8 @@ impl KiroProvider {
                                 eventstream_observed_frames,
                                 eventstream_assistant_events,
                                 eventstream_assistant_content_bytes,
+                                eventstream_reasoning_events,
+                                eventstream_reasoning_text_bytes,
                                 eventstream_tool_use_events,
                                 eventstream_unknown_events,
                                 eventstream_error_events,
@@ -3791,6 +3830,9 @@ impl KiroProvider {
                                 prefetch_assistant_events = probe_diagnostics.assistant_events,
                                 prefetch_assistant_content_bytes =
                                     probe_diagnostics.assistant_content_bytes,
+                                prefetch_reasoning_events = probe_diagnostics.reasoning_events,
+                                prefetch_reasoning_text_bytes =
+                                    probe_diagnostics.reasoning_text_bytes,
                                 prefetch_tool_use_events = probe_diagnostics.tool_use_events,
                                 prefetch_error_events = probe_diagnostics.error_events,
                                 slow_first_content_failovers,
@@ -3898,6 +3940,9 @@ impl KiroProvider {
                                 prefetch_assistant_events = probe_diagnostics.assistant_events,
                                 prefetch_assistant_content_bytes =
                                     probe_diagnostics.assistant_content_bytes,
+                                prefetch_reasoning_events = probe_diagnostics.reasoning_events,
+                                prefetch_reasoning_text_bytes =
+                                    probe_diagnostics.reasoning_text_bytes,
                                 prefetch_tool_use_events = probe_diagnostics.tool_use_events,
                                 prefetch_error_events = probe_diagnostics.error_events,
                                 slow_first_content_failovers,
@@ -6155,6 +6200,25 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_content_start_probe_thinking_accepts_reasoning_content() {
+        let event = Event::ReasoningContent(
+            serde_json::from_str(r#"{"text":"thinking","signature":"sig"}"#).unwrap(),
+        );
+
+        let mut probe = StreamContentStartProbe::new(true);
+        assert!(probe.observe(&event));
+        let diagnostics = probe.diagnostics();
+        assert_eq!(diagnostics.reasoning_events, 1);
+        assert_eq!(diagnostics.reasoning_text_bytes, 8);
+
+        let mut non_thinking_probe = StreamContentStartProbe::new(false);
+        assert!(!non_thinking_probe.observe(&event));
+        let diagnostics = non_thinking_probe.diagnostics();
+        assert_eq!(diagnostics.reasoning_events, 1);
+        assert_eq!(diagnostics.reasoning_text_bytes, 8);
+    }
+
+    #[test]
     fn test_stream_content_start_probe_does_not_release_errors_or_non_thinking() {
         let mut errored_probe = StreamContentStartProbe::new(true);
         assert!(!errored_probe.observe(&Event::Error {
@@ -6175,9 +6239,12 @@ mod tests {
     }
 
     #[test]
-    fn test_non_stream_eventstream_diagnostics_marks_reasoning_only_stall_safe_to_retry() {
+    fn test_non_stream_eventstream_diagnostics_counts_reasoning_as_output() {
         let mut decoder = EventStreamDecoder::new();
-        let frame = event_frame("reasoningContentEvent", br#"{"content":"thinking"}"#);
+        let frame = event_frame(
+            "reasoningContentEvent",
+            br#"{"text":"thinking","signature":"sig"}"#,
+        );
         decoder.feed(&frame).unwrap();
 
         let parsed = decoder.decode().unwrap().unwrap();
@@ -6185,9 +6252,11 @@ mod tests {
         diagnostics.observe_frame(parsed);
 
         assert_eq!(diagnostics.observed_frames, 1);
-        assert_eq!(diagnostics.unknown_events, 1);
-        assert!(!diagnostics.has_usable_output());
-        assert!(diagnostics.safe_to_retry_stall());
+        assert_eq!(diagnostics.reasoning_events, 1);
+        assert_eq!(diagnostics.reasoning_text_bytes, 8);
+        assert_eq!(diagnostics.unknown_events, 0);
+        assert!(diagnostics.has_usable_output());
+        assert!(!diagnostics.safe_to_retry_stall());
     }
 
     #[test]
@@ -6208,7 +6277,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_non_stream_eventstream_reader_times_out_on_idle_with_diagnostics() {
-        let event = event_frame("reasoningContentEvent", br#"{"content":"thinking"}"#);
+        let event = event_frame("reasoningContentEvent", br#"{"text":"thinking"}"#);
         let app = Router::new().route(
             "/eventstream",
             get(move || {
@@ -6250,8 +6319,10 @@ mod tests {
                 assert_eq!(timeout_ms, 20);
                 assert_eq!(reason, "eventstream_idle_timeout");
                 assert_eq!(diagnostics.observed_frames, 1);
-                assert_eq!(diagnostics.unknown_events, 1);
-                assert!(diagnostics.safe_to_retry_stall());
+                assert_eq!(diagnostics.reasoning_events, 1);
+                assert_eq!(diagnostics.reasoning_text_bytes, 8);
+                assert_eq!(diagnostics.unknown_events, 0);
+                assert!(!diagnostics.safe_to_retry_stall());
             }
             other => panic!(
                 "unexpected read result: {:?}",

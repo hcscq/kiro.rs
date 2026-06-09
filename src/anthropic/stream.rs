@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::kiro::model::events::Event;
+use crate::kiro::model::events::{Event, ReasoningContentEvent};
 
 use super::thinking_compat::{
     canonicalize_thinking_for_signature, sign_synthetic_hidden_thinking_block, sign_thinking_block,
@@ -493,6 +493,10 @@ pub struct StreamContext {
     strip_thinking_leading_newline: bool,
     /// 已发送给客户端的 thinking 内容，用于生成不透明 signature
     thinking_signature_source: String,
+    /// 上游 reasoningContentEvent 返回的 signature
+    upstream_reasoning_signature: Option<String>,
+    /// 是否有由 reasoningContentEvent 打开的 thinking 块尚未关闭
+    reasoning_thinking_block_open: bool,
     /// 当前 assistant message 中已签发的 thinking block 序号
     thinking_ordinal: u32,
     /// 是否在上游未返回 thinking 内容时补齐隐藏 synthetic thinking signature
@@ -526,6 +530,8 @@ impl StreamContext {
             text_block_index: None,
             strip_thinking_leading_newline: false,
             thinking_signature_source: String::new(),
+            upstream_reasoning_signature: None,
+            reasoning_thinking_block_open: false,
             thinking_ordinal: 0,
             synthesize_hidden_thinking_signature: false,
             synthetic_hidden_thinking_emitted: false,
@@ -578,6 +584,7 @@ impl StreamContext {
     pub fn process_kiro_event(&mut self, event: &Event) -> Vec<SseEvent> {
         match event {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
+            Event::ReasoningContent(reasoning) => self.process_reasoning_content(reasoning),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比计算实际的 input_tokens
@@ -625,17 +632,57 @@ impl StreamContext {
             return Vec::new();
         }
 
+        let mut events = self.close_reasoning_thinking_block_events();
+
         // 估算 tokens
         self.output_tokens += estimate_tokens(content);
 
         // 如果启用了thinking，需要处理thinking块
         if self.thinking_enabled {
-            return self.process_content_with_thinking(content);
+            events.extend(self.process_content_with_thinking(content));
+            return events;
         }
 
         // 非 thinking 模式同样复用统一的 text_delta 发送逻辑，
         // 以便在 tool_use 自动关闭文本块后能够自愈重建新的文本块，避免“吞字”。
-        self.create_text_delta_events(content)
+        events.extend(self.create_text_delta_events(content));
+        events
+    }
+
+    /// 处理 Opus 4.7/4.8 上游 reasoningContentEvent。
+    ///
+    /// 4.6 仍通过 assistantResponseEvent.content 里的 `<thinking>` 标签进入原有逻辑；
+    /// 4.7/4.8 则把可见 thinking 文本和 signature 放在独立 reasoningContentEvent 中。
+    fn process_reasoning_content(&mut self, event: &ReasoningContentEvent) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        if !self.thinking_enabled {
+            return events;
+        }
+
+        let text = event.text.as_str();
+        let signature = event
+            .signature
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if text.is_empty() && signature.is_none() {
+            return events;
+        }
+
+        let Some(thinking_index) = self.ensure_reasoning_thinking_block(&mut events) else {
+            return events;
+        };
+
+        if !text.is_empty() {
+            self.output_tokens += estimate_tokens(text);
+            events.push(self.create_tracked_thinking_delta_event(thinking_index, text));
+        }
+
+        if let Some(signature) = signature {
+            self.upstream_reasoning_signature = Some(signature.to_string());
+        }
+
+        events
     }
 
     /// 处理包含thinking块的内容
@@ -801,6 +848,92 @@ impl StreamContext {
             self.context_input_tokens.unwrap_or_default()
         )
         .into_bytes()
+    }
+
+    fn ensure_reasoning_thinking_block(&mut self, events: &mut Vec<SseEvent>) -> Option<i32> {
+        if self.reasoning_thinking_block_open {
+            return self.thinking_block_index;
+        }
+
+        // 现有实现只支持每个 assistant message 一个 thinking 块；如果已经有
+        // 4.6 标签路径产生过 thinking 块，则后续 reasoning 事件不能再复用已关闭块。
+        if self.thinking_block_index.is_some() {
+            return None;
+        }
+
+        if self.thinking_enabled
+            && !self.in_thinking_block
+            && !self.thinking_extracted
+            && !self.thinking_buffer.is_empty()
+            && self.thinking_buffer.trim().is_empty()
+        {
+            self.thinking_buffer.clear();
+        }
+
+        let thinking_index = self.state_manager.next_block_index();
+        self.thinking_block_index = Some(thinking_index);
+        self.thinking_extracted = true;
+        self.in_thinking_block = false;
+        self.strip_thinking_leading_newline = false;
+        self.thinking_signature_source.clear();
+        self.upstream_reasoning_signature = None;
+        self.reasoning_thinking_block_open = true;
+
+        let start_events = self.state_manager.handle_content_block_start(
+            thinking_index,
+            "thinking",
+            json!({
+                "type": "content_block_start",
+                "index": thinking_index,
+                "content_block": {
+                    "type": "thinking",
+                    "thinking": ""
+                }
+            }),
+        );
+        events.extend(start_events);
+
+        Some(thinking_index)
+    }
+
+    fn close_reasoning_thinking_block_events(&mut self) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        if !self.reasoning_thinking_block_open {
+            return events;
+        }
+
+        let Some(thinking_index) = self.thinking_block_index else {
+            self.reasoning_thinking_block_open = false;
+            self.upstream_reasoning_signature = None;
+            return events;
+        };
+
+        if !self
+            .state_manager
+            .is_block_open_of_type(thinking_index, "thinking")
+        {
+            self.reasoning_thinking_block_open = false;
+            self.upstream_reasoning_signature = None;
+            return events;
+        }
+
+        events.push(self.create_thinking_delta_event(thinking_index, ""));
+        if let Some(signature) = self.upstream_reasoning_signature.take() {
+            self.thinking_ordinal = self.thinking_ordinal.saturating_add(1);
+            if let Some(signature_event) =
+                self.create_signature_delta_event_with_signature(thinking_index, signature)
+            {
+                events.push(signature_event);
+            }
+        } else if let Some(signature_event) = self.create_signature_delta_event(thinking_index) {
+            events.push(signature_event);
+        }
+        if let Some(stop_event) = self.state_manager.handle_content_block_stop(thinking_index) {
+            events.push(stop_event);
+        }
+        self.reasoning_thinking_block_open = false;
+
+        events
     }
 
     /// 在首个非 thinking 内容块前补齐隐藏 thinking block。
@@ -1039,6 +1172,7 @@ impl StreamContext {
             events.extend(self.create_text_delta_events(&buffered));
         }
 
+        events.extend(self.close_reasoning_thinking_block_events());
         events.extend(self.synthesize_hidden_thinking_block_events());
 
         // 获取或分配块索引
@@ -1160,6 +1294,8 @@ impl StreamContext {
             }
             self.thinking_buffer.clear();
         }
+
+        events.extend(self.close_reasoning_thinking_block_events());
 
         // 若最终没有任何非 thinking 内容块，需要补一个最小 text 块，
         // 避免输出成为仅有 message_* 或 thinking-only 的 Anthropic SSE，导致兼容性问题。
@@ -2098,6 +2234,77 @@ mod tests {
             output_config: None,
             metadata: None,
         }
+    }
+
+    fn reasoning_event(payload: &str) -> Event {
+        Event::ReasoningContent(serde_json::from_str(payload).expect("valid reasoning event"))
+    }
+
+    #[test]
+    fn test_reasoning_content_event_emits_thinking_with_upstream_signature_before_text() {
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-4-8", 1, true, HashMap::new())
+            .with_synthetic_hidden_thinking_signature(true);
+        let mut all = ctx.generate_initial_events();
+
+        all.extend(ctx.process_kiro_event(&reasoning_event(r#"{"text":"step 1\n"}"#)));
+        all.extend(ctx.process_kiro_event(&reasoning_event(r#"{"text":"step 2"}"#)));
+        all.extend(ctx.process_kiro_event(&reasoning_event(r#"{"signature":"upstream-sig"}"#)));
+        all.extend(ctx.process_assistant_response("answer"));
+        all.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_thinking_content(&all), "step 1\nstep 2");
+        assert_eq!(collect_text_content(&all), "answer");
+        assert_eq!(
+            collect_first_signature(&all).as_deref(),
+            Some("upstream-sig")
+        );
+
+        let thinking_start = all
+            .iter()
+            .position(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "thinking"
+            })
+            .expect("thinking block should start");
+        let signature_pos = all
+            .iter()
+            .position(|e| {
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "signature_delta"
+            })
+            .expect("signature_delta should be emitted");
+        let thinking_stop = all
+            .iter()
+            .position(|e| e.event == "content_block_stop" && e.data["index"].as_i64() == Some(0))
+            .expect("thinking block should stop");
+        let text_start = all
+            .iter()
+            .position(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "text"
+            })
+            .expect("text block should start");
+
+        assert!(thinking_start < signature_pos);
+        assert!(signature_pos < thinking_stop);
+        assert!(thinking_stop < text_start);
+
+        let req = request_with_stream_thinking("step 1\nstep 2".to_string(), "upstream-sig".into());
+        validate_thinking_signatures(&req).expect("foreign upstream signature should pass through");
+    }
+
+    #[test]
+    fn test_reasoning_content_event_generates_local_signature_without_upstream_signature() {
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-4-7", 1, true, HashMap::new());
+        let mut all = ctx.generate_initial_events();
+
+        all.extend(ctx.process_kiro_event(&reasoning_event(r#"{"text":"step"}"#)));
+        all.extend(ctx.process_assistant_response("done"));
+        all.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_thinking_content(&all), "step");
+        assert_eq!(collect_text_content(&all), "done");
+
+        let signature = collect_first_signature(&all).expect("signature_delta should be emitted");
+        let req = request_with_stream_thinking("step".to_string(), signature);
+        validate_thinking_signatures(&req).expect("fallback stream signature should validate");
     }
 
     #[test]
