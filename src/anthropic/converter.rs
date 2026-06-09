@@ -958,7 +958,7 @@ fn build_additional_model_request_fields(
         .filter(|config| config.effort_explicit)
         .map(|config| config.effort.as_str())?;
 
-    Some(AdditionalModelRequestFields::with_override(
+    Some(AdditionalModelRequestFields::with_field(
         "output_config",
         serde_json::json!({ "effort": effort }),
     ))
@@ -3862,7 +3862,7 @@ mod tests {
             result
                 .additional_model_request_fields
                 .as_ref()
-                .and_then(|fields| fields.overrides.get("output_config"))
+                .and_then(|fields| fields.fields.get("output_config"))
                 .and_then(|value| value.get("effort"))
                 .and_then(|value| value.as_str()),
             Some("medium")
@@ -3876,8 +3876,13 @@ mod tests {
         let json = serde_json::to_value(request).expect("request should serialize");
 
         assert_eq!(
-            json["additionalModelRequestFields"]["overrides"]["output_config"]["effort"],
+            json["additionalModelRequestFields"]["output_config"]["effort"],
             "medium"
+        );
+        assert!(
+            json["additionalModelRequestFields"]
+                .get("overrides")
+                .is_none()
         );
     }
 

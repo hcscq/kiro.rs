@@ -5660,7 +5660,7 @@ mod tests {
     fn test_summarize_kiro_request_body_for_log_is_bounded_shape_only() {
         let body = r#"{
             "profileArn":"arn:test",
-            "additionalModelRequestFields":{"overrides":{"output_config":{"effort":"medium"}}},
+            "additionalModelRequestFields":{"output_config":{"effort":"medium"}},
             "conversationState":{
                 "conversationId":"conv-1",
                 "agentTaskType":"vibe",

@@ -8,20 +8,20 @@ use super::conversation::ConversationState;
 
 /// Kiro additional model request fields.
 ///
-/// Kiro CLI models this as `AdditionalModelFields { overrides }` when sending
-/// provider-specific options such as `output_config.effort` to the upstream runtime.
+/// These fields are validated directly against the model's additional_fields
+/// schema. For Opus adaptive effort, the wire shape is
+/// `additionalModelRequestFields.output_config.effort`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct AdditionalModelRequestFields {
-    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
-    pub overrides: serde_json::Map<String, serde_json::Value>,
+    #[serde(flatten)]
+    pub fields: serde_json::Map<String, serde_json::Value>,
 }
 
 impl AdditionalModelRequestFields {
-    pub fn with_override(key: impl Into<String>, value: impl Into<serde_json::Value>) -> Self {
-        let mut overrides = serde_json::Map::new();
-        overrides.insert(key.into(), value.into());
-        Self { overrides }
+    pub fn with_field(key: impl Into<String>, value: impl Into<serde_json::Value>) -> Self {
+        let mut fields = serde_json::Map::new();
+        fields.insert(key.into(), value.into());
+        Self { fields }
     }
 }
 
@@ -51,7 +51,7 @@ impl AdditionalModelRequestFields {
 pub struct KiroRequest {
     /// 对话状态
     pub conversation_state: ConversationState,
-    /// Additional model request fields, such as `output_config.effort` overrides.
+    /// Additional model request fields, such as `output_config.effort`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
     /// Profile ARN（可选）
