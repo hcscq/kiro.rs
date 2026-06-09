@@ -566,6 +566,7 @@ mod tests {
                     "additionalProperties": false
                 })),
             }),
+            effort_explicit: false,
         });
 
         let retry = build_retry_payload(

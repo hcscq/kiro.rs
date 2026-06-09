@@ -1143,6 +1143,7 @@ enum StreamContentStartPrefetch {
 struct KiroRequestBodyDiagnostics {
     body_bytes: usize,
     profile_arn_present: bool,
+    additional_model_request_fields_present: bool,
     conversation_id_present: bool,
     agent_task_type_present: bool,
     chat_trigger_type: Option<String>,
@@ -1711,6 +1712,9 @@ impl KiroProvider {
         let mut diagnostics = KiroRequestBodyDiagnostics {
             body_bytes: request_body.len(),
             profile_arn_present: json.get("profileArn").is_some(),
+            additional_model_request_fields_present: json
+                .get("additionalModelRequestFields")
+                .is_some(),
             conversation_id_present: conversation
                 .get("conversationId")
                 .and_then(|value| value.as_str())
@@ -4276,6 +4280,7 @@ impl KiroProvider {
                         error_summary = %error_summary,
                         kiro_body_bytes = diagnostics.body_bytes,
                         kiro_profile_arn_present = diagnostics.profile_arn_present,
+                        kiro_additional_model_request_fields_present = diagnostics.additional_model_request_fields_present,
                         kiro_conversation_id_present = diagnostics.conversation_id_present,
                         kiro_agent_task_type_present = diagnostics.agent_task_type_present,
                         kiro_chat_trigger_type = diagnostics.chat_trigger_type.as_deref().unwrap_or(""),
@@ -5655,6 +5660,7 @@ mod tests {
     fn test_summarize_kiro_request_body_for_log_is_bounded_shape_only() {
         let body = r#"{
             "profileArn":"arn:test",
+            "additionalModelRequestFields":{"overrides":{"output_config":{"effort":"medium"}}},
             "conversationState":{
                 "conversationId":"conv-1",
                 "agentTaskType":"vibe",
@@ -5691,6 +5697,7 @@ mod tests {
 
         assert_eq!(diagnostics.body_bytes, body.len());
         assert!(diagnostics.profile_arn_present);
+        assert!(diagnostics.additional_model_request_fields_present);
         assert!(diagnostics.conversation_id_present);
         assert!(diagnostics.agent_task_type_present);
         assert_eq!(diagnostics.chat_trigger_type.as_deref(), Some("MANUAL"));

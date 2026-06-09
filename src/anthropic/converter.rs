@@ -22,6 +22,7 @@ use crate::kiro::model::requests::conversation::{
     HistoryUserMessage, KiroDocument, KiroImage, Message, UserInputMessage,
     UserInputMessageContext, UserMessage,
 };
+use crate::kiro::model::requests::kiro::AdditionalModelRequestFields;
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
@@ -649,6 +650,8 @@ pub struct ConversionResult {
     pub session_id: Option<String>,
     /// 转换后的 Kiro 请求
     pub conversation_state: ConversationState,
+    /// Kiro 上游 additionalModelRequestFields
+    pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
     /// 工具名称映射（短名称 → 原始名称），仅当存在超长工具名时非空
     pub tool_name_map: HashMap<String, String>,
 }
@@ -757,6 +760,7 @@ pub fn convert_request_with_probe(
     // 1. 映射模型
     let model_id = map_model(&req.model)
         .ok_or_else(|| ConversionError::UnsupportedModel(req.model.clone()))?;
+    let additional_model_request_fields = build_additional_model_request_fields(req, &model_id);
 
     // 2. 检查消息列表
     if req.messages.is_empty() {
@@ -930,8 +934,42 @@ pub fn convert_request_with_probe(
         model_id,
         session_id,
         conversation_state,
+        additional_model_request_fields,
         tool_name_map,
     })
+}
+
+fn build_additional_model_request_fields(
+    req: &MessagesRequest,
+    model_id: &str,
+) -> Option<AdditionalModelRequestFields> {
+    if !model_uses_output_config_effort(model_id)
+        || !req
+            .thinking
+            .as_ref()
+            .is_some_and(|thinking| thinking.thinking_type == "adaptive")
+    {
+        return None;
+    }
+
+    let effort = req
+        .output_config
+        .as_ref()
+        .filter(|config| config.effort_explicit)
+        .map(|config| config.effort.as_str())?;
+
+    Some(AdditionalModelRequestFields::with_override(
+        "output_config",
+        serde_json::json!({ "effort": effort }),
+    ))
+}
+
+fn model_uses_output_config_effort(model_id: &str) -> bool {
+    let model = model_id.to_ascii_lowercase();
+    model.contains("claude-opus-4.8")
+        || model.contains("claude-opus-4-8")
+        || model.contains("claude-opus-4.7")
+        || model.contains("claude-opus-4-7")
 }
 
 fn inject_document_fallback_text(content: &mut String, has_documents: bool) {
@@ -2519,11 +2557,18 @@ fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
                 .unwrap_or("high");
             return Some(format!(
                 "<thinking_mode>adaptive</thinking_mode><thinking_effort>{}</thinking_effort>",
-                effort
+                xml_escape_text(effort)
             ));
         }
     }
     None
+}
+
+fn xml_escape_text(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// 检查内容是否已包含thinking标签
@@ -3722,6 +3767,168 @@ mod tests {
             output_config: None,
             metadata: None,
         }
+    }
+
+    #[test]
+    fn test_adaptive_thinking_uses_output_config_effort() {
+        use super::super::types::{OutputConfig, Thinking};
+
+        let mut req = request_from_messages(vec![super::super::types::Message {
+            role: "user".to_string(),
+            content: serde_json::json!("hello"),
+        }]);
+        req.thinking = Some(Thinking {
+            thinking_type: "adaptive".to_string(),
+            display: None,
+            budget_tokens: 20_000,
+        });
+        req.output_config = Some(OutputConfig {
+            effort: "medium".to_string(),
+            format: None,
+            effort_explicit: true,
+        });
+
+        let state = convert_request(&req)
+            .expect("adaptive thinking request should convert")
+            .conversation_state;
+
+        match &state.history[0] {
+            Message::User(user) => assert!(
+                user.user_input_message
+                    .content
+                    .contains("<thinking_effort>medium</thinking_effort>")
+            ),
+            other => panic!("history[0] should be system-like user message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_adaptive_thinking_effort_is_xml_escaped() {
+        use super::super::types::{OutputConfig, Thinking};
+
+        let mut req = request_from_messages(vec![super::super::types::Message {
+            role: "user".to_string(),
+            content: serde_json::json!("hello"),
+        }]);
+        req.thinking = Some(Thinking {
+            thinking_type: "adaptive".to_string(),
+            display: None,
+            budget_tokens: 20_000,
+        });
+        req.output_config = Some(OutputConfig {
+            effort: "low</thinking_effort><bad>".to_string(),
+            format: None,
+            effort_explicit: true,
+        });
+
+        let state = convert_request(&req)
+            .expect("adaptive thinking request should convert")
+            .conversation_state;
+
+        match &state.history[0] {
+            Message::User(user) => {
+                let content = &user.user_input_message.content;
+                assert!(content.contains("low&lt;/thinking_effort&gt;&lt;bad&gt;"));
+                assert!(!content.contains("low</thinking_effort><bad>"));
+            }
+            other => panic!("history[0] should be system-like user message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_adaptive_opus_4_8_sends_output_config_effort_additional_field() {
+        use super::super::types::{OutputConfig, Thinking};
+        use crate::kiro::model::requests::kiro::KiroRequest;
+
+        let mut req = request_from_messages(vec![super::super::types::Message {
+            role: "user".to_string(),
+            content: serde_json::json!("hello"),
+        }]);
+        req.model = "claude-opus-4.8".to_string();
+        req.thinking = Some(Thinking {
+            thinking_type: "adaptive".to_string(),
+            display: None,
+            budget_tokens: 20_000,
+        });
+        req.output_config = Some(OutputConfig {
+            effort: "medium".to_string(),
+            format: None,
+            effort_explicit: true,
+        });
+
+        let result = convert_request(&req).expect("adaptive opus 4.8 request should convert");
+
+        assert_eq!(
+            result
+                .additional_model_request_fields
+                .as_ref()
+                .and_then(|fields| fields.overrides.get("output_config"))
+                .and_then(|value| value.get("effort"))
+                .and_then(|value| value.as_str()),
+            Some("medium")
+        );
+
+        let request = KiroRequest {
+            conversation_state: result.conversation_state,
+            additional_model_request_fields: result.additional_model_request_fields,
+            profile_arn: None,
+        };
+        let json = serde_json::to_value(request).expect("request should serialize");
+
+        assert_eq!(
+            json["additionalModelRequestFields"]["overrides"]["output_config"]["effort"],
+            "medium"
+        );
+    }
+
+    #[test]
+    fn test_adaptive_opus_4_8_without_explicit_effort_omits_additional_field() {
+        use super::super::types::{OutputConfig, Thinking};
+
+        let mut req = request_from_messages(vec![super::super::types::Message {
+            role: "user".to_string(),
+            content: serde_json::json!("hello"),
+        }]);
+        req.model = "claude-opus-4.8".to_string();
+        req.thinking = Some(Thinking {
+            thinking_type: "adaptive".to_string(),
+            display: None,
+            budget_tokens: 20_000,
+        });
+        req.output_config = Some(OutputConfig {
+            effort: "high".to_string(),
+            format: None,
+            effort_explicit: false,
+        });
+
+        let result = convert_request(&req).expect("adaptive opus 4.8 request should convert");
+
+        assert!(result.additional_model_request_fields.is_none());
+    }
+
+    #[test]
+    fn test_adaptive_sonnet_does_not_send_additional_effort_field() {
+        use super::super::types::{OutputConfig, Thinking};
+
+        let mut req = request_from_messages(vec![super::super::types::Message {
+            role: "user".to_string(),
+            content: serde_json::json!("hello"),
+        }]);
+        req.model = "claude-sonnet-4.5".to_string();
+        req.thinking = Some(Thinking {
+            thinking_type: "adaptive".to_string(),
+            display: None,
+            budget_tokens: 20_000,
+        });
+        req.output_config = Some(OutputConfig {
+            effort: "medium".to_string(),
+            format: None,
+            effort_explicit: true,
+        });
+
+        let result = convert_request(&req).expect("adaptive sonnet request should convert");
+
+        assert!(result.additional_model_request_fields.is_none());
     }
 
     fn oversized_jpeg_block(width: u32, height: u32) -> serde_json::Value {
@@ -7264,6 +7471,7 @@ mod tests {
                         "additionalProperties": false
                     })),
                 }),
+                effort_explicit: false,
             }),
             metadata: None,
         };

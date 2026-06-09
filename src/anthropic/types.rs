@@ -164,6 +164,8 @@ pub struct OutputConfig {
     pub effort: String,
     #[serde(default)]
     pub format: Option<OutputFormat>,
+    #[serde(default, skip)]
+    pub effort_explicit: bool,
 }
 
 /// Claude Structured Outputs 的 format 配置
@@ -187,15 +189,13 @@ pub struct Metadata {
 }
 
 /// Messages 请求体
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct MessagesRequest {
     pub model: String,
     pub max_tokens: i32,
     pub messages: Vec<Message>,
-    #[serde(default)]
     pub stream: bool,
-    #[serde(default, deserialize_with = "deserialize_system")]
     pub system: Option<Vec<SystemMessage>>,
     pub tools: Option<Vec<Tool>>,
     pub tool_choice: Option<serde_json::Value>,
@@ -203,6 +203,78 @@ pub struct MessagesRequest {
     pub output_config: Option<OutputConfig>,
     /// Claude Code 请求中的 metadata，包含 session 信息
     pub metadata: Option<Metadata>,
+}
+
+impl<'de> Deserialize<'de> for MessagesRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawOutputConfig {
+            #[serde(default)]
+            effort: Option<String>,
+            #[serde(default)]
+            format: Option<OutputFormat>,
+        }
+
+        #[derive(Deserialize)]
+        struct RawReasoningConfig {
+            #[serde(default)]
+            effort: Option<String>,
+        }
+
+        #[derive(Deserialize)]
+        struct RawMessagesRequest {
+            model: String,
+            max_tokens: i32,
+            messages: Vec<Message>,
+            #[serde(default)]
+            stream: bool,
+            #[serde(default, deserialize_with = "deserialize_system")]
+            system: Option<Vec<SystemMessage>>,
+            tools: Option<Vec<Tool>>,
+            tool_choice: Option<serde_json::Value>,
+            thinking: Option<Thinking>,
+            output_config: Option<RawOutputConfig>,
+            reasoning: Option<RawReasoningConfig>,
+            metadata: Option<Metadata>,
+        }
+
+        let raw = RawMessagesRequest::deserialize(deserializer)?;
+        let reasoning_effort = raw.reasoning.and_then(|reasoning| reasoning.effort);
+        let output_config = match raw.output_config {
+            Some(config) => {
+                let effort_explicit = config.effort.is_some() || reasoning_effort.is_some();
+                Some(OutputConfig {
+                    effort: config
+                        .effort
+                        .or(reasoning_effort)
+                        .unwrap_or_else(default_effort),
+                    format: config.format,
+                    effort_explicit,
+                })
+            }
+            None => reasoning_effort.map(|effort| OutputConfig {
+                effort,
+                format: None,
+                effort_explicit: true,
+            }),
+        };
+
+        Ok(Self {
+            model: raw.model,
+            max_tokens: raw.max_tokens,
+            messages: raw.messages,
+            stream: raw.stream,
+            system: raw.system,
+            tools: raw.tools,
+            tool_choice: raw.tool_choice,
+            thinking: raw.thinking,
+            output_config,
+            metadata: raw.metadata,
+        })
+    }
 }
 
 impl MessagesRequest {
@@ -529,6 +601,104 @@ mod tests {
 
         let tools = request.tools.expect("tools should deserialize");
         assert!(tools[0].input_schema.is_empty());
+    }
+
+    #[test]
+    fn test_reasoning_effort_deserializes_as_output_config_effort() {
+        let request: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-opus-4.8",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "hello"}],
+            "thinking": {"type": "adaptive"},
+            "reasoning": {"effort": "medium"}
+        }))
+        .expect("reasoning.effort should deserialize");
+
+        assert_eq!(
+            request
+                .output_config
+                .as_ref()
+                .map(|config| config.effort.as_str()),
+            Some("medium")
+        );
+        assert!(
+            request
+                .output_config
+                .as_ref()
+                .is_some_and(|config| config.effort_explicit)
+        );
+    }
+
+    #[test]
+    fn test_output_config_effort_deserializes_as_output_config_effort() {
+        let request: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-opus-4.8",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "hello"}],
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "low"}
+        }))
+        .expect("output_config.effort should deserialize");
+
+        assert_eq!(
+            request
+                .output_config
+                .as_ref()
+                .map(|config| config.effort.as_str()),
+            Some("low")
+        );
+        assert!(
+            request
+                .output_config
+                .as_ref()
+                .is_some_and(|config| config.effort_explicit)
+        );
+    }
+
+    #[test]
+    fn test_output_config_effort_takes_precedence_over_reasoning_effort() {
+        let request: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-opus-4.8",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "hello"}],
+            "thinking": {"type": "adaptive"},
+            "reasoning": {"effort": "low"},
+            "output_config": {"effort": "high"}
+        }))
+        .expect("nested output_config effort should deserialize");
+
+        assert_eq!(
+            request
+                .output_config
+                .as_ref()
+                .map(|config| config.effort.as_str()),
+            Some("high")
+        );
+        assert!(
+            request
+                .output_config
+                .as_ref()
+                .is_some_and(|config| config.effort_explicit)
+        );
+    }
+
+    #[test]
+    fn test_output_config_without_effort_uses_default_without_explicit_effort() {
+        let request: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-opus-4.8",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "hello"}],
+            "thinking": {"type": "adaptive"},
+            "output_config": {"format": {"type": "text"}}
+        }))
+        .expect("output_config without effort should deserialize");
+
+        let output_config = request
+            .output_config
+            .as_ref()
+            .expect("output_config should be preserved");
+        assert_eq!(output_config.effort, "high");
+        assert!(!output_config.effort_explicit);
     }
 
     #[test]

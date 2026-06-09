@@ -6,6 +6,25 @@ use serde::{Deserialize, Serialize};
 
 use super::conversation::ConversationState;
 
+/// Kiro additional model request fields.
+///
+/// Kiro CLI models this as `AdditionalModelFields { overrides }` when sending
+/// provider-specific options such as `output_config.effort` to the upstream runtime.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdditionalModelRequestFields {
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub overrides: serde_json::Map<String, serde_json::Value>,
+}
+
+impl AdditionalModelRequestFields {
+    pub fn with_override(key: impl Into<String>, value: impl Into<serde_json::Value>) -> Self {
+        let mut overrides = serde_json::Map::new();
+        overrides.insert(key.into(), value.into());
+        Self { overrides }
+    }
+}
+
 /// Kiro API 请求
 ///
 /// 用于构建发送给 Kiro API 的请求
@@ -32,6 +51,9 @@ use super::conversation::ConversationState;
 pub struct KiroRequest {
     /// 对话状态
     pub conversation_state: ConversationState,
+    /// Additional model request fields, such as `output_config.effort` overrides.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
     /// Profile ARN（可选）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_arn: Option<String>,

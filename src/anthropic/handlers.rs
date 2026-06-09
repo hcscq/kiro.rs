@@ -1202,6 +1202,7 @@ pub async fn post_messages(
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
+        additional_model_request_fields: conversion_result.additional_model_request_fields,
         profile_arn: None,
     };
 
@@ -1687,6 +1688,7 @@ pub(crate) async fn execute_non_stream_round(
 
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
+        additional_model_request_fields: conversion_result.additional_model_request_fields,
         profile_arn: None,
     };
 
@@ -2323,6 +2325,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
             format: None,
+            effort_explicit: false,
         });
     }
 }
@@ -2634,6 +2637,7 @@ pub async fn post_messages_cc(
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
+        additional_model_request_fields: conversion_result.additional_model_request_fields,
         profile_arn: None,
     };
 
