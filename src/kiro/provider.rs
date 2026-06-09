@@ -8,11 +8,17 @@ use bytes::{Bytes, BytesMut};
 use futures::stream::BoxStream;
 use futures::{StreamExt, stream};
 use reqwest::{Client, header::HeaderMap};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::error::Error as StdError;
 use std::fmt;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
@@ -66,6 +72,11 @@ const AMAZON_EVENTSTREAM_CONTENT_TYPE: &str = "application/vnd.amazon.eventstrea
 const MAX_NON_STREAM_EVENTSTREAM_STALL_FAILOVERS: usize = 1;
 const CONTEXT_LENGTH_EXCEEDED_CODE: &str = "context_length_exceeded";
 const CONTEXT_LENGTH_EXCEEDED_PUBLIC_MESSAGE: &str = "prompt is too long: context window is full. Reduce conversation history, system prompt, or tools.";
+const DEFAULT_CAPTURE_400_DIR: &str = "/app/diagnostics/400-bodies";
+const DEFAULT_CAPTURE_400_MAX_PER_CLASS: usize = 3;
+const DEFAULT_CAPTURE_400_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_CAPTURE_400_TTL_HOURS: u64 = 24;
+const DEFAULT_CAPTURE_400_MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Kiro API Provider
 ///
@@ -1134,6 +1145,384 @@ struct KiroToolSchemaDiagnostics {
 
 const KIRO_REQUEST_DIAGNOSTICS_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 const KIRO_REQUEST_DIAGNOSTICS_MAX_TOOL_SCHEMAS: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Capture400BodiesConfig {
+    enabled: bool,
+    dir: PathBuf,
+    max_per_class: usize,
+    max_body_bytes: usize,
+    ttl: Duration,
+    max_total_bytes: u64,
+}
+
+impl Capture400BodiesConfig {
+    fn disabled() -> Self {
+        Self {
+            enabled: false,
+            dir: PathBuf::from(DEFAULT_CAPTURE_400_DIR),
+            max_per_class: DEFAULT_CAPTURE_400_MAX_PER_CLASS,
+            max_body_bytes: DEFAULT_CAPTURE_400_MAX_BODY_BYTES,
+            ttl: Duration::from_secs(DEFAULT_CAPTURE_400_TTL_HOURS * 60 * 60),
+            max_total_bytes: DEFAULT_CAPTURE_400_MAX_TOTAL_BYTES,
+        }
+    }
+
+    fn from_env() -> Self {
+        let enabled = std::env::var("KIRO_CAPTURE_400_BODIES")
+            .ok()
+            .is_some_and(|value| env_bool_enabled(&value));
+        let mut config = Self::disabled();
+        config.enabled = enabled;
+        config.dir = std::env::var("KIRO_CAPTURE_400_DIR")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_CAPTURE_400_DIR));
+        config.max_per_class = env_usize_or(
+            "KIRO_CAPTURE_400_MAX_PER_CLASS",
+            DEFAULT_CAPTURE_400_MAX_PER_CLASS,
+        )
+        .min(50);
+        config.max_body_bytes = env_usize_or(
+            "KIRO_CAPTURE_400_MAX_BODY_BYTES",
+            DEFAULT_CAPTURE_400_MAX_BODY_BYTES,
+        );
+        let ttl_hours = env_u64_or("KIRO_CAPTURE_400_TTL_HOURS", DEFAULT_CAPTURE_400_TTL_HOURS);
+        config.ttl = Duration::from_secs(ttl_hours.saturating_mul(60 * 60));
+        config.max_total_bytes = env_u64_or(
+            "KIRO_CAPTURE_400_MAX_TOTAL_BYTES",
+            DEFAULT_CAPTURE_400_MAX_TOTAL_BYTES,
+        );
+        config
+    }
+}
+
+#[derive(Debug)]
+struct Capture400Request<'a> {
+    request_id: &'a str,
+    api_type: &'static str,
+    model: Option<&'a str>,
+    credential_id: u64,
+    attempt: usize,
+    max_retries: usize,
+    region: &'a str,
+    stream: bool,
+    status_code: u16,
+    error_summary: &'a str,
+    upstream_error_body: &'a str,
+    request_body: &'a str,
+}
+
+#[derive(Debug, Clone)]
+struct CaptureFilePair {
+    meta_path: PathBuf,
+    body_path: PathBuf,
+    modified: SystemTime,
+    bytes: u64,
+}
+
+fn env_bool_enabled(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn env_usize_or(name: &str, default_value: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(default_value)
+}
+
+fn env_u64_or(name: &str, default_value: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(default_value)
+}
+
+fn capture_400_error_class(body: &str, error_summary: &str) -> &'static str {
+    if KiroProvider::is_invalid_thinking_signature_error(body, error_summary) {
+        "invalid_thinking_signature"
+    } else if KiroProvider::is_context_length_exceeded_body(body)
+        || body.contains("Input is too long")
+        || error_summary.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD")
+        || error_summary.contains("context_length_exceeded")
+    {
+        "context_length_exceeded"
+    } else if KiroProvider::is_tool_schema_invalid_body(body) {
+        "tool_schema_invalid"
+    } else if body.contains("TOOL_USE_RESULT_MISMATCH")
+        || body.contains("toolResult blocks")
+        || body.contains("toolUse blocks of previous turn")
+    {
+        "tool_use_result_mismatch"
+    } else if body.contains("REQUEST_BODY_INVALID")
+        || error_summary.contains("REQUEST_BODY_INVALID")
+        || body.contains("Improperly formed request")
+    {
+        "request_body_invalid"
+    } else {
+        "invalid_request"
+    }
+}
+
+fn set_private_dir_permissions(path: &Path) {
+    #[cfg(unix)]
+    {
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+    }
+}
+
+fn set_private_file_permissions(path: &Path) {
+    #[cfg(unix)]
+    {
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+}
+
+fn now_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn sha256_hex_str(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn sanitize_capture_component(value: &str, limit: usize) -> String {
+    let mut sanitized = String::with_capacity(value.len().min(limit));
+    for ch in value.chars().take(limit) {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('_');
+        }
+    }
+    if sanitized.is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    set_private_file_permissions(path);
+    Ok(())
+}
+
+fn capture_400_request_body_for_diagnostics(
+    config: &Capture400BodiesConfig,
+    req: Capture400Request<'_>,
+) {
+    if !config.enabled || config.max_per_class == 0 {
+        return;
+    }
+
+    if let Err(err) = capture_400_request_body_for_diagnostics_inner(config, req) {
+        tracing::warn!(error = %err, "保存上游 400 请求体诊断失败");
+    }
+}
+
+fn capture_400_request_body_for_diagnostics_inner(
+    config: &Capture400BodiesConfig,
+    req: Capture400Request<'_>,
+) -> anyhow::Result<()> {
+    let class = capture_400_error_class(req.upstream_error_body, req.error_summary);
+    let base_dir = &config.dir;
+    let class_dir = base_dir.join(class);
+    fs::create_dir_all(&class_dir)?;
+    set_private_dir_permissions(base_dir);
+    set_private_dir_permissions(&class_dir);
+
+    let request_hash = sha256_hex_str(req.request_body);
+    let name = format!(
+        "{}-{}-{}",
+        now_millis(),
+        sanitize_capture_component(req.request_id, 96),
+        &request_hash[..16]
+    );
+    let body_path = class_dir.join(format!("{name}.body.json"));
+    let meta_path = class_dir.join(format!("{name}.meta.json"));
+    let body_saved = req.request_body.len() <= config.max_body_bytes;
+
+    if body_saved {
+        write_private_file(&body_path, req.request_body.as_bytes())?;
+    }
+
+    let metadata = serde_json::json!({
+        "captured_at": chrono::Utc::now().to_rfc3339(),
+        "request_id": req.request_id,
+        "api_type": req.api_type,
+        "model": req.model.unwrap_or("unknown"),
+        "credential_id": req.credential_id,
+        "attempt": req.attempt,
+        "max_retries": req.max_retries,
+        "region": req.region,
+        "stream": req.stream,
+        "status_code": req.status_code,
+        "error_class": class,
+        "error_summary": req.error_summary,
+        "upstream_error_body_bytes": req.upstream_error_body.len(),
+        "upstream_error_body_excerpt": truncate_log_string(req.upstream_error_body, 4096),
+        "request_body_bytes": req.request_body.len(),
+        "request_sha256": request_hash,
+        "body_saved": body_saved,
+        "body_file": if body_saved { Some(body_path.file_name().and_then(|name| name.to_str()).unwrap_or_default()) } else { None },
+        "body_omitted_reason": if body_saved { None } else { Some("request body exceeds KIRO_CAPTURE_400_MAX_BODY_BYTES") },
+        "max_body_bytes": config.max_body_bytes,
+        "max_per_class": config.max_per_class,
+        "ttl_seconds": config.ttl.as_secs(),
+        "max_total_bytes": config.max_total_bytes
+    });
+    let metadata_bytes = serde_json::to_vec_pretty(&metadata)?;
+    if let Err(err) = write_private_file(&meta_path, &metadata_bytes) {
+        if body_saved {
+            let _ = fs::remove_file(&body_path);
+        }
+        return Err(err.into());
+    }
+
+    prune_capture_class(&class_dir, config.max_per_class, config.ttl);
+    prune_capture_expired_in_tree(base_dir, config.ttl);
+    prune_capture_total(base_dir, config.max_total_bytes);
+
+    tracing::warn!(
+        request_id = req.request_id,
+        error_class = class,
+        body_saved,
+        request_body_bytes = req.request_body.len(),
+        capture_dir = %class_dir.display(),
+        "已保存上游 400 请求体诊断样本"
+    );
+
+    Ok(())
+}
+
+fn capture_body_path_for_meta(meta_path: &Path) -> PathBuf {
+    let Some(file_name) = meta_path.file_name().and_then(|name| name.to_str()) else {
+        return meta_path.with_extension("body.json");
+    };
+    if let Some(stem) = file_name.strip_suffix(".meta.json") {
+        meta_path.with_file_name(format!("{stem}.body.json"))
+    } else {
+        meta_path.with_extension("body.json")
+    }
+}
+
+fn capture_file_pair_from_meta(meta_path: PathBuf) -> Option<CaptureFilePair> {
+    let body_path = capture_body_path_for_meta(&meta_path);
+    let meta = fs::metadata(&meta_path).ok()?;
+    let modified = meta.modified().unwrap_or(UNIX_EPOCH);
+    let mut bytes = meta.len();
+    if let Ok(body_meta) = fs::metadata(&body_path) {
+        bytes = bytes.saturating_add(body_meta.len());
+    }
+    Some(CaptureFilePair {
+        meta_path,
+        body_path,
+        modified,
+        bytes,
+    })
+}
+
+fn capture_pairs_in_dir(dir: &Path) -> Vec<CaptureFilePair> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".meta.json"))
+        })
+        .filter_map(capture_file_pair_from_meta)
+        .collect()
+}
+
+fn remove_capture_pair(pair: &CaptureFilePair) {
+    let _ = fs::remove_file(&pair.body_path);
+    let _ = fs::remove_file(&pair.meta_path);
+}
+
+fn prune_capture_class(class_dir: &Path, max_per_class: usize, ttl: Duration) {
+    let mut pairs = capture_pairs_in_dir(class_dir);
+    let now = SystemTime::now();
+    for pair in &pairs {
+        if ttl.as_secs() > 0 && now.duration_since(pair.modified).is_ok_and(|age| age > ttl) {
+            remove_capture_pair(pair);
+        }
+    }
+
+    pairs = capture_pairs_in_dir(class_dir);
+    pairs.sort_by(|a, b| b.modified.cmp(&a.modified));
+    for pair in pairs.into_iter().skip(max_per_class) {
+        remove_capture_pair(&pair);
+    }
+}
+
+fn capture_pairs_in_tree(base_dir: &Path) -> Vec<CaptureFilePair> {
+    let Ok(class_dirs) = fs::read_dir(base_dir) else {
+        return Vec::new();
+    };
+    let mut pairs = Vec::new();
+    for class_dir in class_dirs.filter_map(Result::ok).map(|entry| entry.path()) {
+        if class_dir.is_dir() {
+            pairs.extend(capture_pairs_in_dir(&class_dir));
+        }
+    }
+    pairs
+}
+
+fn prune_capture_expired_in_tree(base_dir: &Path, ttl: Duration) {
+    if ttl.as_secs() == 0 {
+        return;
+    }
+
+    let now = SystemTime::now();
+    for pair in capture_pairs_in_tree(base_dir) {
+        if now.duration_since(pair.modified).is_ok_and(|age| age > ttl) {
+            remove_capture_pair(&pair);
+        }
+    }
+}
+
+fn prune_capture_total(base_dir: &Path, max_total_bytes: u64) {
+    if max_total_bytes == 0 {
+        return;
+    }
+    let mut pairs = capture_pairs_in_tree(base_dir);
+    let mut total_bytes = pairs
+        .iter()
+        .fold(0_u64, |total, pair| total.saturating_add(pair.bytes));
+    if total_bytes <= max_total_bytes {
+        return;
+    }
+
+    pairs.sort_by(|a, b| a.modified.cmp(&b.modified));
+    for pair in pairs {
+        if total_bytes <= max_total_bytes {
+            break;
+        }
+        total_bytes = total_bytes.saturating_sub(pair.bytes);
+        remove_capture_pair(&pair);
+    }
+}
 
 fn append_bounded_tail(mut values: Vec<String>, value: &str, limit: usize) -> Vec<String> {
     if limit == 0 {
@@ -3769,6 +4158,25 @@ impl KiroProvider {
                     );
                 }
 
+                let capture_config = Capture400BodiesConfig::from_env();
+                capture_400_request_body_for_diagnostics(
+                    &capture_config,
+                    Capture400Request {
+                        request_id: &request_id,
+                        api_type,
+                        model: model.as_deref(),
+                        credential_id: ctx_id,
+                        attempt: attempt + 1,
+                        max_retries,
+                        region: &region,
+                        stream: is_stream,
+                        status_code: status.as_u16(),
+                        error_summary: &error_summary,
+                        upstream_error_body: &body,
+                        request_body,
+                    },
+                );
+
                 if request_body.len() > KIRO_REQUEST_DIAGNOSTICS_MAX_BODY_BYTES {
                     let rejected_tool_index = Self::rejected_tool_index_from_error_body(&body)
                         .map(|index| index.to_string())
@@ -5003,6 +5411,199 @@ mod tests {
             "",
             "body_excerpt=\"Invalid thinking signature at messages[315] thinking block 0\""
         ));
+    }
+
+    fn unique_capture_test_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("kiro-rs-{name}-{}", Uuid::new_v4()))
+    }
+
+    fn test_capture_config(dir: PathBuf) -> Capture400BodiesConfig {
+        Capture400BodiesConfig {
+            enabled: true,
+            dir,
+            max_per_class: 2,
+            max_body_bytes: 1024,
+            ttl: Duration::from_secs(24 * 60 * 60),
+            max_total_bytes: 1024 * 1024,
+        }
+    }
+
+    fn capture_test_request<'a>(
+        request_id: &'a str,
+        error_body: &'a str,
+        request_body: &'a str,
+    ) -> Capture400Request<'a> {
+        Capture400Request {
+            request_id,
+            api_type: "非流式",
+            model: Some("claude-sonnet-4.6"),
+            credential_id: 919,
+            attempt: 1,
+            max_retries: 9,
+            region: "us-east-1",
+            stream: false,
+            status_code: 400,
+            error_summary: "status=400 reason=REQUEST_BODY_INVALID message=\"Improperly formed request.\"",
+            upstream_error_body: error_body,
+            request_body,
+        }
+    }
+
+    #[test]
+    fn test_capture_400_error_classifies_common_failures() {
+        assert_eq!(
+            capture_400_error_class(
+                r#"{"reason":"REQUEST_BODY_INVALID","message":"Improperly formed request."}"#,
+                ""
+            ),
+            "request_body_invalid"
+        );
+        assert_eq!(
+            capture_400_error_class(
+                r#"{"reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD","message":"Input is too long."}"#,
+                ""
+            ),
+            "context_length_exceeded"
+        );
+        assert_eq!(
+            capture_400_error_class(
+                r#"{"reason":"TOOL_SCHEMA_INVALID","message":"tools.0.custom.input_schema: JSON schema is invalid."}"#,
+                ""
+            ),
+            "tool_schema_invalid"
+        );
+        assert_eq!(
+            capture_400_error_class(
+                r#"{"message":"The number of toolResult blocks exceeds the number of toolUse blocks of previous turn."}"#,
+                ""
+            ),
+            "tool_use_result_mismatch"
+        );
+        assert_eq!(
+            capture_400_error_class(
+                r#"{"error":{"message":"Invalid thinking signature at messages[1] thinking block 0"}}"#,
+                ""
+            ),
+            "invalid_thinking_signature"
+        );
+    }
+
+    #[test]
+    fn test_capture_400_request_body_prunes_per_class() {
+        let dir = unique_capture_test_dir("capture-prune");
+        let config = test_capture_config(dir.clone());
+
+        for index in 0..3 {
+            let body = format!(r#"{{"conversationState":{{"index":{index}}}}}"#);
+            capture_400_request_body_for_diagnostics_inner(
+                &config,
+                capture_test_request(
+                    &format!("request-{index}"),
+                    r#"{"reason":"REQUEST_BODY_INVALID","message":"Improperly formed request."}"#,
+                    &body,
+                ),
+            )
+            .expect("capture should succeed");
+        }
+
+        let class_dir = dir.join("request_body_invalid");
+        let pairs = capture_pairs_in_dir(&class_dir);
+        assert_eq!(pairs.len(), 2);
+        for pair in &pairs {
+            assert!(pair.meta_path.exists());
+            assert!(pair.body_path.exists());
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_capture_400_request_body_disabled_does_not_write() {
+        let dir = unique_capture_test_dir("capture-disabled");
+        let mut config = test_capture_config(dir.clone());
+        config.enabled = false;
+
+        capture_400_request_body_for_diagnostics(
+            &config,
+            capture_test_request(
+                "disabled-request",
+                r#"{"reason":"REQUEST_BODY_INVALID","message":"Improperly formed request."}"#,
+                r#"{"conversationState":{"index":0}}"#,
+            ),
+        );
+
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn test_capture_400_request_body_omits_oversized_body() {
+        let dir = unique_capture_test_dir("capture-oversized");
+        let mut config = test_capture_config(dir.clone());
+        config.max_body_bytes = 4;
+
+        capture_400_request_body_for_diagnostics_inner(
+            &config,
+            capture_test_request(
+                "oversized-request",
+                r#"{"reason":"REQUEST_BODY_INVALID","message":"Improperly formed request."}"#,
+                r#"{"large":"body"}"#,
+            ),
+        )
+        .expect("capture should succeed");
+
+        let class_dir = dir.join("request_body_invalid");
+        let pairs = capture_pairs_in_dir(&class_dir);
+        assert_eq!(pairs.len(), 1);
+        let pair = &pairs[0];
+        assert!(pair.meta_path.exists());
+        assert!(!pair.body_path.exists());
+
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&pair.meta_path).unwrap()).unwrap();
+        assert_eq!(metadata["body_saved"], false);
+        assert_eq!(
+            metadata["body_omitted_reason"],
+            "request body exceeds KIRO_CAPTURE_400_MAX_BODY_BYTES"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_capture_400_request_body_prunes_total_bytes() {
+        let dir = unique_capture_test_dir("capture-total");
+        let mut config = test_capture_config(dir.clone());
+        config.max_per_class = 10;
+        config.max_total_bytes = u64::MAX;
+
+        for index in 0..3 {
+            let body = format!(r#"{{"conversationState":{{"index":{index}}}}}"#);
+            capture_400_request_body_for_diagnostics_inner(
+                &config,
+                capture_test_request(
+                    &format!("request-{index}"),
+                    r#"{"reason":"REQUEST_BODY_INVALID","message":"Improperly formed request."}"#,
+                    &body,
+                ),
+            )
+            .expect("capture should succeed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let mut pairs = capture_pairs_in_tree(&dir);
+        assert_eq!(pairs.len(), 3);
+        pairs.sort_by(|a, b| b.modified.cmp(&a.modified));
+        let newest_meta_path = pairs[0].meta_path.clone();
+        let newest_body_path = pairs[0].body_path.clone();
+
+        prune_capture_total(&dir, pairs[0].bytes + 32);
+
+        let remaining_pairs = capture_pairs_in_tree(&dir);
+        assert_eq!(remaining_pairs.len(), 1);
+        assert_eq!(remaining_pairs[0].meta_path, newest_meta_path);
+        assert_eq!(remaining_pairs[0].body_path, newest_body_path);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
