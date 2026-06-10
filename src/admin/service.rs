@@ -7,7 +7,6 @@ use chrono::Utc;
 use parking_lot::Mutex;
 
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::account_type_preset::{
     built_in_account_type_presets, infer_standard_account_type_id_from_subscription,
@@ -17,11 +16,12 @@ use crate::state::{CachedBalanceRecord, RuntimeCoordinationStatus, StateChangeKi
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialProfilesResponse,
-    CredentialStatusItem, CredentialsStatusResponse, LoadBalancingModeResponse,
-    ModelCapabilitiesConfigResponse, ModelCatalogItemResponse, ModelCatalogResponse,
-    SetCredentialModelPolicyRequest, SetCredentialProfileRequest, SetLoadBalancingModeRequest,
-    SetModelCapabilitiesConfigRequest, StandardAccountTypePresetResponse,
+    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CachedBalanceResponse,
+    CredentialProfilesResponse, CredentialStatusItem, CredentialsStatusResponse,
+    LoadBalancingModeResponse, ModelCapabilitiesConfigResponse, ModelCatalogItemResponse,
+    ModelCatalogResponse, SetCredentialModelPolicyRequest, SetCredentialProfileRequest,
+    SetLoadBalancingModeRequest, SetModelCapabilitiesConfigRequest,
+    StandardAccountTypePresetResponse,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -70,11 +70,14 @@ impl AdminService {
     /// 获取所有凭据状态
     pub fn get_all_credentials(&self) -> Result<CredentialsStatusResponse, AdminServiceError> {
         self.sync_runtime_state_for_read()?;
+        self.sync_balance_cache_if_changed()
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
         let snapshot = self.token_manager.snapshot();
         let current_id = snapshot.current_id;
         let total = snapshot.total;
         let available = snapshot.available;
         let dispatchable = snapshot.dispatchable;
+        let balance_cache = self.balance_cache.lock().clone();
 
         let mut credentials: Vec<CredentialStatusItem> = snapshot
             .entries
@@ -85,6 +88,15 @@ impl AdminService {
                     entry.subscription_type.as_deref(),
                 )
                 .map(|value| value.to_string());
+                let profile_arn = entry.profile_arn.clone();
+                let cached_balance = balance_cache
+                    .get(&entry.id)
+                    .filter(|cached| Self::is_balance_cache_fresh(cached))
+                    .filter(|cached| cached.profile_arn.as_deref() == profile_arn.as_deref())
+                    .map(|cached| CachedBalanceResponse {
+                        cached_at: cached.cached_at,
+                        balance: cached.data.clone(),
+                    });
 
                 CredentialStatusItem {
                     id: entry.id,
@@ -96,7 +108,7 @@ impl AdminService {
                     auth_method: entry.auth_method,
                     provider: entry.provider,
                     has_profile_arn: entry.has_profile_arn,
-                    profile_arn: entry.profile_arn,
+                    profile_arn,
                     refresh_token_hash: entry.refresh_token_hash,
                     email: entry.email,
                     user_id: entry.user_id,
@@ -147,6 +159,7 @@ impl AdminService {
                     rate_limit_refill_base_per_second: entry.rate_limit_refill_base_per_second,
                     rate_limit_hit_streak: entry.rate_limit_hit_streak,
                     next_ready_in_ms: entry.next_ready_in_ms,
+                    cached_balance,
                 }
             })
             .collect();
@@ -350,7 +363,7 @@ impl AdminService {
             .effective_profile_arn_for(id)
             .map_err(|e| self.classify_error(e, id))?;
 
-        Ok(Self::balance_from_usage(id, profile_arn, &usage))
+        Ok(BalanceResponse::from_usage(id, profile_arn, &usage))
     }
 
     /// 设置凭据超额使用开关
@@ -370,49 +383,11 @@ impl AdminService {
             .token_manager
             .effective_profile_arn_for(id)
             .map_err(|e| self.classify_error(e, id))?;
-        let balance = Self::balance_from_usage(id, profile_arn, &usage);
+        let balance = BalanceResponse::from_usage(id, profile_arn, &usage);
 
         self.cache_balance(id, balance.clone());
 
         Ok(balance)
-    }
-
-    fn balance_from_usage(
-        id: u64,
-        profile_arn: Option<String>,
-        usage: &UsageLimitsResponse,
-    ) -> BalanceResponse {
-        let current_usage = usage.current_usage();
-        let usage_limit = usage.usage_limit();
-        let effective_usage_limit = usage.effective_usage_limit();
-        let remaining = (effective_usage_limit - current_usage).max(0.0);
-        let usage_percentage = if effective_usage_limit > 0.0 {
-            (current_usage / effective_usage_limit * 100.0).min(100.0)
-        } else {
-            0.0
-        };
-
-        BalanceResponse {
-            id,
-            profile_arn,
-            subscription_title: usage.subscription_title().map(|s| s.to_string()),
-            subscription_type: usage.subscription_type().map(|s| s.to_string()),
-            current_usage,
-            usage_limit,
-            effective_usage_limit,
-            remaining,
-            usage_percentage,
-            next_reset_at: usage.next_date_reset,
-            overage_capability: usage.overage_capability().map(|value| value.to_string()),
-            overage_status: usage.overage_status().map(|value| value.to_string()),
-            overage_enabled: usage.overage_enabled(),
-            overage_cap: usage.overage_cap(),
-            current_overages: usage.current_overages(),
-            overage_charges: usage.overage_charges(),
-            overage_rate: usage.overage_rate(),
-            currency: usage.currency().map(|value| value.to_string()),
-            unit: usage.unit().map(|value| value.to_string()),
-        }
     }
 
     /// 添加新凭据

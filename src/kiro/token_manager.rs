@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
+use crate::admin::types::BalanceResponse;
 use crate::common::logging::summarize_upstream_error;
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
@@ -37,11 +38,11 @@ use crate::model::model_policy::{
     normalize_account_type_policies, normalize_model_entries, normalize_model_selector,
 };
 use crate::state::{
-    CredentialCompareAndSwapResult, CredentialHealthPatch, CredentialMetadataPatch,
-    DispatchLeaseReservationStatus, DispatchRuntimeBucketPolicy, DispatchRuntimeCredential,
-    DispatchRuntimeSnapshot, PersistedDispatchConfig, RuntimeCoordinationStatus,
-    RuntimeRefreshLeaseAcquisition, StateChangeKind, StateChangeRevisions, StateStore,
-    StatsEntryRecord, StatsMergeRecord, current_epoch_ms,
+    CachedBalanceRecord, CredentialCompareAndSwapResult, CredentialHealthPatch,
+    CredentialMetadataPatch, DispatchLeaseReservationStatus, DispatchRuntimeBucketPolicy,
+    DispatchRuntimeCredential, DispatchRuntimeSnapshot, PersistedDispatchConfig,
+    RuntimeCoordinationStatus, RuntimeRefreshLeaseAcquisition, StateChangeKind,
+    StateChangeRevisions, StateStore, StatsEntryRecord, StatsMergeRecord, current_epoch_ms,
 };
 
 const DEFAULT_REQUEST_WEIGHT: f64 = 1.0;
@@ -1614,6 +1615,8 @@ pub struct MultiTokenManager {
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+    /// 402 后台用量刷新本地去重冷却
+    usage_balance_refresh_cooldowns: Mutex<HashMap<u64, Instant>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1646,6 +1649,8 @@ const BACKGROUND_REFRESH_RETRY_COOLDOWN: StdDuration = StdDuration::from_secs(5 
 ///
 /// 该刷新只用于调度优化，失败不应阻塞请求热路径，也不应在响应结构变化时反复打管理接口。
 const AVAILABLE_MODELS_REFRESH_RETRY_COOLDOWN: StdDuration = StdDuration::from_secs(10 * 60);
+/// 402 触发的用量缓存刷新冷却，避免同一账号错误风暴时重复打管理接口。
+const USAGE_BALANCE_REFRESH_COOLDOWN: StdDuration = StdDuration::from_secs(60);
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 
@@ -1880,6 +1885,7 @@ impl MultiTokenManager {
             last_hot_path_state_sync_check_ms: AtomicU64::new(u64::MAX),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
+            usage_balance_refresh_cooldowns: Mutex::new(HashMap::new()),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -7666,6 +7672,72 @@ impl MultiTokenManager {
         // 更新订阅和用户信息到凭据（仅在发生变化时持久化）
         self.apply_usage_limits_metadata_update(id, &usage_limits);
         Ok(usage_limits)
+    }
+
+    /// 尝试登记一次后台用量刷新。
+    ///
+    /// 该方法只做本实例内的短窗口去重；实际刷新失败也会保留冷却，避免上游错误风暴时重复打管理接口。
+    pub fn try_schedule_usage_balance_refresh(&self, id: u64) -> bool {
+        let now = Instant::now();
+        let mut cooldowns = self.usage_balance_refresh_cooldowns.lock();
+        cooldowns.retain(|_, cooldown_until| *cooldown_until > now);
+
+        if cooldowns
+            .get(&id)
+            .is_some_and(|cooldown_until| *cooldown_until > now)
+        {
+            return false;
+        }
+
+        cooldowns.insert(id, now + USAGE_BALANCE_REFRESH_COOLDOWN);
+        true
+    }
+
+    /// 刷新指定凭据的用量并写入共享余额缓存。
+    ///
+    /// 用于 402/超额上限错误后的后台观测刷新；不会改变凭据禁用状态。
+    pub async fn refresh_usage_balance_cache_for(
+        &self,
+        id: u64,
+        reason: &str,
+    ) -> anyhow::Result<BalanceResponse> {
+        tracing::info!(
+            credential_id = id,
+            refresh_reason = reason,
+            "开始后台刷新凭据用量缓存"
+        );
+
+        let usage_limits = self.get_usage_limits_for(id).await?;
+        let profile_arn = self.effective_profile_arn_for(id)?;
+        let balance = BalanceResponse::from_usage(id, profile_arn, &usage_limits);
+
+        self.save_usage_balance_cache(id, balance.clone())?;
+
+        tracing::info!(
+            credential_id = id,
+            refresh_reason = reason,
+            current_usage = balance.current_usage,
+            effective_usage_limit = balance.effective_usage_limit,
+            overage_enabled = ?balance.overage_enabled,
+            "后台刷新凭据用量缓存完成"
+        );
+
+        Ok(balance)
+    }
+
+    fn save_usage_balance_cache(&self, id: u64, balance: BalanceResponse) -> anyhow::Result<()> {
+        let mut cache = self.state_store.load_balance_cache()?;
+        cache.insert(
+            id,
+            CachedBalanceRecord {
+                profile_arn: balance.profile_arn.clone(),
+                cached_at: Utc::now().timestamp() as f64,
+                data: balance,
+            },
+        );
+        self.state_store.save_balance_cache(&cache)?;
+        self.try_bump_state_change_revision(StateChangeKind::BalanceCache);
+        Ok(())
     }
 
     /// 设置指定凭据的超额使用开关（Admin API）

@@ -9,8 +9,10 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Switch } from '@/components/ui/switch'
 import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
-import { getCredentialBalance, setCredentialDisabled } from '@/api/credentials'
+import { getCredentialBalance, setCredentialDisabled, setCredentialOverageStatus } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
 
 interface KamImportDialogProps {
@@ -38,6 +40,7 @@ interface KamAccount {
   maxConcurrency?: number
   rateLimitBucketCapacity?: number
   rateLimitRefillPerSecond?: number
+  priority?: number
   credentials: {
     refreshToken: string
     clientId?: string
@@ -51,6 +54,7 @@ interface KamAccount {
     maxConcurrency?: number
     rateLimitBucketCapacity?: number
     rateLimitRefillPerSecond?: number
+    priority?: number
   }
   machineId?: string
   status?: string
@@ -170,6 +174,7 @@ function normalizeKamAccount(item: unknown): unknown {
     const maxConcurrency = getNumber(obj.maxConcurrency)
     const rateLimitBucketCapacity = getNumber(obj.rateLimitBucketCapacity)
     const rateLimitRefillPerSecond = getNumber(obj.rateLimitRefillPerSecond)
+    const priority = getNumber(obj.priority)
     const status = getString(obj.status)
     const machineId = getString(obj.machineId)
     const clientId = getString(obj.clientId)
@@ -206,6 +211,7 @@ function normalizeKamAccount(item: unknown): unknown {
         profileArn,
         authMethod,
         startUrl,
+        priority,
       },
     }
   }
@@ -270,6 +276,9 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
   const [progress, setProgress] = useState({ current: 0, total: 0 })
   const [currentProcessing, setCurrentProcessing] = useState<string>('')
   const [results, setResults] = useState<VerificationResult[]>([])
+  const [defaultPriority, setDefaultPriority] = useState('0')
+  const [defaultMaxConcurrency, setDefaultMaxConcurrency] = useState('')
+  const [autoEnableOverage, setAutoEnableOverage] = useState(false)
 
   const { data: existingCredentials } = useCredentials()
   const { mutateAsync: addCredential } = useAddCredential()
@@ -294,6 +303,9 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     setProgress({ current: 0, total: 0 })
     setCurrentProcessing('')
     setResults([])
+    setDefaultPriority('0')
+    setDefaultMaxConcurrency('')
+    setAutoEnableOverage(false)
   }
 
   const handleImport = async () => {
@@ -314,6 +326,23 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
       }
     } catch (error) {
       toast.error('JSON 格式错误: ' + extractErrorMessage(error))
+      return
+    }
+
+    const parsedDefaultPriority = Number.parseInt(defaultPriority.trim() || '0', 10)
+    if (!Number.isInteger(parsedDefaultPriority) || parsedDefaultPriority < 0) {
+      toast.error('默认优先级必须是非负整数')
+      return
+    }
+
+    const parsedDefaultMaxConcurrency = defaultMaxConcurrency.trim()
+      ? Number.parseInt(defaultMaxConcurrency.trim(), 10)
+      : undefined
+    if (
+      parsedDefaultMaxConcurrency !== undefined &&
+      (!Number.isInteger(parsedDefaultMaxConcurrency) || parsedDefaultMaxConcurrency <= 0)
+    ) {
+      toast.error('默认并发数必须是大于 0 的整数，留空表示不限制')
       return
     }
 
@@ -399,9 +428,12 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           const enterprise = isEnterpriseProvider(provider)
           const profileArn = account.profileArn?.trim() || cred.profileArn?.trim() || undefined
           const availableModelIds = extractAvailableModelIds(account)
-          const maxConcurrency = getKamDispatchNumber(account, 'maxConcurrency')
+          const maxConcurrency =
+            getKamDispatchNumber(account, 'maxConcurrency') ?? parsedDefaultMaxConcurrency
           const rateLimitBucketCapacity = getKamDispatchNumber(account, 'rateLimitBucketCapacity')
           const rateLimitRefillPerSecond = getKamDispatchNumber(account, 'rateLimitRefillPerSecond')
+          const priority =
+            getNumber(account.priority) ?? getNumber(account.credentials.priority) ?? parsedDefaultPriority
 
           // idc 模式下必须同时提供 clientId 和 clientSecret
           if (authMethod === 'social' && (clientId || clientSecret)) {
@@ -417,6 +449,11 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             throw new Error('Enterprise 账号必须包含 region')
           }
 
+          if (
+            !Number.isInteger(priority) || priority < 0
+          ) {
+            throw new Error('priority 必须是非负整数')
+          }
           if (
             maxConcurrency !== undefined &&
             (!Number.isInteger(maxConcurrency) || maxConcurrency <= 0)
@@ -451,6 +488,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             clientId,
             clientSecret,
             startUrl,
+            priority,
             machineId: account.machineId?.trim() || undefined,
             accountType: account.accountType?.trim() || undefined,
             availableModelIds: availableModelIds.length > 0 ? availableModelIds : undefined,
@@ -466,8 +504,20 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           let usage: string | undefined
           let balanceError: string | undefined
           try {
-            const balance = await getCredentialBalance(addedCred.credentialId)
-            usage = `${balance.currentUsage}/${balance.usageLimit}`
+            let balance = await getCredentialBalance(addedCred.credentialId)
+            let overageNote = ''
+            const overageEnabled = balance.overageEnabled ?? balance.overageStatus === 'ENABLED'
+            if (
+              autoEnableOverage &&
+              balance.overageCapability === 'OVERAGE_CAPABLE' &&
+              !overageEnabled
+            ) {
+              balance = await setCredentialOverageStatus(addedCred.credentialId, true)
+              overageNote = '，超额已开启'
+            } else if (autoEnableOverage && balance.overageCapability !== 'OVERAGE_CAPABLE') {
+              overageNote = '，不支持超额'
+            }
+            usage = `${balance.currentUsage}/${balance.effectiveUsageLimit ?? balance.usageLimit}${overageNote}`
           } catch (error) {
             balanceError = `获取额度失败: ${extractErrorMessage(error)}`
           }
@@ -603,6 +653,43 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
         <div className="flex-1 overflow-y-auto space-y-4 py-4">
           <div className="space-y-2">
             <label className="text-sm font-medium">KAM 导出 JSON</label>
+            <div className="grid gap-3 rounded-md border p-3 md:grid-cols-3">
+              <div className="space-y-1.5">
+                <label htmlFor="kamDefaultPriority" className="text-xs font-medium text-muted-foreground">
+                  默认优先级
+                </label>
+                <Input
+                  id="kamDefaultPriority"
+                  type="number"
+                  min="0"
+                  value={defaultPriority}
+                  onChange={(e) => setDefaultPriority(e.target.value)}
+                  disabled={importing}
+                />
+              </div>
+              <div className="space-y-1.5">
+                <label htmlFor="kamDefaultMaxConcurrency" className="text-xs font-medium text-muted-foreground">
+                  默认并发数
+                </label>
+                <Input
+                  id="kamDefaultMaxConcurrency"
+                  type="number"
+                  min="1"
+                  placeholder="不限"
+                  value={defaultMaxConcurrency}
+                  onChange={(e) => setDefaultMaxConcurrency(e.target.value)}
+                  disabled={importing}
+                />
+              </div>
+              <div className="flex items-center justify-between gap-3 rounded-md bg-muted/30 px-3 py-2">
+                <div className="text-sm font-medium">自动超额</div>
+                <Switch
+                  checked={autoEnableOverage}
+                  onCheckedChange={(checked) => setAutoEnableOverage(Boolean(checked))}
+                  disabled={importing}
+                />
+              </div>
+            </div>
             <textarea
               placeholder={'粘贴 Kiro Account Manager 导出的 JSON\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "userId": "...",\n    "provider": "Enterprise",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "us-east-1",\n    "startUrl": "https://example.awsapps.com/start",\n    "accountType": "power",\n    "maxConcurrency": 20\n  }\n]\n\n（可选的 authMethod 字段会被忽略，系统会根据 clientId/clientSecret 自动判断）\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "provider": "Enterprise",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "us-east-1",\n        "startUrl": "https://example.awsapps.com/start"\n      }\n    }\n  ]\n}'}
               value={jsonInput}

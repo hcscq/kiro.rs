@@ -9,8 +9,10 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Switch } from '@/components/ui/switch'
 import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
-import { getCredentialBalance, setCredentialDisabled } from '@/api/credentials'
+import { getCredentialBalance, setCredentialDisabled, setCredentialOverageStatus } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
 
 interface BatchImportDialogProps {
@@ -73,6 +75,9 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
   const [progress, setProgress] = useState({ current: 0, total: 0 })
   const [currentProcessing, setCurrentProcessing] = useState<string>('')
   const [results, setResults] = useState<VerificationResult[]>([])
+  const [defaultPriority, setDefaultPriority] = useState('0')
+  const [defaultMaxConcurrency, setDefaultMaxConcurrency] = useState('')
+  const [autoEnableOverage, setAutoEnableOverage] = useState(false)
 
   const { data: existingCredentials } = useCredentials()
   const { mutateAsync: addCredential } = useAddCredential()
@@ -104,6 +109,9 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     setProgress({ current: 0, total: 0 })
     setCurrentProcessing('')
     setResults([])
+    setDefaultPriority('0')
+    setDefaultMaxConcurrency('')
+    setAutoEnableOverage(false)
   }
 
   const handleBatchImport = async () => {
@@ -119,6 +127,23 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
     if (credentials.length === 0) {
       toast.error('没有可导入的凭据')
+      return
+    }
+
+    const parsedDefaultPriority = Number.parseInt(defaultPriority.trim() || '0', 10)
+    if (!Number.isInteger(parsedDefaultPriority) || parsedDefaultPriority < 0) {
+      toast.error('默认优先级必须是非负整数')
+      return
+    }
+
+    const parsedDefaultMaxConcurrency = defaultMaxConcurrency.trim()
+      ? Number.parseInt(defaultMaxConcurrency.trim(), 10)
+      : undefined
+    if (
+      parsedDefaultMaxConcurrency !== undefined &&
+      (!Number.isInteger(parsedDefaultMaxConcurrency) || parsedDefaultMaxConcurrency <= 0)
+    ) {
+      toast.error('默认并发数必须是大于 0 的整数，留空表示不限制')
       return
     }
 
@@ -223,6 +248,12 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           }
 
           if (
+            cred.priority !== undefined &&
+            (!Number.isInteger(cred.priority) || cred.priority < 0)
+          ) {
+            throw new Error('priority 必须是非负整数')
+          }
+          if (
             cred.maxConcurrency !== undefined &&
             (!Number.isInteger(cred.maxConcurrency) || cred.maxConcurrency <= 0)
           ) {
@@ -255,14 +286,16 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             clientId,
             clientSecret,
             startUrl,
-            priority: cred.priority || 0,
+            priority: typeof cred.priority === 'number' ? cred.priority : parsedDefaultPriority,
             machineId: cred.machineId?.trim() || undefined,
             accountType: cred.accountType?.trim() || undefined,
             availableModelIds: Array.isArray(cred.availableModelIds)
               ? cred.availableModelIds.filter(modelId => typeof modelId === 'string' && modelId.trim())
               : undefined,
             maxConcurrency:
-              typeof cred.maxConcurrency === 'number' ? cred.maxConcurrency : undefined,
+              typeof cred.maxConcurrency === 'number'
+                ? cred.maxConcurrency
+                : parsedDefaultMaxConcurrency,
             rateLimitBucketCapacity:
               typeof cred.rateLimitBucketCapacity === 'number'
                 ? cred.rateLimitBucketCapacity
@@ -279,7 +312,19 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           await new Promise(resolve => setTimeout(resolve, 1000))
 
           // 验活
-          const balance = await getCredentialBalance(addedCred.credentialId)
+          let balance = await getCredentialBalance(addedCred.credentialId)
+          let overageNote = ''
+          const overageEnabled = balance.overageEnabled ?? balance.overageStatus === 'ENABLED'
+          if (
+            autoEnableOverage &&
+            balance.overageCapability === 'OVERAGE_CAPABLE' &&
+            !overageEnabled
+          ) {
+            balance = await setCredentialOverageStatus(addedCred.credentialId, true)
+            overageNote = '，超额已开启'
+          } else if (autoEnableOverage && balance.overageCapability !== 'OVERAGE_CAPABLE') {
+            overageNote = '，不支持超额'
+          }
 
           // 验活成功
           successCount++
@@ -292,7 +337,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             newResults[i] = {
               ...newResults[i],
               status: 'verified',
-              usage: `${balance.currentUsage}/${balance.usageLimit}`,
+              usage: `${balance.currentUsage}/${balance.effectiveUsageLimit ?? balance.usageLimit}${overageNote}`,
               email: addedCred.email || addedCred.userId || credentialEmail || credentialUserId,
               credentialId: addedCred.credentialId
             }
@@ -411,6 +456,43 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             <label className="text-sm font-medium">
               JSON 格式凭据
             </label>
+            <div className="grid gap-3 rounded-md border p-3 md:grid-cols-3">
+              <div className="space-y-1.5">
+                <label htmlFor="batchDefaultPriority" className="text-xs font-medium text-muted-foreground">
+                  默认优先级
+                </label>
+                <Input
+                  id="batchDefaultPriority"
+                  type="number"
+                  min="0"
+                  value={defaultPriority}
+                  onChange={(e) => setDefaultPriority(e.target.value)}
+                  disabled={importing}
+                />
+              </div>
+              <div className="space-y-1.5">
+                <label htmlFor="batchDefaultMaxConcurrency" className="text-xs font-medium text-muted-foreground">
+                  默认并发数
+                </label>
+                <Input
+                  id="batchDefaultMaxConcurrency"
+                  type="number"
+                  min="1"
+                  placeholder="不限"
+                  value={defaultMaxConcurrency}
+                  onChange={(e) => setDefaultMaxConcurrency(e.target.value)}
+                  disabled={importing}
+                />
+              </div>
+              <div className="flex items-center justify-between gap-3 rounded-md bg-muted/30 px-3 py-2">
+                <div className="text-sm font-medium">自动超额</div>
+                <Switch
+                  checked={autoEnableOverage}
+                  onCheckedChange={(checked) => setAutoEnableOverage(Boolean(checked))}
+                  disabled={importing}
+                />
+              </div>
+            </div>
             <textarea
               placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n例如: [{"email":"user@example.com","provider":"Enterprise","refreshToken":"...","clientId":"...","clientSecret":"...","region":"us-east-1","startUrl":"https://example.awsapps.com/start"}]\n支持 region 字段自动映射为 authRegion 和 apiRegion'}
               value={jsonInput}

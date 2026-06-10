@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use crate::kiro::model::available_profiles::AvailableProfile;
+use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::{
     KiroRequestBodyGuardConfig, NonStreamBodyReadTimeoutConfig, RequestWeightingConfig,
     StreamPreSseFailoverConfig, ThinkingSignatureValidationMode,
@@ -191,6 +192,19 @@ pub struct CredentialStatusItem {
     /// 当前账号再次可被调度的剩余时间（毫秒）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_ready_in_ms: Option<u64>,
+    /// 最近一次缓存的额度数据（不会在列表接口触发上游查询）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_balance: Option<CachedBalanceResponse>,
+}
+
+/// 凭据列表中附带的额度缓存快照
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachedBalanceResponse {
+    /// 缓存写入时间（Unix 秒）
+    pub cached_at: f64,
+    /// 缓存的额度数据
+    pub balance: BalanceResponse,
 }
 
 // ============ 操作请求 ============
@@ -441,6 +455,40 @@ pub struct BalanceResponse {
 }
 
 impl BalanceResponse {
+    pub fn from_usage(id: u64, profile_arn: Option<String>, usage: &UsageLimitsResponse) -> Self {
+        let current_usage = usage.current_usage();
+        let usage_limit = usage.usage_limit();
+        let effective_usage_limit = usage.effective_usage_limit();
+        let remaining = (effective_usage_limit - current_usage).max(0.0);
+        let usage_percentage = if effective_usage_limit > 0.0 {
+            (current_usage / effective_usage_limit * 100.0).min(100.0)
+        } else {
+            0.0
+        };
+
+        Self {
+            id,
+            profile_arn,
+            subscription_title: usage.subscription_title().map(|s| s.to_string()),
+            subscription_type: usage.subscription_type().map(|s| s.to_string()),
+            current_usage,
+            usage_limit,
+            effective_usage_limit,
+            remaining,
+            usage_percentage,
+            next_reset_at: usage.next_date_reset,
+            overage_capability: usage.overage_capability().map(|value| value.to_string()),
+            overage_status: usage.overage_status().map(|value| value.to_string()),
+            overage_enabled: usage.overage_enabled(),
+            overage_cap: usage.overage_cap(),
+            current_overages: usage.current_overages(),
+            overage_charges: usage.overage_charges(),
+            overage_rate: usage.overage_rate(),
+            currency: usage.currency().map(|value| value.to_string()),
+            unit: usage.unit().map(|value| value.to_string()),
+        }
+    }
+
     pub fn normalize_cached_compat(&mut self) {
         if self.effective_usage_limit <= 0.0 {
             self.effective_usage_limit = self.usage_limit;

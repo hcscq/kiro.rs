@@ -627,9 +627,9 @@ export function CredentialCard({
   const balanceSummary = loadingBalance
     ? null
     : balance
-      ? `${balance.remaining.toFixed(2)} / ${(balance.effectiveUsageLimit ?? balance.usageLimit).toFixed(2)}`
+      ? `${balance.currentUsage.toFixed(2)} / ${(balance.effectiveUsageLimit ?? balance.usageLimit).toFixed(2)}`
       : '未知'
-  const balancePercentRemaining = balance ? `${(100 - balance.usagePercentage).toFixed(1)}% 剩余` : null
+  const balancePercentUsed = balance ? `${balance.usagePercentage.toFixed(1)}% 已用` : null
   const overageEnabled = balance?.overageEnabled ?? balance?.overageStatus === 'ENABLED'
   const subscriptionLabel = credential.subscriptionTitle || balance?.subscriptionTitle || '未知'
   const subscriptionTypeLabel = credential.subscriptionType || balance?.subscriptionType || null
@@ -794,9 +794,9 @@ export function CredentialCard({
                 {loadingBalance ? (
                   <Loader2 className="h-3 w-3 animate-spin inline" />
                 ) : balance ? (
-                  <span title={balancePercentRemaining ? `${balanceSummary} (${balancePercentRemaining})` : balanceSummary ?? undefined}>
+                  <span title={balancePercentUsed ? `${balanceSummary} (${balancePercentUsed})` : balanceSummary ?? undefined}>
                     {balanceSummary}
-                    {balancePercentRemaining && <span className="ml-1 text-[10px] text-primary">({balancePercentRemaining})</span>}
+                    {balancePercentUsed && <span className="ml-1 text-[10px] text-primary">({balancePercentUsed})</span>}
                   </span>
                 ) : (
                   '未知余额'

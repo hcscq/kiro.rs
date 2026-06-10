@@ -2706,6 +2706,7 @@ impl KiroProvider {
                 let has_available = self
                     .token_manager
                     .report_quota_exhausted_with_error(ctx_id, Some(&error_summary));
+                self.trigger_usage_balance_refresh_after_quota_exhausted(ctx_id, "MCP", None);
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {}", error_summary);
                 }
@@ -4087,6 +4088,11 @@ impl KiroProvider {
                 let has_available = self
                     .token_manager
                     .report_quota_exhausted_with_error(ctx_id, Some(&error_summary));
+                self.trigger_usage_balance_refresh_after_quota_exhausted(
+                    ctx_id,
+                    api_type,
+                    Some(&request_id),
+                );
                 if !has_available {
                     anyhow::bail!(
                         "{} API 请求失败（所有凭据已用尽）: {}",
@@ -4891,6 +4897,52 @@ impl KiroProvider {
             && !Self::is_bearer_token_invalid(body)
             && !Self::is_account_suspended(body)
             && Self::is_enterprise_profile_unauthorized_error(body, error_summary)
+    }
+
+    fn trigger_usage_balance_refresh_after_quota_exhausted(
+        &self,
+        credential_id: u64,
+        api_type: &'static str,
+        request_id: Option<&str>,
+    ) {
+        if !self
+            .token_manager
+            .try_schedule_usage_balance_refresh(credential_id)
+        {
+            tracing::debug!(
+                request_id = request_id.unwrap_or(""),
+                api_type,
+                credential_id,
+                "跳过 402 后台用量刷新：该凭据刷新任务仍在本地冷却窗口内"
+            );
+            return;
+        }
+
+        let token_manager = Arc::clone(&self.token_manager);
+        let request_id = request_id.map(str::to_string);
+        tokio::spawn(async move {
+            match token_manager
+                .refresh_usage_balance_cache_for(credential_id, "quota-exhausted-402")
+                .await
+            {
+                Ok(balance) => tracing::info!(
+                    request_id = request_id.as_deref().unwrap_or(""),
+                    api_type,
+                    credential_id,
+                    current_usage = balance.current_usage,
+                    effective_usage_limit = balance.effective_usage_limit,
+                    overage_enabled = ?balance.overage_enabled,
+                    "402 后台用量刷新成功"
+                ),
+                Err(err) => tracing::warn!(
+                    request_id = request_id.as_deref().unwrap_or(""),
+                    api_type,
+                    credential_id,
+                    "402 后台用量刷新失败: {}",
+                    err
+                ),
+            }
+        });
     }
 
     fn is_quota_exhausted(body: &str) -> bool {

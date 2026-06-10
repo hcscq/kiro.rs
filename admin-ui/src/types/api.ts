@@ -65,6 +65,12 @@ export interface CredentialStatusItem {
   rateLimitRefillBasePerSecond?: number | null
   rateLimitHitStreak: number
   nextReadyInMs?: number | null
+  cachedBalance?: CachedBalanceResponse | null
+}
+
+export interface CachedBalanceResponse {
+  cachedAt: number
+  balance: BalanceResponse
 }
 
 // 余额响应

@@ -338,13 +338,16 @@ export function Dashboard() {
     const validIds = new Set(data.credentials.map(credential => credential.id))
 
     setBalanceMap(prev => {
+      let changed = false
       const next = new Map<number, BalanceResponse>()
       prev.forEach((value, id) => {
         if (validIds.has(id)) {
           next.set(id, value)
+        } else {
+          changed = true
         }
       })
-      return next.size === prev.size ? prev : next
+      return changed ? next : prev
     })
 
     setLoadingBalanceIds(prev => {
@@ -1102,15 +1105,15 @@ export function Dashboard() {
                     key={credential.id}
                     credential={credential}
                     onViewBalance={handleViewBalance}
-                  selected={selectedIds.has(credential.id)}
-                  onToggleSelect={() => toggleSelect(credential.id)}
-                  balance={balanceMap.get(credential.id) || null}
-                  loadingBalance={loadingBalanceIds.has(credential.id)}
-                  accountTypeSuggestions={accountTypeSuggestions}
-                  standardAccountTypePresets={standardAccountTypePresets}
-                  modelCatalog={modelCatalog}
-                />
-              ))}
+                    selected={selectedIds.has(credential.id)}
+                    onToggleSelect={() => toggleSelect(credential.id)}
+                    balance={balanceMap.get(credential.id) || credential.cachedBalance?.balance || null}
+                    loadingBalance={loadingBalanceIds.has(credential.id)}
+                    accountTypeSuggestions={accountTypeSuggestions}
+                    standardAccountTypePresets={standardAccountTypePresets}
+                    modelCatalog={modelCatalog}
+                  />
+                ))}
               </div>
 
               {/* 分页控件 */}
