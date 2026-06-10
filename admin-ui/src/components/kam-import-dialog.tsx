@@ -48,6 +48,9 @@ interface KamAccount {
     profileArn?: string
     authMethod?: string
     startUrl?: string
+    maxConcurrency?: number
+    rateLimitBucketCapacity?: number
+    rateLimitRefillPerSecond?: number
   }
   machineId?: string
   status?: string
@@ -71,6 +74,13 @@ function getString(value: unknown): string | undefined {
 
 function getNumber(value: unknown): number | undefined {
   return typeof value === 'number' ? value : undefined
+}
+
+function getKamDispatchNumber(
+  account: KamAccount,
+  key: 'maxConcurrency' | 'rateLimitBucketCapacity' | 'rateLimitRefillPerSecond'
+): number | undefined {
+  return getNumber(account[key]) ?? getNumber(account.credentials[key])
 }
 
 function extractModelId(value: unknown): string | undefined {
@@ -389,6 +399,9 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           const enterprise = isEnterpriseProvider(provider)
           const profileArn = account.profileArn?.trim() || cred.profileArn?.trim() || undefined
           const availableModelIds = extractAvailableModelIds(account)
+          const maxConcurrency = getKamDispatchNumber(account, 'maxConcurrency')
+          const rateLimitBucketCapacity = getKamDispatchNumber(account, 'rateLimitBucketCapacity')
+          const rateLimitRefillPerSecond = getKamDispatchNumber(account, 'rateLimitRefillPerSecond')
 
           // idc 模式下必须同时提供 clientId 和 clientSecret
           if (authMethod === 'social' && (clientId || clientSecret)) {
@@ -405,22 +418,22 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           }
 
           if (
-            account.maxConcurrency !== undefined &&
-            (!Number.isInteger(account.maxConcurrency) || account.maxConcurrency <= 0)
+            maxConcurrency !== undefined &&
+            (!Number.isInteger(maxConcurrency) || maxConcurrency <= 0)
           ) {
             throw new Error('maxConcurrency 必须是大于 0 的整数')
           }
           if (
-            account.rateLimitBucketCapacity !== undefined &&
-            (!Number.isFinite(account.rateLimitBucketCapacity) ||
-              account.rateLimitBucketCapacity < 0)
+            rateLimitBucketCapacity !== undefined &&
+            (!Number.isFinite(rateLimitBucketCapacity) ||
+              rateLimitBucketCapacity < 0)
           ) {
             throw new Error('rateLimitBucketCapacity 必须是大于等于 0 的数字')
           }
           if (
-            account.rateLimitRefillPerSecond !== undefined &&
-            (!Number.isFinite(account.rateLimitRefillPerSecond) ||
-              account.rateLimitRefillPerSecond < 0)
+            rateLimitRefillPerSecond !== undefined &&
+            (!Number.isFinite(rateLimitRefillPerSecond) ||
+              rateLimitRefillPerSecond < 0)
           ) {
             throw new Error('rateLimitRefillPerSecond 必须是大于等于 0 的数字')
           }
@@ -441,16 +454,9 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             machineId: account.machineId?.trim() || undefined,
             accountType: account.accountType?.trim() || undefined,
             availableModelIds: availableModelIds.length > 0 ? availableModelIds : undefined,
-            maxConcurrency:
-              typeof account.maxConcurrency === 'number' ? account.maxConcurrency : undefined,
-            rateLimitBucketCapacity:
-              typeof account.rateLimitBucketCapacity === 'number'
-                ? account.rateLimitBucketCapacity
-                : undefined,
-            rateLimitRefillPerSecond:
-              typeof account.rateLimitRefillPerSecond === 'number'
-                ? account.rateLimitRefillPerSecond
-                : undefined,
+            maxConcurrency,
+            rateLimitBucketCapacity,
+            rateLimitRefillPerSecond,
           })
 
           addedCredId = addedCred.credentialId

@@ -602,6 +602,10 @@ export function CredentialCard({
   }
 
   const maxConcurrencySourceLabel = formatDispatchSourceLabel(credential.maxConcurrencySource)
+  const maxConcurrencyPlaceholder =
+    credential.maxConcurrency !== undefined && credential.maxConcurrency !== null
+      ? `跟随 ${credential.maxConcurrency}`
+      : '不限'
   const accountTypeSourceLabel = formatAccountTypeSourceLabel(credential.accountTypeSource)
   const accountTypeSourceShortLabel = formatAccountTypeSourceShortLabel(credential.accountTypeSource)
   const rateLimitOverrideSummary = [
@@ -1144,10 +1148,10 @@ export function CredentialCard({
                   onChange={(e) => setMaxConcurrencyValue(e.target.value)}
                   className="h-9 text-sm"
                   min="1"
-                  placeholder="不限"
+                  placeholder={maxConcurrencyPlaceholder}
                   disabled={isSaving}
                 />
-                <p className="text-[10px] text-muted-foreground">留空表示无并发上限限制</p>
+                <p className="text-[10px] text-muted-foreground">留空表示清除凭据覆盖，继续跟随默认策略</p>
               </div>
             </div>
 

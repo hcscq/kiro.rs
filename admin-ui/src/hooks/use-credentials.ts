@@ -23,6 +23,7 @@ import {
 } from '@/api/credentials'
 import type {
   AddCredentialRequest,
+  CredentialsStatusResponse,
   SetCredentialModelPolicyRequest,
   SetCredentialProfileRequest,
   UpdateLoadBalancingConfigRequest,
@@ -88,8 +89,27 @@ export function useSetMaxConcurrency() {
   return useMutation({
     mutationFn: ({ id, maxConcurrency }: { id: number; maxConcurrency: number | null }) =>
       setCredentialMaxConcurrency(id, maxConcurrency),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    onSuccess: async (_response, { id, maxConcurrency }) => {
+      queryClient.setQueryData<CredentialsStatusResponse>(['credentials'], (current) => {
+        if (!current) return current
+
+        return {
+          ...current,
+          credentials: current.credentials.map((credential) => {
+            if (credential.id !== id || maxConcurrency === null) {
+              return credential
+            }
+
+            return {
+              ...credential,
+              maxConcurrency,
+              maxConcurrencyOverride: maxConcurrency,
+              maxConcurrencySource: 'credential',
+            }
+          }),
+        }
+      })
+      await queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
   })
 }
