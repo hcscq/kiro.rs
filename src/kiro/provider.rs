@@ -1569,6 +1569,14 @@ fn append_bounded_tail(mut values: Vec<String>, value: &str, limit: usize) -> Ve
     values
 }
 
+fn push_bounded_schema_issue_for_log(keys: &mut Vec<String>, path: &str) {
+    const MAX_KEYS: usize = 12;
+    if keys.len() >= MAX_KEYS {
+        return;
+    }
+    keys.push(truncate_log_string(path, 160));
+}
+
 fn truncate_log_string(value: &str, limit: usize) -> String {
     if limit == 0 || value.len() <= limit {
         return value.to_string();
@@ -1701,10 +1709,6 @@ impl KiroProvider {
     fn summarize_kiro_request_body_for_log(
         request_body: &str,
     ) -> Option<KiroRequestBodyDiagnostics> {
-        if request_body.len() > KIRO_REQUEST_DIAGNOSTICS_MAX_BODY_BYTES {
-            return None;
-        }
-
         let json: serde_json::Value = serde_json::from_str(request_body).ok()?;
         let conversation = json.get("conversationState")?;
         let current = conversation
@@ -1868,6 +1872,19 @@ impl KiroProvider {
 
     fn collect_unsupported_schema_keys_for_log(schema: &serde_json::Value) -> Vec<String> {
         let mut keys = Vec::new();
+        if !matches!(
+            schema.get("type"),
+            Some(serde_json::Value::String(type_name)) if type_name == "object"
+        ) {
+            push_bounded_schema_issue_for_log(&mut keys, "$.type");
+        }
+        if let serde_json::Value::Object(obj) = schema {
+            for key in ["anyOf", "oneOf", "allOf"] {
+                if obj.contains_key(key) {
+                    push_bounded_schema_issue_for_log(&mut keys, &format!("$.{key}"));
+                }
+            }
+        }
         Self::collect_unsupported_schema_keys_for_log_at(schema, "$", &mut keys);
         keys
     }
@@ -1890,8 +1907,8 @@ impl KiroProvider {
                     } else {
                         format!("{path}.{key}")
                     };
-                    if Self::is_unsupported_schema_key_for_log(key) {
-                        keys.push(truncate_log_string(&child_path, 160));
+                    if Self::is_rejected_schema_shape_for_log(key, child) {
+                        push_bounded_schema_issue_for_log(keys, &child_path);
                         if keys.len() >= MAX_KEYS {
                             return;
                         }
@@ -1918,37 +1935,20 @@ impl KiroProvider {
         }
     }
 
-    fn is_unsupported_schema_key_for_log(key: &str) -> bool {
-        matches!(
-            key,
-            "$ref"
-                | "$defs"
-                | "definitions"
-                | "$id"
-                | "$anchor"
-                | "$dynamicRef"
-                | "$dynamicAnchor"
-                | "$vocabulary"
-                | "$comment"
-                | "anyOf"
-                | "oneOf"
-                | "allOf"
-                | "not"
-                | "if"
-                | "then"
-                | "else"
-                | "dependentSchemas"
-                | "dependentRequired"
-                | "unevaluatedProperties"
-                | "unevaluatedItems"
-                | "patternProperties"
-                | "propertyNames"
-                | "prefixItems"
-                | "contains"
-                | "default"
-                | "examples"
-                | "example"
-        )
+    fn is_rejected_schema_shape_for_log(key: &str, value: &serde_json::Value) -> bool {
+        match key {
+            "properties" => !value.is_object(),
+            "required" => match value {
+                serde_json::Value::Array(items) => items.iter().any(|item| !item.is_string()),
+                _ => true,
+            },
+            "additionalProperties" => !matches!(
+                value,
+                serde_json::Value::Bool(_) | serde_json::Value::Object(_)
+            ),
+            "items" => value.is_array(),
+            _ => false,
+        }
     }
 
     fn summarize_json_schema_type_for_log(value: &serde_json::Value) -> String {
@@ -4353,31 +4353,7 @@ impl KiroProvider {
                     },
                 );
 
-                if request_body.len() > KIRO_REQUEST_DIAGNOSTICS_MAX_BODY_BYTES {
-                    let rejected_tool_index = Self::rejected_tool_index_from_error_body(&body)
-                        .map(|index| index.to_string())
-                        .unwrap_or_default();
-                    tracing::warn!(
-                        request_id = %request_id,
-                        api_type,
-                        model = model.as_deref().unwrap_or("unknown"),
-                        credential_id = ctx_id,
-                        attempt = attempt + 1,
-                        max_retries,
-                        region = %region,
-                        stream = is_stream,
-                        request_body_bytes,
-                        status_code = status.as_u16(),
-                        error_summary = %error_summary,
-                        kiro_body_bytes = request_body.len(),
-                        kiro_diagnostic_body_limit_bytes = KIRO_REQUEST_DIAGNOSTICS_MAX_BODY_BYTES,
-                        kiro_tool_error_index = %rejected_tool_index,
-                        total_elapsed_ms = overall_started_at.elapsed().as_millis(),
-                        "API 请求失败（上游 400，诊断摘要跳过：请求体超过诊断上限）"
-                    );
-                } else if let Some(diagnostics) =
-                    Self::summarize_kiro_request_body_for_log(request_body)
-                {
+                if let Some(diagnostics) = Self::summarize_kiro_request_body_for_log(request_body) {
                     let rejected_tool_index = Self::rejected_tool_index_from_error_body(&body);
                     let rejected_tool = rejected_tool_index.and_then(|index| {
                         diagnostics
@@ -4406,6 +4382,8 @@ impl KiroProvider {
                         status_code = status.as_u16(),
                         error_summary = %error_summary,
                         kiro_body_bytes = diagnostics.body_bytes,
+                        kiro_diagnostic_body_limit_bytes = KIRO_REQUEST_DIAGNOSTICS_MAX_BODY_BYTES,
+                        kiro_diagnostic_body_exceeded_limit = diagnostics.body_bytes > KIRO_REQUEST_DIAGNOSTICS_MAX_BODY_BYTES,
                         kiro_profile_arn_present = diagnostics.profile_arn_present,
                         kiro_additional_model_request_fields_present = diagnostics.additional_model_request_fields_present,
                         kiro_conversation_id_present = diagnostics.conversation_id_present,
@@ -5921,6 +5899,111 @@ mod tests {
                 "user".to_string(),
                 "assistant".to_string(),
                 "unknown".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_summarize_kiro_request_body_for_log_handles_large_bodies() {
+        let large_content = "x".repeat(KIRO_REQUEST_DIAGNOSTICS_MAX_BODY_BYTES + 1024);
+        let body = serde_json::json!({
+            "conversationState": {
+                "currentMessage": {
+                    "userInputMessage": {
+                        "modelId": "claude-sonnet-4-6",
+                        "origin": "AI_EDITOR",
+                        "content": large_content,
+                        "userInputMessageContext": {
+                            "tools": [
+                                {
+                                    "toolSpecification": {
+                                        "name": "Read",
+                                        "description": "read",
+                                        "inputSchema": {
+                                            "json": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "file_path": {"type": "string"}
+                                                },
+                                                "required": ["file_path"],
+                                                "additionalProperties": false
+                                            }
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        assert!(body.len() > KIRO_REQUEST_DIAGNOSTICS_MAX_BODY_BYTES);
+        let diagnostics =
+            KiroProvider::summarize_kiro_request_body_for_log(&body).expect("expected diagnostics");
+
+        assert_eq!(diagnostics.body_bytes, body.len());
+        assert_eq!(
+            diagnostics.current_content_bytes,
+            KIRO_REQUEST_DIAGNOSTICS_MAX_BODY_BYTES + 1024
+        );
+        assert_eq!(diagnostics.current_tool_count, 1);
+        assert_eq!(diagnostics.current_tool_schemas[0].name, "Read");
+        assert_eq!(diagnostics.current_tool_schemas[0].root_type, "object");
+    }
+
+    #[test]
+    fn test_schema_diagnostics_flags_only_upstream_rejected_shapes() {
+        let accepted_advanced_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "status": {
+                    "anyOf": [
+                        {"type": "string", "enum": ["todo", "done"]},
+                        {"type": "null"}
+                    ]
+                },
+                "labels": {
+                    "type": "object",
+                    "patternProperties": {
+                        "^x-": {"type": "string"}
+                    },
+                    "propertyNames": {"pattern": "^[a-z-]+$"},
+                    "unevaluatedProperties": false
+                }
+            },
+            "if": {"required": ["status"]},
+            "then": {"required": ["labels"]},
+            "dependentRequired": {"status": ["labels"]},
+            "contains": {"type": "string"},
+            "not": {"required": ["forbidden"]},
+            "additionalProperties": false
+        });
+
+        assert_eq!(
+            KiroProvider::collect_unsupported_schema_keys_for_log(&accepted_advanced_schema),
+            Vec::<String>::new()
+        );
+
+        let rejected_shape_schema = serde_json::json!({
+            "type": ["object"],
+            "anyOf": [{"required": ["value"]}],
+            "properties": null,
+            "required": ["value", 1],
+            "additionalProperties": "no",
+            "items": [{"type": "string"}]
+        });
+
+        assert_eq!(
+            KiroProvider::collect_unsupported_schema_keys_for_log(&rejected_shape_schema),
+            vec![
+                "$.type".to_string(),
+                "$.anyOf".to_string(),
+                "$.additionalProperties".to_string(),
+                "$.items".to_string(),
+                "$.properties".to_string(),
+                "$.required".to_string(),
             ]
         );
     }

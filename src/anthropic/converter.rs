@@ -50,6 +50,7 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     inline_local_schema_refs_for_kiro(&mut obj);
     remove_schema_definition_keywords_for_kiro(&mut obj);
     normalize_schema_object_for_kiro(&mut obj);
+    normalize_root_union_keywords_for_kiro(&mut obj);
     normalize_root_tool_schema_for_kiro(&mut obj);
 
     // type（Bedrock/Kiro 要求工具 inputSchema 根节点必须是 object）
@@ -195,6 +196,10 @@ fn resolve_local_schema_ref_for_kiro(
 fn remove_schema_definition_keywords_for_kiro(
     obj: &mut serde_json::Map<String, serde_json::Value>,
 ) -> bool {
+    if schema_map_contains_key(obj, "$dynamicRef") {
+        return false;
+    }
+
     let mut removed = false;
     for key in ["$defs", "definitions"] {
         if obj.remove(key).is_some() {
@@ -202,6 +207,40 @@ fn remove_schema_definition_keywords_for_kiro(
         }
     }
     removed
+}
+
+fn schema_map_contains_key(obj: &serde_json::Map<String, serde_json::Value>, target: &str) -> bool {
+    obj.iter()
+        .any(|(key, value)| key == target || schema_value_contains_key(value, target))
+}
+
+fn schema_value_contains_key(value: &serde_json::Value, target: &str) -> bool {
+    match value {
+        serde_json::Value::Object(obj) => schema_map_contains_key(obj, target),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .any(|value| schema_value_contains_key(value, target)),
+        _ => false,
+    }
+}
+
+fn normalize_root_union_keywords_for_kiro(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    let mut removed = Vec::new();
+    for key in ["allOf", "anyOf", "oneOf"] {
+        if obj.remove(key).is_some() {
+            removed.push(key);
+        }
+    }
+
+    if !removed.is_empty() {
+        add_schema_description_hint(
+            obj,
+            &format!(
+                "Top-level JSON Schema union keywords ({}) were simplified for tool schema compatibility.",
+                removed.join(", ")
+            ),
+        );
+    }
 }
 
 fn normalize_root_tool_schema_for_kiro(obj: &mut serde_json::Map<String, serde_json::Value>) {
@@ -319,12 +358,8 @@ fn normalize_schema_value_for_kiro(value: &mut serde_json::Value) {
 
 fn normalize_schema_object_for_kiro(obj: &mut serde_json::Map<String, serde_json::Value>) {
     normalize_schema_dialect_for_kiro(obj);
-    strip_unsupported_schema_keywords_for_kiro(obj);
+    normalize_schema_object_shape_for_kiro(obj);
     remove_schema_definition_keywords_for_kiro(obj);
-
-    for key in ["allOf", "anyOf", "oneOf"] {
-        normalize_schema_union_for_kiro(obj, key);
-    }
 
     if let Some(serde_json::Value::Object(properties)) = obj.get_mut("properties") {
         for schema in properties.values_mut() {
@@ -355,59 +390,90 @@ fn normalize_schema_object_for_kiro(obj: &mut serde_json::Map<String, serde_json
             normalize_schema_value_for_kiro(child);
         }
     }
-}
 
-fn strip_unsupported_schema_keywords_for_kiro(
-    obj: &mut serde_json::Map<String, serde_json::Value>,
-) {
-    for key in [
-        "$id",
-        "$anchor",
-        "$dynamicAnchor",
-        "$dynamicRef",
-        "$vocabulary",
-        "$comment",
-        "examples",
-        "example",
-        "readOnly",
-        "writeOnly",
-        "deprecated",
-    ] {
-        obj.remove(key);
-    }
-
-    if obj.remove("default").is_some() {
-        add_schema_description_hint(
-            obj,
-            "Default value metadata was omitted for tool schema compatibility.",
-        );
-    }
-
-    let mut stripped_advanced_keyword = false;
-    for key in [
-        "if",
-        "then",
-        "else",
-        "dependentSchemas",
-        "dependentRequired",
-        "unevaluatedProperties",
-        "unevaluatedItems",
-        "prefixItems",
-        "contains",
-        "propertyNames",
-        "not",
-        "patternProperties",
-    ] {
-        if obj.remove(key).is_some() {
-            stripped_advanced_keyword = true;
+    for key in ["allOf", "anyOf", "oneOf", "$defs", "definitions"] {
+        if let Some(serde_json::Value::Array(children)) = obj.get_mut(key) {
+            for schema in children {
+                normalize_schema_value_for_kiro(schema);
+            }
+        } else if let Some(serde_json::Value::Object(children)) = obj.get_mut(key) {
+            for schema in children.values_mut() {
+                normalize_schema_value_for_kiro(schema);
+            }
         }
     }
+}
 
-    if stripped_advanced_keyword {
-        add_schema_description_hint(
-            obj,
-            "Advanced JSON Schema constraints were simplified for tool compatibility.",
+fn normalize_schema_object_shape_for_kiro(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    if obj.contains_key("properties")
+        && !obj.get("properties").is_some_and(|value| value.is_object())
+    {
+        obj.insert(
+            "properties".to_string(),
+            serde_json::Value::Object(serde_json::Map::new()),
         );
+    }
+
+    if let Some(required) = obj.remove("required") {
+        let required = match required {
+            serde_json::Value::Array(items) => serde_json::Value::Array(
+                items
+                    .into_iter()
+                    .filter_map(|item| {
+                        item.as_str()
+                            .map(|name| serde_json::Value::String(name.to_string()))
+                    })
+                    .collect(),
+            ),
+            _ => serde_json::Value::Array(Vec::new()),
+        };
+        obj.insert("required".to_string(), required);
+    }
+
+    if obj.contains_key("additionalProperties")
+        && !matches!(
+            obj.get("additionalProperties"),
+            Some(serde_json::Value::Bool(_)) | Some(serde_json::Value::Object(_))
+        )
+    {
+        obj.insert(
+            "additionalProperties".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+
+    normalize_draft_07_tuple_items_for_kiro(obj);
+}
+
+fn normalize_draft_07_tuple_items_for_kiro(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    let Some(items) = obj.remove("items") else {
+        return;
+    };
+
+    match items {
+        serde_json::Value::Array(prefix_items) => {
+            if !obj.contains_key("prefixItems") {
+                obj.insert(
+                    "prefixItems".to_string(),
+                    serde_json::Value::Array(prefix_items),
+                );
+            }
+            obj.insert("items".to_string(), serde_json::Value::Bool(true));
+            add_schema_description_hint(
+                obj,
+                "Draft-07 tuple items were converted to JSON Schema 2020-12 prefixItems.",
+            );
+        }
+        serde_json::Value::Bool(_) | serde_json::Value::Object(_) => {
+            obj.insert("items".to_string(), items);
+        }
+        _ => {
+            obj.insert("items".to_string(), serde_json::Value::Bool(true));
+            add_schema_description_hint(
+                obj,
+                "Invalid array item schema metadata was simplified for tool compatibility.",
+            );
+        }
     }
 }
 
@@ -422,243 +488,6 @@ fn normalize_schema_dialect_for_kiro(obj: &mut serde_json::Map<String, serde_jso
         return;
     }
     obj.remove("$schema");
-}
-
-fn normalize_schema_union_for_kiro(
-    obj: &mut serde_json::Map<String, serde_json::Value>,
-    key: &str,
-) {
-    let Some(raw) = obj.remove(key) else {
-        return;
-    };
-    let serde_json::Value::Array(branches) = raw else {
-        add_schema_description_hint(
-            obj,
-            "Original schema union was simplified for compatibility.",
-        );
-        ensure_fallback_schema_type(obj);
-        return;
-    };
-
-    let mut nullable = false;
-    let mut non_null_branches = Vec::with_capacity(branches.len());
-    for mut branch in branches {
-        normalize_schema_value_for_kiro(&mut branch);
-        if is_null_schema_branch(&branch) {
-            nullable = true;
-            continue;
-        }
-        non_null_branches.push(branch);
-    }
-
-    if non_null_branches.is_empty() {
-        obj.insert(
-            "type".to_string(),
-            serde_json::Value::String("string".to_string()),
-        );
-        if nullable {
-            add_schema_description_hint(obj, "Nullable: null is also accepted.");
-        }
-        return;
-    }
-
-    if non_null_branches.len() == 1 {
-        merge_schema_branch_for_kiro(obj, &non_null_branches[0]);
-        if nullable {
-            add_schema_description_hint(obj, "Nullable: null is also accepted.");
-        }
-        normalize_schema_object_for_kiro(obj);
-        return;
-    }
-
-    if collapse_scalar_union_for_kiro(obj, &non_null_branches, nullable) {
-        return;
-    }
-    if collapse_object_union_for_kiro(obj, &non_null_branches, nullable) {
-        normalize_schema_object_for_kiro(obj);
-        return;
-    }
-
-    add_schema_description_hint(obj, "Original schema accepted one of multiple shapes.");
-    ensure_fallback_schema_type(obj);
-    if nullable {
-        add_schema_description_hint(obj, "Nullable: null is also accepted.");
-    }
-}
-
-fn is_null_schema_branch(branch: &serde_json::Value) -> bool {
-    match branch {
-        serde_json::Value::Null => true,
-        serde_json::Value::Object(obj) => match obj.get("type") {
-            Some(serde_json::Value::String(value)) => value == "null",
-            Some(serde_json::Value::Array(values)) => values
-                .iter()
-                .all(|value| value.as_str().is_some_and(|type_name| type_name == "null")),
-            _ => false,
-        },
-        _ => false,
-    }
-}
-
-fn merge_schema_branch_for_kiro(
-    target: &mut serde_json::Map<String, serde_json::Value>,
-    branch: &serde_json::Value,
-) {
-    let serde_json::Value::Object(branch_obj) = branch else {
-        ensure_fallback_schema_type(target);
-        return;
-    };
-
-    for (key, value) in branch_obj {
-        if key == "description" {
-            if let Some(text) = value.as_str() {
-                add_schema_description_hint(target, text);
-            }
-            continue;
-        }
-        target.insert(key.clone(), value.clone());
-    }
-}
-
-fn collapse_scalar_union_for_kiro(
-    target: &mut serde_json::Map<String, serde_json::Value>,
-    branches: &[serde_json::Value],
-    nullable: bool,
-) -> bool {
-    let mut scalar_type = String::new();
-    let mut enum_values = Vec::new();
-    let mut has_open_branch = false;
-
-    for branch in branches {
-        let Some((branch_type, values)) = scalar_schema_branch_for_kiro(branch) else {
-            return false;
-        };
-        if scalar_type.is_empty() {
-            scalar_type = branch_type;
-        } else if scalar_type != branch_type {
-            target.insert(
-                "type".to_string(),
-                serde_json::Value::String("string".to_string()),
-            );
-            add_schema_description_hint(
-                target,
-                "Compatible scalar types were simplified to string.",
-            );
-            if nullable {
-                add_schema_description_hint(target, "Nullable: null is also accepted.");
-            }
-            return true;
-        }
-
-        if values.is_empty() {
-            has_open_branch = true;
-            continue;
-        }
-        for value in values {
-            if !enum_values.contains(&value) {
-                enum_values.push(value);
-            }
-        }
-    }
-
-    if scalar_type.is_empty() {
-        return false;
-    }
-
-    target.insert("type".to_string(), serde_json::Value::String(scalar_type));
-    if !has_open_branch && !enum_values.is_empty() {
-        target.insert("enum".to_string(), serde_json::Value::Array(enum_values));
-    }
-    if nullable {
-        add_schema_description_hint(target, "Nullable: null is also accepted.");
-    }
-    true
-}
-
-fn scalar_schema_branch_for_kiro(
-    branch: &serde_json::Value,
-) -> Option<(String, Vec<serde_json::Value>)> {
-    let serde_json::Value::Object(obj) = branch else {
-        return None;
-    };
-
-    let scalar_type = obj
-        .get("type")
-        .and_then(|value| value.as_str())
-        .filter(|value| matches!(*value, "string" | "number" | "integer" | "boolean"))?
-        .to_string();
-
-    let mut values = Vec::new();
-    if let Some(serde_json::Value::Array(enum_values)) = obj.get("enum") {
-        values.extend(enum_values.iter().cloned());
-    }
-    if let Some(value) = obj.get("const") {
-        values.push(value.clone());
-    }
-    Some((scalar_type, values))
-}
-
-fn collapse_object_union_for_kiro(
-    target: &mut serde_json::Map<String, serde_json::Value>,
-    branches: &[serde_json::Value],
-    nullable: bool,
-) -> bool {
-    let mut merged_properties = serde_json::Map::new();
-    let mut saw_object_branch = false;
-
-    for branch in branches {
-        let serde_json::Value::Object(obj) = branch else {
-            return false;
-        };
-        if obj
-            .get("type")
-            .and_then(|value| value.as_str())
-            .is_some_and(|value| value != "object")
-        {
-            return false;
-        }
-        saw_object_branch = true;
-        if let Some(serde_json::Value::Object(properties)) = obj.get("properties") {
-            for (name, schema) in properties {
-                merged_properties
-                    .entry(name.clone())
-                    .or_insert_with(|| schema.clone());
-            }
-        }
-    }
-
-    if !saw_object_branch {
-        return false;
-    }
-
-    target.insert(
-        "type".to_string(),
-        serde_json::Value::String("object".to_string()),
-    );
-    target.insert(
-        "properties".to_string(),
-        serde_json::Value::Object(merged_properties),
-    );
-    add_schema_description_hint(target, "Alternative object shapes are accepted.");
-    if nullable {
-        add_schema_description_hint(target, "Nullable: null is also accepted.");
-    }
-    true
-}
-
-fn ensure_fallback_schema_type(obj: &mut serde_json::Map<String, serde_json::Value>) {
-    if obj.get("type").and_then(|value| value.as_str()).is_some() {
-        return;
-    }
-    let fallback_type = if obj.get("properties").is_some() {
-        "object"
-    } else {
-        "string"
-    };
-    obj.insert(
-        "type".to_string(),
-        serde_json::Value::String(fallback_type.to_string()),
-    );
 }
 
 fn add_schema_description_hint(obj: &mut serde_json::Map<String, serde_json::Value>, hint: &str) {
@@ -5208,7 +5037,7 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_tools_normalizes_nested_nullable_enum_anyof_schema() {
+    fn test_convert_tools_preserves_nested_nullable_enum_anyof_schema() {
         let tools = Some(vec![super::super::types::Tool {
             tool_type: None,
             name: "TaskUpdate".to_string(),
@@ -5241,28 +5070,31 @@ mod tests {
 
         let schema = &converted[0].tool_specification.input_schema.json;
         assert!(
-            !schema_contains_key(schema, "anyOf"),
-            "normalized schema must not retain anyOf: {schema}"
+            schema.pointer("/properties/status/anyOf").is_some(),
+            "nested anyOf is accepted upstream and should be preserved: {schema}"
         );
-        let status = schema
-            .pointer("/properties/status")
-            .expect("status property should exist");
         assert_eq!(
-            status.get("type").and_then(|value| value.as_str()),
+            schema
+                .pointer("/properties/status/anyOf/0/type")
+                .and_then(|value| value.as_str()),
             Some("string")
         );
         assert_eq!(
-            status
-                .get("enum")
+            schema
+                .pointer("/properties/status/anyOf/0/enum")
                 .and_then(|value| value.as_array())
                 .map(Vec::len),
             Some(3)
         );
+        assert_eq!(
+            schema
+                .pointer("/properties/status/anyOf/1/type")
+                .and_then(|value| value.as_str()),
+            Some("null")
+        );
         assert!(
-            status
-                .get("description")
-                .and_then(|value| value.as_str())
-                .is_some_and(|value| value.contains("Nullable"))
+            jsonschema::validator_for(schema).is_ok(),
+            "normalized schema should remain locally valid: {schema}"
         );
     }
 
@@ -5342,10 +5174,51 @@ mod tests {
             schema
                 .get("description")
                 .and_then(|value| value.as_str())
-                .is_some_and(|value| {
-                    value.contains("Original root schema type \"string\"")
-                        && value.contains("Nullable")
-                })
+                .is_some_and(|value| value.contains("Top-level JSON Schema union keywords"))
+        );
+    }
+
+    #[test]
+    fn test_convert_tools_strips_top_level_object_union_schema() {
+        let tools = Some(vec![super::super::types::Tool {
+            tool_type: None,
+            name: "RootUnionTool".to_string(),
+            description: "Tool with root anyOf schema".to_string(),
+            input_schema: HashMap::from([
+                ("type".to_string(), serde_json::json!("object")),
+                (
+                    "properties".to_string(),
+                    serde_json::json!({
+                        "value": {"type": "string"},
+                        "count": {"type": "integer"}
+                    }),
+                ),
+                (
+                    "anyOf".to_string(),
+                    serde_json::json!([
+                        {"required": ["value"]},
+                        {"required": ["count"]}
+                    ]),
+                ),
+            ]),
+            max_uses: None,
+            ..super::super::types::Tool::default()
+        }]);
+
+        let converted = convert_tools(&tools, &mut HashMap::new());
+
+        let schema = &converted[0].tool_specification.input_schema.json;
+        assert!(
+            schema.get("anyOf").is_none(),
+            "top-level anyOf is rejected upstream and must be removed: {schema}"
+        );
+        assert_eq!(
+            schema.get("type").and_then(|value| value.as_str()),
+            Some("object")
+        );
+        assert!(
+            schema.pointer("/properties/value").is_some(),
+            "root properties should be preserved when top-level union is removed: {schema}"
         );
     }
 
@@ -5395,6 +5268,52 @@ mod tests {
                 .get("description")
                 .and_then(|value| value.as_str())
                 .is_some_and(|value| value.contains("Nullable"))
+        );
+    }
+
+    #[test]
+    fn test_convert_tools_converts_draft_07_tuple_items_to_prefix_items() {
+        let tools = Some(vec![super::super::types::Tool {
+            tool_type: None,
+            name: "TupleTool".to_string(),
+            description: "Tool with draft-07 tuple items".to_string(),
+            input_schema: HashMap::from([
+                ("type".to_string(), serde_json::json!("object")),
+                (
+                    "properties".to_string(),
+                    serde_json::json!({
+                        "tuple": {
+                            "type": "array",
+                            "items": [
+                                {"type": "string"},
+                                {"type": "integer"}
+                            ]
+                        }
+                    }),
+                ),
+                ("required".to_string(), serde_json::json!(["tuple"])),
+            ]),
+            max_uses: None,
+            ..super::super::types::Tool::default()
+        }]);
+
+        let converted = convert_tools(&tools, &mut HashMap::new());
+
+        let schema = &converted[0].tool_specification.input_schema.json;
+        assert_eq!(
+            schema
+                .pointer("/properties/tuple/prefixItems")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            schema.pointer("/properties/tuple/items"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert!(
+            jsonschema::validator_for(schema).is_ok(),
+            "normalized schema should remain locally valid: {schema}"
         );
     }
 
@@ -5518,7 +5437,7 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_tools_strips_advanced_schema_keywords() {
+    fn test_convert_tools_preserves_upstream_accepted_advanced_schema_keywords() {
         let tools = Some(vec![super::super::types::Tool {
             tool_type: None,
             name: "AdvancedSchemaTool".to_string(),
@@ -5587,22 +5506,10 @@ mod tests {
             "not",
         ] {
             assert!(
-                !schema_contains_key(schema, key),
-                "advanced keyword {key} should be stripped: {schema}"
+                schema_contains_key(schema, key),
+                "upstream-accepted keyword {key} should be preserved: {schema}"
             );
         }
-        assert!(
-            schema
-                .pointer("/properties/mode/description")
-                .and_then(|value| value.as_str())
-                .is_some_and(|value| value.contains("Default value metadata"))
-        );
-        assert!(
-            schema
-                .pointer("/properties/labels/description")
-                .and_then(|value| value.as_str())
-                .is_some_and(|value| value.contains("Advanced JSON Schema constraints"))
-        );
         assert!(
             jsonschema::validator_for(schema).is_ok(),
             "normalized schema should remain locally valid: {schema}"
