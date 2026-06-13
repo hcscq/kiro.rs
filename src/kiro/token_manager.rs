@@ -620,6 +620,51 @@ async fn discover_available_profile_arn(
     Ok(response.selected_profile_arn(region))
 }
 
+fn is_enterprise_model_access_denied_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("not authorized to make this call")
+        || lower.contains("feature_not_supported")
+        || lower.contains("权限不足")
+}
+
+async fn validate_enterprise_model_access_on_import(
+    credentials: &mut KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<()> {
+    if credentials.detected_auth_account_type().as_deref() != Some("enterprise") {
+        return Ok(());
+    }
+
+    let response = match list_available_models(credentials, config, token, None, proxy).await {
+        Ok(response) => response,
+        Err(err) => {
+            let message = err.to_string();
+            if is_enterprise_model_access_denied_error(&message) {
+                bail!("Enterprise 凭据没有 Kiro 模型调用权限: {}", message);
+            }
+            bail!("Enterprise 凭据模型授权验证失败: {}", message);
+        }
+    };
+
+    let model_ids = response.model_ids();
+    if model_ids.is_empty() {
+        bail!("Enterprise 凭据没有返回可用模型，无法确认 Kiro 模型调用权限");
+    }
+
+    let model_count = model_ids.len();
+    credentials.available_model_ids = model_ids;
+    credentials.available_models_cached_at = Some(Utc::now().to_rfc3339());
+    credentials.normalize_model_capabilities();
+    tracing::info!(
+        model_count,
+        "Enterprise 凭据已通过 ListAvailableModels 验证模型授权"
+    );
+
+    Ok(())
+}
+
 /// 获取使用额度信息
 pub(crate) async fn get_usage_limits(
     credentials: &KiroCredentials,
@@ -7906,29 +7951,6 @@ impl MultiTokenManager {
         let mut validated_cred =
             refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?;
 
-        // 5. 写入前重新检查一次，避免并发添加时插入重复凭据
-        let _state_write_guard = self.state_write_lock.lock();
-        let mut persisted = self.persisted_credentials_snapshot();
-        let duplicate_exists = persisted.iter().any(|credential| {
-            credential
-                .refresh_token
-                .as_deref()
-                .map(sha256_hex)
-                .as_deref()
-                == Some(new_refresh_token_hash.as_str())
-        });
-        if duplicate_exists {
-            anyhow::bail!("凭据已存在（refreshToken 重复）");
-        }
-
-        let new_id = persisted
-            .iter()
-            .filter_map(|credential| credential.id)
-            .max()
-            .unwrap_or(0)
-            + 1;
-
-        validated_cred.id = Some(new_id);
         validated_cred.priority = new_cred.priority;
         validated_cred.provider = new_cred.provider;
         if import_is_enterprise {
@@ -7974,6 +7996,43 @@ impl MultiTokenManager {
         Self::clear_disabled_metadata(&mut validated_cred);
         validated_cred.normalize_model_capabilities();
 
+        if import_is_enterprise {
+            let token = validated_cred
+                .access_token
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("没有可用的 accessToken"))?;
+            validate_enterprise_model_access_on_import(
+                &mut validated_cred,
+                &self.config,
+                &token,
+                effective_proxy.as_ref(),
+            )
+            .await?;
+        }
+
+        // 5. 写入前重新检查一次，避免并发添加时插入重复凭据
+        let _state_write_guard = self.state_write_lock.lock();
+        let mut persisted = self.persisted_credentials_snapshot();
+        let duplicate_exists = persisted.iter().any(|credential| {
+            credential
+                .refresh_token
+                .as_deref()
+                .map(sha256_hex)
+                .as_deref()
+                == Some(new_refresh_token_hash.as_str())
+        });
+        if duplicate_exists {
+            anyhow::bail!("凭据已存在（refreshToken 重复）");
+        }
+
+        let new_id = persisted
+            .iter()
+            .filter_map(|credential| credential.id)
+            .max()
+            .unwrap_or(0)
+            + 1;
+
+        validated_cred.id = Some(new_id);
         persisted.push(validated_cred.clone());
         self.persist_credentials_snapshot(&persisted)?;
 
@@ -11624,6 +11683,19 @@ mod tests {
             ),
             "a saved Enterprise profileArn can be stale and must not suppress rediscovery"
         );
+    }
+
+    #[test]
+    fn test_enterprise_import_model_access_denied_error_detection() {
+        assert!(is_enterprise_model_access_denied_error(
+            "权限不足，无法获取可用模型列表: status=403 message=\"Your account is not authorized to make this call.\""
+        ));
+        assert!(is_enterprise_model_access_denied_error(
+            "status=403 reason=FEATURE_NOT_SUPPORTED message=\"FEATURE_NOT_SUPPORTED\""
+        ));
+        assert!(!is_enterprise_model_access_denied_error(
+            "请求过于频繁，已被限流: status=429"
+        ));
     }
 
     #[tokio::test]
