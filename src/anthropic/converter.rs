@@ -1072,6 +1072,7 @@ fn get_document_format(media_type: &str) -> Option<&'static str> {
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => Some("xlsx"),
         "text/html" => Some("html"),
         "text/plain" => Some("txt"),
+        "text/x-chdr" => Some("txt"),
         "text/markdown" => Some("md"),
         _ => None,
     }
@@ -1087,7 +1088,7 @@ fn get_document_format_from_extension(name: &str) -> Option<&'static str> {
         "xls" => Some("xls"),
         "xlsx" => Some("xlsx"),
         "html" | "htm" => Some("html"),
-        "txt" => Some("txt"),
+        "txt" | "h" => Some("txt"),
         "md" | "markdown" => Some("md"),
         _ => None,
     }
@@ -4237,6 +4238,56 @@ mod tests {
         assert_eq!(documents[0].source.bytes, "U0tRRFlHREY=");
         assert!(tool_results.is_empty());
         assert!(text.contains("What text does this document contain?"));
+    }
+
+    #[test]
+    fn test_process_message_content_maps_header_documents_to_txt() {
+        assert_eq!(
+            document_format_for_media_or_name(Some("text/x-chdr; charset=utf-8"), None),
+            Some("txt".to_string())
+        );
+        assert_eq!(
+            document_format_for_media_or_name(None, Some("header.h")),
+            Some("txt".to_string())
+        );
+        assert!(
+            document_format_for_media_or_name(Some("application/zip"), Some("archive.zip"))
+                .is_none()
+        );
+
+        let content = serde_json::Value::Array(vec![
+            serde_json::json!({
+                "type": "document",
+                "title": "header.h",
+                "source": {
+                    "type": "base64",
+                    "media_type": "text/x-chdr",
+                    "data": "I3ByYWdtYSBvbmNlCg=="
+                }
+            }),
+            serde_json::json!({
+                "type": "document_url",
+                "document_url": {
+                    "name": "header-url.h",
+                    "mimeType": "text/x-chdr",
+                    "data": "I2RlZmluZSBPSyAxCg=="
+                }
+            }),
+        ]);
+
+        let (text, images, documents, tool_results) =
+            process_message_content(&content).expect("header documents should convert");
+
+        assert!(text.is_empty());
+        assert!(images.is_empty());
+        assert!(tool_results.is_empty());
+        assert_eq!(documents.len(), 2);
+        assert_eq!(documents[0].name, "header");
+        assert_eq!(documents[0].format, "txt");
+        assert_eq!(documents[0].source.bytes, "I3ByYWdtYSBvbmNlCg==");
+        assert_eq!(documents[1].name, "header-url");
+        assert_eq!(documents[1].format, "txt");
+        assert_eq!(documents[1].source.bytes, "I2RlZmluZSBPSyAxCg==");
     }
 
     #[test]

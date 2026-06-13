@@ -862,7 +862,7 @@ fn document_media_type_from_extension(name: &str) -> Option<&'static str> {
         "xls" => Some("application/vnd.ms-excel"),
         "xlsx" => Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
         "html" | "htm" => Some("text/html"),
-        "txt" => Some("text/plain"),
+        "txt" | "h" => Some("text/plain"),
         "md" | "markdown" => Some("text/markdown"),
         _ => None,
     }
@@ -944,6 +944,7 @@ fn supported_document_media_type(media_type: &str) -> Option<&'static str> {
         }
         "text/html" => Some("text/html"),
         "text/plain" => Some("text/plain"),
+        "text/x-chdr" => Some("text/plain"),
         "text/markdown" => Some("text/markdown"),
         _ => None,
     }
@@ -1056,6 +1057,58 @@ mod tests {
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         );
         assert_eq!(block["document_url"]["data"], "UEsDBA==");
+    }
+
+    #[test]
+    fn test_header_document_media_type_normalizes_to_text_plain() {
+        assert_eq!(
+            supported_document_media_type("text/x-chdr; charset=utf-8"),
+            Some("text/plain")
+        );
+        assert_eq!(
+            document_media_type_from_extension("/workspace/include/header.h"),
+            Some("text/plain")
+        );
+        assert_eq!(
+            select_document_media_type(None, Some("text/x-chdr"), "/workspace/include/header.h")
+                .expect("header MIME should normalize"),
+            "text/plain"
+        );
+        assert!(supported_document_media_type("application/zip").is_none());
+        assert!(
+            select_document_media_type(
+                Some("application/zip"),
+                Some("application/zip"),
+                "/tmp/archive.zip"
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_normalize_openai_image_url_header_data_url_as_text_document() {
+        let mut req = request_with_content(serde_json::json!([
+            {
+                "type":"image_url",
+                "image_url":{
+                    "url":"data:text/x-chdr;base64,I3ByYWdtYSBvbmNlCg==",
+                    "name":"header.h"
+                }
+            }
+        ]));
+
+        let stats = normalize_multimodal_urls(&mut req)
+            .await
+            .expect("header file in image_url should normalize as text document");
+
+        assert_eq!(stats.openai_image_url_blocks, 1);
+        assert_eq!(stats.image_url_document_blocks, 1);
+        assert_eq!(stats.data_url_documents, 1);
+        let block = &req.messages[0].content.as_array().unwrap()[0];
+        assert_eq!(block["type"], "document_url");
+        assert_eq!(block["document_url"]["name"], "header.h");
+        assert_eq!(block["document_url"]["mimeType"], "text/plain");
+        assert_eq!(block["document_url"]["data"], "I3ByYWdtYSBvbmNlCg==");
     }
 
     #[tokio::test]
