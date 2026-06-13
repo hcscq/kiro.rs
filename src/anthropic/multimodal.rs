@@ -28,6 +28,7 @@ pub(crate) struct MultimodalNormalizeStats {
     pub remote_documents: usize,
     pub data_url_documents: usize,
     pub openai_image_url_blocks: usize,
+    pub image_url_document_blocks: usize,
     pub anthropic_url_blocks: usize,
     pub document_url_blocks: usize,
     pub anthropic_document_url_blocks: usize,
@@ -83,11 +84,32 @@ async fn normalize_content_block(
 
     match obj.get("type").and_then(Value::as_str) {
         Some("image_url") => {
-            let reference = openai_image_url_reference(obj)?;
-            let source = image_reference_to_base64_source(reference, None, client, stats).await?;
-            obj.insert("type".to_string(), Value::String("image".to_string()));
+            let reference = openai_image_url_reference(obj)?.to_string();
+            let normalized =
+                openai_image_url_reference_to_block(&reference, obj, client, stats).await?;
             obj.remove("image_url");
-            obj.insert("source".to_string(), Value::Object(source));
+            match normalized {
+                OpenAiImageUrlBlock::Image(source) => {
+                    obj.insert("type".to_string(), Value::String("image".to_string()));
+                    obj.insert("source".to_string(), Value::Object(source));
+                }
+                OpenAiImageUrlBlock::Document {
+                    media_type,
+                    data,
+                    name,
+                } => {
+                    let mut document_url = Map::new();
+                    document_url.insert("data".to_string(), Value::String(data));
+                    document_url.insert("mimeType".to_string(), Value::String(media_type));
+                    document_url.insert("name".to_string(), Value::String(name));
+                    obj.insert(
+                        "type".to_string(),
+                        Value::String("document_url".to_string()),
+                    );
+                    obj.insert("document_url".to_string(), Value::Object(document_url));
+                    stats.image_url_document_blocks += 1;
+                }
+            }
             stats.openai_image_url_blocks += 1;
         }
         Some("image") => {
@@ -217,6 +239,51 @@ async fn normalize_content_block(
     Ok(())
 }
 
+enum OpenAiImageUrlBlock {
+    Image(Map<String, Value>),
+    Document {
+        media_type: String,
+        data: String,
+        name: String,
+    },
+}
+
+async fn openai_image_url_reference_to_block(
+    reference: &str,
+    obj: &Map<String, Value>,
+    client: &reqwest::Client,
+    stats: &mut MultimodalNormalizeStats,
+) -> Result<OpenAiImageUrlBlock, MultimodalNormalizeError> {
+    let reference = reference.trim();
+    if let Some((media_type, data)) = parse_image_data_url(reference)
+        .or_else(|image_err| parse_document_data_url(reference).map_err(|_| image_err))?
+    {
+        if supported_image_media_type(&media_type).is_some() {
+            stats.data_url_images += 1;
+            let mut source = Map::new();
+            source.insert("type".to_string(), Value::String("base64".to_string()));
+            source.insert("media_type".to_string(), Value::String(media_type));
+            source.insert("data".to_string(), Value::String(data));
+            return Ok(OpenAiImageUrlBlock::Image(source));
+        }
+
+        stats.data_url_documents += 1;
+        let name = document_name_for_image_url(obj, reference, &media_type);
+        return Ok(OpenAiImageUrlBlock::Document {
+            media_type,
+            data,
+            name,
+        });
+    }
+
+    let fetched = fetch_remote_image_or_document(reference, client).await?;
+    match fetched {
+        OpenAiImageUrlBlock::Image(_) => stats.remote_images += 1,
+        OpenAiImageUrlBlock::Document { .. } => stats.remote_documents += 1,
+    }
+    Ok(fetched)
+}
+
 async fn document_reference_to_base64(
     reference: &str,
     declared_media_type: Option<String>,
@@ -269,6 +336,95 @@ async fn image_reference_to_base64_source(
     source.insert("media_type".to_string(), Value::String(media_type));
     source.insert("data".to_string(), Value::String(data));
     Ok(source)
+}
+
+async fn fetch_remote_image_or_document(
+    url: &str,
+    client: &reqwest::Client,
+) -> Result<OpenAiImageUrlBlock, MultimodalNormalizeError> {
+    let mut current = parse_and_validate_remote_image_url(url).await?;
+
+    for redirect_count in 0..=MAX_IMAGE_REDIRECTS {
+        let response = client
+            .get(current.clone())
+            .header(
+                ACCEPT,
+                "image/png,image/jpeg,image/gif,image/webp,application/pdf,text/csv,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/html,text/plain,text/markdown",
+            )
+            .send()
+            .await
+            .map_err(|err| {
+                MultimodalNormalizeError::new(format!("failed to fetch image: {err}"))
+            })?;
+
+        if response.status().is_redirection() {
+            if redirect_count == MAX_IMAGE_REDIRECTS {
+                return Err(MultimodalNormalizeError::new(
+                    "image URL redirected too many times",
+                ));
+            }
+            let location = response
+                .headers()
+                .get(LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| {
+                    MultimodalNormalizeError::new("image URL redirect missing Location header")
+                })?;
+            current = current.join(location).map_err(|err| {
+                MultimodalNormalizeError::new(format!("invalid image redirect URL: {err}"))
+            })?;
+            validate_remote_image_url(&current).await?;
+            continue;
+        }
+
+        if !response.status().is_success() {
+            return Err(MultimodalNormalizeError::new(format!(
+                "image URL returned HTTP {}",
+                response.status()
+            )));
+        }
+
+        let raw_header_media_type = raw_content_type_media_type(response.headers());
+        let bytes = read_limited_response_body(response, MAX_REMOTE_IMAGE_BYTES, "image").await?;
+        if let Ok(media_type) =
+            select_image_media_type(None, raw_header_media_type.as_deref(), &bytes)
+        {
+            let mut source = Map::new();
+            source.insert("type".to_string(), Value::String("base64".to_string()));
+            source.insert("media_type".to_string(), Value::String(media_type));
+            source.insert(
+                "data".to_string(),
+                Value::String(BASE64_STANDARD.encode(bytes)),
+            );
+            return Ok(OpenAiImageUrlBlock::Image(source));
+        }
+
+        let url_path = current.path().to_string();
+        if let Ok(media_type) =
+            select_document_media_type(None, raw_header_media_type.as_deref(), &url_path)
+        {
+            if bytes.len() > MAX_REMOTE_DOCUMENT_BYTES {
+                return Err(MultimodalNormalizeError::new(
+                    "document URL body is too large",
+                ));
+            }
+            let name = document_name_from_url_or_media_type(&current, &media_type);
+            return Ok(OpenAiImageUrlBlock::Document {
+                media_type,
+                data: BASE64_STANDARD.encode(bytes),
+                name,
+            });
+        }
+
+        return Err(unsupported_remote_image_error(
+            raw_header_media_type.as_deref(),
+            &bytes,
+        ));
+    }
+
+    Err(MultimodalNormalizeError::new(
+        "image URL redirected too many times",
+    ))
 }
 
 fn parse_image_data_url(
@@ -712,6 +868,61 @@ fn document_media_type_from_extension(name: &str) -> Option<&'static str> {
     }
 }
 
+fn document_name_for_image_url(
+    obj: &Map<String, Value>,
+    reference: &str,
+    media_type: &str,
+) -> String {
+    obj.get("image_url")
+        .and_then(Value::as_object)
+        .and_then(|image_url| {
+            image_url
+                .get("name")
+                .or_else(|| image_url.get("filename"))
+                .or_else(|| image_url.get("file_name"))
+        })
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| document_name_from_reference(reference))
+        .unwrap_or_else(|| default_document_name_for_media_type(media_type))
+}
+
+fn document_name_from_reference(reference: &str) -> Option<String> {
+    let url = Url::parse(reference).ok()?;
+    url.path_segments()?
+        .rev()
+        .find(|segment| !segment.trim().is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn document_name_from_url_or_media_type(url: &Url, media_type: &str) -> String {
+    url.path_segments()
+        .and_then(|segments| {
+            segments
+                .rev()
+                .find(|segment| !segment.trim().is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| default_document_name_for_media_type(media_type))
+}
+
+fn default_document_name_for_media_type(media_type: &str) -> String {
+    let extension = match supported_document_media_type(media_type).unwrap_or("text/plain") {
+        "application/pdf" => "pdf",
+        "text/csv" => "csv",
+        "application/msword" => "doc",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => "docx",
+        "application/vnd.ms-excel" => "xls",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => "xlsx",
+        "text/html" => "html",
+        "text/markdown" => "md",
+        _ => "txt",
+    };
+    format!("document.{extension}")
+}
+
 fn supported_document_media_type(media_type: &str) -> Option<&'static str> {
     match media_type
         .split(';')
@@ -814,6 +1025,37 @@ mod tests {
         assert_eq!(block["source"]["type"], "base64");
         assert_eq!(block["source"]["media_type"], "image/jpeg");
         assert_eq!(block["source"]["data"], "aGVsbG8=");
+    }
+
+    #[tokio::test]
+    async fn test_normalize_openai_image_url_document_data_url() {
+        let mut req = request_with_content(serde_json::json!([
+            {
+                "type":"image_url",
+                "image_url":{
+                    "url":"data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64,UEsDBA==",
+                    "name":"Spec.docx"
+                }
+            }
+        ]));
+
+        let stats = normalize_multimodal_urls(&mut req)
+            .await
+            .expect("supported document in image_url should normalize");
+
+        assert_eq!(stats.openai_image_url_blocks, 1);
+        assert_eq!(stats.image_url_document_blocks, 1);
+        assert_eq!(stats.data_url_documents, 1);
+        assert_eq!(stats.data_url_images, 0);
+        let block = &req.messages[0].content.as_array().unwrap()[0];
+        assert_eq!(block["type"], "document_url");
+        assert!(block.get("image_url").is_none());
+        assert_eq!(block["document_url"]["name"], "Spec.docx");
+        assert_eq!(
+            block["document_url"]["mimeType"],
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        );
+        assert_eq!(block["document_url"]["data"], "UEsDBA==");
     }
 
     #[tokio::test]

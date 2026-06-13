@@ -531,6 +531,7 @@ async fn normalize_multimodal_payload(
                 || stats.remote_documents > 0
                 || stats.data_url_documents > 0
                 || stats.openai_image_url_blocks > 0
+                || stats.image_url_document_blocks > 0
                 || stats.anthropic_url_blocks > 0
                 || stats.document_url_blocks > 0
                 || stats.anthropic_document_url_blocks > 0
@@ -542,6 +543,7 @@ async fn normalize_multimodal_payload(
                     remote_documents = stats.remote_documents,
                     data_url_documents = stats.data_url_documents,
                     openai_image_url_blocks = stats.openai_image_url_blocks,
+                    image_url_document_blocks = stats.image_url_document_blocks,
                     anthropic_url_blocks = stats.anthropic_url_blocks,
                     document_url_blocks = stats.document_url_blocks,
                     anthropic_document_url_blocks = stats.anthropic_document_url_blocks,

@@ -407,6 +407,8 @@ fn normalize_schema_object_for_kiro(obj: &mut serde_json::Map<String, serde_json
 }
 
 fn normalize_schema_object_shape_for_kiro(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    normalize_schema_type_names_for_kiro(obj);
+
     if obj.contains_key("properties")
         && !obj.get("properties").is_some_and(|value| value.is_object())
     {
@@ -445,6 +447,43 @@ fn normalize_schema_object_shape_for_kiro(obj: &mut serde_json::Map<String, serd
     }
 
     normalize_draft_07_tuple_items_for_kiro(obj);
+}
+
+fn normalize_schema_type_names_for_kiro(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    let Some(schema_type) = obj.get_mut("type") else {
+        return;
+    };
+
+    match schema_type {
+        serde_json::Value::String(type_name) => {
+            if let Some(normalized) = normalize_json_schema_type_name(type_name) {
+                *type_name = normalized.to_string();
+            }
+        }
+        serde_json::Value::Array(type_names) => {
+            for type_name in type_names {
+                if let serde_json::Value::String(type_name) = type_name
+                    && let Some(normalized) = normalize_json_schema_type_name(type_name)
+                {
+                    *type_name = normalized.to_string();
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_json_schema_type_name(type_name: &str) -> Option<&'static str> {
+    match type_name.trim().to_ascii_lowercase().as_str() {
+        "object" => Some("object"),
+        "string" => Some("string"),
+        "number" => Some("number"),
+        "integer" => Some("integer"),
+        "boolean" => Some("boolean"),
+        "array" => Some("array"),
+        "null" => Some("null"),
+        _ => None,
+    }
 }
 
 fn normalize_draft_07_tuple_items_for_kiro(obj: &mut serde_json::Map<String, serde_json::Value>) {
@@ -5261,6 +5300,101 @@ mod tests {
                 .pointer("/properties/status/anyOf/1/type")
                 .and_then(|value| value.as_str()),
             Some("null")
+        );
+        assert!(
+            jsonschema::validator_for(schema).is_ok(),
+            "normalized schema should remain locally valid: {schema}"
+        );
+    }
+
+    #[test]
+    fn test_convert_tools_normalizes_uppercase_schema_types_recursively() {
+        let tools = Some(vec![super::super::types::Tool {
+            tool_type: None,
+            name: "UppercaseTypes".to_string(),
+            description: "Tool with Gemini-style uppercase schema types".to_string(),
+            input_schema: HashMap::from([
+                ("type".to_string(), serde_json::json!("OBJECT")),
+                (
+                    "properties".to_string(),
+                    serde_json::json!({
+                        "path": {"type": "STRING"},
+                        "count": {"type": "NUMBER"},
+                        "enabled": {"type": "BOOLEAN"},
+                        "items": {
+                            "type": "ARRAY",
+                            "items": {"type": ["STRING", "NULL"]}
+                        },
+                        "options": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "mode": {"type": "STRING"}
+                            },
+                            "required": ["mode"],
+                            "additionalProperties": false
+                        }
+                    }),
+                ),
+                ("required".to_string(), serde_json::json!(["path"])),
+            ]),
+            max_uses: None,
+            ..super::super::types::Tool::default()
+        }]);
+
+        let converted = convert_tools(&tools, &mut HashMap::new());
+        let schema = &converted[0].tool_specification.input_schema.json;
+
+        assert_eq!(
+            schema.pointer("/type").and_then(|value| value.as_str()),
+            Some("object")
+        );
+        assert_eq!(
+            schema
+                .pointer("/properties/path/type")
+                .and_then(|value| value.as_str()),
+            Some("string")
+        );
+        assert_eq!(
+            schema
+                .pointer("/properties/count/type")
+                .and_then(|value| value.as_str()),
+            Some("number")
+        );
+        assert_eq!(
+            schema
+                .pointer("/properties/enabled/type")
+                .and_then(|value| value.as_str()),
+            Some("boolean")
+        );
+        assert_eq!(
+            schema
+                .pointer("/properties/items/type")
+                .and_then(|value| value.as_str()),
+            Some("array")
+        );
+        assert_eq!(
+            schema
+                .pointer("/properties/items/items/type/0")
+                .and_then(|value| value.as_str()),
+            Some("string")
+        );
+        assert_eq!(
+            schema
+                .pointer("/properties/items/items/type/1")
+                .and_then(|value| value.as_str()),
+            Some("null")
+        );
+        assert_eq!(
+            schema
+                .pointer("/properties/options/type")
+                .and_then(|value| value.as_str()),
+            Some("object")
+        );
+        assert_eq!(
+            schema
+                .pointer("/properties/options/properties/mode/type")
+                .and_then(|value| value.as_str()),
+            Some("string")
         );
         assert!(
             jsonschema::validator_for(schema).is_ok(),
