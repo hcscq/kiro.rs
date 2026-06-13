@@ -71,6 +71,8 @@ interface VerificationResult {
   rollbackError?: string
 }
 
+const KAM_DEFAULT_AUTH_REGION = 'us-east-1'
+
 
 function getString(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined
@@ -141,6 +143,21 @@ function normalizeProvider(provider?: string): string | undefined {
 
 function isEnterpriseProvider(provider?: string): boolean {
   return provider?.trim().toLowerCase() === 'enterprise'
+}
+
+function resolveKamRegions(
+  cred: KamAccount['credentials'],
+  enterprise: boolean
+): { region: string | undefined; authRegion: string | undefined; apiRegion: string | undefined } {
+  const region = cred.region?.trim() || undefined
+  const explicitAuthRegion = cred.authRegion?.trim() || undefined
+  const explicitApiRegion = cred.apiRegion?.trim() || undefined
+
+  return {
+    region,
+    authRegion: explicitAuthRegion || (enterprise ? KAM_DEFAULT_AUTH_REGION : region),
+    apiRegion: explicitApiRegion || region,
+  }
 }
 
 
@@ -421,11 +438,9 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           const clientSecret = cred.clientSecret?.trim() || undefined
           const provider = normalizeProvider(account.provider)
           const authMethod = clientId && clientSecret ? 'idc' : 'social'
-          const kamRegion = cred.region?.trim() || undefined
-          const authRegion = cred.authRegion?.trim() || kamRegion || undefined
-          const apiRegion = cred.apiRegion?.trim() || kamRegion || undefined
           const startUrl = cred.startUrl?.trim() || undefined
           const enterprise = isEnterpriseProvider(provider)
+          const { region: kamRegion, authRegion, apiRegion } = resolveKamRegions(cred, enterprise)
           const profileArn = account.profileArn?.trim() || cred.profileArn?.trim() || undefined
           const availableModelIds = extractAvailableModelIds(account)
           const maxConcurrency =
@@ -691,7 +706,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
               </div>
             </div>
             <textarea
-              placeholder={'粘贴 Kiro Account Manager 导出的 JSON\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "userId": "...",\n    "provider": "Enterprise",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "us-east-1",\n    "startUrl": "https://example.awsapps.com/start",\n    "accountType": "power",\n    "maxConcurrency": 20\n  }\n]\n\n（可选的 authMethod 字段会被忽略，系统会根据 clientId/clientSecret 自动判断）\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "provider": "Enterprise",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "us-east-1",\n        "startUrl": "https://example.awsapps.com/start"\n      }\n    }\n  ]\n}'}
+              placeholder={'粘贴 Kiro Account Manager 导出的 JSON\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "userId": "...",\n    "provider": "Enterprise",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "eu-central-1",\n    "authRegion": "us-east-1",\n    "startUrl": "https://example.awsapps.com/start",\n    "accountType": "power",\n    "maxConcurrency": 20\n  }\n]\n\n（可选的 authMethod 字段会被忽略，系统会根据 clientId/clientSecret 自动判断；未提供 authRegion 时，Enterprise 默认使用 us-east-1 进行 OIDC 刷新）\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "provider": "Enterprise",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "eu-central-1",\n        "authRegion": "us-east-1",\n        "startUrl": "https://example.awsapps.com/start"\n      }\n    }\n  ]\n}'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}
