@@ -25,6 +25,7 @@
 mod body_budget;
 mod conversion_runtime;
 mod converter;
+mod diagnostics;
 mod extractor;
 mod handlers;
 mod middleware;

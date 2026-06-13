@@ -28,6 +28,7 @@ use uuid::Uuid;
 
 use super::conversion_runtime::{ConversionRuntime, ConversionRuntimeError};
 use super::converter::{ConversionError, ConversionResult};
+use super::diagnostics;
 use super::extractor::AnthropicJson;
 use super::middleware::{ANTHROPIC_RUNTIME_LEADER_REQUIRED_HEADER, AppState};
 use super::multimodal;
@@ -520,6 +521,8 @@ pub(crate) fn map_provider_error(err: Error) -> Response {
 async fn normalize_multimodal_payload(
     payload: &mut MessagesRequest,
     request_id: &str,
+    route: &'static str,
+    original_body_bytes: usize,
 ) -> Result<(), Response> {
     match multimodal::normalize_multimodal_urls(payload).await {
         Ok(stats) => {
@@ -549,6 +552,13 @@ async fn normalize_multimodal_payload(
         }
         Err(err) => {
             tracing::warn!(request_id = %request_id, error = %err, "多模态归一化失败");
+            diagnostics::capture_invalid_multimodal_request(
+                request_id,
+                route,
+                payload,
+                original_body_bytes,
+                &err.to_string(),
+            );
             Err((
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse::new(
@@ -1050,7 +1060,9 @@ pub async fn post_messages(
 
     pre_upstream_trace.mark_stage_started("normalize_multimodal");
     let normalize_started_at = Instant::now();
-    if let Err(response) = normalize_multimodal_payload(&mut payload, &request_id).await {
+    if let Err(response) =
+        normalize_multimodal_payload(&mut payload, &request_id, "messages", body_bytes).await
+    {
         pre_upstream_trace.mark_terminal("normalize_multimodal_failed");
         return response;
     }
@@ -2506,7 +2518,9 @@ pub async fn post_messages_cc(
 
     pre_upstream_trace.mark_stage_started("normalize_multimodal");
     let normalize_started_at = Instant::now();
-    if let Err(response) = normalize_multimodal_payload(&mut payload, &request_id).await {
+    if let Err(response) =
+        normalize_multimodal_payload(&mut payload, &request_id, "cc_messages", body_bytes).await
+    {
         pre_upstream_trace.mark_terminal("normalize_multimodal_failed");
         return response;
     }

@@ -8,6 +8,7 @@ use futures::StreamExt;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, LOCATION};
 use reqwest::redirect::Policy;
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use tokio::net::lookup_host;
 use url::Url;
 
@@ -399,13 +400,18 @@ async fn fetch_remote_image(
             )));
         }
 
-        let header_media_type = content_type_media_type(response.headers());
+        let raw_header_media_type = raw_content_type_media_type(response.headers());
+        let header_media_type = raw_header_media_type
+            .as_deref()
+            .and_then(supported_image_media_type)
+            .map(str::to_string);
         let bytes = read_limited_response_body(response, MAX_REMOTE_IMAGE_BYTES, "image").await?;
         let media_type = select_image_media_type(
             declared_media_type.as_deref(),
             header_media_type.as_deref(),
             &bytes,
-        )?;
+        )
+        .map_err(|_| unsupported_remote_image_error(raw_header_media_type.as_deref(), &bytes))?;
         return Ok((media_type, BASE64_STANDARD.encode(bytes)));
     }
 
@@ -614,10 +620,6 @@ fn raw_content_type_media_type(headers: &HeaderMap) -> Option<String> {
         .map(str::to_ascii_lowercase)
 }
 
-fn content_type_media_type(headers: &HeaderMap) -> Option<String> {
-    raw_content_type_media_type(headers).filter(|value| supported_image_media_type(value).is_some())
-}
-
 fn select_image_media_type(
     declared: Option<&str>,
     header: Option<&str>,
@@ -635,6 +637,33 @@ fn select_image_media_type(
     Err(MultimodalNormalizeError::new(
         "image URL did not contain a supported png/jpeg/gif/webp image",
     ))
+}
+
+fn unsupported_remote_image_error(
+    raw_content_type: Option<&str>,
+    bytes: &[u8],
+) -> MultimodalNormalizeError {
+    MultimodalNormalizeError::new(format!(
+        "image URL did not contain a supported png/jpeg/gif/webp image (response_content_type={}, response_body_bytes={}, response_body_sha256_prefix={}, response_first_bytes_hex={})",
+        raw_content_type.unwrap_or("unknown"),
+        bytes.len(),
+        sha256_hex_prefix(bytes, 16),
+        first_bytes_hex(bytes, 16)
+    ))
+}
+
+fn sha256_hex_prefix(bytes: &[u8], chars: usize) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let hash = hex::encode(hasher.finalize());
+    hash.chars().take(chars).collect()
+}
+
+fn first_bytes_hex(bytes: &[u8], max_bytes: usize) -> String {
+    if bytes.is_empty() {
+        return "empty".to_string();
+    }
+    hex::encode(&bytes[..bytes.len().min(max_bytes)])
 }
 
 fn detect_image_media_type(bytes: &[u8]) -> Option<String> {
@@ -859,5 +888,16 @@ mod tests {
             .expect_err("private URL should be rejected");
 
         assert!(err.to_string().contains("private or reserved"));
+    }
+
+    #[test]
+    fn test_unsupported_remote_image_error_includes_bounded_response_context() {
+        let err = unsupported_remote_image_error(Some("text/html"), b"<html>no image</html>");
+        let message = err.to_string();
+
+        assert!(message.contains("response_content_type=text/html"));
+        assert!(message.contains("response_body_bytes=21"));
+        assert!(message.contains("response_body_sha256_prefix="));
+        assert!(message.contains("response_first_bytes_hex=3c68746d6c3e6e6f20696d6167653c"));
     }
 }
