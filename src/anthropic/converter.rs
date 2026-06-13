@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{BufReader, Cursor};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::LazyLock;
 use std::time::Instant;
 
 use base64::Engine;
@@ -14,6 +15,7 @@ use image::codecs::gif::GifDecoder;
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
 use image::{AnimationDecoder, GenericImageView, Rgba, RgbaImage};
+use regex::Regex;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -571,6 +573,12 @@ const KIRO_IMAGE_JPEG_QUALITY: u8 = 85;
 const KIRO_GIF_MAX_OUTPUT_FRAMES: usize = 5;
 const KIRO_GIF_SAMPLE_INTERVAL_MS: u64 = 500;
 const KIRO_GIF_MIN_FRAME_DELAY_MS: u64 = 20;
+static EMBEDDED_IMAGE_DATA_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)data:image/(png|jpe?g|gif|webp)(?:;[a-z0-9!#$&^_.+-]+(?:=[^;,\s]+)?)*;base64,([A-Za-z0-9+/=]+)",
+    )
+        .expect("embedded image data URL regex must compile")
+});
 
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 ///
@@ -1396,6 +1404,81 @@ fn dedupe_documents_across_conversation(
     Ok(())
 }
 
+fn kiro_image_format_from_data_url_suffix(suffix: &str) -> String {
+    match suffix.to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" => "jpeg".to_string(),
+        "png" => "png".to_string(),
+        "gif" => "gif".to_string(),
+        "webp" => "webp".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn embedded_image_placeholder(format: &str, data: &str, output_image_count: usize) -> String {
+    let decoded_bytes = base64_decoded_len(data)
+        .map(|bytes| bytes.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let mut hasher = Sha256::new();
+    hasher.update(data.as_bytes());
+    let hash = hex::encode(hasher.finalize());
+    let hash_prefix = &hash[..16];
+
+    format!(
+        "[Embedded {format} image extracted from text into Kiro image attachment: decoded_bytes={decoded_bytes}, sha256_prefix={hash_prefix}, output_images={output_image_count}]"
+    )
+}
+
+fn extract_embedded_image_data_urls_from_text(text: &str) -> (String, Vec<KiroImage>) {
+    let mut rewritten = String::with_capacity(text.len().min(64 * 1024));
+    let mut images = Vec::new();
+    let mut last_end = 0usize;
+    let mut extracted_count = 0usize;
+    let mut extracted_source_base64_bytes = 0usize;
+
+    for captures in EMBEDDED_IMAGE_DATA_URL_RE.captures_iter(text) {
+        let Some(full_match) = captures.get(0) else {
+            continue;
+        };
+        let Some(format_match) = captures.get(1) else {
+            continue;
+        };
+        let Some(data_match) = captures.get(2) else {
+            continue;
+        };
+
+        let format = kiro_image_format_from_data_url_suffix(format_match.as_str());
+        let data = normalize_base64_payload(data_match.as_str());
+        let built_images = build_kiro_images(format.clone(), data.clone());
+        if built_images.is_empty() {
+            continue;
+        }
+
+        rewritten.push_str(&text[last_end..full_match.start()]);
+        rewritten.push_str(&embedded_image_placeholder(
+            &format,
+            &data,
+            built_images.len(),
+        ));
+        last_end = full_match.end();
+        extracted_count += 1;
+        extracted_source_base64_bytes += data.len();
+        images.extend(built_images);
+    }
+
+    if extracted_count == 0 {
+        return (text.to_string(), Vec::new());
+    }
+
+    rewritten.push_str(&text[last_end..]);
+    tracing::info!(
+        extracted_count,
+        extracted_source_base64_bytes,
+        output_image_count = images.len(),
+        "从文本 content 中提取 data:image base64 为 Kiro images，避免上游 malformed 400"
+    );
+    (rewritten, images)
+}
+
 /// 处理消息内容，提取文本、图片和工具结果
 fn process_message_content(
     content: &serde_json::Value,
@@ -1407,7 +1490,9 @@ fn process_message_content(
 
     match content {
         serde_json::Value::String(s) => {
-            text_parts.push(s.clone());
+            let (text, extracted_images) = extract_embedded_image_data_urls_from_text(s);
+            text_parts.push(text);
+            images.extend(extracted_images);
         }
         serde_json::Value::Array(arr) => {
             for item in arr {
@@ -1415,7 +1500,10 @@ fn process_message_content(
                     match block.block_type.as_str() {
                         "text" => {
                             if let Some(text) = block.text {
+                                let (text, extracted_images) =
+                                    extract_embedded_image_data_urls_from_text(&text);
                                 text_parts.push(text);
+                                images.extend(extracted_images);
                             }
                         }
                         "image" => {
@@ -4006,6 +4094,88 @@ mod tests {
         assert_eq!(images[0].format, "png");
         assert_eq!(images[0].source.bytes, VALID_RGB_1X1_PNG);
         assert!(documents.is_empty());
+    }
+
+    #[test]
+    fn test_process_message_content_extracts_embedded_image_data_url_from_string() {
+        let content = serde_json::Value::String(format!(
+            "Before data:image/png;base64,{VALID_RGB_1X1_PNG} after"
+        ));
+
+        let (text, images, documents, tool_results) =
+            process_message_content(&content).expect("embedded image data url should convert");
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].format, "png");
+        assert_eq!(images[0].source.bytes, VALID_RGB_1X1_PNG);
+        assert!(documents.is_empty());
+        assert!(tool_results.is_empty());
+        assert!(text.contains("Before "));
+        assert!(text.contains(" after"));
+        assert!(text.contains("Embedded png image extracted from text"));
+        assert!(text.contains("decoded_bytes="));
+        assert!(!text.contains("data:image/png;base64"));
+        assert!(!text.contains(VALID_RGB_1X1_PNG));
+    }
+
+    #[test]
+    fn test_process_message_content_extracts_embedded_image_data_url_from_text_block() {
+        let content = serde_json::Value::Array(vec![serde_json::json!({
+            "type": "text",
+            "text": format!(
+                "first=data:image/png;base64,{VALID_RGB_1X1_PNG}\nsecond=data:image/png;base64,{VALID_RGBA_1X1_PNG}"
+            )
+        })]);
+
+        let (text, images, documents, tool_results) =
+            process_message_content(&content).expect("embedded image data urls should convert");
+
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0].format, "png");
+        assert_eq!(images[0].source.bytes, VALID_RGB_1X1_PNG);
+        assert_eq!(images[1].format, "png");
+        assert_eq!(images[1].source.bytes, VALID_RGBA_1X1_PNG);
+        assert!(documents.is_empty());
+        assert!(tool_results.is_empty());
+        assert_eq!(
+            text.matches("Embedded png image extracted from text")
+                .count(),
+            2
+        );
+        assert!(!text.contains("data:image/png;base64"));
+    }
+
+    #[test]
+    fn test_process_message_content_extracts_embedded_image_data_url_with_mime_params() {
+        let content = serde_json::Value::String(format!(
+            "Before DATA:image/png;charset=utf-8;base64,{VALID_RGB_1X1_PNG} after"
+        ));
+
+        let (text, images, documents, tool_results) = process_message_content(&content)
+            .expect("embedded image data url with mime params should convert");
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].format, "png");
+        assert_eq!(images[0].source.bytes, VALID_RGB_1X1_PNG);
+        assert!(documents.is_empty());
+        assert!(tool_results.is_empty());
+        assert!(text.contains("Embedded png image extracted from text"));
+        assert!(!text.contains("DATA:image/png;charset=utf-8;base64"));
+        assert!(!text.contains(VALID_RGB_1X1_PNG));
+    }
+
+    #[test]
+    fn test_process_message_content_preserves_invalid_embedded_image_data_url() {
+        let original = "Keep literal data:image/png;base64,not-a-valid-image-data text";
+        let content = serde_json::Value::String(original.to_string());
+
+        let (text, images, documents, tool_results) =
+            process_message_content(&content).expect("invalid embedded data url should not fail");
+
+        assert_eq!(text, original);
+        assert!(images.is_empty());
+        assert!(documents.is_empty());
+        assert!(tool_results.is_empty());
     }
 
     #[test]
@@ -7195,6 +7365,35 @@ mod tests {
         let current = &state.current_message.user_input_message;
         assert_eq!(current.content, "Describe all screenshots.");
         assert_eq!(current.images.len(), 1);
+    }
+
+    #[test]
+    fn test_convert_request_extracts_current_embedded_image_data_url() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = request_from_messages(vec![AnthropicMessage {
+            role: "user".to_string(),
+            content: serde_json::json!(format!(
+                "Analyze this screenshot: data:image/png;base64,{VALID_RGB_1X1_PNG}"
+            )),
+        }]);
+
+        let state = convert_request(&req)
+            .expect("current embedded image data url should convert to Kiro image attachment")
+            .conversation_state;
+
+        let current = &state.current_message.user_input_message;
+        assert_eq!(current.images.len(), 1);
+        assert_eq!(current.images[0].format, "png");
+        assert_eq!(current.images[0].source.bytes, VALID_RGB_1X1_PNG);
+        assert!(current.content.contains("Analyze this screenshot: "));
+        assert!(
+            current
+                .content
+                .contains("Embedded png image extracted from text")
+        );
+        assert!(!current.content.contains("data:image/png;base64"));
+        assert!(!current.content.contains(VALID_RGB_1X1_PNG));
     }
 
     #[test]
