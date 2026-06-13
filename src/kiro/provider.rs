@@ -1171,6 +1171,9 @@ struct KiroToolSchemaDiagnostics {
     index: usize,
     name: String,
     root_type: String,
+    schema_bytes: usize,
+    ref_count: usize,
+    unsupported_keys: Vec<String>,
 }
 
 const KIRO_REQUEST_DIAGNOSTICS_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
@@ -1822,12 +1825,130 @@ impl KiroProvider {
             .and_then(|schema| schema.get("type"))
             .map(Self::summarize_json_schema_type_for_log)
             .unwrap_or_else(|| "<missing>".to_string());
+        let schema = tool_spec
+            .and_then(|spec| spec.get("inputSchema"))
+            .and_then(|schema| schema.get("json"));
+        let schema_bytes = schema
+            .and_then(|schema| serde_json::to_vec(schema).ok())
+            .map(|bytes| bytes.len())
+            .unwrap_or_default();
+        let ref_count = schema
+            .map(|schema| Self::count_schema_key_for_log(schema, "$ref"))
+            .unwrap_or_default();
+        let unsupported_keys = schema
+            .map(Self::collect_unsupported_schema_keys_for_log)
+            .unwrap_or_default();
 
         KiroToolSchemaDiagnostics {
             index,
             name,
             root_type,
+            schema_bytes,
+            ref_count,
+            unsupported_keys,
         }
+    }
+
+    fn count_schema_key_for_log(value: &serde_json::Value, target: &str) -> usize {
+        match value {
+            serde_json::Value::Object(obj) => {
+                let own = usize::from(obj.contains_key(target));
+                own + obj
+                    .values()
+                    .map(|child| Self::count_schema_key_for_log(child, target))
+                    .sum::<usize>()
+            }
+            serde_json::Value::Array(items) => items
+                .iter()
+                .map(|child| Self::count_schema_key_for_log(child, target))
+                .sum(),
+            _ => 0,
+        }
+    }
+
+    fn collect_unsupported_schema_keys_for_log(schema: &serde_json::Value) -> Vec<String> {
+        let mut keys = Vec::new();
+        Self::collect_unsupported_schema_keys_for_log_at(schema, "$", &mut keys);
+        keys
+    }
+
+    fn collect_unsupported_schema_keys_for_log_at(
+        value: &serde_json::Value,
+        path: &str,
+        keys: &mut Vec<String>,
+    ) {
+        const MAX_KEYS: usize = 12;
+        if keys.len() >= MAX_KEYS {
+            return;
+        }
+
+        match value {
+            serde_json::Value::Object(obj) => {
+                for (key, child) in obj {
+                    let child_path = if path == "$" {
+                        format!("$.{}", key)
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    if Self::is_unsupported_schema_key_for_log(key) {
+                        keys.push(truncate_log_string(&child_path, 160));
+                        if keys.len() >= MAX_KEYS {
+                            return;
+                        }
+                    }
+                    Self::collect_unsupported_schema_keys_for_log_at(child, &child_path, keys);
+                    if keys.len() >= MAX_KEYS {
+                        return;
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (index, child) in items.iter().enumerate() {
+                    Self::collect_unsupported_schema_keys_for_log_at(
+                        child,
+                        &format!("{path}[{index}]"),
+                        keys,
+                    );
+                    if keys.len() >= MAX_KEYS {
+                        return;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn is_unsupported_schema_key_for_log(key: &str) -> bool {
+        matches!(
+            key,
+            "$ref"
+                | "$defs"
+                | "definitions"
+                | "$id"
+                | "$anchor"
+                | "$dynamicRef"
+                | "$dynamicAnchor"
+                | "$vocabulary"
+                | "$comment"
+                | "anyOf"
+                | "oneOf"
+                | "allOf"
+                | "not"
+                | "if"
+                | "then"
+                | "else"
+                | "dependentSchemas"
+                | "dependentRequired"
+                | "unevaluatedProperties"
+                | "unevaluatedItems"
+                | "patternProperties"
+                | "propertyNames"
+                | "prefixItems"
+                | "contains"
+                | "default"
+                | "examples"
+                | "example"
+        )
     }
 
     fn summarize_json_schema_type_for_log(value: &serde_json::Value) -> String {
@@ -5765,30 +5886,25 @@ mod tests {
         assert_eq!(diagnostics.current_image_count, 1);
         assert_eq!(diagnostics.current_document_count, 1);
         assert_eq!(diagnostics.current_tool_count, 4);
+        let tool_schema_summaries = diagnostics
+            .current_tool_schemas
+            .iter()
+            .map(|tool| (tool.index, tool.name.as_str(), tool.root_type.as_str()))
+            .collect::<Vec<_>>();
         assert_eq!(
-            diagnostics.current_tool_schemas,
+            tool_schema_summaries,
             vec![
-                KiroToolSchemaDiagnostics {
-                    index: 0,
-                    name: "Read".to_string(),
-                    root_type: "object".to_string(),
-                },
-                KiroToolSchemaDiagnostics {
-                    index: 1,
-                    name: "BadScalar".to_string(),
-                    root_type: "string".to_string(),
-                },
-                KiroToolSchemaDiagnostics {
-                    index: 2,
-                    name: "Nullable".to_string(),
-                    root_type: "[object,null]".to_string(),
-                },
-                KiroToolSchemaDiagnostics {
-                    index: 3,
-                    name: "MissingType".to_string(),
-                    root_type: "<missing>".to_string(),
-                },
+                (0, "Read", "object"),
+                (1, "BadScalar", "string"),
+                (2, "Nullable", "[object,null]"),
+                (3, "MissingType", "<missing>"),
             ]
+        );
+        assert!(
+            diagnostics
+                .current_tool_schemas
+                .iter()
+                .all(|tool| tool.schema_bytes > 0 || tool.root_type == "<missing>")
         );
         assert_eq!(diagnostics.current_tool_result_count, 2);
         assert_eq!(diagnostics.current_tool_result_error_count, 1);

@@ -47,6 +47,8 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
         });
     };
 
+    inline_local_schema_refs_for_kiro(&mut obj);
+    remove_schema_definition_keywords_for_kiro(&mut obj);
     normalize_schema_object_for_kiro(&mut obj);
     normalize_root_tool_schema_for_kiro(&mut obj);
 
@@ -96,6 +98,110 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     }
 
     serde_json::Value::Object(obj)
+}
+
+fn inline_local_schema_refs_for_kiro(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    let root = serde_json::Value::Object(obj.clone());
+    let mut value = serde_json::Value::Object(std::mem::take(obj));
+    let mut active_refs = HashSet::new();
+    rewrite_schema_refs_for_kiro(&mut value, &root, &mut active_refs);
+    if let serde_json::Value::Object(rewritten) = value {
+        *obj = rewritten;
+    }
+}
+
+fn rewrite_schema_refs_for_kiro(
+    value: &mut serde_json::Value,
+    root: &serde_json::Value,
+    active_refs: &mut HashSet<String>,
+) {
+    match value {
+        serde_json::Value::Object(obj) => {
+            let ref_uri = obj
+                .get("$ref")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned);
+
+            if let Some(ref_uri) = ref_uri {
+                if ref_uri.starts_with('#') && active_refs.insert(ref_uri.clone()) {
+                    let resolved = resolve_local_schema_ref_for_kiro(root, &ref_uri);
+                    if let Some(mut target) = resolved {
+                        rewrite_schema_refs_for_kiro(&mut target, root, active_refs);
+                        active_refs.remove(&ref_uri);
+                        if let serde_json::Value::Object(mut target_obj) = target {
+                            let siblings = std::mem::take(obj);
+                            for (key, sibling_value) in siblings {
+                                if key == "$ref" {
+                                    continue;
+                                }
+                                target_obj.insert(key, sibling_value);
+                            }
+                            *obj = target_obj;
+                        } else {
+                            obj.remove("$ref");
+                            add_schema_description_hint(
+                                obj,
+                                "Original schema reference was simplified for compatibility.",
+                            );
+                        }
+                    } else {
+                        active_refs.remove(&ref_uri);
+                        obj.remove("$ref");
+                        add_schema_description_hint(
+                            obj,
+                            "Original schema reference was simplified for compatibility.",
+                        );
+                    }
+                } else {
+                    obj.remove("$ref");
+                    add_schema_description_hint(
+                        obj,
+                        "Original schema reference was simplified for compatibility.",
+                    );
+                }
+            }
+
+            for child in obj.values_mut() {
+                rewrite_schema_refs_for_kiro(child, root, active_refs);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                rewrite_schema_refs_for_kiro(item, root, active_refs);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn resolve_local_schema_ref_for_kiro(
+    root: &serde_json::Value,
+    ref_uri: &str,
+) -> Option<serde_json::Value> {
+    if !ref_uri.starts_with('#') {
+        return None;
+    }
+    if ref_uri == "#" {
+        Some(root.clone())
+    } else if let Some(pointer) = ref_uri.strip_prefix('#') {
+        root.pointer(pointer).cloned()
+    } else {
+        None
+    }
+}
+
+fn remove_schema_definition_keywords_for_kiro(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    let mut removed = false;
+    for key in ["$defs", "definitions"] {
+        if obj.remove(key).is_some() {
+            removed = true;
+        }
+    }
+    removed
 }
 
 fn normalize_root_tool_schema_for_kiro(obj: &mut serde_json::Map<String, serde_json::Value>) {
@@ -213,6 +319,8 @@ fn normalize_schema_value_for_kiro(value: &mut serde_json::Value) {
 
 fn normalize_schema_object_for_kiro(obj: &mut serde_json::Map<String, serde_json::Value>) {
     normalize_schema_dialect_for_kiro(obj);
+    strip_unsupported_schema_keywords_for_kiro(obj);
+    remove_schema_definition_keywords_for_kiro(obj);
 
     for key in ["allOf", "anyOf", "oneOf"] {
         normalize_schema_union_for_kiro(obj, key);
@@ -224,12 +332,7 @@ fn normalize_schema_object_for_kiro(obj: &mut serde_json::Map<String, serde_json
         }
     }
 
-    for key in [
-        "$defs",
-        "definitions",
-        "patternProperties",
-        "dependentSchemas",
-    ] {
+    for key in ["patternProperties", "dependentSchemas"] {
         if let Some(serde_json::Value::Object(children)) = obj.get_mut(key) {
             for schema in children.values_mut() {
                 normalize_schema_value_for_kiro(schema);
@@ -251,6 +354,60 @@ fn normalize_schema_object_for_kiro(obj: &mut serde_json::Map<String, serde_json
         if let Some(child) = obj.get_mut(key) {
             normalize_schema_value_for_kiro(child);
         }
+    }
+}
+
+fn strip_unsupported_schema_keywords_for_kiro(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    for key in [
+        "$id",
+        "$anchor",
+        "$dynamicAnchor",
+        "$dynamicRef",
+        "$vocabulary",
+        "$comment",
+        "examples",
+        "example",
+        "readOnly",
+        "writeOnly",
+        "deprecated",
+    ] {
+        obj.remove(key);
+    }
+
+    if obj.remove("default").is_some() {
+        add_schema_description_hint(
+            obj,
+            "Default value metadata was omitted for tool schema compatibility.",
+        );
+    }
+
+    let mut stripped_advanced_keyword = false;
+    for key in [
+        "if",
+        "then",
+        "else",
+        "dependentSchemas",
+        "dependentRequired",
+        "unevaluatedProperties",
+        "unevaluatedItems",
+        "prefixItems",
+        "contains",
+        "propertyNames",
+        "not",
+        "patternProperties",
+    ] {
+        if obj.remove(key).is_some() {
+            stripped_advanced_keyword = true;
+        }
+    }
+
+    if stripped_advanced_keyword {
+        add_schema_description_hint(
+            obj,
+            "Advanced JSON Schema constraints were simplified for tool compatibility.",
+        );
     }
 }
 
@@ -5289,6 +5446,162 @@ mod tests {
                 .pointer("/properties/modern/$schema")
                 .and_then(|value| value.as_str()),
             Some("https://json-schema.org/draft/2020-12/schema")
+        );
+        assert!(
+            jsonschema::validator_for(schema).is_ok(),
+            "normalized schema should remain locally valid: {schema}"
+        );
+    }
+
+    #[test]
+    fn test_convert_tools_inlines_local_refs_and_removes_definitions() {
+        let tools = Some(vec![super::super::types::Tool {
+            tool_type: None,
+            name: "RefTool".to_string(),
+            description: "Tool with local JSON Schema refs".to_string(),
+            input_schema: HashMap::from([
+                ("type".to_string(), serde_json::json!("object")),
+                (
+                    "properties".to_string(),
+                    serde_json::json!({
+                        "payload": {
+                            "$ref": "#/$defs/Payload",
+                            "description": "Payload to send."
+                        }
+                    }),
+                ),
+                (
+                    "$defs".to_string(),
+                    serde_json::json!({
+                        "Payload": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"}
+                            },
+                            "required": ["path"]
+                        }
+                    }),
+                ),
+            ]),
+            max_uses: None,
+            ..super::super::types::Tool::default()
+        }]);
+
+        let converted = convert_tools(&tools, &mut HashMap::new());
+
+        let schema = &converted[0].tool_specification.input_schema.json;
+        assert!(
+            !schema_contains_key(schema, "$ref"),
+            "local refs must be inlined before upstream submission: {schema}"
+        );
+        assert!(
+            !schema_contains_key(schema, "$defs"),
+            "local definitions should be removed after inlining: {schema}"
+        );
+        let payload = schema
+            .pointer("/properties/payload")
+            .expect("payload property should exist");
+        assert_eq!(
+            payload.get("type").and_then(|value| value.as_str()),
+            Some("object")
+        );
+        assert_eq!(
+            payload
+                .pointer("/properties/path/type")
+                .and_then(|value| value.as_str()),
+            Some("string")
+        );
+        assert!(
+            jsonschema::validator_for(schema).is_ok(),
+            "normalized schema should remain locally valid: {schema}"
+        );
+    }
+
+    #[test]
+    fn test_convert_tools_strips_advanced_schema_keywords() {
+        let tools = Some(vec![super::super::types::Tool {
+            tool_type: None,
+            name: "AdvancedSchemaTool".to_string(),
+            description: "Tool with advanced JSON Schema keywords".to_string(),
+            input_schema: HashMap::from([
+                ("$id".to_string(), serde_json::json!("urn:test:schema")),
+                ("type".to_string(), serde_json::json!("object")),
+                (
+                    "properties".to_string(),
+                    serde_json::json!({
+                        "mode": {
+                            "type": "string",
+                            "default": "auto",
+                            "examples": ["auto"],
+                            "if": {"const": "manual"},
+                            "then": {"minLength": 1},
+                            "else": {"maxLength": 32}
+                        },
+                        "labels": {
+                            "type": "object",
+                            "patternProperties": {
+                                "^x-": {"type": "string"}
+                            },
+                            "propertyNames": {"type": "string"},
+                            "unevaluatedProperties": false,
+                            "dependentRequired": {"kind": ["value"]}
+                        },
+                        "tuple": {
+                            "type": "array",
+                            "prefixItems": [{"type": "string"}],
+                            "contains": {"type": "string"},
+                            "unevaluatedItems": false
+                        },
+                        "blocked": {
+                            "not": {"type": "null"}
+                        }
+                    }),
+                ),
+                (
+                    "dependentSchemas".to_string(),
+                    serde_json::json!({"mode": {"required": ["labels"]}}),
+                ),
+            ]),
+            max_uses: None,
+            ..super::super::types::Tool::default()
+        }]);
+
+        let converted = convert_tools(&tools, &mut HashMap::new());
+
+        let schema = &converted[0].tool_specification.input_schema.json;
+        for key in [
+            "$id",
+            "default",
+            "examples",
+            "if",
+            "then",
+            "else",
+            "dependentSchemas",
+            "dependentRequired",
+            "patternProperties",
+            "propertyNames",
+            "unevaluatedProperties",
+            "unevaluatedItems",
+            "prefixItems",
+            "contains",
+            "not",
+        ] {
+            assert!(
+                !schema_contains_key(schema, key),
+                "advanced keyword {key} should be stripped: {schema}"
+            );
+        }
+        assert!(
+            schema
+                .pointer("/properties/mode/description")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| value.contains("Default value metadata"))
+        );
+        assert!(
+            schema
+                .pointer("/properties/labels/description")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| value.contains("Advanced JSON Schema constraints"))
         );
         assert!(
             jsonschema::validator_for(schema).is_ok(),
