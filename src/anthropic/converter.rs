@@ -1395,44 +1395,68 @@ fn dedupe_documents_by_name(documents: Vec<KiroDocument>) -> Vec<KiroDocument> {
     deduped
 }
 
+fn retain_latest_documents_by_name(
+    documents: &mut Vec<KiroDocument>,
+    seen: &mut HashSet<String>,
+    duplicate_log_message: &'static str,
+) {
+    if documents.is_empty() {
+        return;
+    }
+
+    let mut keep = vec![false; documents.len()];
+    for (index, document) in documents.iter().enumerate().rev() {
+        if seen.insert(document.name.clone()) {
+            keep[index] = true;
+        } else {
+            tracing::warn!(
+                document_name = %document.name,
+                reason = duplicate_log_message,
+                "跳过重复或较旧的 Kiro 文档附件"
+            );
+        }
+    }
+
+    let mut index = 0usize;
+    documents.retain(|_| {
+        let keep_document = keep[index];
+        index += 1;
+        keep_document
+    });
+}
+
 fn dedupe_documents_across_conversation(
     history: &mut [Message],
     current_documents: &mut Vec<KiroDocument>,
 ) -> Result<(), ConversionError> {
     let mut seen = HashSet::new();
-    let mut document_count = 0usize;
 
-    for msg in history {
+    retain_latest_documents_by_name(
+        current_documents,
+        &mut seen,
+        "跳过 current 中重复或已被更新附件覆盖的 Kiro 文档附件",
+    );
+
+    for msg in history.iter_mut().rev() {
         let Message::User(user_msg) = msg else {
             continue;
         };
         let documents = &mut user_msg.user_input_message.documents;
-        documents.retain(|document| {
-            if seen.insert(document.name.clone()) {
-                document_count += 1;
-                true
-            } else {
-                tracing::warn!(
-                    document_name = %document.name,
-                    "跳过会话内重复名称的 Kiro 文档附件"
-                );
-                false
-            }
-        });
+        retain_latest_documents_by_name(
+            documents,
+            &mut seen,
+            "跳过 history 中重复或已被更新附件覆盖的 Kiro 文档附件",
+        );
     }
 
-    current_documents.retain(|document| {
-        if seen.insert(document.name.clone()) {
-            document_count += 1;
-            true
-        } else {
-            tracing::warn!(
-                document_name = %document.name,
-                "跳过 current 中与历史重复名称的 Kiro 文档附件"
-            );
-            false
-        }
-    });
+    let history_document_count = history
+        .iter()
+        .filter_map(|message| match message {
+            Message::User(user) => Some(user.user_input_message.documents.len()),
+            _ => None,
+        })
+        .sum::<usize>();
+    let document_count = current_documents.len() + history_document_count;
 
     if document_count > KIRO_MAX_DOCUMENTS_PER_CONVERSATION {
         return Err(ConversionError::DocumentValidation(format!(
@@ -8024,15 +8048,18 @@ mod tests {
 
         match &state.history[0] {
             Message::User(user) => {
-                assert_eq!(user.user_input_message.documents.len(), 1);
-                assert_eq!(user.user_input_message.documents[0].name, "Plan");
+                assert!(
+                    user.user_input_message.documents.is_empty(),
+                    "older duplicate history document should be dropped in favor of current"
+                );
             }
             other => panic!("history[0] should be document user, got {:?}", other),
         }
 
         let current = &state.current_message.user_input_message;
         assert_eq!(current.content, "Use the latest attachment.");
-        assert!(current.documents.is_empty());
+        assert_eq!(current.documents.len(), 1);
+        assert_eq!(current.documents[0].name, "Plan");
     }
 
     #[test]
@@ -8051,6 +8078,57 @@ mod tests {
 
         assert!(matches!(err, ConversionError::DocumentValidation(_)));
         assert!(err.to_string().contains("Maximum is 5"));
+    }
+
+    #[test]
+    fn test_convert_request_keeps_current_duplicate_before_document_limit_check() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let mut messages = Vec::new();
+        for idx in 0..KIRO_MAX_DOCUMENTS_PER_CONVERSATION {
+            messages.push(AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::Value::Array(vec![named_document_block(
+                    &format!("History {idx}.pdf"),
+                    "application/pdf",
+                    "cGRm",
+                )]),
+            });
+            messages.push(AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!("OK"),
+            });
+        }
+        messages.push(AnthropicMessage {
+            role: "user".to_string(),
+            content: serde_json::Value::Array(vec![
+                named_document_block("History 4.pdf", "application/pdf", "cGRm"),
+                serde_json::json!({"type":"text","text":"Use the latest duplicate."}),
+            ]),
+        });
+
+        let state = convert_request(&request_from_messages(messages))
+            .expect("duplicate document should be deduped before limit validation")
+            .conversation_state;
+
+        let current = &state.current_message.user_input_message;
+        assert_eq!(current.documents.len(), 1);
+        assert_eq!(current.documents[0].name, "History 4");
+        assert_eq!(current.content, "Use the latest duplicate.");
+
+        let history_document_names = state
+            .history
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(user) => Some(&user.user_input_message.documents),
+                _ => None,
+            })
+            .flat_map(|documents| documents.iter().map(|document| document.name.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            history_document_names,
+            vec!["History 0", "History 1", "History 2", "History 3"]
+        );
     }
 
     #[test]
