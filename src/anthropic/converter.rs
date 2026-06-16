@@ -605,7 +605,10 @@ const DOCUMENT_RENDER_LINE_PX: u32 = 10 * DOCUMENT_RENDER_SCALE;
 const MAX_TOOL_RESULT_TEXT_CHARS: usize = 120_000;
 const TOOL_RESULT_HEAD_CHARS: usize = 80_000;
 const TOOL_RESULT_TAIL_CHARS: usize = 40_000;
-const MAX_STRUCTURED_HISTORY_TOOL_PAIRS: usize = 48;
+// Real Kiro upstream traffic accepted 16 retained historical structured tool
+// pairs but still rejected 20 with REQUEST_BODY_INVALID. Older pairs are kept
+// as text, so this trades exact old tool structure for upstream compatibility.
+const MAX_STRUCTURED_HISTORY_TOOL_PAIRS: usize = 16;
 const COLLAPSED_HISTORY_TOOL_TEXT_CHARS: usize = 16_000;
 const KIRO_REENCODE_IMAGE_BYTES: usize = 200_000;
 const KIRO_IMAGE_JPEG_QUALITY: u8 = 85;
