@@ -621,6 +621,10 @@ static EMBEDDED_IMAGE_DATA_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
     )
         .expect("embedded image data URL regex must compile")
 });
+static PDF_PAGES_COUNT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?is)/Type\s*/Pages\b.{0,2048}?/Count\s+(\d+)")
+        .expect("PDF pages count regex must compile")
+});
 
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 ///
@@ -1268,6 +1272,30 @@ fn base64_decoded_len(data: &str) -> Option<usize> {
     Some((unpadded_len / 4) * 3 + tail)
 }
 
+fn pdf_declares_zero_pages(bytes: &[u8]) -> bool {
+    if !bytes.starts_with(b"%PDF-") {
+        return false;
+    }
+
+    let text = String::from_utf8_lossy(bytes);
+    let mut saw_page_tree = false;
+    let mut saw_positive_count = false;
+
+    for captures in PDF_PAGES_COUNT_RE.captures_iter(&text) {
+        saw_page_tree = true;
+        if captures
+            .get(1)
+            .and_then(|matched| matched.as_str().parse::<u64>().ok())
+            .is_some_and(|count| count > 0)
+        {
+            saw_positive_count = true;
+            break;
+        }
+    }
+
+    saw_page_tree && !saw_positive_count
+}
+
 fn validate_kiro_document(document: &KiroDocument) -> Result<(), ConversionError> {
     let data = normalize_base64_payload(&document.source.bytes);
     let decoded_len = base64_decoded_len(&data).ok_or_else(|| {
@@ -1284,12 +1312,19 @@ fn validate_kiro_document(document: &KiroDocument) -> Result<(), ConversionError
         )));
     }
 
-    BASE64_STANDARD.decode(&data).map_err(|_| {
+    let decoded = BASE64_STANDARD.decode(&data).map_err(|_| {
         ConversionError::DocumentValidation(format!(
             "Invalid base64 data for document '{}'.",
             document.name
         ))
     })?;
+    if document.format == "pdf" && pdf_declares_zero_pages(&decoded) {
+        return Err(ConversionError::DocumentValidation(format!(
+            "PDF document '{}' has no pages. Remove or replace the attachment.",
+            document.name
+        )));
+    }
+
     Ok(())
 }
 
@@ -4296,6 +4331,18 @@ mod tests {
                 "type": "base64",
                 "media_type": "application/pdf",
                 "data": "JVBERi0xLjAKMSAwIG9iajw8L1R5cGUvQ2F0YWxvZy9QYWdlcyAyIDAgUj4+ZW5kb2JqCjIgMCBvYmo8PC9UeXBlL1BhZ2VzL0tpZHNbMyAwIFJdL0NvdW50IDE+PmVuZG9iagozIDAgb2JqPDwvVHlwZS9QYWdlL01lZGlhQm94WzAgMCAzMDAgNTBdL1BhcmVudCAyIDAgUi9Db250ZW50cyA0IDAgUi9SZXNvdXJjZXM8PC9Gb250PDwvRjEgNSAwIFI+Pj4+Pj5lbmRvYmoKNCAwIG9iajw8L0xlbmd0aCAzOD4+CnN0cmVhbQpCVCAvRjEgMTQgVGYgMTAgMjAgVGQgKDZHNlM3TVNTKSBUaiBFVAplbmRzdHJlYW0KZW5kb2JqCjUgMCBvYmo8PC9UeXBlL0ZvbnQvU3VidHlwZS9UeXBlMS9CYXNlRm9udC9IZWx2ZXRpY2E+PmVuZG9iagp4cmVmCjAgNgowMDAwMDAwMDAwIDY1NTM1IGYgCjAwMDAwMDAwMDkgMDAwMDAgbiAKMDAwMDAwMDA1MiAwMDAwMCBuIAowMDAwMDAwMTAxIDAwMDAwIG4gCjAwMDAwMDAyMTAgMDAwMDAgbiAKMDAwMDAwMDI5NSAwMDAwMCBuIAp0cmFpbGVyPDwvU2l6ZSA2L1Jvb3QgMSAwIFI+PgpzdGFydHhyZWYKMzU2CiUlRU9G"
+            }
+        })
+    }
+
+    fn zero_page_pdf_document_block() -> serde_json::Value {
+        serde_json::json!({
+            "type": "document",
+            "title": "empty.pdf",
+            "source": {
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": "JVBERi0xLjAKMSAwIG9iajw8L1R5cGUvQ2F0YWxvZy9QYWdlcyAyIDAgUj4+ZW5kb2JqCjIgMCBvYmo8PC9UeXBlL1BhZ2VzL0tpZHNbXS9Db3VudCAwPj5lbmRvYmoKeHJlZgowIDMKMDAwMDAwMDAwMCA2NTUzNSBmIAowMDAwMDAwMDA5IDAwMDAwIG4gCjAwMDAwMDAwNTggMDAwMDAgbiAKdHJhaWxlcjw8L1NpemUgMy9Sb290IDEgMCBSPj4Kc3RhcnR4cmVmCiUlRU9G"
             }
         })
     }
@@ -8286,6 +8333,28 @@ mod tests {
         assert_eq!(current.documents.len(), 1);
         assert_eq!(current.documents[0].name, "document");
         assert_eq!(current.documents[0].format, "pdf");
+    }
+
+    #[test]
+    fn test_convert_request_rejects_zero_page_pdf_document() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = request_from_messages(vec![AnthropicMessage {
+            role: "user".to_string(),
+            content: serde_json::Value::Array(vec![
+                zero_page_pdf_document_block(),
+                serde_json::json!({
+                    "type": "text",
+                    "text": "Summarize the PDF."
+                }),
+            ]),
+        }]);
+
+        let err = convert_request(&req).expect_err("zero-page pdf should be rejected locally");
+        assert!(
+            err.to_string().contains("has no pages"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
