@@ -5,7 +5,7 @@ use std::time::Duration;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use futures::StreamExt;
-use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, LOCATION};
+use reqwest::header::{ACCEPT, ACCEPT_ENCODING, CONTENT_TYPE, HeaderMap, LOCATION};
 use reqwest::redirect::Policy;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -19,6 +19,8 @@ const MAX_REMOTE_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_REMOTE_DOCUMENT_BYTES: usize = 4_500_000;
 const MAX_IMAGE_REDIRECTS: usize = 3;
 const IMAGE_FETCH_TIMEOUT_SECS: u64 = 10;
+const IMAGE_ACCEPT_HEADER: &str = "image/png,image/jpeg,image/gif,image/webp";
+const IMAGE_OR_DOCUMENT_ACCEPT_HEADER: &str = "image/png,image/jpeg,image/gif,image/webp,application/pdf,text/csv,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/html,text/plain,text/markdown";
 static IMAGE_FETCH_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -345,17 +347,14 @@ async fn fetch_remote_image_or_document(
     let mut current = parse_and_validate_remote_image_url(url).await?;
 
     for redirect_count in 0..=MAX_IMAGE_REDIRECTS {
-        let response = client
-            .get(current.clone())
-            .header(
-                ACCEPT,
-                "image/png,image/jpeg,image/gif,image/webp,application/pdf,text/csv,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/html,text/plain,text/markdown",
-            )
-            .send()
-            .await
-            .map_err(|err| {
-                MultimodalNormalizeError::new(format!("failed to fetch image: {err}"))
-            })?;
+        let response = send_remote_get(
+            client,
+            current.clone(),
+            IMAGE_OR_DOCUMENT_ACCEPT_HEADER,
+            false,
+            "image",
+        )
+        .await?;
 
         if response.status().is_redirection() {
             if redirect_count == MAX_IMAGE_REDIRECTS {
@@ -384,8 +383,15 @@ async fn fetch_remote_image_or_document(
             )));
         }
 
-        let raw_header_media_type = raw_content_type_media_type(response.headers());
-        let bytes = read_limited_response_body(response, MAX_REMOTE_IMAGE_BYTES, "image").await?;
+        let (raw_header_media_type, bytes) = read_response_body_retry_identity(
+            client,
+            &current,
+            response,
+            MAX_REMOTE_IMAGE_BYTES,
+            "image",
+            IMAGE_OR_DOCUMENT_ACCEPT_HEADER,
+        )
+        .await?;
         if let Ok(media_type) =
             select_image_media_type(None, raw_header_media_type.as_deref(), &bytes)
         {
@@ -520,14 +526,8 @@ async fn fetch_remote_image(
     let mut current = parse_and_validate_remote_image_url(url).await?;
 
     for redirect_count in 0..=MAX_IMAGE_REDIRECTS {
-        let response = client
-            .get(current.clone())
-            .header(ACCEPT, "image/png,image/jpeg,image/gif,image/webp")
-            .send()
-            .await
-            .map_err(|err| {
-                MultimodalNormalizeError::new(format!("failed to fetch image: {err}"))
-            })?;
+        let response =
+            send_remote_get(client, current.clone(), IMAGE_ACCEPT_HEADER, false, "image").await?;
 
         if response.status().is_redirection() {
             if redirect_count == MAX_IMAGE_REDIRECTS {
@@ -556,12 +556,19 @@ async fn fetch_remote_image(
             )));
         }
 
-        let raw_header_media_type = raw_content_type_media_type(response.headers());
+        let (raw_header_media_type, bytes) = read_response_body_retry_identity(
+            client,
+            &current,
+            response,
+            MAX_REMOTE_IMAGE_BYTES,
+            "image",
+            IMAGE_ACCEPT_HEADER,
+        )
+        .await?;
         let header_media_type = raw_header_media_type
             .as_deref()
             .and_then(supported_image_media_type)
             .map(str::to_string);
-        let bytes = read_limited_response_body(response, MAX_REMOTE_IMAGE_BYTES, "image").await?;
         let media_type = select_image_media_type(
             declared_media_type.as_deref(),
             header_media_type.as_deref(),
@@ -704,6 +711,24 @@ async fn validate_remote_url(url: &Url, kind: &str) -> Result<(), MultimodalNorm
     Ok(())
 }
 
+async fn send_remote_get(
+    client: &reqwest::Client,
+    url: Url,
+    accept: &'static str,
+    identity_encoding: bool,
+    kind: &'static str,
+) -> Result<reqwest::Response, MultimodalNormalizeError> {
+    let mut request = client.get(url).header(ACCEPT, accept);
+    if identity_encoding {
+        request = request.header(ACCEPT_ENCODING, "identity");
+    }
+
+    request
+        .send()
+        .await
+        .map_err(|err| MultimodalNormalizeError::new(format!("failed to fetch {kind}: {err}")))
+}
+
 fn validate_public_ip(ip: IpAddr, kind: &str) -> Result<(), MultimodalNormalizeError> {
     if is_blocked_ip(ip) {
         return Err(MultimodalNormalizeError::new(format!(
@@ -744,22 +769,94 @@ fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
         || ip.to_ipv4_mapped().is_some_and(is_blocked_ipv4)
 }
 
+#[derive(Debug)]
+enum LimitedBodyReadError {
+    Read {
+        kind: &'static str,
+        err: reqwest::Error,
+    },
+    TooLarge {
+        kind: &'static str,
+    },
+}
+
+impl LimitedBodyReadError {
+    fn is_decode(&self) -> bool {
+        matches!(self, Self::Read { err, .. } if err.is_decode())
+    }
+
+    fn into_normalize_error(self) -> MultimodalNormalizeError {
+        match self {
+            Self::Read { kind, err } => {
+                MultimodalNormalizeError::new(format!("failed to read {kind} body: {err}"))
+            }
+            Self::TooLarge { kind } => {
+                MultimodalNormalizeError::new(format!("{kind} URL body is too large"))
+            }
+        }
+    }
+}
+
+async fn read_response_body_retry_identity(
+    client: &reqwest::Client,
+    url: &Url,
+    response: reqwest::Response,
+    max_bytes: usize,
+    kind: &'static str,
+    accept: &'static str,
+) -> Result<(Option<String>, Vec<u8>), MultimodalNormalizeError> {
+    let raw_header_media_type = raw_content_type_media_type(response.headers());
+    match read_limited_response_body_raw(response, max_bytes, kind).await {
+        Ok(bytes) => return Ok((raw_header_media_type, bytes)),
+        Err(err) if err.is_decode() => {
+            tracing::warn!(
+                url = %url,
+                "远程 image 响应体解码失败，使用 Accept-Encoding=identity 重试一次"
+            );
+        }
+        Err(err) => return Err(err.into_normalize_error()),
+    }
+
+    let retry_response = send_remote_get(client, url.clone(), accept, true, kind).await?;
+    if retry_response.status().is_redirection() {
+        return Err(MultimodalNormalizeError::new(format!(
+            "{kind} URL returned redirect during identity retry"
+        )));
+    }
+    if !retry_response.status().is_success() {
+        return Err(MultimodalNormalizeError::new(format!(
+            "{kind} URL returned HTTP {} during identity retry",
+            retry_response.status()
+        )));
+    }
+
+    let retry_header_media_type = raw_content_type_media_type(retry_response.headers());
+    let retry_bytes = read_limited_response_body(retry_response, max_bytes, kind).await?;
+    Ok((retry_header_media_type, retry_bytes))
+}
+
 async fn read_limited_response_body(
     response: reqwest::Response,
     max_bytes: usize,
-    kind: &str,
+    kind: &'static str,
 ) -> Result<Vec<u8>, MultimodalNormalizeError> {
+    read_limited_response_body_raw(response, max_bytes, kind)
+        .await
+        .map_err(LimitedBodyReadError::into_normalize_error)
+}
+
+async fn read_limited_response_body_raw(
+    response: reqwest::Response,
+    max_bytes: usize,
+    kind: &'static str,
+) -> Result<Vec<u8>, LimitedBodyReadError> {
     let mut out = Vec::new();
     let mut stream = response.bytes_stream();
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|err| {
-            MultimodalNormalizeError::new(format!("failed to read {kind} body: {err}"))
-        })?;
+        let chunk = chunk.map_err(|err| LimitedBodyReadError::Read { kind, err })?;
         if out.len() + chunk.len() > max_bytes {
-            return Err(MultimodalNormalizeError::new(format!(
-                "{kind} URL body is too large"
-            )));
+            return Err(LimitedBodyReadError::TooLarge { kind });
         }
         out.extend_from_slice(&chunk);
     }
@@ -971,6 +1068,8 @@ fn supported_image_media_type(media_type: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
     use crate::anthropic::types::Message;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     fn request_with_content(content: Value) -> MessagesRequest {
         MessagesRequest {
@@ -988,6 +1087,12 @@ mod tests {
             output_config: None,
             metadata: None,
         }
+    }
+
+    fn one_pixel_png() -> Vec<u8> {
+        BASE64_STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/l1MiWQAAAABJRU5ErkJggg==")
+            .unwrap()
     }
 
     #[tokio::test]
@@ -1183,6 +1288,66 @@ mod tests {
             .expect_err("private URL should be rejected");
 
         assert!(err.to_string().contains("private or reserved"));
+    }
+
+    #[tokio::test]
+    async fn test_remote_image_read_retries_identity_after_decode_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = first.read(&mut buf).await.unwrap();
+            first
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nTransfer-Encoding: chunked\r\n\r\nnot-a-chunk\r\n",
+                )
+                .await
+                .unwrap();
+            let _ = first.shutdown().await;
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            let read = second.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..read]);
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("accept-encoding: identity")
+            );
+
+            let body = one_pixel_png();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            second.write_all(response.as_bytes()).await.unwrap();
+            second.write_all(&body).await.unwrap();
+            let _ = second.shutdown().await;
+        });
+
+        let client = reqwest::Client::builder()
+            .redirect(Policy::none())
+            .build()
+            .unwrap();
+        let url = Url::parse(&format!("http://{addr}/image.png")).unwrap();
+        let response = send_remote_get(&client, url.clone(), IMAGE_ACCEPT_HEADER, false, "image")
+            .await
+            .unwrap();
+        let (media_type, bytes) = read_response_body_retry_identity(
+            &client,
+            &url,
+            response,
+            MAX_REMOTE_IMAGE_BYTES,
+            "image",
+            IMAGE_ACCEPT_HEADER,
+        )
+        .await
+        .expect("identity retry should recover the image body");
+
+        assert_eq!(media_type.as_deref(), Some("image/png"));
+        assert_eq!(bytes, one_pixel_png());
+
+        server.abort();
     }
 
     #[test]

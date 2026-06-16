@@ -903,6 +903,12 @@ pub fn convert_request_with_probe(
         &validated_tool_results,
         MAX_STRUCTURED_HISTORY_TOOL_PAIRS,
     );
+    coalesce_split_history_tool_results_for_kiro(&mut history);
+    repair_history_tool_result_pairing_for_kiro(&mut history, &validated_tool_results);
+    remove_empty_history_user_messages(&mut history);
+    merge_consecutive_history_assistant_messages(&mut history);
+    repair_history_tool_result_pairing_for_kiro(&mut history, &validated_tool_results);
+    remove_empty_history_user_messages(&mut history);
 
     // 10. 收集历史中使用的工具名称，为缺失的工具生成占位符定义
     // Kiro API 要求：历史消息中引用的工具必须在 tools 列表中有定义
@@ -3246,6 +3252,194 @@ fn repair_history_tool_result_pairing_for_kiro(
     }
 
     converted_results
+}
+
+fn coalesce_split_history_tool_results_for_kiro(history: &mut [Message]) -> usize {
+    let mut moved_results = 0usize;
+
+    for assistant_index in 0..history.len() {
+        let tool_use_ids = history_tool_use_ids_at(history, assistant_index);
+        if tool_use_ids.is_empty() {
+            continue;
+        }
+
+        let immediate_user_index = assistant_index + 1;
+        if !matches!(history.get(immediate_user_index), Some(Message::User(_))) {
+            continue;
+        }
+
+        let tool_use_id_set: HashSet<_> = tool_use_ids.iter().cloned().collect();
+        let mut seen_result_ids = immediate_history_tool_result_ids(history, immediate_user_index);
+        let mut moved = Vec::new();
+
+        for scan_index in (immediate_user_index + 1)..history.len() {
+            let Message::User(user_msg) = &mut history[scan_index] else {
+                continue;
+            };
+
+            let tool_results = &mut user_msg
+                .user_input_message
+                .user_input_message_context
+                .tool_results;
+            if tool_results.is_empty() {
+                continue;
+            }
+
+            let mut retained = Vec::with_capacity(tool_results.len());
+            for result in std::mem::take(tool_results) {
+                if tool_use_id_set.contains(&result.tool_use_id)
+                    && seen_result_ids.insert(result.tool_use_id.clone())
+                {
+                    moved.push(result);
+                } else {
+                    retained.push(result);
+                }
+            }
+            *tool_results = retained;
+        }
+
+        if moved.is_empty() {
+            continue;
+        }
+
+        moved_results += moved.len();
+        if let Some(Message::User(user_msg)) = history.get_mut(immediate_user_index) {
+            let tool_results = &mut user_msg
+                .user_input_message
+                .user_input_message_context
+                .tool_results;
+            tool_results.extend(moved);
+            reorder_tool_results_by_tool_use_order(tool_results, &tool_use_ids);
+        }
+    }
+
+    if moved_results > 0 {
+        tracing::info!(
+            moved_history_tool_results = moved_results,
+            "合并拆散的 history tool_result 到紧邻 user turn，满足 Bedrock toolUse/toolResult 顺序要求"
+        );
+    }
+
+    moved_results
+}
+
+fn history_tool_use_ids_at(history: &[Message], index: usize) -> Vec<String> {
+    let Some(Message::Assistant(assistant_msg)) = history.get(index) else {
+        return Vec::new();
+    };
+
+    assistant_msg
+        .assistant_response_message
+        .tool_uses
+        .as_ref()
+        .map(|tool_uses| {
+            tool_uses
+                .iter()
+                .map(|tool_use| tool_use.tool_use_id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn immediate_history_tool_result_ids(history: &[Message], index: usize) -> HashSet<String> {
+    let Some(Message::User(user_msg)) = history.get(index) else {
+        return HashSet::new();
+    };
+
+    user_msg
+        .user_input_message
+        .user_input_message_context
+        .tool_results
+        .iter()
+        .map(|result| result.tool_use_id.clone())
+        .collect()
+}
+
+fn reorder_tool_results_by_tool_use_order(
+    tool_results: &mut Vec<ToolResult>,
+    tool_use_ids: &[String],
+) {
+    if tool_results.len() <= 1 {
+        return;
+    }
+
+    let mut remaining = std::mem::take(tool_results);
+    let mut ordered = Vec::with_capacity(remaining.len());
+
+    for tool_use_id in tool_use_ids {
+        if let Some(position) = remaining
+            .iter()
+            .position(|result| result.tool_use_id == *tool_use_id)
+        {
+            ordered.push(remaining.remove(position));
+        }
+    }
+
+    ordered.extend(remaining);
+    *tool_results = dedupe_tool_results_by_id(ordered);
+}
+
+fn remove_empty_history_user_messages(history: &mut Vec<Message>) -> usize {
+    let before = history.len();
+    history.retain(|message| match message {
+        Message::User(user_msg) => !is_empty_history_user_message(user_msg),
+        Message::Assistant(_) => true,
+    });
+    before.saturating_sub(history.len())
+}
+
+fn is_empty_history_user_message(user_msg: &HistoryUserMessage) -> bool {
+    let user = &user_msg.user_input_message;
+    user.content.trim().is_empty()
+        && user.images.is_empty()
+        && user.documents.is_empty()
+        && user.user_input_message_context.tools.is_empty()
+        && user.user_input_message_context.tool_results.is_empty()
+}
+
+fn merge_consecutive_history_assistant_messages(history: &mut Vec<Message>) -> usize {
+    let mut merged_count = 0usize;
+    let mut index = 1usize;
+
+    while index < history.len() {
+        let current_is_assistant = matches!(history[index], Message::Assistant(_));
+        let previous_is_assistant = matches!(history[index - 1], Message::Assistant(_));
+        if !current_is_assistant || !previous_is_assistant {
+            index += 1;
+            continue;
+        }
+
+        let Message::Assistant(current) = history.remove(index) else {
+            unreachable!();
+        };
+        let Message::Assistant(previous) = &mut history[index - 1] else {
+            unreachable!();
+        };
+
+        append_history_text(
+            &mut previous.assistant_response_message.content,
+            &current.assistant_response_message.content,
+        );
+
+        if let Some(current_tool_uses) = current.assistant_response_message.tool_uses {
+            previous
+                .assistant_response_message
+                .tool_uses
+                .get_or_insert_with(Vec::new)
+                .extend(current_tool_uses);
+        }
+
+        merged_count += 1;
+    }
+
+    if merged_count > 0 {
+        tracing::info!(
+            merged_history_assistant_messages = merged_count,
+            "合并最终清理后相邻的 history assistant 消息"
+        );
+    }
+
+    merged_count
 }
 
 fn find_history_assistant_for_tool_use(history: &[Message], tool_use_id: &str) -> Option<usize> {
@@ -6850,6 +7044,134 @@ mod tests {
             }
             other => panic!("history[1] 应为 assistant，got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_convert_request_coalesces_split_history_tool_results() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Run both tools"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "text", "text": "I'll run both tools."},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_first",
+                            "name": "Bash",
+                            "input": {"command": "echo first"}
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_second",
+                            "name": "Read",
+                            "input": {"file_path": "/tmp/second.txt"}
+                        }
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_second",
+                            "content": "second result"
+                        }
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("OK"),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_first",
+                            "content": "first result"
+                        }
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let state = convert_request(&req)
+            .expect("split tool_results should be repaired")
+            .conversation_state;
+
+        let assistant_index = state
+            .history
+            .iter()
+            .position(|message| {
+                matches!(
+                    message,
+                    Message::Assistant(assistant)
+                        if assistant
+                            .assistant_response_message
+                            .tool_uses
+                            .as_ref()
+                            .is_some_and(|tool_uses| {
+                                tool_uses
+                                    .iter()
+                                    .any(|tool_use| tool_use.tool_use_id == "toolu_first")
+                            })
+                )
+            })
+            .expect("history should retain the structured assistant tool_use");
+
+        let Message::User(user) = &state.history[assistant_index + 1] else {
+            panic!("assistant tool_use must be followed by a user tool_result turn");
+        };
+
+        let tool_result_ids: Vec<_> = user
+            .user_input_message
+            .user_input_message_context
+            .tool_results
+            .iter()
+            .map(|result| result.tool_use_id.as_str())
+            .collect();
+        assert_eq!(tool_result_ids, vec!["toolu_first", "toolu_second"]);
+
+        let later_duplicate_count = state.history[(assistant_index + 2)..]
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(user) => Some(
+                    user.user_input_message
+                        .user_input_message_context
+                        .tool_results
+                        .iter(),
+                ),
+                Message::Assistant(_) => None,
+            })
+            .flatten()
+            .filter(|result| {
+                result.tool_use_id == "toolu_first" || result.tool_use_id == "toolu_second"
+            })
+            .count();
+        assert_eq!(later_duplicate_count, 0);
+
+        assert!(
+            state
+                .history
+                .windows(2)
+                .all(|pair| !matches!(pair, [Message::Assistant(_), Message::Assistant(_)])),
+            "final history should not contain consecutive assistant messages"
+        );
     }
 
     #[test]
