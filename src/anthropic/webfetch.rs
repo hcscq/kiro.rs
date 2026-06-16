@@ -41,10 +41,12 @@ use super::types::{ErrorResponse, Message, MessagesRequest, Tool};
 use super::websearch;
 
 const WEB_FETCH_TOOL_TYPE_20250910: &str = "web_fetch_20250910";
+const WEB_FETCH_TOOL_TYPE_20250930: &str = "web_fetch_20250930";
 const WEB_FETCH_TOOL_TYPE_20260209: &str = "web_fetch_20260209";
 const WEB_FETCH_TOOL_TYPE_20260309: &str = "web_fetch_20260309";
 const SUPPORTED_WEB_FETCH_TOOL_TYPES: &[&str] = &[
     WEB_FETCH_TOOL_TYPE_20250910,
+    WEB_FETCH_TOOL_TYPE_20250930,
     WEB_FETCH_TOOL_TYPE_20260209,
     WEB_FETCH_TOOL_TYPE_20260309,
 ];
@@ -2663,6 +2665,10 @@ mod tests {
         old_tool.tool_type = Some(WEB_FETCH_TOOL_TYPE_20250910.to_string());
         assert!(is_supported_web_fetch_tool(&old_tool));
 
+        let mut september_tool = sample_tool();
+        september_tool.tool_type = Some(WEB_FETCH_TOOL_TYPE_20250930.to_string());
+        assert!(is_supported_web_fetch_tool(&september_tool));
+
         let mut new_tool = sample_tool();
         new_tool.tool_type = Some(WEB_FETCH_TOOL_TYPE_20260209.to_string());
         assert!(is_supported_web_fetch_tool(&new_tool));
@@ -2706,6 +2712,18 @@ mod tests {
             .expect("web_fetch config should be present");
 
         assert!(!web_fetch.use_cache);
+    }
+
+    #[test]
+    fn test_validate_server_web_tools_accepts_20250930() {
+        let mut tool = sample_tool();
+        tool.tool_type = Some(WEB_FETCH_TOOL_TYPE_20250930.to_string());
+        let req = sample_request(tool);
+
+        let config = validate_server_web_tools(&req, ServerWebToolsMode::MaxCompat)
+            .expect("20250930 should be supported");
+
+        assert!(config.web_fetch.is_some());
     }
 
     #[test]
