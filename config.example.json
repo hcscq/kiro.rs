@@ -61,6 +61,33 @@
   "thinkingSignatureValidationMode": "strict",
   "responseThinkingSignatureCompatEnabled": false,
   "serverWebToolsMode": "max_compat",
+  "proxyPool": {
+    "enabled": false,
+    "requireProxy": false,
+    "assignmentStrategy": "weighted_least_assigned",
+    "proxies": [
+      {
+        "id": "proxy-a",
+        "url": "http://127.0.0.1:7890",
+        "weight": 1,
+        "enabled": true,
+        "expectedEgressIp": "203.0.113.10"
+      },
+      {
+        "id": "proxy-b",
+        "url": "socks5://127.0.0.1:1080",
+        "weight": 2,
+        "enabled": true,
+        "expectedEgressIp": "203.0.113.11"
+      }
+    ],
+    "failover": {
+      "enabled": true,
+      "failureThreshold": 3,
+      "cooldownSecs": 300,
+      "probeUrl": null
+    }
+  },
   "accountTypePolicies": {
     "power": {
       "allowedModels": [

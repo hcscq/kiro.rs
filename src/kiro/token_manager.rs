@@ -13,6 +13,7 @@ use tokio::sync::{Mutex as TokioMutex, Notify, oneshot};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error as StdError;
 use std::fmt;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1797,6 +1798,13 @@ enum ReservationFailure {
     AllTemporarilyUnavailable { next_ready_at: Option<Instant> },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProxyDispatchAvailability {
+    Available,
+    TemporarilyUnavailable { ready_at: Instant },
+    Unavailable,
+}
+
 #[derive(Debug)]
 struct SharedDispatchSnapshotCandidates {
     credentials: Vec<DispatchRuntimeCredential>,
@@ -2072,6 +2080,24 @@ impl MultiTokenManager {
             .map(Self::pool_entry_to_proxy_config)
     }
 
+    fn proxy_pool_unavailable_until(&self, proxy_id: &str, now: Instant) -> Option<Instant> {
+        let mut health = self.proxy_health.lock();
+        let Some(state) = health.get_mut(proxy_id) else {
+            return None;
+        };
+
+        if let Some(unavailable_until) = state.unavailable_until {
+            if unavailable_until > now {
+                return Some(unavailable_until);
+            }
+            state.unavailable_until = None;
+            state.consecutive_failures = 0;
+            state.last_error = None;
+        }
+
+        None
+    }
+
     fn explicit_proxy_for_credentials(
         credentials: &KiroCredentials,
     ) -> Option<Option<ProxyConfig>> {
@@ -2097,9 +2123,15 @@ impl MultiTokenManager {
     pub fn effective_proxy_for_credentials(
         &self,
         credentials: &KiroCredentials,
-    ) -> Option<ProxyConfig> {
+    ) -> anyhow::Result<Option<ProxyConfig>> {
+        let dispatch = self.dispatch_config();
+        let pool = &dispatch.proxy_pool;
+
         if let Some(explicit_proxy) = Self::explicit_proxy_for_credentials(credentials) {
-            return explicit_proxy;
+            if explicit_proxy.is_none() && pool.enabled && pool.require_proxy {
+                anyhow::bail!("proxyPool.requireProxy=true 时凭据不能使用 direct");
+            }
+            return Ok(explicit_proxy);
         }
 
         if let Some(proxy_id) = credentials
@@ -2108,38 +2140,104 @@ impl MultiTokenManager {
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            if let Some(proxy) = self.proxy_config_for_id(proxy_id) {
-                return Some(proxy);
+            if !pool.enabled {
+                tracing::warn!(
+                    proxy_id,
+                    credential_id = credentials.id.unwrap_or_default(),
+                    "凭据绑定了代理池 ID，但代理池未启用，将回退到全局代理"
+                );
+                return Ok(self.proxy.clone());
             }
-            tracing::warn!(
-                proxy_id,
-                credential_id = credentials.id.unwrap_or_default(),
-                "凭据绑定的代理池 ID 不存在或未启用，将回退到全局代理"
+
+            let Some(entry) = pool
+                .proxies
+                .iter()
+                .find(|entry| entry.enabled && entry.id.trim() == proxy_id)
+            else {
+                anyhow::bail!(
+                    "凭据 #{} 绑定的代理池 ID 不存在或未启用: {}",
+                    credentials.id.unwrap_or_default(),
+                    proxy_id
+                );
+            };
+
+            if let Some(unavailable_until) =
+                self.proxy_pool_unavailable_until(proxy_id, Instant::now())
+            {
+                let remaining_ms = unavailable_until
+                    .saturating_duration_since(Instant::now())
+                    .as_millis();
+                anyhow::bail!(
+                    "凭据 #{} 绑定的代理池节点 {} 正在冷却中（剩余约 {} ms）",
+                    credentials.id.unwrap_or_default(),
+                    proxy_id,
+                    remaining_ms
+                );
+            }
+
+            return Ok(Some(Self::pool_entry_to_proxy_config(entry)));
+        }
+
+        if pool.enabled && pool.require_proxy {
+            anyhow::bail!(
+                "proxyPool.requireProxy=true，但凭据 #{} 未绑定代理池节点",
+                credentials.id.unwrap_or_default()
             );
         }
 
-        self.proxy.clone()
+        Ok(self.proxy.clone())
+    }
+
+    fn proxy_dispatch_availability(
+        &self,
+        dispatch: &DispatchConfig,
+        credentials: &KiroCredentials,
+        now: Instant,
+    ) -> ProxyDispatchAvailability {
+        let pool = &dispatch.proxy_pool;
+
+        if let Some(explicit_proxy) = Self::explicit_proxy_for_credentials(credentials) {
+            if explicit_proxy.is_none() && pool.enabled && pool.require_proxy {
+                return ProxyDispatchAvailability::Unavailable;
+            }
+            return ProxyDispatchAvailability::Available;
+        }
+
+        let proxy_id = credentials
+            .proxy_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+
+        let Some(proxy_id) = proxy_id else {
+            return if pool.enabled && pool.require_proxy {
+                ProxyDispatchAvailability::Unavailable
+            } else {
+                ProxyDispatchAvailability::Available
+            };
+        };
+
+        if !pool.enabled {
+            return ProxyDispatchAvailability::Available;
+        }
+
+        if !pool
+            .proxies
+            .iter()
+            .any(|entry| entry.enabled && entry.id.trim() == proxy_id)
+        {
+            return ProxyDispatchAvailability::Unavailable;
+        }
+
+        if let Some(ready_at) = self.proxy_pool_unavailable_until(proxy_id, now) {
+            return ProxyDispatchAvailability::TemporarilyUnavailable { ready_at };
+        }
+
+        ProxyDispatchAvailability::Available
     }
 
     fn proxy_pool_candidate_healthy(&self, proxy_id: &str, now: Instant) -> bool {
-        let mut health = self.proxy_health.lock();
-        let Some(state) = health.get_mut(proxy_id) else {
-            return true;
-        };
-
-        if state
-            .unavailable_until
-            .is_some_and(|unavailable_until| unavailable_until > now)
-        {
-            return false;
-        }
-
-        if state.unavailable_until.is_some() {
-            state.unavailable_until = None;
-            state.consecutive_failures = 0;
-            state.last_error = None;
-        }
-        true
+        self.proxy_pool_unavailable_until(proxy_id, now).is_none()
     }
 
     fn select_proxy_id_from_pool(
@@ -2285,6 +2383,12 @@ impl MultiTokenManager {
         };
         let mut health = self.proxy_health.lock();
         if let Some(state) = health.get_mut(&proxy_id) {
+            if state
+                .unavailable_until
+                .is_some_and(|unavailable_until| unavailable_until > Instant::now())
+            {
+                return;
+            }
             state.consecutive_failures = 0;
             state.unavailable_until = None;
             state.last_error = None;
@@ -2340,6 +2444,66 @@ impl MultiTokenManager {
         self.migrate_credential_proxy(id, &current_proxy_id, &pool, error_summary)
     }
 
+    fn is_proxy_transport_error(err: &anyhow::Error) -> bool {
+        err.downcast_ref::<reqwest::Error>()
+            .is_some_and(|err| err.is_connect() || err.is_timeout())
+    }
+
+    fn report_proxy_transport_failure_for_error(
+        &self,
+        id: u64,
+        operation: &'static str,
+        err: &anyhow::Error,
+    ) -> bool {
+        if !Self::is_proxy_transport_error(err) {
+            return false;
+        }
+
+        tracing::warn!(
+            credential_id = id,
+            operation,
+            error = %err,
+            "代理池管理请求出现传输失败"
+        );
+        self.report_proxy_transport_failure(id, &err.to_string())
+    }
+
+    async fn proxy_pool_retry_management_call<T, F, Fut>(
+        &self,
+        id: u64,
+        credentials: &KiroCredentials,
+        operation: &'static str,
+        mut call: F,
+    ) -> anyhow::Result<(T, KiroCredentials)>
+    where
+        F: FnMut(KiroCredentials, Option<ProxyConfig>) -> Fut,
+        Fut: Future<Output = anyhow::Result<T>>,
+    {
+        let mut active_credentials = credentials.clone();
+        let mut retried_after_proxy_failover = false;
+
+        loop {
+            let effective_proxy = self.effective_proxy_for_credentials(&active_credentials)?;
+            match call(active_credentials.clone(), effective_proxy).await {
+                Ok(value) => return Ok((value, active_credentials)),
+                Err(err)
+                    if !retried_after_proxy_failover
+                        && self.report_proxy_transport_failure_for_error(id, operation, &err) =>
+                {
+                    retried_after_proxy_failover = true;
+                    active_credentials = self.current_credentials(id)?;
+                    tracing::info!(
+                        credential_id = id,
+                        operation,
+                        proxy_id = ?active_credentials.proxy_id,
+                        "代理池故障迁移后重试管理请求"
+                    );
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
     fn migrate_credential_proxy(
         &self,
         id: u64,
@@ -2349,47 +2513,56 @@ impl MultiTokenManager {
     ) -> bool {
         let _state_write_guard = self.state_write_lock.lock();
         let mut persisted = self.persisted_credentials_snapshot();
-        let Some(position) = persisted
-            .iter()
-            .position(|credential| credential.id == Some(id))
-        else {
-            return false;
-        };
+        let mut migrated: Vec<(u64, String)> = Vec::new();
 
-        let current_proxy_id = persisted[position]
-            .proxy_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        if current_proxy_id.as_deref() != Some(failed_proxy_id) {
-            return false;
-        }
-        if Self::explicit_proxy_for_credentials(&persisted[position]).is_some() {
-            return false;
+        for position in 0..persisted.len() {
+            if Self::explicit_proxy_for_credentials(&persisted[position]).is_some() {
+                continue;
+            }
+
+            let current_proxy_id = persisted[position]
+                .proxy_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            if current_proxy_id.as_deref() != Some(failed_proxy_id) {
+                continue;
+            }
+
+            let credential_id = persisted[position].id.unwrap_or_default();
+            let next_proxy_id = self.select_proxy_id_from_pool(
+                pool,
+                &persisted,
+                Some(failed_proxy_id),
+                persisted[position].refresh_token.as_deref(),
+            );
+            let Some(next_proxy_id) = next_proxy_id else {
+                tracing::warn!(
+                    credential_id,
+                    proxy_id = %failed_proxy_id,
+                    "代理池故障后没有可迁移的健康代理节点"
+                );
+                continue;
+            };
+
+            persisted[position].proxy_id = Some(next_proxy_id.clone());
+            migrated.push((credential_id, next_proxy_id));
         }
 
-        let next_proxy_id = self.select_proxy_id_from_pool(
-            pool,
-            &persisted,
-            Some(failed_proxy_id),
-            persisted[position].refresh_token.as_deref(),
-        );
-        let Some(next_proxy_id) = next_proxy_id else {
+        if migrated.is_empty() {
             tracing::warn!(
                 credential_id = id,
                 proxy_id = %failed_proxy_id,
-                "代理池故障后没有可迁移的健康代理节点"
+                "代理池故障后没有完成任何凭据迁移"
             );
             return false;
-        };
+        }
 
-        persisted[position].proxy_id = Some(next_proxy_id.clone());
         if let Err(err) = self.persist_credentials_snapshot(&persisted) {
             tracing::error!(
                 credential_id = id,
                 from_proxy_id = %failed_proxy_id,
-                to_proxy_id = %next_proxy_id,
                 error = %err,
                 "持久化代理池故障迁移失败"
             );
@@ -2398,21 +2571,30 @@ impl MultiTokenManager {
 
         {
             let mut entries = self.entries.lock();
-            if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
-                entry.credentials.proxy_id = Some(next_proxy_id.clone());
-                entry.failure_count = 0;
+            for (credential_id, next_proxy_id) in &migrated {
+                if let Some(entry) = entries.iter_mut().find(|entry| entry.id == *credential_id) {
+                    entry.credentials.proxy_id = Some(next_proxy_id.clone());
+                    entry.failure_count = 0;
+                }
             }
         }
 
-        self.proxy_health.lock().remove(&next_proxy_id);
+        {
+            let mut health = self.proxy_health.lock();
+            for (_, next_proxy_id) in &migrated {
+                health.remove(next_proxy_id);
+            }
+        }
         self.availability_notify.notify_waiters();
-        tracing::warn!(
-            credential_id = id,
-            from_proxy_id = %failed_proxy_id,
-            to_proxy_id = %next_proxy_id,
-            error = %error_summary,
-            "已完成凭据代理池绑定迁移"
-        );
+        for (credential_id, next_proxy_id) in migrated {
+            tracing::warn!(
+                credential_id,
+                from_proxy_id = %failed_proxy_id,
+                to_proxy_id = %next_proxy_id,
+                error = %error_summary,
+                "已完成凭据代理池绑定迁移"
+            );
+        }
         true
     }
 
@@ -3129,6 +3311,7 @@ impl MultiTokenManager {
     }
 
     fn entry_dispatchable_for_background_refresh(
+        &self,
         dispatch: &DispatchConfig,
         entry: &CredentialEntry,
         snapshots: Option<&HashMap<u64, DispatchRuntimeSnapshot>>,
@@ -3143,6 +3326,12 @@ impl MultiTokenManager {
         if entry
             .background_refresh_cooldown_until
             .is_some_and(|until| until > now)
+        {
+            return false;
+        }
+
+        if self.proxy_dispatch_availability(dispatch, &entry.credentials, now)
+            != ProxyDispatchAvailability::Available
         {
             return false;
         }
@@ -3203,7 +3392,7 @@ impl MultiTokenManager {
                         model_requirement,
                     )
                     && Self::has_usable_access_token(&entry.credentials)
-                    && Self::entry_dispatchable_for_background_refresh(
+                    && self.entry_dispatchable_for_background_refresh(
                         &dispatch,
                         entry,
                         shared_snapshots.as_ref(),
@@ -3230,7 +3419,7 @@ impl MultiTokenManager {
                         model_requirement,
                     )
                     || !Self::needs_token_refresh(&entry.credentials)
-                    || !Self::entry_dispatchable_for_background_refresh(
+                    || !self.entry_dispatchable_for_background_refresh(
                         &dispatch,
                         entry,
                         shared_snapshots.as_ref(),
@@ -3686,6 +3875,18 @@ impl MultiTokenManager {
             }
             has_supported = true;
 
+            match self.proxy_dispatch_availability(&dispatch, &entry.credentials, now) {
+                ProxyDispatchAvailability::Available => {}
+                ProxyDispatchAvailability::TemporarilyUnavailable { ready_at } => {
+                    next_ready_at = Some(match next_ready_at {
+                        Some(existing) => existing.min(ready_at),
+                        None => ready_at,
+                    });
+                    continue;
+                }
+                ProxyDispatchAvailability::Unavailable => continue,
+            }
+
             if let Some(ready_at) =
                 Self::suspicious_activity_quarantine_ready_at(&entry.credentials, now, now_utc)
             {
@@ -3941,6 +4142,18 @@ impl MultiTokenManager {
                 continue;
             }
             has_supported = true;
+
+            match self.proxy_dispatch_availability(&dispatch, &entry.credentials, now) {
+                ProxyDispatchAvailability::Available => {}
+                ProxyDispatchAvailability::TemporarilyUnavailable { ready_at } => {
+                    next_ready_at = Some(match next_ready_at {
+                        Some(existing) => existing.min(ready_at),
+                        None => ready_at,
+                    });
+                    continue;
+                }
+                ProxyDispatchAvailability::Unavailable => continue,
+            }
 
             if let Some(ready_at) =
                 Self::suspicious_activity_quarantine_ready_at(&entry.credentials, now, &now_utc)
@@ -4217,6 +4430,18 @@ impl MultiTokenManager {
                         continue;
                     }
                     has_supported = true;
+
+                    match self.proxy_dispatch_availability(&dispatch, &entry.credentials, now) {
+                        ProxyDispatchAvailability::Available => {}
+                        ProxyDispatchAvailability::TemporarilyUnavailable { ready_at } => {
+                            next_ready_at = Some(match next_ready_at {
+                                Some(existing) => existing.min(ready_at),
+                                None => ready_at,
+                            });
+                            continue;
+                        }
+                        ProxyDispatchAvailability::Unavailable => continue,
+                    }
 
                     // 候选预筛选和 Redis snapshot 读取之间可能发生 Admin 写入或热重载；
                     // 这里保留防御性复核，确保最终选择仍以最新本地状态为准。
@@ -4802,26 +5027,42 @@ impl MultiTokenManager {
         id: u64,
         current_creds: &KiroCredentials,
     ) -> anyhow::Result<KiroCredentials> {
-        let effective_proxy = self.effective_proxy_for_credentials(current_creds);
-        let refreshed = match refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
-            .await
-        {
-            Ok(refreshed) => refreshed,
-            Err(err) => {
-                if err.downcast_ref::<RefreshTokenInvalidError>().is_some()
-                    && self.runtime_refresh_lease_enabled()
-                    && !self.refresh_token_still_current_in_shared_state(
-                        id,
-                        current_creds.refresh_token.as_deref(),
-                    )
-                {
-                    tracing::warn!(
-                        "凭据 #{} refresh 返回 invalid_grant，但共享状态中的 refreshToken 已变化，等待最新刷新结果同步",
-                        id
-                    );
-                    return Err(self.runtime_refresh_busy_error(None));
+        let mut active_credentials = current_creds.clone();
+        let mut retried_after_proxy_failover = false;
+        let refreshed = loop {
+            let effective_proxy = self.effective_proxy_for_credentials(&active_credentials)?;
+            match refresh_token(&active_credentials, &self.config, effective_proxy.as_ref()).await {
+                Ok(refreshed) => break refreshed,
+                Err(err) => {
+                    if err.downcast_ref::<RefreshTokenInvalidError>().is_some()
+                        && self.runtime_refresh_lease_enabled()
+                        && !self.refresh_token_still_current_in_shared_state(
+                            id,
+                            current_creds.refresh_token.as_deref(),
+                        )
+                    {
+                        tracing::warn!(
+                            "凭据 #{} refresh 返回 invalid_grant，但共享状态中的 refreshToken 已变化，等待最新刷新结果同步",
+                            id
+                        );
+                        return Err(self.runtime_refresh_busy_error(None));
+                    }
+
+                    if !retried_after_proxy_failover
+                        && self.report_proxy_transport_failure_for_error(id, "refreshToken", &err)
+                    {
+                        retried_after_proxy_failover = true;
+                        active_credentials = self.current_credentials(id)?;
+                        tracing::info!(
+                            credential_id = id,
+                            proxy_id = ?active_credentials.proxy_id,
+                            "代理池故障迁移后重试 Token 刷新"
+                        );
+                        continue;
+                    }
+
+                    return Err(err);
                 }
-                return Err(err);
             }
         };
 
@@ -5451,18 +5692,25 @@ impl MultiTokenManager {
             .as_deref()
             .filter(|token| !token.trim().is_empty())
             .unwrap_or(&request_token);
-        let effective_proxy = self.effective_proxy_for_credentials(&credentials);
-
-        let response = match list_available_models(
-            &credentials,
-            &self.config,
-            token,
-            None,
-            effective_proxy.as_ref(),
-        )
-        .await
+        let config = self.config.clone();
+        let token = token.to_string();
+        let response = match self
+            .proxy_pool_retry_management_call(
+                id,
+                &credentials,
+                "ListAvailableModels",
+                move |credentials, proxy| {
+                    let config = config.clone();
+                    let token = token.clone();
+                    async move {
+                        list_available_models(&credentials, &config, &token, None, proxy.as_ref())
+                            .await
+                    }
+                },
+            )
+            .await
         {
-            Ok(response) => response,
+            Ok((response, _credentials)) => response,
             Err(err) => {
                 tracing::warn!(
                     credential_id = id,
@@ -5645,6 +5893,22 @@ impl MultiTokenManager {
             || previous.account_type_dispatch_policies != next.account_type_dispatch_policies
         {
             self.reconfigure_rate_limit_runtime(&next);
+        }
+        if previous.proxy_pool != next.proxy_pool {
+            let active_proxy_ids: HashSet<String> = next
+                .proxy_pool
+                .proxies
+                .iter()
+                .filter(|entry| entry.enabled)
+                .map(|entry| entry.id.trim().to_string())
+                .filter(|id| !id.is_empty())
+                .collect();
+            let mut health = self.proxy_health.lock();
+            if next.proxy_pool.enabled {
+                health.retain(|proxy_id, _| active_proxy_ids.contains(proxy_id));
+            } else {
+                health.clear();
+            }
         }
 
         self.availability_notify.notify_waiters();
@@ -7368,6 +7632,12 @@ impl MultiTokenManager {
             .iter()
             .filter(|e| !e.disabled)
             .filter(|e| {
+                if self.proxy_dispatch_availability(&dispatch, &e.credentials, now)
+                    != ProxyDispatchAvailability::Available
+                {
+                    return false;
+                }
+
                 if let Some(shared_snapshots) = shared_snapshots.as_ref() {
                     let runtime =
                         Self::shared_dispatch_snapshot_for_entry(e, &dispatch, shared_snapshots);
@@ -7970,15 +8240,29 @@ impl MultiTokenManager {
         let previous_profile_arn = credentials
             .effective_profile_arn_for_kiro_requests()
             .map(str::to_string);
-        let effective_proxy = self.effective_proxy_for_credentials(credentials);
-        let Some(discovered_profile_arn) = discover_available_profile_arn(
-            credentials,
-            &self.config,
-            token,
-            effective_proxy.as_ref(),
-        )
-        .await?
-        else {
+        let config = self.config.clone();
+        let token = token.to_string();
+        let (discovered_profile_arn, _active_credentials) = self
+            .proxy_pool_retry_management_call(
+                id,
+                credentials,
+                "ListAvailableProfiles",
+                move |credentials, proxy| {
+                    let config = config.clone();
+                    let token = token.clone();
+                    async move {
+                        discover_available_profile_arn(
+                            &credentials,
+                            &config,
+                            &token,
+                            proxy.as_ref(),
+                        )
+                        .await
+                    }
+                },
+            )
+            .await?;
+        let Some(discovered_profile_arn) = discovered_profile_arn else {
             return Ok(None);
         };
 
@@ -8033,9 +8317,22 @@ impl MultiTokenManager {
         credentials: &KiroCredentials,
         token: &str,
     ) -> anyhow::Result<(UsageLimitsResponse, KiroCredentials)> {
-        let effective_proxy = self.effective_proxy_for_credentials(credentials);
-        match get_usage_limits(credentials, &self.config, token, effective_proxy.as_ref()).await {
-            Ok(usage_limits) => Ok((usage_limits, credentials.clone())),
+        let config = self.config.clone();
+        let token_owned = token.to_string();
+        match self
+            .proxy_pool_retry_management_call(
+                id,
+                credentials,
+                "getUsageLimits",
+                move |credentials, proxy| {
+                    let config = config.clone();
+                    let token = token_owned.clone();
+                    async move { get_usage_limits(&credentials, &config, &token, proxy.as_ref()).await }
+                },
+            )
+            .await
+        {
+            Ok((usage_limits, active_credentials)) => Ok((usage_limits, active_credentials)),
             Err(err)
                 if Self::should_retry_management_call_after_profile_rediscovery(
                     credentials,
@@ -8053,15 +8350,28 @@ impl MultiTokenManager {
                     Ok(Some(updated_credentials)) => {
                         let retry_token =
                             updated_credentials.access_token.as_deref().unwrap_or(token);
-                        let effective_proxy =
-                            self.effective_proxy_for_credentials(&updated_credentials);
-                        let usage_limits = get_usage_limits(
-                            &updated_credentials,
-                            &self.config,
-                            retry_token,
-                            effective_proxy.as_ref(),
-                        )
-                        .await?;
+                        let config = self.config.clone();
+                        let retry_token = retry_token.to_string();
+                        let (usage_limits, updated_credentials) = self
+                            .proxy_pool_retry_management_call(
+                                id,
+                                &updated_credentials,
+                                "getUsageLimits",
+                                move |credentials, proxy| {
+                                    let config = config.clone();
+                                    let retry_token = retry_token.clone();
+                                    async move {
+                                        get_usage_limits(
+                                            &credentials,
+                                            &config,
+                                            &retry_token,
+                                            proxy.as_ref(),
+                                        )
+                                        .await
+                                    }
+                                },
+                            )
+                            .await?;
                         Ok((usage_limits, updated_credentials))
                     }
                     Ok(None) => Err(err),
@@ -8094,10 +8404,21 @@ impl MultiTokenManager {
     ) -> anyhow::Result<(Vec<AvailableProfile>, Option<String>)> {
         let credentials = self.current_credentials(id)?;
         let (credentials, token) = self.try_ensure_token(id, &credentials).await?;
-        let effective_proxy = self.effective_proxy_for_credentials(&credentials);
-        let response =
-            list_available_profiles(&credentials, &self.config, &token, effective_proxy.as_ref())
-                .await?;
+        let config = self.config.clone();
+        let (response, credentials) = self
+            .proxy_pool_retry_management_call(
+                id,
+                &credentials,
+                "ListAvailableProfiles",
+                move |credentials, proxy| {
+                    let config = config.clone();
+                    let token = token.clone();
+                    async move {
+                        list_available_profiles(&credentials, &config, &token, proxy.as_ref()).await
+                    }
+                },
+            )
+            .await?;
         let selected_profile_arn = credentials
             .profile_arn
             .as_deref()
@@ -8203,7 +8524,6 @@ impl MultiTokenManager {
         if let Some(updated_token) = credentials.access_token.clone() {
             token = updated_token;
         }
-        let mut effective_proxy = self.effective_proxy_for_credentials(&credentials);
 
         self.apply_usage_limits_metadata_update(id, &usage_limits);
 
@@ -8215,14 +8535,30 @@ impl MultiTokenManager {
             return Ok(usage_limits);
         }
 
-        let mut result = set_user_preference_overage_status(
-            &credentials,
-            &self.config,
-            &token,
-            enabled,
-            effective_proxy.as_ref(),
-        )
-        .await;
+        let config = self.config.clone();
+        let token_for_set = token.clone();
+        let mut result = self
+            .proxy_pool_retry_management_call(
+                id,
+                &credentials,
+                "setUserPreference",
+                move |credentials, proxy| {
+                    let config = config.clone();
+                    let token = token_for_set.clone();
+                    async move {
+                        set_user_preference_overage_status(
+                            &credentials,
+                            &config,
+                            &token,
+                            enabled,
+                            proxy.as_ref(),
+                        )
+                        .await
+                    }
+                },
+            )
+            .await
+            .map(|(_value, active_credentials)| active_credentials);
 
         if result.as_ref().err().is_some_and(|err| {
             Self::should_retry_management_call_after_profile_rediscovery(&credentials, err)
@@ -8240,15 +8576,30 @@ impl MultiTokenManager {
                     if let Some(updated_token) = credentials.access_token.clone() {
                         token = updated_token;
                     }
-                    effective_proxy = self.effective_proxy_for_credentials(&credentials);
-                    result = set_user_preference_overage_status(
-                        &credentials,
-                        &self.config,
-                        &token,
-                        enabled,
-                        effective_proxy.as_ref(),
-                    )
-                    .await;
+                    let config = self.config.clone();
+                    let token_for_set = token.clone();
+                    result = self
+                        .proxy_pool_retry_management_call(
+                            id,
+                            &credentials,
+                            "setUserPreference",
+                            move |credentials, proxy| {
+                                let config = config.clone();
+                                let token = token_for_set.clone();
+                                async move {
+                                    set_user_preference_overage_status(
+                                        &credentials,
+                                        &config,
+                                        &token,
+                                        enabled,
+                                        proxy.as_ref(),
+                                    )
+                                    .await
+                                }
+                            },
+                        )
+                        .await
+                        .map(|(_value, active_credentials)| active_credentials);
                 }
                 Ok(None) => {}
                 Err(err) => {
@@ -8282,16 +8633,31 @@ impl MultiTokenManager {
                 .access_token
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("没有可用的 accessToken"))?;
-            effective_proxy = self.effective_proxy_for_credentials(&credentials);
+            let config = self.config.clone();
+            let token_for_set = token.clone();
 
-            result = set_user_preference_overage_status(
-                &credentials,
-                &self.config,
-                &token,
-                enabled,
-                effective_proxy.as_ref(),
-            )
-            .await;
+            result = self
+                .proxy_pool_retry_management_call(
+                    id,
+                    &credentials,
+                    "setUserPreference",
+                    move |credentials, proxy| {
+                        let config = config.clone();
+                        let token = token_for_set.clone();
+                        async move {
+                            set_user_preference_overage_status(
+                                &credentials,
+                                &config,
+                                &token,
+                                enabled,
+                                proxy.as_ref(),
+                            )
+                            .await
+                        }
+                    },
+                )
+                .await
+                .map(|(_value, active_credentials)| active_credentials);
         }
 
         result?;
@@ -8349,7 +8715,7 @@ impl MultiTokenManager {
             new_cred.detected_auth_account_type().as_deref() == Some("enterprise");
 
         // 4. 尝试刷新 Token 验证凭据有效性
-        let effective_proxy = self.effective_proxy_for_credentials(&new_cred);
+        let effective_proxy = self.effective_proxy_for_credentials(&new_cred)?;
         let mut validated_cred =
             refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?;
 
@@ -9221,6 +9587,107 @@ mod tests {
         assert_eq!(persisted[0].proxy_id.as_deref(), Some("node-b"));
 
         std::fs::remove_file(credentials_path).unwrap();
+    }
+
+    #[test]
+    fn proxy_pool_failover_migrates_all_credentials_on_failed_node() {
+        let credentials_path = temp_credentials_path("proxy-pool-failover-all");
+        let mut config = Config::default();
+        config.proxy_pool = proxy_pool_config_for_tests();
+
+        let mut first = available_credential(0);
+        first.id = Some(1);
+        first.refresh_token = Some("refresh-token-for-proxy-failover-first".repeat(4));
+        first.proxy_id = Some("node-a".to_string());
+        let mut second = available_credential(1);
+        second.id = Some(2);
+        second.refresh_token = Some("refresh-token-for-proxy-failover-second".repeat(4));
+        second.proxy_id = Some("node-a".to_string());
+        write_credentials_file(&credentials_path, &[first.clone(), second.clone()]);
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![first, second],
+            None,
+            Some(credentials_path.clone()),
+            true,
+        )
+        .unwrap();
+
+        assert!(manager.report_proxy_transport_failure(1, "proxy connect timeout"));
+        assert_eq!(
+            manager.current_credentials(1).unwrap().proxy_id.as_deref(),
+            Some("node-b")
+        );
+        assert_eq!(
+            manager.current_credentials(2).unwrap().proxy_id.as_deref(),
+            Some("node-b")
+        );
+
+        let persisted = CredentialsConfig::load(&credentials_path)
+            .unwrap()
+            .into_sorted_credentials();
+        assert_eq!(persisted[0].proxy_id.as_deref(), Some("node-b"));
+        assert_eq!(persisted[1].proxy_id.as_deref(), Some("node-b"));
+
+        std::fs::remove_file(credentials_path).unwrap();
+    }
+
+    #[test]
+    fn proxy_pool_bound_missing_id_does_not_fallback_to_global_proxy() {
+        let mut config = Config::default();
+        config.proxy_pool = proxy_pool_config_for_tests();
+        let manager = MultiTokenManager::new(
+            config,
+            Vec::new(),
+            Some(ProxyConfig::new("http://global.local:8080")),
+            None,
+            false,
+        )
+        .unwrap();
+        let mut credential = available_credential(0);
+        credential.id = Some(1);
+        credential.proxy_id = Some("missing-node".to_string());
+
+        let err = manager
+            .effective_proxy_for_credentials(&credential)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("不存在或未启用"));
+    }
+
+    #[test]
+    fn proxy_pool_cooling_node_is_not_effective_proxy() {
+        let mut config = Config::default();
+        let mut pool = proxy_pool_config_for_tests();
+        pool.proxies.truncate(1);
+        config.proxy_pool = pool;
+
+        let mut credential = available_credential(0);
+        credential.id = Some(1);
+        credential.refresh_token = Some("refresh-token-for-single-proxy".repeat(4));
+        credential.proxy_id = Some("node-a".to_string());
+        let manager = MultiTokenManager::new(config, vec![credential], None, None, false).unwrap();
+
+        assert!(!manager.report_proxy_transport_failure(1, "proxy connect timeout"));
+        let current = manager.current_credentials(1).unwrap();
+        let err = manager
+            .effective_proxy_for_credentials(&current)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("冷却中"));
+    }
+
+    #[test]
+    fn proxy_pool_validate_rejects_invalid_proxy_url() {
+        let mut pool = proxy_pool_config_for_tests();
+        pool.proxies[0].url = "not-a-proxy-url".to_string();
+
+        let err = pool.validate().unwrap_err().to_string();
+
+        assert!(err.contains("url 无效"));
     }
 
     #[test]

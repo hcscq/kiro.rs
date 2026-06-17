@@ -579,6 +579,20 @@ impl ProxyPoolConfig {
             if proxy.url.trim().is_empty() {
                 anyhow::bail!("proxyPool.proxies[{}].url 不能为空", id);
             }
+            let parsed_url = url::Url::parse(proxy.url.trim())
+                .map_err(|err| anyhow::anyhow!("proxyPool.proxies[{}].url 无效: {}", id, err))?;
+            match parsed_url.scheme() {
+                "http" | "https" | "socks5" | "socks5h" => {}
+                scheme => {
+                    anyhow::bail!("proxyPool.proxies[{}].url scheme 不支持: {}", id, scheme);
+                }
+            }
+            if parsed_url.host_str().is_none() {
+                anyhow::bail!("proxyPool.proxies[{}].url 缺少 host", id);
+            }
+            if let Err(err) = reqwest::Proxy::all(proxy.url.trim()) {
+                anyhow::bail!("proxyPool.proxies[{}].url 无效: {}", id, err);
+            }
             if proxy.weight == 0 {
                 anyhow::bail!("proxyPool.proxies[{}].weight 必须大于 0", id);
             }

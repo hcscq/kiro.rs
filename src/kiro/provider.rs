@@ -1650,7 +1650,7 @@ impl KiroProvider {
     fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
         let effective = self
             .token_manager
-            .effective_proxy_for_credentials(credentials);
+            .effective_proxy_for_credentials(credentials)?;
         let mut cache = self.client_cache.lock();
         if let Some(client) = cache.get(&effective) {
             return Ok(client.clone());
