@@ -133,6 +133,7 @@ impl AdminService {
                     max_concurrency_source: entry.max_concurrency_source,
                     has_proxy: entry.has_proxy,
                     proxy_url: entry.proxy_url,
+                    proxy_id: entry.proxy_id,
                     refresh_failure_count: entry.refresh_failure_count,
                     disabled_reason: entry.disabled_reason,
                     disabled_at: entry.disabled_at,
@@ -483,6 +484,7 @@ impl AdminService {
             proxy_url: req.proxy_url,
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
+            proxy_id: req.proxy_id,
             disabled: false, // 新添加的凭据默认启用
             disabled_reason: None,
             disabled_at: None,
@@ -626,6 +628,7 @@ impl AdminService {
             thinking_signature_validation_mode: snapshot.thinking_signature_validation_mode,
             response_thinking_signature_compat_enabled: snapshot
                 .response_thinking_signature_compat_enabled,
+            proxy_pool: snapshot.proxy_pool,
             waiting_requests: snapshot.waiting_requests,
         })
     }
@@ -708,6 +711,7 @@ impl AdminService {
             && req.kiro_request_body_guard.is_none()
             && req.thinking_signature_validation_mode.is_none()
             && req.response_thinking_signature_compat_enabled.is_none()
+            && req.proxy_pool.is_none()
         {
             return self.get_load_balancing_mode();
         }
@@ -750,6 +754,7 @@ impl AdminService {
                 req.session_affinity_enabled,
                 req.thinking_signature_validation_mode,
                 req.response_thinking_signature_compat_enabled,
+                req.proxy_pool,
             )
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 

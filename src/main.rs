@@ -1360,7 +1360,8 @@ fn log_runtime_coordination_status(
 mod tests {
     use super::*;
     use crate::model::config::{
-        RequestWeightingConfig, StreamPreSseFailoverConfig, ThinkingSignatureValidationMode,
+        ProxyPoolConfig, RequestWeightingConfig, StreamPreSseFailoverConfig,
+        ThinkingSignatureValidationMode,
     };
 
     #[test]
@@ -1408,6 +1409,7 @@ mod tests {
             kiro_request_body_guard: Default::default(),
             thinking_signature_validation_mode: ThinkingSignatureValidationMode::WarnOnly,
             response_thinking_signature_compat_enabled: true,
+            proxy_pool: ProxyPoolConfig::default(),
             account_type_policies: std::collections::BTreeMap::new(),
             account_type_dispatch_policies: std::collections::BTreeMap::new(),
         };

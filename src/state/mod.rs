@@ -15,8 +15,9 @@ use serde::{Deserialize, Serialize};
 use crate::admin::types::BalanceResponse;
 use crate::kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use crate::model::config::{
-    Config, KiroRequestBodyGuardConfig, NonStreamBodyReadTimeoutConfig, RequestWeightingConfig,
-    StateBackendKind, StreamPreSseFailoverConfig, ThinkingSignatureValidationMode,
+    Config, KiroRequestBodyGuardConfig, NonStreamBodyReadTimeoutConfig, ProxyPoolConfig,
+    RequestWeightingConfig, StateBackendKind, StreamPreSseFailoverConfig,
+    ThinkingSignatureValidationMode,
 };
 use crate::model::model_policy::{
     AccountTypeDispatchPolicy, ModelSupportPolicy, normalize_account_type_dispatch_policies,
@@ -896,6 +897,8 @@ pub struct PersistedDispatchConfig {
     pub thinking_signature_validation_mode: ThinkingSignatureValidationMode,
     #[serde(default)]
     pub response_thinking_signature_compat_enabled: bool,
+    #[serde(default)]
+    pub proxy_pool: ProxyPoolConfig,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub account_type_policies: BTreeMap<String, ModelSupportPolicy>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -1007,6 +1010,7 @@ impl PersistedDispatchConfig {
             thinking_signature_validation_mode: config.thinking_signature_validation_mode,
             response_thinking_signature_compat_enabled: config
                 .response_thinking_signature_compat_enabled,
+            proxy_pool: config.proxy_pool.clone(),
             account_type_policies,
             account_type_dispatch_policies,
         }
@@ -1050,6 +1054,7 @@ impl PersistedDispatchConfig {
         config.thinking_signature_validation_mode = self.thinking_signature_validation_mode;
         config.response_thinking_signature_compat_enabled =
             self.response_thinking_signature_compat_enabled;
+        config.proxy_pool = self.proxy_pool.clone();
         config.account_type_policies = self.account_type_policies.clone();
         config.account_type_dispatch_policies = self.account_type_dispatch_policies.clone();
     }
@@ -3925,6 +3930,7 @@ mod tests {
             },
             thinking_signature_validation_mode: ThinkingSignatureValidationMode::StripInvalid,
             response_thinking_signature_compat_enabled: true,
+            proxy_pool: ProxyPoolConfig::default(),
             account_type_policies: BTreeMap::new(),
             account_type_dispatch_policies: BTreeMap::new(),
         };

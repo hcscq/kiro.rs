@@ -1001,10 +1001,12 @@ export function CredentialCard({
             </details>
           )}
 
-          {credential.hasProxy && credential.proxyUrl && (
+          {credential.hasProxy && (credential.proxyUrl || credential.proxyId) && (
             <details className="text-xs text-muted-foreground cursor-pointer">
               <summary className="outline-none">代理配置详情</summary>
-              <div className="mt-1 break-all text-foreground bg-muted/20 p-2 rounded border">{credential.proxyUrl}</div>
+              <div className="mt-1 break-all text-foreground bg-muted/20 p-2 rounded border">
+                {credential.proxyUrl || `proxyId: ${credential.proxyId}`}
+              </div>
             </details>
           )}
 

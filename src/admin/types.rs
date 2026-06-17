@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use crate::kiro::model::available_profiles::AvailableProfile;
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::{
-    KiroRequestBodyGuardConfig, NonStreamBodyReadTimeoutConfig, RequestWeightingConfig,
-    StreamPreSseFailoverConfig, ThinkingSignatureValidationMode,
+    KiroRequestBodyGuardConfig, NonStreamBodyReadTimeoutConfig, ProxyPoolConfig,
+    RequestWeightingConfig, StreamPreSseFailoverConfig, ThinkingSignatureValidationMode,
 };
 use crate::model::model_policy::{
     AccountTypeDispatchPolicy, ModelSupportPolicy, RuntimeModelRestriction,
@@ -130,6 +130,9 @@ pub struct CredentialStatusItem {
     /// 代理 URL（用于前端展示）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
+    /// 代理池绑定 ID（用于前端展示）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_id: Option<String>,
     /// Token 刷新连续失败次数
     pub refresh_failure_count: u32,
     /// 禁用原因
@@ -372,6 +375,9 @@ pub struct AddCredentialRequest {
 
     /// 凭据级代理认证密码（可选）
     pub proxy_password: Option<String>,
+
+    /// 代理池 ID（可选；留空时由后端按代理池策略自动分配）
+    pub proxy_id: Option<String>,
 }
 
 fn default_auth_method() -> String {
@@ -560,6 +566,8 @@ pub struct LoadBalancingModeResponse {
     pub thinking_signature_validation_mode: ThinkingSignatureValidationMode,
     /// 响应侧隐藏 thinking signature 兼容补齐开关
     pub response_thinking_signature_compat_enabled: bool,
+    /// 凭据级代理池配置
+    pub proxy_pool: ProxyPoolConfig,
     /// 当前正在排队的请求数
     pub waiting_requests: usize,
 }
@@ -626,6 +634,8 @@ pub struct SetLoadBalancingModeRequest {
     pub thinking_signature_validation_mode: Option<ThinkingSignatureValidationMode>,
     /// 响应侧隐藏 thinking signature 兼容补齐开关
     pub response_thinking_signature_compat_enabled: Option<bool>,
+    /// 凭据级代理池配置
+    pub proxy_pool: Option<ProxyPoolConfig>,
 }
 
 #[derive(Debug, Serialize)]

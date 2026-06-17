@@ -16,10 +16,12 @@ import {
   useSetLoadBalancingMode,
 } from '@/hooks/use-credentials'
 import { extractErrorMessage } from '@/lib/utils'
-import { Save, AlertCircle, Info } from 'lucide-react'
+import { Save, AlertCircle, Info, Plus, Trash2 } from 'lucide-react'
 import type {
   KiroRequestBodyGuardConfig,
   NonStreamBodyReadTimeoutConfig,
+  ProxyPoolConfig,
+  ProxyPoolEntry,
   RequestWeightingConfig,
   StreamPreSseFailoverConfig,
   ThinkingSignatureValidationMode,
@@ -75,6 +77,19 @@ const DEFAULT_NON_STREAM_BODY_READ_TIMEOUT: NonStreamBodyReadTimeoutConfig = {
 const DEFAULT_KIRO_REQUEST_BODY_GUARD: KiroRequestBodyGuardConfig = {
   enabled: true,
   maxBytes: 30 * MIB_BYTES,
+}
+
+const DEFAULT_PROXY_POOL: ProxyPoolConfig = {
+  enabled: false,
+  requireProxy: false,
+  assignmentStrategy: 'weighted_least_assigned',
+  proxies: [],
+  failover: {
+    enabled: true,
+    failureThreshold: 3,
+    cooldownSecs: 300,
+    probeUrl: null,
+  },
 }
 
 const THINKING_SIGNATURE_VALIDATION_OPTIONS: Array<{
@@ -490,6 +505,7 @@ export function SettingsPage() {
     useState<ThinkingSignatureValidationMode>('strict')
   const [responseThinkingSignatureCompatEnabled, setResponseThinkingSignatureCompatEnabled] =
     useState(false)
+  const [proxyPool, setProxyPool] = useState<ProxyPoolConfig>(DEFAULT_PROXY_POOL)
 
   useEffect(() => {
     if (!loadBalancingData) {
@@ -541,7 +557,67 @@ export function SettingsPage() {
     setKiroRequestBodyGuardMaxMiBInput(bytesToMiBInput(kiroRequestBodyGuard.maxBytes))
     setThinkingSignatureValidationMode(loadBalancingData.thinkingSignatureValidationMode ?? 'strict')
     setResponseThinkingSignatureCompatEnabled(loadBalancingData.responseThinkingSignatureCompatEnabled ?? false)
+    setProxyPool({
+      ...DEFAULT_PROXY_POOL,
+      ...(loadBalancingData.proxyPool ?? {}),
+      failover: {
+        ...DEFAULT_PROXY_POOL.failover,
+        ...(loadBalancingData.proxyPool?.failover ?? {}),
+      },
+      proxies: loadBalancingData.proxyPool?.proxies ?? [],
+    })
   }, [loadBalancingData])
+
+  const updateProxyPool = (patch: Partial<ProxyPoolConfig>) => {
+    setProxyPool((prev) => ({
+      ...prev,
+      ...patch,
+    }))
+  }
+
+  const updateProxyPoolFailover = (patch: Partial<ProxyPoolConfig['failover']>) => {
+    setProxyPool((prev) => ({
+      ...prev,
+      failover: {
+        ...prev.failover,
+        ...patch,
+      },
+    }))
+  }
+
+  const updateProxyPoolEntry = (index: number, patch: Partial<ProxyPoolEntry>) => {
+    setProxyPool((prev) => ({
+      ...prev,
+      proxies: prev.proxies.map((entry, entryIndex) =>
+        entryIndex === index ? { ...entry, ...patch } : entry
+      ),
+    }))
+  }
+
+  const addProxyPoolEntry = () => {
+    setProxyPool((prev) => ({
+      ...prev,
+      proxies: [
+        ...prev.proxies,
+        {
+          id: `proxy-${prev.proxies.length + 1}`,
+          url: '',
+          username: null,
+          password: null,
+          weight: 1,
+          enabled: true,
+          expectedEgressIp: null,
+        },
+      ],
+    }))
+  }
+
+  const removeProxyPoolEntry = (index: number) => {
+    setProxyPool((prev) => ({
+      ...prev,
+      proxies: prev.proxies.filter((_, entryIndex) => entryIndex !== index),
+    }))
+  }
 
   const handleRequestWeightingInputChange = (
     key: RequestWeightingNumericField,
@@ -609,6 +685,26 @@ export function SettingsPage() {
       slowModelMinTimeoutMs: streamPreSseFailoverInputs.slowModelMinTimeoutMs.trim() === '' ? 0 : parseInt(streamPreSseFailoverInputs.slowModelMinTimeoutMs, 10),
       maxFastFailovers: streamPreSseFailoverInputs.maxFastFailovers.trim() === '' ? 0 : parseInt(streamPreSseFailoverInputs.maxFastFailovers, 10),
       minRemainingMs: streamPreSseFailoverInputs.minRemainingMs.trim() === '' ? 0 : parseInt(streamPreSseFailoverInputs.minRemainingMs, 10),
+    }
+    const parsedProxyPool: ProxyPoolConfig = {
+      enabled: proxyPool.enabled,
+      requireProxy: proxyPool.requireProxy,
+      assignmentStrategy: proxyPool.assignmentStrategy,
+      proxies: proxyPool.proxies.map((entry) => ({
+        id: entry.id.trim(),
+        url: entry.url.trim(),
+        username: entry.username?.trim() || null,
+        password: entry.password?.trim() || null,
+        weight: Number(entry.weight),
+        enabled: entry.enabled,
+        expectedEgressIp: entry.expectedEgressIp?.trim() || null,
+      })),
+      failover: {
+        enabled: proxyPool.failover.enabled,
+        failureThreshold: Number(proxyPool.failover.failureThreshold),
+        cooldownSecs: Number(proxyPool.failover.cooldownSecs),
+        probeUrl: proxyPool.failover.probeUrl?.trim() || null,
+      },
     }
 
     if (
@@ -779,6 +875,51 @@ export function SettingsPage() {
       return
     }
 
+    if (
+      parsedProxyPool.assignmentStrategy !== 'weighted_least_assigned' &&
+      parsedProxyPool.assignmentStrategy !== 'hash'
+    ) {
+      toast.error('代理池分配策略无效')
+      return
+    }
+
+    const proxyIds = new Set<string>()
+    for (const proxy of parsedProxyPool.proxies) {
+      if (!proxy.id) {
+        toast.error('代理池节点 ID 不能为空')
+        return
+      }
+      if (proxyIds.has(proxy.id)) {
+        toast.error(`代理池节点 ID 重复: ${proxy.id}`)
+        return
+      }
+      proxyIds.add(proxy.id)
+      if (!proxy.url) {
+        toast.error(`代理池节点 ${proxy.id} 的 URL 不能为空`)
+        return
+      }
+      if (!Number.isFinite(proxy.weight) || proxy.weight <= 0) {
+        toast.error(`代理池节点 ${proxy.id} 的权重必须大于 0`)
+        return
+      }
+    }
+
+    if (parsedProxyPool.enabled && !parsedProxyPool.proxies.some((proxy) => proxy.enabled)) {
+      toast.error('启用代理池时至少需要一个启用节点')
+      return
+    }
+
+    if (
+      parsedProxyPool.failover.enabled &&
+      (!Number.isFinite(parsedProxyPool.failover.failureThreshold) ||
+        parsedProxyPool.failover.failureThreshold <= 0 ||
+        !Number.isFinite(parsedProxyPool.failover.cooldownSecs) ||
+        parsedProxyPool.failover.cooldownSecs <= 0)
+    ) {
+      toast.error('代理故障转移阈值和冷却时间必须大于 0')
+      return
+    }
+
     setLoadBalancingMode(
       {
         queueMaxSize: parsedQueueMaxSize,
@@ -818,6 +959,7 @@ export function SettingsPage() {
         },
         thinkingSignatureValidationMode,
         responseThinkingSignatureCompatEnabled,
+        proxyPool: parsedProxyPool,
       },
       {
         onSuccess: () => {
@@ -871,6 +1013,211 @@ export function SettingsPage() {
         </CardHeader>
 
         <CardContent className="space-y-6">
+          <div className="space-y-4">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <h3 className="text-sm font-semibold flex items-center text-primary">代理池配置</h3>
+              <Button type="button" variant="outline" size="sm" onClick={addProxyPoolEntry}>
+                <Plus className="h-4 w-4" />
+                添加节点
+              </Button>
+            </div>
+            <div className="space-y-4 bg-muted/30 p-4 rounded-lg">
+              <div className="grid gap-4 lg:grid-cols-3">
+                <SwitchSettingCard
+                  title="启用代理池"
+                  checked={proxyPool.enabled}
+                  onCheckedChange={(checked) => updateProxyPool({ enabled: Boolean(checked) })}
+                  ariaLabel="切换代理池"
+                  description="未显式配置代理的新凭据会绑定到池内节点。"
+                />
+                <SwitchSettingCard
+                  title="强制代理"
+                  checked={proxyPool.requireProxy}
+                  onCheckedChange={(checked) => updateProxyPool({ requireProxy: Boolean(checked) })}
+                  ariaLabel="切换强制代理"
+                  description="启用后，新凭据不能在没有可用代理节点时导入。"
+                />
+                <SwitchSettingCard
+                  title="故障迁移"
+                  checked={proxyPool.failover.enabled}
+                  onCheckedChange={(checked) =>
+                    updateProxyPoolFailover({ enabled: Boolean(checked) })
+                  }
+                  ariaLabel="切换代理故障迁移"
+                  description="池内代理连续传输失败后自动迁移凭据绑定。"
+                />
+              </div>
+
+              <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
+                <div className="space-y-2">
+                  <label className="text-sm font-medium" htmlFor="proxyAssignmentStrategy">
+                    分配策略
+                  </label>
+                  <select
+                    id="proxyAssignmentStrategy"
+                    value={proxyPool.assignmentStrategy}
+                    onChange={(e) =>
+                      updateProxyPool({
+                        assignmentStrategy: e.target.value as ProxyPoolConfig['assignmentStrategy'],
+                      })
+                    }
+                    className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                  >
+                    <option value="weighted_least_assigned">权重均衡</option>
+                    <option value="hash">固定哈希</option>
+                  </select>
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-sm font-medium" htmlFor="proxyFailureThreshold">
+                    故障阈值
+                  </label>
+                  <Input
+                    id="proxyFailureThreshold"
+                    type="number"
+                    min="1"
+                    step="1"
+                    value={proxyPool.failover.failureThreshold}
+                    onChange={(e) =>
+                      updateProxyPoolFailover({
+                        failureThreshold: Number.parseInt(e.target.value || '0', 10),
+                      })
+                    }
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-sm font-medium" htmlFor="proxyCooldownSecs">
+                    冷却秒数
+                  </label>
+                  <Input
+                    id="proxyCooldownSecs"
+                    type="number"
+                    min="1"
+                    step="1"
+                    value={proxyPool.failover.cooldownSecs}
+                    onChange={(e) =>
+                      updateProxyPoolFailover({
+                        cooldownSecs: Number.parseInt(e.target.value || '0', 10),
+                      })
+                    }
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-sm font-medium" htmlFor="proxyProbeUrl">
+                    探测 URL
+                  </label>
+                  <Input
+                    id="proxyProbeUrl"
+                    placeholder="可选"
+                    value={proxyPool.failover.probeUrl ?? ''}
+                    onChange={(e) =>
+                      updateProxyPoolFailover({ probeUrl: e.target.value || null })
+                    }
+                  />
+                </div>
+              </div>
+
+              <div className="space-y-3">
+                {proxyPool.proxies.length === 0 ? (
+                  <div className="rounded-md border border-dashed bg-background/50 px-3 py-4 text-sm text-muted-foreground">
+                    暂无代理节点
+                  </div>
+                ) : (
+                  proxyPool.proxies.map((proxy, index) => (
+                    <div
+                      key={`${proxy.id}-${index}`}
+                      className="grid gap-3 rounded-md border bg-background/50 p-3 lg:grid-cols-[minmax(120px,0.8fr)_minmax(220px,1.6fr)_80px_90px_minmax(140px,1fr)_minmax(140px,1fr)_minmax(120px,1fr)_44px]"
+                    >
+                      <div className="space-y-1.5">
+                        <label className="text-xs font-medium text-muted-foreground">ID</label>
+                        <Input
+                          value={proxy.id}
+                          onChange={(e) => updateProxyPoolEntry(index, { id: e.target.value })}
+                        />
+                      </div>
+                      <div className="space-y-1.5">
+                        <label className="text-xs font-medium text-muted-foreground">URL</label>
+                        <Input
+                          value={proxy.url}
+                          placeholder="http://host:port 或 socks5://host:port"
+                          onChange={(e) => updateProxyPoolEntry(index, { url: e.target.value })}
+                        />
+                      </div>
+                      <div className="space-y-1.5">
+                        <label className="text-xs font-medium text-muted-foreground">权重</label>
+                        <Input
+                          type="number"
+                          min="1"
+                          step="1"
+                          value={proxy.weight}
+                          onChange={(e) =>
+                            updateProxyPoolEntry(index, {
+                              weight: Number.parseInt(e.target.value || '0', 10),
+                            })
+                          }
+                        />
+                      </div>
+                      <div className="space-y-1.5">
+                        <label className="text-xs font-medium text-muted-foreground">启用</label>
+                        <div className="flex h-10 items-center">
+                          <Switch
+                            checked={proxy.enabled}
+                            onCheckedChange={(checked) =>
+                              updateProxyPoolEntry(index, { enabled: Boolean(checked) })
+                            }
+                          />
+                        </div>
+                      </div>
+                      <div className="space-y-1.5">
+                        <label className="text-xs font-medium text-muted-foreground">用户名</label>
+                        <Input
+                          value={proxy.username ?? ''}
+                          onChange={(e) =>
+                            updateProxyPoolEntry(index, { username: e.target.value || null })
+                          }
+                        />
+                      </div>
+                      <div className="space-y-1.5">
+                        <label className="text-xs font-medium text-muted-foreground">密码</label>
+                        <Input
+                          type="password"
+                          value={proxy.password ?? ''}
+                          onChange={(e) =>
+                            updateProxyPoolEntry(index, { password: e.target.value || null })
+                          }
+                        />
+                      </div>
+                      <div className="space-y-1.5">
+                        <label className="text-xs font-medium text-muted-foreground">出口 IP</label>
+                        <Input
+                          value={proxy.expectedEgressIp ?? ''}
+                          onChange={(e) =>
+                            updateProxyPoolEntry(index, {
+                              expectedEgressIp: e.target.value || null,
+                            })
+                          }
+                        />
+                      </div>
+                      <div className="flex items-end">
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="icon"
+                          onClick={() => removeProxyPoolEntry(index)}
+                          aria-label="删除代理节点"
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </Button>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          </div>
+
           <div className="space-y-4">
             <h3 className="text-sm font-semibold flex items-center text-primary">队列控制配置</h3>
             <div className="grid gap-4 bg-muted/30 p-4 rounded-lg md:grid-cols-2">

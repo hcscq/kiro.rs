@@ -41,6 +41,10 @@ interface KamAccount {
   rateLimitBucketCapacity?: number
   rateLimitRefillPerSecond?: number
   priority?: number
+  proxyId?: string
+  proxyUrl?: string
+  proxyUsername?: string
+  proxyPassword?: string
   credentials: {
     refreshToken: string
     clientId?: string
@@ -55,6 +59,10 @@ interface KamAccount {
     rateLimitBucketCapacity?: number
     rateLimitRefillPerSecond?: number
     priority?: number
+    proxyId?: string
+    proxyUrl?: string
+    proxyUsername?: string
+    proxyPassword?: string
   }
   machineId?: string
   status?: string
@@ -201,6 +209,10 @@ function normalizeKamAccount(item: unknown): unknown {
     const apiRegion = getString(obj.apiRegion)
     const authMethod = getString(obj.authMethod)
     const startUrl = getString(obj.startUrl)
+    const proxyId = getString(obj.proxyId)
+    const proxyUrl = getString(obj.proxyUrl)
+    const proxyUsername = getString(obj.proxyUsername)
+    const proxyPassword = getString(obj.proxyPassword)
 
     return {
       email,
@@ -229,6 +241,10 @@ function normalizeKamAccount(item: unknown): unknown {
         authMethod,
         startUrl,
         priority,
+        proxyId,
+        proxyUrl,
+        proxyUsername,
+        proxyPassword,
       },
     }
   }
@@ -442,6 +458,14 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           const enterprise = isEnterpriseProvider(provider)
           const { region: kamRegion, authRegion, apiRegion } = resolveKamRegions(cred, enterprise)
           const profileArn = account.profileArn?.trim() || cred.profileArn?.trim() || undefined
+          const proxyUrl = cred.proxyUrl?.trim() || account.proxyUrl?.trim() || undefined
+          const proxyId = proxyUrl
+            ? undefined
+            : cred.proxyId?.trim() || account.proxyId?.trim() || undefined
+          const proxyUsername =
+            cred.proxyUsername?.trim() || account.proxyUsername?.trim() || undefined
+          const proxyPassword =
+            cred.proxyPassword?.trim() || account.proxyPassword?.trim() || undefined
           const availableModelIds = extractAvailableModelIds(account)
           const maxConcurrency =
             getKamDispatchNumber(account, 'maxConcurrency') ?? parsedDefaultMaxConcurrency
@@ -510,6 +534,10 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             maxConcurrency,
             rateLimitBucketCapacity,
             rateLimitRefillPerSecond,
+            proxyId,
+            proxyUrl,
+            proxyUsername,
+            proxyPassword,
           })
 
           addedCredId = addedCred.credentialId

@@ -84,8 +84,6 @@ const DEFAULT_CAPTURE_400_MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 /// 支持多凭据故障转移和重试机制
 pub struct KiroProvider {
     token_manager: Arc<MultiTokenManager>,
-    /// 全局代理配置（用于凭据无自定义代理时的回退）
-    global_proxy: Option<ProxyConfig>,
     /// Client 缓存：key = effective proxy config, value = reqwest::Client
     /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client
     client_cache: Mutex<HashMap<Option<ProxyConfig>, Client>>,
@@ -1609,7 +1607,6 @@ impl KiroProvider {
 
         Self {
             token_manager,
-            global_proxy: proxy,
             client_cache: Mutex::new(cache),
             tls_backend,
         }
@@ -1645,9 +1642,15 @@ impl KiroProvider {
         self.token_manager.runtime_leader_http_base_url()
     }
 
+    fn should_report_proxy_transport_failure(error: &reqwest::Error) -> bool {
+        error.is_connect() || error.is_timeout()
+    }
+
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
     fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
-        let effective = credentials.effective_proxy(self.global_proxy.as_ref());
+        let effective = self
+            .token_manager
+            .effective_proxy_for_credentials(credentials);
         let mut cache = self.client_cache.lock();
         if let Some(client) = cache.get(&effective) {
             return Ok(client.clone());
@@ -2801,6 +2804,10 @@ impl KiroProvider {
                         max_retries,
                         e
                     );
+                    if Self::should_report_proxy_transport_failure(&e) {
+                        self.token_manager
+                            .report_proxy_transport_failure(ctx_id, &e.to_string());
+                    }
                     last_error = Some(e.into());
                     request_scoped_transient_error_credentials.insert(ctx_id);
                     if attempt + 1 < max_retries {
@@ -3507,6 +3514,10 @@ impl KiroProvider {
                         error = %e,
                         "API 请求发送失败"
                     );
+                    if Self::should_report_proxy_transport_failure(&e) {
+                        self.token_manager
+                            .report_proxy_transport_failure(ctx_id, &e.to_string());
+                    }
                     // 网络错误通常是上游/链路瞬态问题，不应禁用凭据；
                     // 仅在当前请求内跳过该候选，给低优先级账号兜底机会。
                     if e.is_timeout() {

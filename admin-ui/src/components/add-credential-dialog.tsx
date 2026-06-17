@@ -17,6 +17,7 @@ import { Input } from '@/components/ui/input'
 import {
   useAddCredential,
   useCredentials,
+  useLoadBalancingMode,
   useModelCapabilitiesConfig,
   useModelCatalog,
 } from '@/hooks/use-credentials'
@@ -47,12 +48,14 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [accountType, setAccountType] = useState('')
   const [allowedModels, setAllowedModels] = useState<string[]>([])
   const [blockedModels, setBlockedModels] = useState<string[]>([])
+  const [proxyId, setProxyId] = useState('')
   const [proxyUrl, setProxyUrl] = useState('')
   const [proxyUsername, setProxyUsername] = useState('')
   const [proxyPassword, setProxyPassword] = useState('')
 
   const { mutate, isPending } = useAddCredential()
   const { data: credentialsData } = useCredentials()
+  const { data: loadBalancingData } = useLoadBalancingMode()
   const { data: modelCapabilitiesData } = useModelCapabilitiesConfig()
   const { data: modelCatalogData } = useModelCatalog()
 
@@ -73,6 +76,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   )
   const modelCatalog = modelCatalogData?.models ?? []
   const standardAccountTypePresets = modelCapabilitiesData?.standardAccountTypePresets ?? []
+  const proxyPoolOptions =
+    loadBalancingData?.proxyPool?.proxies.filter((proxy) => proxy.enabled) ?? []
 
   const resetForm = () => {
     setRefreshToken('')
@@ -92,6 +97,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setAccountType('')
     setAllowedModels([])
     setBlockedModels([])
+    setProxyId('')
     setProxyUrl('')
     setProxyUsername('')
     setProxyPassword('')
@@ -163,6 +169,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         accountType: accountType.trim() || undefined,
         allowedModels: allowedModels.length ? allowedModels : undefined,
         blockedModels: blockedModels.length ? blockedModels : undefined,
+        proxyId: proxyUrl.trim() ? undefined : proxyId || undefined,
         proxyUrl: proxyUrl.trim() || undefined,
         proxyUsername: proxyUsername.trim() || undefined,
         proxyPassword: proxyPassword.trim() || undefined,
@@ -438,6 +445,21 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
             {/* 代理配置 */}
             <div className="space-y-2">
               <label className="text-sm font-medium">代理配置</label>
+              <select
+                id="proxyId"
+                value={proxyId}
+                onChange={(e) => setProxyId(e.target.value)}
+                disabled={isPending || proxyPoolOptions.length === 0 || Boolean(proxyUrl.trim())}
+                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <option value="">自动分配代理池节点</option>
+                {proxyPoolOptions.map((proxy) => (
+                  <option key={proxy.id} value={proxy.id}>
+                    {proxy.id}
+                    {proxy.expectedEgressIp ? ` (${proxy.expectedEgressIp})` : ''}
+                  </option>
+                ))}
+              </select>
               <Input
                 id="proxyUrl"
                 placeholder='代理 URL（留空使用全局配置，"direct" 不使用代理）'
@@ -463,7 +485,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 />
               </div>
               <p className="text-xs text-muted-foreground">
-                留空使用全局代理。输入 "direct" 可显式不使用代理
+                显式 URL 优先于代理池选择。留空时由后端按代理池策略分配
               </p>
             </div>
           </div>

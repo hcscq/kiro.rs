@@ -39,6 +39,10 @@ interface CredentialInput {
   maxConcurrency?: number
   rateLimitBucketCapacity?: number
   rateLimitRefillPerSecond?: number
+  proxyId?: string
+  proxyUrl?: string
+  proxyUsername?: string
+  proxyPassword?: string
 }
 
 interface VerificationResult {
@@ -304,6 +308,10 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               typeof cred.rateLimitRefillPerSecond === 'number'
                 ? cred.rateLimitRefillPerSecond
                 : undefined,
+            proxyId: cred.proxyUrl?.trim() ? undefined : cred.proxyId?.trim() || undefined,
+            proxyUrl: cred.proxyUrl?.trim() || undefined,
+            proxyUsername: cred.proxyUsername?.trim() || undefined,
+            proxyPassword: cred.proxyPassword?.trim() || undefined,
           })
 
           addedCredId = addedCred.credentialId

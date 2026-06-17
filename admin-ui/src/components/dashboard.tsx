@@ -265,6 +265,7 @@ export function Dashboard() {
           credential.resolvedAccountType,
           credential.standardAccountType,
           credential.proxyUrl,
+          credential.proxyId,
           credential.disabledReason,
           credential.suspiciousActivityCount > 0 ? 'suspicious activity' : null,
         ]

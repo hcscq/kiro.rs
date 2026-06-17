@@ -206,6 +206,10 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_password: Option<String>,
 
+    /// 凭据绑定的代理池 ID（可选）。仅在未显式配置 proxy_url 时生效。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_id: Option<String>,
+
     /// 凭据是否被禁用（默认为 false）
     #[serde(default)]
     pub disabled: bool,
@@ -1151,6 +1155,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_id: None,
             disabled: false,
             disabled_reason: None,
             disabled_at: None,
@@ -1548,6 +1553,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_id: None,
             disabled: false,
             disabled_reason: None,
             disabled_at: None,
@@ -1601,6 +1607,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_id: None,
             disabled: false,
             disabled_reason: None,
             disabled_at: None,
@@ -1736,6 +1743,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_id: None,
             disabled: false,
             disabled_reason: None,
             disabled_at: None,

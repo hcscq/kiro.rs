@@ -43,6 +43,7 @@ export interface CredentialStatusItem {
   maxConcurrencySource?: 'credential' | 'account-type' | 'global-default' | null
   hasProxy: boolean
   proxyUrl?: string
+  proxyId?: string | null
   refreshFailureCount: number
   disabledReason?: string
   disabledAt?: string | null
@@ -208,6 +209,7 @@ export interface AddCredentialRequest {
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string
+  proxyId?: string
 }
 
 // 添加凭据响应
@@ -270,6 +272,31 @@ export interface KiroRequestBodyGuardConfig {
 
 export type ThinkingSignatureValidationMode = 'strict' | 'warn_only' | 'disabled' | 'strip_invalid'
 
+export interface ProxyPoolEntry {
+  id: string
+  url: string
+  username?: string | null
+  password?: string | null
+  weight: number
+  enabled: boolean
+  expectedEgressIp?: string | null
+}
+
+export interface ProxyPoolFailoverConfig {
+  enabled: boolean
+  failureThreshold: number
+  cooldownSecs: number
+  probeUrl?: string | null
+}
+
+export interface ProxyPoolConfig {
+  enabled: boolean
+  requireProxy: boolean
+  assignmentStrategy: 'weighted_least_assigned' | 'hash'
+  proxies: ProxyPoolEntry[]
+  failover: ProxyPoolFailoverConfig
+}
+
 export interface LoadBalancingConfigResponse {
   mode: 'priority' | 'balanced'
   sessionAffinityEnabled: boolean
@@ -300,6 +327,7 @@ export interface LoadBalancingConfigResponse {
   kiroRequestBodyGuard: KiroRequestBodyGuardConfig
   thinkingSignatureValidationMode: ThinkingSignatureValidationMode
   responseThinkingSignatureCompatEnabled: boolean
+  proxyPool: ProxyPoolConfig
   waitingRequests: number
 }
 
@@ -333,6 +361,7 @@ export interface UpdateLoadBalancingConfigRequest {
   kiroRequestBodyGuard?: KiroRequestBodyGuardConfig
   thinkingSignatureValidationMode?: ThinkingSignatureValidationMode
   responseThinkingSignatureCompatEnabled?: boolean
+  proxyPool?: ProxyPoolConfig
 }
 
 export interface ModelCapabilitiesConfigResponse {

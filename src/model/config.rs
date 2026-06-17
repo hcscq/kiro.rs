@@ -468,6 +468,139 @@ impl ServerWebToolsMode {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyPoolEntry {
+    pub id: String,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    #[serde(default = "default_proxy_pool_entry_weight")]
+    pub weight: u32,
+    #[serde(default = "default_proxy_pool_entry_enabled")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_egress_ip: Option<String>,
+}
+
+fn default_proxy_pool_entry_weight() -> u32 {
+    1
+}
+
+fn default_proxy_pool_entry_enabled() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyPoolFailoverConfig {
+    #[serde(default = "default_proxy_pool_failover_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_proxy_pool_failure_threshold")]
+    pub failure_threshold: u32,
+    #[serde(default = "default_proxy_pool_cooldown_secs")]
+    pub cooldown_secs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_url: Option<String>,
+}
+
+impl Default for ProxyPoolFailoverConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_proxy_pool_failover_enabled(),
+            failure_threshold: default_proxy_pool_failure_threshold(),
+            cooldown_secs: default_proxy_pool_cooldown_secs(),
+            probe_url: None,
+        }
+    }
+}
+
+fn default_proxy_pool_failover_enabled() -> bool {
+    true
+}
+
+fn default_proxy_pool_failure_threshold() -> u32 {
+    3
+}
+
+fn default_proxy_pool_cooldown_secs() -> u64 {
+    300
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyPoolConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub require_proxy: bool,
+    #[serde(default = "default_proxy_pool_assignment_strategy")]
+    pub assignment_strategy: String,
+    #[serde(default)]
+    pub proxies: Vec<ProxyPoolEntry>,
+    #[serde(default)]
+    pub failover: ProxyPoolFailoverConfig,
+}
+
+impl Default for ProxyPoolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            require_proxy: false,
+            assignment_strategy: default_proxy_pool_assignment_strategy(),
+            proxies: Vec::new(),
+            failover: ProxyPoolFailoverConfig::default(),
+        }
+    }
+}
+
+fn default_proxy_pool_assignment_strategy() -> String {
+    "weighted_least_assigned".to_string()
+}
+
+impl ProxyPoolConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let strategy = self.assignment_strategy.trim();
+        if strategy != "weighted_least_assigned" && strategy != "hash" {
+            anyhow::bail!("proxyPool.assignmentStrategy 必须是 weighted_least_assigned 或 hash");
+        }
+
+        let mut ids = std::collections::BTreeSet::new();
+        for proxy in &self.proxies {
+            let id = proxy.id.trim();
+            if id.is_empty() {
+                anyhow::bail!("proxyPool.proxies[].id 不能为空");
+            }
+            if !ids.insert(id.to_string()) {
+                anyhow::bail!("proxyPool.proxies[].id 重复: {}", id);
+            }
+            if proxy.url.trim().is_empty() {
+                anyhow::bail!("proxyPool.proxies[{}].url 不能为空", id);
+            }
+            if proxy.weight == 0 {
+                anyhow::bail!("proxyPool.proxies[{}].weight 必须大于 0", id);
+            }
+        }
+
+        if self.enabled && self.proxies.iter().all(|proxy| !proxy.enabled) {
+            anyhow::bail!("proxyPool.enabled=true 时至少需要一个启用的代理");
+        }
+
+        if self.failover.enabled {
+            if self.failover.failure_threshold == 0 {
+                anyhow::bail!("proxyPool.failover.failureThreshold 必须大于 0");
+            }
+            if self.failover.cooldown_secs == 0 {
+                anyhow::bail!("proxyPool.failover.cooldownSecs 必须大于 0");
+            }
+        }
+
+        Ok(())
+    }
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -548,6 +681,10 @@ pub struct Config {
     /// 代理认证密码（可选）
     #[serde(default)]
     pub proxy_password: Option<String>,
+
+    /// 凭据级代理池。启用后，未显式指定代理的新凭据会在导入时绑定池内代理 ID。
+    #[serde(default)]
+    pub proxy_pool: ProxyPoolConfig,
 
     /// Admin API 密钥（可选，启用 Admin API 功能）
     #[serde(default)]
@@ -1020,6 +1157,7 @@ impl Default for Config {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_pool: ProxyPoolConfig::default(),
             admin_api_key: None,
             state_backend: default_state_backend(),
             state_postgres_url: None,
@@ -1207,6 +1345,7 @@ impl Config {
         self.non_stream_body_read_timeout.validate()?;
         self.kiro_request_body_guard.validate()?;
         self.conversion_runtime.validate()?;
+        self.proxy_pool.validate()?;
 
         Ok(())
     }
