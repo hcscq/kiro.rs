@@ -84,7 +84,11 @@ const KAM_DEFAULT_AUTH_REGION = 'us-east-1'
 
 
 function proxyPoolEntryLabel(proxy: ProxyPoolEntry): string {
-  return proxy.expectedEgressIp ? `${proxy.id} (${proxy.expectedEgressIp})` : proxy.id
+  const egress = proxy.expectedEgressIp ? ` (${proxy.expectedEgressIp})` : ''
+  const assigned = typeof proxy.assignedCredentials === 'number'
+    ? ` · 已挂载 ${proxy.assignedCredentials} 凭据`
+    : ''
+  return `${proxy.id}${egress}${assigned}`
 }
 
 function getString(value: unknown): string | undefined {

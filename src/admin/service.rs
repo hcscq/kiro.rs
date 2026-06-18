@@ -19,8 +19,9 @@ use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CachedBalanceResponse,
     CredentialProfilesResponse, CredentialStatusItem, CredentialsStatusResponse,
     LoadBalancingModeResponse, ModelCapabilitiesConfigResponse, ModelCatalogItemResponse,
-    ModelCatalogResponse, SetCredentialModelPolicyRequest, SetCredentialProfileRequest,
-    SetCredentialProxyRequest, SetLoadBalancingModeRequest, SetModelCapabilitiesConfigRequest,
+    ModelCatalogResponse, ProxyPoolConfigResponse, ProxyPoolEntryResponse,
+    SetCredentialModelPolicyRequest, SetCredentialProfileRequest, SetCredentialProxyRequest,
+    SetLoadBalancingModeRequest, SetModelCapabilitiesConfigRequest,
     StandardAccountTypePresetResponse,
 };
 
@@ -609,6 +610,46 @@ impl AdminService {
     pub fn get_load_balancing_mode(&self) -> Result<LoadBalancingModeResponse, AdminServiceError> {
         self.sync_runtime_state_for_read()?;
         let snapshot = self.token_manager.load_balancing_config_snapshot();
+        let mut assigned_by_proxy_id: HashMap<String, usize> = HashMap::new();
+        for entry in self.token_manager.snapshot().entries {
+            if let Some(proxy_id) = entry
+                .proxy_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                *assigned_by_proxy_id
+                    .entry(proxy_id.to_string())
+                    .or_insert(0) += 1;
+            }
+        }
+        let proxy_pool = ProxyPoolConfigResponse {
+            enabled: snapshot.proxy_pool.enabled,
+            require_proxy: snapshot.proxy_pool.require_proxy,
+            assignment_strategy: snapshot.proxy_pool.assignment_strategy,
+            proxies: snapshot
+                .proxy_pool
+                .proxies
+                .into_iter()
+                .map(|proxy| {
+                    let assigned_credentials = assigned_by_proxy_id
+                        .get(proxy.id.trim())
+                        .copied()
+                        .unwrap_or(0);
+                    ProxyPoolEntryResponse {
+                        id: proxy.id,
+                        url: proxy.url,
+                        username: proxy.username,
+                        password: proxy.password,
+                        weight: proxy.weight,
+                        enabled: proxy.enabled,
+                        expected_egress_ip: proxy.expected_egress_ip,
+                        assigned_credentials,
+                    }
+                })
+                .collect(),
+            failover: snapshot.proxy_pool.failover,
+        };
         Ok(LoadBalancingModeResponse {
             mode: snapshot.mode,
             session_affinity_enabled: snapshot.session_affinity_enabled,
@@ -647,7 +688,7 @@ impl AdminService {
             thinking_signature_validation_mode: snapshot.thinking_signature_validation_mode,
             response_thinking_signature_compat_enabled: snapshot
                 .response_thinking_signature_compat_enabled,
-            proxy_pool: snapshot.proxy_pool,
+            proxy_pool: proxy_pool,
             waiting_requests: snapshot.waiting_requests,
         })
     }
@@ -1115,7 +1156,7 @@ mod tests {
 
     use crate::admin::types::BalanceResponse;
     use crate::kiro::model::credentials::KiroCredentials;
-    use crate::model::config::Config;
+    use crate::model::config::{Config, ProxyPoolConfig, ProxyPoolEntry};
 
     fn temp_credentials_path(test_name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -1133,6 +1174,62 @@ mod tests {
         credentials.access_token = Some("token-1".to_string());
         credentials.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
         credentials
+    }
+
+    #[test]
+    fn get_load_balancing_mode_reports_proxy_assignment_counts() {
+        let mut config = Config::default();
+        config.proxy_pool = ProxyPoolConfig {
+            enabled: true,
+            proxies: vec![
+                ProxyPoolEntry {
+                    id: "node-a".to_string(),
+                    url: "http://node-a.local:3128".to_string(),
+                    username: None,
+                    password: None,
+                    weight: 1,
+                    enabled: true,
+                    expected_egress_ip: None,
+                },
+                ProxyPoolEntry {
+                    id: "node-b".to_string(),
+                    url: "http://node-b.local:3128".to_string(),
+                    username: None,
+                    password: None,
+                    weight: 1,
+                    enabled: true,
+                    expected_egress_ip: None,
+                },
+            ],
+            ..ProxyPoolConfig::default()
+        };
+
+        let mut first = available_credential();
+        first.proxy_id = Some("node-a".to_string());
+        let mut second = available_credential();
+        second.id = Some(2);
+        second.machine_id = Some("machine-2".to_string());
+        second.proxy_id = Some("node-a".to_string());
+        let mut third = available_credential();
+        third.id = Some(3);
+        third.machine_id = Some("machine-3".to_string());
+        third.proxy_id = Some("node-b".to_string());
+
+        let manager = Arc::new(
+            MultiTokenManager::new(config, vec![first, second, third], None, None, false).unwrap(),
+        );
+        let service = AdminService::new(manager);
+
+        let response = service.get_load_balancing_mode().unwrap();
+        let counts: HashMap<_, _> = response
+            .proxy_pool
+            .proxies
+            .into_iter()
+            .map(|entry| (entry.id, entry.assigned_credentials))
+            .collect();
+
+        assert_eq!(counts.get("node-a"), Some(&2));
+        assert_eq!(counts.get("node-b"), Some(&1));
     }
 
     #[tokio::test]

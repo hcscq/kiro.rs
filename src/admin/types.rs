@@ -6,7 +6,8 @@ use crate::kiro::model::available_profiles::AvailableProfile;
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::{
     KiroRequestBodyGuardConfig, NonStreamBodyReadTimeoutConfig, ProxyPoolConfig,
-    RequestWeightingConfig, StreamPreSseFailoverConfig, ThinkingSignatureValidationMode,
+    ProxyPoolFailoverConfig, RequestWeightingConfig, StreamPreSseFailoverConfig,
+    ThinkingSignatureValidationMode,
 };
 use crate::model::model_policy::{
     AccountTypeDispatchPolicy, ModelSupportPolicy, RuntimeModelRestriction,
@@ -524,6 +525,35 @@ impl BalanceResponse {
 
 // ============ 负载均衡配置 ============
 
+/// 代理池节点响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyPoolEntryResponse {
+    pub id: String,
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    pub weight: u32,
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_egress_ip: Option<String>,
+    /// 当前绑定到该代理池节点的凭据数量
+    pub assigned_credentials: usize,
+}
+
+/// 代理池配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyPoolConfigResponse {
+    pub enabled: bool,
+    pub require_proxy: bool,
+    pub assignment_strategy: String,
+    pub proxies: Vec<ProxyPoolEntryResponse>,
+    pub failover: ProxyPoolFailoverConfig,
+}
+
 /// 负载均衡配置响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -587,7 +617,7 @@ pub struct LoadBalancingModeResponse {
     /// 响应侧隐藏 thinking signature 兼容补齐开关
     pub response_thinking_signature_compat_enabled: bool,
     /// 凭据级代理池配置
-    pub proxy_pool: ProxyPoolConfig,
+    pub proxy_pool: ProxyPoolConfigResponse,
     /// 当前正在排队的请求数
     pub waiting_requests: usize,
 }

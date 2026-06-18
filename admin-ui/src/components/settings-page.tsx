@@ -1131,7 +1131,12 @@ export function SettingsPage() {
                       className="grid gap-3 rounded-md border bg-background/50 p-3 lg:grid-cols-[minmax(120px,0.8fr)_minmax(220px,1.6fr)_80px_90px_minmax(140px,1fr)_minmax(140px,1fr)_minmax(120px,1fr)_44px]"
                     >
                       <div className="space-y-1.5">
-                        <label className="text-xs font-medium text-muted-foreground">ID</label>
+                        <div className="flex items-center justify-between gap-2">
+                          <label className="text-xs font-medium text-muted-foreground">ID</label>
+                          <Badge variant="outline" className="shrink-0 px-1.5 py-0 text-[10px]">
+                            {proxy.assignedCredentials ?? 0} 凭据
+                          </Badge>
+                        </div>
                         <Input
                           value={proxy.id}
                           onChange={(e) => updateProxyPoolEntry(index, { id: e.target.value })}

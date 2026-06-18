@@ -290,6 +290,7 @@ export interface ProxyPoolEntry {
   weight: number
   enabled: boolean
   expectedEgressIp?: string | null
+  assignedCredentials?: number
 }
 
 export interface ProxyPoolFailoverConfig {

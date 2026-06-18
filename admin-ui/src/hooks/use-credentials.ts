@@ -160,6 +160,7 @@ export function useSetCredentialProxy() {
       setCredentialProxy(id, payload),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
     },
   })
 }
@@ -234,6 +235,7 @@ export function useAddCredential() {
     mutationFn: (req: AddCredentialRequest) => addCredential(req),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
     },
   })
 }
@@ -245,6 +247,7 @@ export function useDeleteCredential() {
     mutationFn: (id: number) => deleteCredential(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
     },
   })
 }

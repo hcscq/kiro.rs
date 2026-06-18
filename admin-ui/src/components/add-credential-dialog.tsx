@@ -33,7 +33,11 @@ interface AddCredentialDialogProps {
 type AuthMethod = 'social' | 'idc'
 
 function proxyPoolEntryLabel(proxy: ProxyPoolEntry): string {
-  return proxy.expectedEgressIp ? `${proxy.id} (${proxy.expectedEgressIp})` : proxy.id
+  const egress = proxy.expectedEgressIp ? ` (${proxy.expectedEgressIp})` : ''
+  const assigned = typeof proxy.assignedCredentials === 'number'
+    ? ` · 已挂载 ${proxy.assignedCredentials} 凭据`
+    : ''
+  return `${proxy.id}${egress}${assigned}`
 }
 
 export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
