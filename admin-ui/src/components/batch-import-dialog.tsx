@@ -23,11 +23,16 @@ interface BatchImportDialogProps {
 
 interface CredentialInput {
   refreshToken: string
+  authMethod?: string
   email?: string
   userId?: string
   provider?: string
   clientId?: string
   clientSecret?: string
+  tokenEndpoint?: string
+  issuerUrl?: string
+  scopes?: string | string[]
+  audience?: string
   region?: string
   authRegion?: string
   apiRegion?: string
@@ -70,6 +75,7 @@ function normalizeProvider(provider?: string): string | undefined {
   if (!trimmed) return undefined
   const lower = trimmed.toLowerCase()
   if (lower === 'enterprise') return 'Enterprise'
+  if (lower === 'externalidp' || lower === 'external-idp' || lower === 'external_idp' || lower === 'external idp') return 'ExternalIdp'
   if (lower === 'builderid' || lower === 'builder-id' || lower === 'builder_id') return 'BuilderId'
   if (lower === 'google') return 'Google'
   if (lower === 'github') return 'Github'
@@ -80,6 +86,28 @@ function isEnterpriseProvider(provider?: string): boolean {
   return provider?.trim().toLowerCase() === 'enterprise'
 }
 
+function isExternalIdpProvider(provider?: string): boolean {
+  const lower = provider?.trim().toLowerCase()
+  return lower === 'externalidp' || lower === 'external-idp' || lower === 'external_idp' || lower === 'external idp'
+}
+
+function normalizeAuthMethod(authMethod?: string): 'social' | 'idc' | 'external_idp' | undefined {
+  const lower = authMethod?.trim().toLowerCase()
+  if (!lower) return undefined
+  if (lower === 'external_idp' || lower === 'external-idp' || lower === 'externalidp') return 'external_idp'
+  if (lower === 'idc' || lower === 'builder-id' || lower === 'iam') return 'idc'
+  if (lower === 'social') return 'social'
+  return undefined
+}
+
+function normalizeScopes(scopes?: string | string[]): string | undefined {
+  if (Array.isArray(scopes)) {
+    const joined = scopes.flatMap(scope => scope.split(/\s+/)).map(scope => scope.trim()).filter(Boolean).join(' ')
+    return joined || undefined
+  }
+  const joined = scopes?.split(/\s+/).map(scope => scope.trim()).filter(Boolean).join(' ')
+  return joined || undefined
+}
 
 export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps) {
   const [jsonInput, setJsonInput] = useState('')
@@ -268,17 +296,29 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           const clientId = cred.clientId?.trim() || undefined
           const clientSecret = cred.clientSecret?.trim() || undefined
           const provider = normalizeProvider(cred.provider)
+          const tokenEndpoint = cred.tokenEndpoint?.trim() || undefined
+          const issuerUrl = cred.issuerUrl?.trim() || undefined
+          const scopes = normalizeScopes(cred.scopes)
+          const audience = cred.audience?.trim() || undefined
           const enterprise = isEnterpriseProvider(provider)
-          const authMethod = clientId && clientSecret ? 'idc' : 'social'
+          const externalIdp =
+            isExternalIdpProvider(provider) ||
+            normalizeAuthMethod(cred.authMethod) === 'external_idp' ||
+            Boolean(issuerUrl)
+          const authMethod =
+            normalizeAuthMethod(cred.authMethod) ||
+            (externalIdp ? 'external_idp' : clientId && clientSecret ? 'idc' : 'social')
           const region = cred.region?.trim() || undefined
           const authRegion = cred.authRegion?.trim() || region || undefined
           const apiRegion = cred.apiRegion?.trim() || region || undefined
           const startUrl = cred.startUrl?.trim() || undefined
           const profileArn = cred.profileArn?.trim() || undefined
 
-          // idc 模式下必须同时提供 clientId 和 clientSecret
-          if (authMethod === 'social' && (clientId || clientSecret)) {
+          if (authMethod === 'idc' && (!clientId || !clientSecret)) {
             throw new Error('idc 模式需要同时提供 clientId 和 clientSecret')
+          }
+          if (authMethod === 'social' && (clientId || clientSecret || issuerUrl || tokenEndpoint)) {
+            throw new Error('包含 clientId/clientSecret/issuerUrl/tokenEndpoint 的凭据必须指定 idc 或 external_idp')
           }
           if (enterprise && (!clientId || !clientSecret)) {
             throw new Error('Enterprise 账号必须包含 clientId 和 clientSecret')
@@ -288,6 +328,12 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           }
           if (enterprise && !region && !authRegion && !apiRegion) {
             throw new Error('Enterprise 账号必须包含 region')
+          }
+          if (externalIdp && !clientId) {
+            throw new Error('ExternalIdp 账号必须包含 clientId')
+          }
+          if (externalIdp && !issuerUrl) {
+            throw new Error('ExternalIdp 账号必须包含 issuerUrl')
           }
 
           if (
@@ -350,13 +396,17 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             email: credentialEmail,
             userId: credentialUserId,
             authMethod,
-            provider,
+            provider: externalIdp && !provider ? 'ExternalIdp' : provider,
             region,
             authRegion,
             apiRegion,
             profileArn,
             clientId,
             clientSecret,
+            tokenEndpoint,
+            issuerUrl,
+            scopes,
+            audience,
             startUrl,
             priority: typeof cred.priority === 'number' ? cred.priority : parsedDefaultPriority,
             machineId: cred.machineId?.trim() || undefined,
@@ -659,14 +709,14 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               )}
             </div>
             <textarea
-              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n例如: [{"email":"user@example.com","provider":"Enterprise","refreshToken":"...","clientId":"...","clientSecret":"...","region":"us-east-1","startUrl":"https://example.awsapps.com/start"}]\n支持 region 字段自动映射为 authRegion 和 apiRegion'}
+              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\nEnterprise: [{"email":"user@example.com","provider":"Enterprise","refreshToken":"...","clientId":"...","clientSecret":"...","region":"us-east-1","startUrl":"https://example.awsapps.com/start"}]\nExternalIdp: [{"authMethod":"external_idp","provider":"ExternalIdp","refreshToken":"...","clientId":"...","issuerUrl":"https://login.microsoftonline.com/.../v2.0","tokenEndpoint":"...","scopes":"..."}]\n支持 region 字段自动映射为 authRegion 和 apiRegion'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}
               className="flex min-h-[200px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
             />
             <p className="text-xs text-muted-foreground">
-              支持附带 `email`、`userId`、`provider`、`startUrl`、`accountType`、`availableModelIds`、`maxConcurrency`、`rateLimitBucketCapacity`、`rateLimitRefillPerSecond`。
+              支持附带 `email`、`userId`、`provider`、`authMethod`、`startUrl`、`issuerUrl`、`tokenEndpoint`、`scopes`、`accountType`、`availableModelIds`、`maxConcurrency`、`rateLimitBucketCapacity`、`rateLimitRefillPerSecond`。
               导入时会自动验活，失败的凭据会被排除。
             </p>
           </div>

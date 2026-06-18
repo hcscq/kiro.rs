@@ -420,11 +420,26 @@ impl AdminService {
 
         // 构建凭据对象
         let email = req.email.clone();
-        let is_enterprise = req
+        let is_enterprise_provider = req
             .provider
             .as_deref()
             .is_some_and(|provider| provider.trim().eq_ignore_ascii_case("enterprise"));
-        if is_enterprise {
+        let is_external_idp = req.auth_method.trim().eq_ignore_ascii_case("external_idp")
+            || req.auth_method.trim().eq_ignore_ascii_case("external-idp")
+            || req.provider.as_deref().is_some_and(|provider| {
+                let provider = provider.trim();
+                provider.eq_ignore_ascii_case("externalidp")
+                    || provider.eq_ignore_ascii_case("external-idp")
+                    || provider.eq_ignore_ascii_case("external_idp")
+                    || provider.eq_ignore_ascii_case("external idp")
+            })
+            || req
+                .issuer_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_some();
+        if is_enterprise_provider {
             if req
                 .client_id
                 .as_deref()
@@ -467,20 +482,54 @@ impl AdminService {
                 ));
             }
         }
+        if is_external_idp {
+            if req
+                .client_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none()
+            {
+                return Err(AdminServiceError::InvalidCredential(
+                    "ExternalIdP 账号必须提供 clientId".to_string(),
+                ));
+            }
+            if req
+                .issuer_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none()
+            {
+                return Err(AdminServiceError::InvalidCredential(
+                    "ExternalIdP 账号必须提供 issuerUrl".to_string(),
+                ));
+            }
+        }
         let new_cred = KiroCredentials {
             id: None,
             access_token: None,
             refresh_token: Some(req.refresh_token),
             profile_arn: req.profile_arn,
             expires_at: None,
-            auth_method: Some(if is_enterprise {
+            auth_method: Some(if is_external_idp {
+                "external_idp".to_string()
+            } else if is_enterprise_provider {
                 "idc".to_string()
             } else {
                 req.auth_method
             }),
-            provider: req.provider,
+            provider: if is_external_idp && req.provider.is_none() {
+                Some("ExternalIdp".to_string())
+            } else {
+                req.provider
+            },
             client_id: req.client_id,
             client_secret: req.client_secret,
+            token_endpoint: req.token_endpoint,
+            issuer_url: req.issuer_url,
+            scopes: req.scopes,
+            audience: req.audience,
             start_url: req.start_url,
             priority: req.priority,
             max_concurrency: req.max_concurrency,

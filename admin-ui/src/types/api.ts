@@ -196,11 +196,15 @@ export interface SetCredentialProfileRequest {
 // 添加凭据请求
 export interface AddCredentialRequest {
   refreshToken: string
-  authMethod?: 'social' | 'idc'
+  authMethod?: 'social' | 'idc' | 'external_idp'
   provider?: string
   profileArn?: string
   clientId?: string
   clientSecret?: string
+  tokenEndpoint?: string
+  issuerUrl?: string
+  scopes?: string
+  audience?: string
   priority?: number
   maxConcurrency?: number
   rateLimitBucketCapacity?: number

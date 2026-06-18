@@ -27,7 +27,8 @@ use crate::kiro::model::available_models::ListAvailableModelsResponse;
 use crate::kiro::model::available_profiles::{AvailableProfile, ListAvailableProfilesResponse};
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
-    IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
+    ExternalIdpDiscoveryResponse, ExternalIdpRefreshResponse, IdcRefreshRequest,
+    IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::{
@@ -238,7 +239,11 @@ pub(crate) async fn refresh_token(
     // 根据 auth_method 选择刷新方式；如果未指定，则根据 clientId/clientSecret 自动判断。
     let auth_method = credentials.effective_auth_method();
 
-    if auth_method.eq_ignore_ascii_case("idc")
+    if auth_method.eq_ignore_ascii_case("external_idp")
+        || auth_method.eq_ignore_ascii_case("external-idp")
+    {
+        refresh_external_idp_token(credentials, config, proxy).await
+    } else if auth_method.eq_ignore_ascii_case("idc")
         || auth_method.eq_ignore_ascii_case("builder-id")
         || auth_method.eq_ignore_ascii_case("iam")
     {
@@ -331,6 +336,187 @@ async fn refresh_social_token(
     if let Some(expires_in) = data.expires_in {
         let expires_at = Utc::now() + Duration::seconds(expires_in);
         new_credentials.expires_at = Some(expires_at.to_rfc3339());
+    }
+
+    Ok(new_credentials)
+}
+
+fn oidc_discovery_url(issuer_url: &str) -> anyhow::Result<url::Url> {
+    let mut url = url::Url::parse(issuer_url)
+        .map_err(|err| anyhow::anyhow!("ExternalIdP issuerUrl 无效: {}", err))?;
+    let mut path = url.path().trim_end_matches('/').to_string();
+    path.push_str("/.well-known/openid-configuration");
+    url.set_path(&path);
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url)
+}
+
+fn external_idp_token_type_header(
+    request: reqwest::RequestBuilder,
+    credentials: &KiroCredentials,
+) -> reqwest::RequestBuilder {
+    if credentials.is_external_idp_auth() {
+        request.header("TokenType", "EXTERNAL_IDP")
+    } else {
+        request
+    }
+}
+
+async fn discover_external_idp_token_endpoint(
+    client: &reqwest::Client,
+    issuer_url: &str,
+) -> anyhow::Result<String> {
+    let discovery_url = oidc_discovery_url(issuer_url)?;
+    let response = client
+        .get(discovery_url)
+        .header("accept", "application/json")
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+        let error_summary =
+            summarize_upstream_error(status.as_u16(), &body_text, UPSTREAM_ERROR_EXCERPT_CHARS);
+        bail!("ExternalIdP OIDC discovery 失败: {}", error_summary);
+    }
+
+    let data: ExternalIdpDiscoveryResponse = response.json().await?;
+    data.token_endpoint
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("ExternalIdP OIDC discovery 未返回 token_endpoint"))
+}
+
+/// 刷新 External IdP Token
+async fn refresh_external_idp_token(
+    credentials: &KiroCredentials,
+    config: &Config,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<KiroCredentials> {
+    tracing::info!("正在刷新 External IdP Token...");
+
+    let refresh_token = credentials.refresh_token.as_ref().unwrap();
+    let issuer_url = credentials
+        .issuer_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("ExternalIdP 刷新需要 issuerUrl"))?;
+    let client_id = credentials
+        .client_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("ExternalIdP 刷新需要 clientId"))?;
+
+    let client = build_client(proxy, 60, config.tls_backend)?;
+    let token_endpoint = match discover_external_idp_token_endpoint(&client, issuer_url).await {
+        Ok(endpoint) => endpoint,
+        Err(err) => {
+            if let Some(endpoint) = credentials
+                .token_endpoint
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                tracing::warn!(
+                    "ExternalIdP OIDC discovery 失败，将回退到缓存的 tokenEndpoint: {}",
+                    err
+                );
+                endpoint.to_string()
+            } else {
+                return Err(err);
+            }
+        }
+    };
+
+    let mut form = vec![
+        ("grant_type", "refresh_token".to_string()),
+        ("refresh_token", refresh_token.to_string()),
+        ("client_id", client_id.to_string()),
+    ];
+    if let Some(scopes) = credentials
+        .scopes
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        form.push(("scope", scopes.to_string()));
+    }
+
+    let response = client
+        .post(&token_endpoint)
+        .header("accept", "application/json")
+        .form(&form)
+        .send()
+        .await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+        let error_summary =
+            summarize_upstream_error(status.as_u16(), &body_text, UPSTREAM_ERROR_EXCERPT_CHARS);
+
+        if status.as_u16() == 400 && body_text.contains("invalid_grant") {
+            return Err(RefreshTokenInvalidError {
+                message: format!(
+                    "ExternalIdP refreshToken 已失效 (invalid_grant): {}",
+                    error_summary
+                ),
+            }
+            .into());
+        }
+
+        let error_msg = match status.as_u16() {
+            401 => "ExternalIdP 凭证已过期或无效，需要重新认证",
+            403 => "权限不足，无法刷新 ExternalIdP Token",
+            429 => "请求过于频繁，已被限流",
+            500..=599 => "ExternalIdP 服务暂时不可用",
+            _ => "ExternalIdP Token 刷新失败",
+        };
+        bail!("{}: {}", error_msg, error_summary);
+    }
+
+    let data: ExternalIdpRefreshResponse = response.json().await?;
+    let access_token = data.access_token;
+    let mut new_credentials = credentials.clone();
+    new_credentials.access_token = Some(access_token.clone());
+    new_credentials.auth_method = Some("external_idp".to_string());
+    new_credentials.provider = Some("ExternalIdp".to_string());
+    new_credentials.token_endpoint = Some(token_endpoint);
+
+    if let Some(new_refresh_token) = data.refresh_token {
+        new_credentials.refresh_token = Some(new_refresh_token);
+    }
+
+    if let Some(expires_in) = data.expires_in {
+        let expires_at = Utc::now() + Duration::seconds(expires_in);
+        new_credentials.expires_at = Some(expires_at.to_rfc3339());
+    }
+
+    let has_saved_profile_arn = new_credentials
+        .profile_arn
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some();
+    if !has_saved_profile_arn {
+        match discover_available_profile_arn(&new_credentials, config, &access_token, proxy).await {
+            Ok(Some(profile_arn)) => {
+                tracing::info!("ExternalIdP 凭据已通过 ListAvailableProfiles 发现可用 profileArn");
+                new_credentials.profile_arn = Some(profile_arn);
+            }
+            Ok(None) => {
+                tracing::warn!("ExternalIdP 凭据 ListAvailableProfiles 未返回可用 profileArn");
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "ExternalIdP 凭据 ListAvailableProfiles 发现 profileArn 失败: {}",
+                    err
+                );
+            }
+        }
     }
 
     Ok(new_credentials)
@@ -491,6 +677,28 @@ fn effective_management_endpoint_base_for_credentials(
     }
 }
 
+fn profile_discovery_regions(credentials: &KiroCredentials, config: &Config) -> Vec<String> {
+    let mut regions = Vec::new();
+    let mut push_region = |region: &str| {
+        let region = region.trim();
+        if !region.is_empty() && !regions.iter().any(|existing| existing == region) {
+            regions.push(region.to_string());
+        }
+    };
+
+    push_region(configured_api_region_for_profile_discovery(
+        credentials,
+        config,
+    ));
+    if credentials.is_external_idp_auth() {
+        // Matches Kiro's commercial default profile scan for external IdP logins.
+        push_region("us-east-1");
+        push_region("eu-central-1");
+    }
+
+    regions
+}
+
 fn normalized_next_token(next_token: Option<String>) -> Option<String> {
     next_token
         .map(|token| token.trim().to_string())
@@ -509,13 +717,13 @@ fn append_available_profiles_page(
 async fn list_available_profiles_page(
     credentials: &KiroCredentials,
     config: &Config,
+    region: &str,
     token: &str,
     next_token: Option<&str>,
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<ListAvailableProfilesResponse> {
     tracing::debug!("正在获取可用 Profile 列表...");
 
-    let region = configured_api_region_for_profile_discovery(credentials, config);
     let management_endpoint =
         effective_management_endpoint_base_for_credentials(credentials, config, region);
     let host = Config::endpoint_host(&management_endpoint);
@@ -543,7 +751,7 @@ async fn list_available_profiles_page(
             serde_json::Value::String(next_token.to_string()),
         );
     }
-    let response = client
+    let request = client
         .post(&url)
         .header("content-type", "application/json")
         .header("accept", "application/json")
@@ -553,7 +761,8 @@ async fn list_available_profiles_page(
         .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
         .header("amz-sdk-request", "attempt=1; max=1")
         .header("Authorization", format!("Bearer {}", token))
-        .json(&body)
+        .json(&body);
+    let response = external_idp_token_type_header(request, credentials)
         .send()
         .await?;
 
@@ -585,25 +794,45 @@ async fn list_available_profiles(
         profiles: Vec::new(),
         next_token: None,
     };
-    let mut next_token: Option<String> = None;
-    let mut seen_next_tokens = HashSet::new();
+    let mut errors = Vec::new();
 
-    loop {
-        let page =
-            list_available_profiles_page(credentials, config, token, next_token.as_deref(), proxy)
-                .await?;
-        next_token = append_available_profiles_page(&mut aggregated, page);
+    for region in profile_discovery_regions(credentials, config) {
+        let mut next_token: Option<String> = None;
+        let mut seen_next_tokens = HashSet::new();
 
-        let Some(token) = next_token.as_deref() else {
-            break;
-        };
-        if !seen_next_tokens.insert(token.to_string()) {
-            tracing::warn!("ListAvailableProfiles 返回重复 nextToken，已停止分页避免循环");
-            break;
+        loop {
+            let page = match list_available_profiles_page(
+                credentials,
+                config,
+                &region,
+                token,
+                next_token.as_deref(),
+                proxy,
+            )
+            .await
+            {
+                Ok(page) => page,
+                Err(err) => {
+                    errors.push(format!("{}: {}", region, err));
+                    break;
+                }
+            };
+            next_token = append_available_profiles_page(&mut aggregated, page);
+
+            let Some(token) = next_token.as_deref() else {
+                break;
+            };
+            if !seen_next_tokens.insert(token.to_string()) {
+                tracing::warn!("ListAvailableProfiles 返回重复 nextToken，已停止分页避免循环");
+                break;
+            }
         }
     }
 
     aggregated.next_token = None;
+    if aggregated.profiles.is_empty() && !errors.is_empty() {
+        bail!("获取可用 Profile 列表失败: {}", errors.join("; "));
+    }
     Ok(aggregated)
 }
 
@@ -708,14 +937,15 @@ pub(crate) async fn get_usage_limits(
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
-    let response = client
+    let request = client
         .get(&url)
         .header("x-amz-user-agent", &amz_user_agent)
         .header("user-agent", &user_agent)
         .header("host", &host)
         .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
         .header("amz-sdk-request", "attempt=1; max=1")
-        .header("Authorization", format!("Bearer {}", token))
+        .header("Authorization", format!("Bearer {}", token));
+    let response = external_idp_token_type_header(request, credentials)
         .send()
         .await?;
 
@@ -788,7 +1018,7 @@ pub(crate) async fn list_available_models_page(
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
-    let response = client
+    let request = client
         .get(url)
         .header("accept", "application/json")
         .header("x-amz-user-agent", &amz_user_agent)
@@ -796,7 +1026,8 @@ pub(crate) async fn list_available_models_page(
         .header("host", &host)
         .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
         .header("amz-sdk-request", "attempt=1; max=1")
-        .header("Authorization", format!("Bearer {}", token))
+        .header("Authorization", format!("Bearer {}", token));
+    let response = external_idp_token_type_header(request, credentials)
         .send()
         .await?;
 
@@ -896,7 +1127,7 @@ pub(crate) async fn set_user_preference_overage_status(
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
-    let response = client
+    let request = client
         .post(&url)
         .header("content-type", "application/json")
         .header("accept", "application/json")
@@ -906,7 +1137,8 @@ pub(crate) async fn set_user_preference_overage_status(
         .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
         .header("amz-sdk-request", "attempt=1; max=1")
         .header("Authorization", format!("Bearer {}", token))
-        .json(&body)
+        .json(&body);
+    let response = external_idp_token_type_header(request, credentials)
         .send()
         .await?;
 
@@ -8890,7 +9122,9 @@ impl MultiTokenManager {
             refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?;
 
         validated_cred.priority = new_cred.priority;
-        validated_cred.provider = new_cred.provider;
+        if let Some(provider) = new_cred.provider {
+            validated_cred.provider = Some(provider);
+        }
         if import_is_enterprise {
             if validated_cred.profile_arn.is_none() {
                 validated_cred.profile_arn = new_cred.profile_arn;
@@ -8898,15 +9132,35 @@ impl MultiTokenManager {
         } else if let Some(profile_arn) = new_cred.profile_arn {
             validated_cred.profile_arn = Some(profile_arn);
         }
-        validated_cred.auth_method = new_cred.auth_method.map(|m| {
-            if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam") {
-                "idc".to_string()
-            } else {
-                m
-            }
-        });
+        if let Some(auth_method) = new_cred.auth_method {
+            validated_cred.auth_method = Some(
+                if auth_method.eq_ignore_ascii_case("builder-id")
+                    || auth_method.eq_ignore_ascii_case("iam")
+                {
+                    "idc".to_string()
+                } else if auth_method.eq_ignore_ascii_case("external-idp")
+                    || auth_method.eq_ignore_ascii_case("externalidp")
+                {
+                    "external_idp".to_string()
+                } else {
+                    auth_method
+                },
+            );
+        }
         validated_cred.client_id = new_cred.client_id;
         validated_cred.client_secret = new_cred.client_secret;
+        if new_cred.token_endpoint.is_some() {
+            validated_cred.token_endpoint = new_cred.token_endpoint;
+        }
+        if new_cred.issuer_url.is_some() {
+            validated_cred.issuer_url = new_cred.issuer_url;
+        }
+        if new_cred.scopes.is_some() {
+            validated_cred.scopes = new_cred.scopes;
+        }
+        if new_cred.audience.is_some() {
+            validated_cred.audience = new_cred.audience;
+        }
         validated_cred.start_url = new_cred.start_url;
         validated_cred.region = new_cred.region;
         validated_cred.auth_region = new_cred.auth_region;

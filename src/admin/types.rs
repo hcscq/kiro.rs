@@ -22,6 +22,56 @@ where
     Option::<T>::deserialize(deserializer).map(Some)
 }
 
+fn normalize_scope_string(value: &str) -> Option<String> {
+    let joined = value
+        .split_whitespace()
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!joined.is_empty()).then_some(joined)
+}
+
+fn deserialize_optional_scope_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(value) => Ok(normalize_scope_string(&value)),
+        serde_json::Value::Array(values) => {
+            let mut scopes = Vec::new();
+            for value in values {
+                match value {
+                    serde_json::Value::String(value) => {
+                        scopes.extend(
+                            value
+                                .split_whitespace()
+                                .filter(|scope| !scope.trim().is_empty())
+                                .map(str::to_string),
+                        );
+                    }
+                    serde_json::Value::Null => {}
+                    other => {
+                        return Err(serde::de::Error::custom(format!(
+                            "scopes entries must be strings, got {other}"
+                        )));
+                    }
+                }
+            }
+            let joined = scopes.join(" ");
+            Ok((!joined.is_empty()).then_some(joined))
+        }
+        other => Err(serde::de::Error::custom(format!(
+            "scopes must be a string or string array, got {other}"
+        ))),
+    }
+}
+
 // ============ 凭据状态 ============
 
 /// 所有凭据状态响应
@@ -324,7 +374,7 @@ pub struct AddCredentialRequest {
     /// 刷新令牌（必填）
     pub refresh_token: String,
 
-    /// 认证方式（可选，默认 social）
+    /// 认证方式（可选，默认 social；支持 social / idc / external_idp）
     #[serde(default = "default_auth_method")]
     pub auth_method: String,
 
@@ -339,6 +389,19 @@ pub struct AddCredentialRequest {
 
     /// OIDC Client Secret（IdC 认证需要）
     pub client_secret: Option<String>,
+
+    /// 外部 IdP Token Endpoint（external_idp 可选；缺省时通过 issuerUrl discovery）
+    pub token_endpoint: Option<String>,
+
+    /// 外部 IdP Issuer URL（external_idp 需要）
+    pub issuer_url: Option<String>,
+
+    /// 外部 IdP scopes（空格分隔）
+    #[serde(default, deserialize_with = "deserialize_optional_scope_string")]
+    pub scopes: Option<String>,
+
+    /// 外部 IdP audience（可选）
+    pub audience: Option<String>,
 
     /// 优先级（可选，默认 0）
     #[serde(default)]

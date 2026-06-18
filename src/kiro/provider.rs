@@ -1692,6 +1692,17 @@ impl KiroProvider {
         Config::endpoint_host(&base)
     }
 
+    fn external_idp_token_type_header(
+        request: reqwest::RequestBuilder,
+        credentials: &KiroCredentials,
+    ) -> reqwest::RequestBuilder {
+        if credentials.is_external_idp_auth() {
+            request.header("TokenType", "EXTERNAL_IDP")
+        } else {
+            request
+        }
+    }
+
     /// 从请求体中提取模型信息
     ///
     /// 尝试解析 JSON 请求体，提取 conversationState.currentMessage.userInputMessage.modelId
@@ -2786,13 +2797,14 @@ impl KiroProvider {
                 request = request.header("x-amzn-kiro-profile-arn", arn);
             }
 
-            let response = match request
+            let request = request
                 .header("x-amz-user-agent", &x_amz_user_agent)
                 .header("user-agent", &user_agent)
                 .header("host", &self.base_domain_for(&credentials))
                 .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
                 .header("amz-sdk-request", "attempt=1; max=3")
-                .header("Authorization", format!("Bearer {}", token))
+                .header("Authorization", format!("Bearer {}", token));
+            let response = match Self::external_idp_token_type_header(request, &credentials)
                 .send()
                 .await
             {
@@ -3336,6 +3348,7 @@ impl KiroProvider {
             if !options.omit_agent_mode_header {
                 request = request.header("x-amzn-kiro-agent-mode", "vibe");
             }
+            request = Self::external_idp_token_type_header(request, &credentials);
             let stream_budget_remaining = if is_stream {
                 Some(Self::remaining_stream_budget(
                     overall_started_at,

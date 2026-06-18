@@ -4,7 +4,7 @@
 //! 支持单凭据和多凭据配置格式
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::borrow::Cow;
 use std::fs;
 use std::path::Path;
@@ -97,6 +97,29 @@ pub struct KiroCredentials {
     /// OIDC Client Secret (IdC 认证需要)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_secret: Option<String>,
+
+    /// 外部 IdP Token Endpoint（Kiro external_idp 登录缓存）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub token_endpoint: Option<String>,
+
+    /// 外部 IdP Issuer URL（Kiro external_idp 登录缓存）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub issuer_url: Option<String>,
+
+    /// 外部 IdP scopes。Kiro 可能保存为空格分隔字符串；兼容字符串数组导入。
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        deserialize_with = "deserialize_optional_scope_string"
+    )]
+    pub scopes: Option<String>,
+
+    /// 外部 IdP audience（可选，当前刷新流程保留但不主动发送）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub audience: Option<String>,
 
     /// AWS IAM Identity Center Start URL（企业 IdC 账号用于识别）
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -275,6 +298,11 @@ fn non_negative_finite(value: f64) -> Option<f64> {
 fn canonicalize_auth_method_value(value: &str) -> &str {
     if value.eq_ignore_ascii_case("builder-id") || value.eq_ignore_ascii_case("iam") {
         "idc"
+    } else if value.eq_ignore_ascii_case("external-idp")
+        || value.eq_ignore_ascii_case("external_idp")
+        || value.eq_ignore_ascii_case("externalidp")
+    {
+        "external_idp"
     } else {
         value
     }
@@ -289,6 +317,25 @@ fn has_client_credentials(credentials: &KiroCredentials) -> bool {
             .client_secret
             .as_ref()
             .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn has_external_idp_metadata(credentials: &KiroCredentials) -> bool {
+    credentials
+        .issuer_url
+        .as_ref()
+        .is_some_and(|value| !value.trim().is_empty())
+        && credentials
+            .client_id
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn is_external_idp_provider(provider: &str) -> bool {
+    let normalized = provider.trim();
+    normalized.eq_ignore_ascii_case("externalidp")
+        || normalized.eq_ignore_ascii_case("external-idp")
+        || normalized.eq_ignore_ascii_case("external_idp")
+        || normalized.eq_ignore_ascii_case("external idp")
 }
 
 fn detected_idc_start_url(credentials: &KiroCredentials) -> Option<Cow<'_, str>> {
@@ -349,6 +396,9 @@ fn provider_auth_account_type(provider: &str) -> Option<&'static str> {
     if normalized.eq_ignore_ascii_case("enterprise") {
         return Some("enterprise");
     }
+    if is_external_idp_provider(normalized) {
+        return Some("enterprise");
+    }
     if normalized.eq_ignore_ascii_case("builderid")
         || normalized.eq_ignore_ascii_case("builder-id")
         || normalized.eq_ignore_ascii_case("builder_id")
@@ -368,6 +418,9 @@ fn normalize_provider_value(provider: &str) -> Option<String> {
     }
     if normalized.eq_ignore_ascii_case("enterprise") {
         return Some("Enterprise".to_string());
+    }
+    if is_external_idp_provider(normalized) {
+        return Some("ExternalIdp".to_string());
     }
     if normalized.eq_ignore_ascii_case("builderid")
         || normalized.eq_ignore_ascii_case("builder-id")
@@ -405,6 +458,56 @@ fn non_empty_trimmed(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
+fn normalize_scope_string(value: &str) -> Option<String> {
+    let joined = value
+        .split_whitespace()
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!joined.is_empty()).then_some(joined)
+}
+
+fn deserialize_optional_scope_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(value) => Ok(normalize_scope_string(&value)),
+        serde_json::Value::Array(values) => {
+            let mut scopes = Vec::new();
+            for value in values {
+                match value {
+                    serde_json::Value::String(value) => {
+                        scopes.extend(
+                            value
+                                .split_whitespace()
+                                .filter(|scope| !scope.trim().is_empty())
+                                .map(str::to_string),
+                        );
+                    }
+                    serde_json::Value::Null => {}
+                    other => {
+                        return Err(serde::de::Error::custom(format!(
+                            "scopes entries must be strings, got {other}"
+                        )));
+                    }
+                }
+            }
+            let joined = scopes.join(" ");
+            Ok((!joined.is_empty()).then_some(joined))
+        }
+        other => Err(serde::de::Error::custom(format!(
+            "scopes must be a string or string array, got {other}"
+        ))),
+    }
+}
+
 /// 凭据配置（支持单对象或数组格式）
 ///
 /// 自动识别配置文件格式：
@@ -426,11 +529,17 @@ impl CredentialsConfig {
     /// - 如果文件内容为空，返回空数组
     /// - 支持单对象或数组格式
     pub fn load<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
-        let path = path.as_ref();
+        let mut path = path.as_ref();
 
         // 文件不存在时返回空数组
         if !path.exists() {
             return Ok(CredentialsConfig::Multiple(vec![]));
+        }
+
+        let cache_token_path;
+        if path.is_dir() {
+            cache_token_path = path.join("kiro-auth-token.json");
+            path = &cache_token_path;
         }
 
         let content = fs::read_to_string(path)?;
@@ -534,6 +643,14 @@ impl KiroCredentials {
         if self
             .provider
             .as_deref()
+            .is_some_and(is_external_idp_provider)
+            || has_external_idp_metadata(self)
+        {
+            return "external_idp";
+        }
+        if self
+            .provider
+            .as_deref()
             .is_some_and(|value| value.trim().eq_ignore_ascii_case("enterprise"))
         {
             return "idc";
@@ -550,11 +667,22 @@ impl KiroCredentials {
             {
                 "idc"
             }
+            Some(value)
+                if value.eq_ignore_ascii_case("external_idp")
+                    || value.eq_ignore_ascii_case("external-idp")
+                    || value.eq_ignore_ascii_case("externalidp") =>
+            {
+                "external_idp"
+            }
             Some(value) if value.eq_ignore_ascii_case("social") => "social",
             Some(_) => "social",
             None if has_client_credentials(self) => "idc",
             None => "social",
         }
+    }
+
+    pub fn is_external_idp_auth(&self) -> bool {
+        self.effective_auth_method() == "external_idp"
     }
 
     pub fn detected_auth_account_type(&self) -> Option<String> {
@@ -564,6 +692,10 @@ impl KiroCredentials {
             .and_then(provider_auth_account_type)
         {
             return Some(account_type.to_string());
+        }
+
+        if self.effective_auth_method() == "external_idp" {
+            return Some("enterprise".to_string());
         }
 
         if let Some(start_url) = detected_idc_start_url(self) {
@@ -621,6 +753,25 @@ impl KiroCredentials {
             .map(str::to_string);
         self.email = self
             .email
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        self.token_endpoint = self
+            .token_endpoint
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        self.issuer_url = self
+            .issuer_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        self.scopes = self.scopes.as_deref().and_then(normalize_scope_string);
+        self.audience = self
+            .audience
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -1132,6 +1283,10 @@ mod tests {
             provider: None,
             client_id: None,
             client_secret: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
+            audience: None,
             start_url: None,
             priority: 0,
             max_concurrency: None,
@@ -1463,6 +1618,38 @@ mod tests {
     }
 
     #[test]
+    fn test_credentials_config_loads_kiro_sso_cache_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "kiro-rs-credentials-cache-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("kiro-auth-token.json"),
+            r#"{
+                "accessToken": "access",
+                "refreshToken": "refresh",
+                "authMethod": "external_idp",
+                "provider": "ExternalIdp",
+                "issuerUrl": "https://login.example.com/tenant/v2.0",
+                "clientId": "client-id"
+            }"#,
+        )
+        .unwrap();
+
+        let config = CredentialsConfig::load(&dir).unwrap();
+        let credentials = config.into_sorted_credentials();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(credentials.len(), 1);
+        assert_eq!(credentials[0].effective_auth_method(), "external_idp");
+        assert_eq!(
+            credentials[0].detected_auth_account_type().as_deref(),
+            Some("enterprise")
+        );
+    }
+
+    #[test]
     fn test_credentials_config_multiple() {
         let json = r#"[
             {"refreshToken": "test1", "priority": 1},
@@ -1530,6 +1717,10 @@ mod tests {
             provider: None,
             client_id: None,
             client_secret: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
+            audience: None,
             start_url: None,
             priority: 0,
             max_concurrency: None,
@@ -1584,6 +1775,10 @@ mod tests {
             provider: None,
             client_id: None,
             client_secret: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
+            audience: None,
             start_url: None,
             priority: 0,
             max_concurrency: None,
@@ -1720,6 +1915,10 @@ mod tests {
             provider: None,
             client_id: None,
             client_secret: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
+            audience: None,
             start_url: None,
             priority: 3,
             max_concurrency: None,
@@ -1988,6 +2187,45 @@ mod tests {
         };
 
         assert_eq!(creds.effective_auth_method(), "idc");
+    }
+
+    #[test]
+    fn test_external_idp_cache_fields_parse_and_force_enterprise_account_type() {
+        let json = r#"{
+            "accessToken": "access",
+            "refreshToken": "refresh",
+            "expiresAt": "2026-06-18T08:29:44.826Z",
+            "authMethod": "external_idp",
+            "provider": "ExternalIdp",
+            "tokenEndpoint": "https://login.example.com/oauth2/v2.0/token",
+            "issuerUrl": "https://login.example.com/tenant/v2.0",
+            "clientId": "client-id",
+            "scopes": ["scope.one", "scope.two offline_access"]
+        }"#;
+
+        let mut creds = KiroCredentials::from_json(json).unwrap();
+        creds.canonicalize_auth_method();
+        creds.normalize_identity_metadata();
+
+        assert_eq!(creds.effective_auth_method(), "external_idp");
+        assert_eq!(
+            creds.detected_auth_account_type().as_deref(),
+            Some("enterprise")
+        );
+        assert_eq!(creds.provider.as_deref(), Some("ExternalIdp"));
+        assert_eq!(
+            creds.scopes.as_deref(),
+            Some("scope.one scope.two offline_access")
+        );
+        assert_eq!(
+            creds.token_endpoint.as_deref(),
+            Some("https://login.example.com/oauth2/v2.0/token")
+        );
+        assert_eq!(
+            creds.issuer_url.as_deref(),
+            Some("https://login.example.com/tenant/v2.0")
+        );
+        assert_eq!(creds.effective_profile_arn_for_kiro_requests(), None);
     }
 
     #[test]
