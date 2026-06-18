@@ -25,6 +25,9 @@ export interface CredentialStatusItem {
   subscriptionType?: string | null
   authAccountType?: 'social' | 'builder-id' | 'enterprise' | 'idc' | string | null
   accountType?: string | null
+  sourceSupplierId?: string | null
+  sourceSupplierName?: string | null
+  sourceBatch?: string | null
   resolvedAccountType?: string | null
   accountTypeSource?: 'credential' | 'subscription-title' | 'subscription-type' | null
   standardAccountType?: string | null
@@ -167,6 +170,12 @@ export interface SetCredentialModelPolicyRequest {
   clearRuntimeModelRestrictions?: boolean
 }
 
+export interface SetCredentialSourceRequest {
+  sourceSupplierId?: string | null
+  sourceSupplierName?: string | null
+  sourceBatch?: string | null
+}
+
 export type CredentialProxyMode = 'auto' | 'pool' | 'custom' | 'direct' | 'global'
 
 export interface SetCredentialProxyRequest {
@@ -217,6 +226,9 @@ export interface AddCredentialRequest {
   email?: string
   userId?: string
   accountType?: string
+  sourceSupplierId?: string
+  sourceSupplierName?: string
+  sourceBatch?: string
   allowedModels?: string[]
   blockedModels?: string[]
   availableModelIds?: string[]

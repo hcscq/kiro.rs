@@ -135,6 +135,15 @@ pub struct CredentialStatusItem {
     /// 账号类型
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_type: Option<String>,
+    /// 账号来源供应商 ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_supplier_id: Option<String>,
+    /// 账号来源供应商名称
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_supplier_name: Option<String>,
+    /// 账号来源批次
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_batch: Option<String>,
     /// 当前命中的账号类型（显式账号类型或标准档位推断）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_account_type: Option<String>,
@@ -339,6 +348,21 @@ pub struct SetCredentialModelPolicyRequest {
     pub clear_runtime_model_restrictions: bool,
 }
 
+/// 修改凭据来源标记请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCredentialSourceRequest {
+    /// 字段缺失表示不修改；null 或空字符串表示清空供应商 ID
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub source_supplier_id: Option<Option<String>>,
+    /// 字段缺失表示不修改；null 或空字符串表示清空供应商名称
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub source_supplier_name: Option<Option<String>>,
+    /// 字段缺失表示不修改；null 或空字符串表示清空批次
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub source_batch: Option<Option<String>>,
+}
+
 /// 设置凭据超额使用开关请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -441,6 +465,15 @@ pub struct AddCredentialRequest {
 
     /// 账号类型（可选）
     pub account_type: Option<String>,
+
+    /// 账号来源供应商 ID（可选，用于兼容 KAM 导入）
+    pub source_supplier_id: Option<String>,
+
+    /// 账号来源供应商名称（可选）
+    pub source_supplier_name: Option<String>,
+
+    /// 账号来源批次（可选）
+    pub source_batch: Option<String>,
 
     /// 账号级额外允许模型
     pub allowed_models: Option<Vec<String>>,

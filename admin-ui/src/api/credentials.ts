@@ -8,6 +8,7 @@ import type {
   SetPriorityRequest,
   SetCredentialRateLimitConfigRequest,
   SetCredentialModelPolicyRequest,
+  SetCredentialSourceRequest,
   SetCredentialProxyRequest,
   SetCredentialProfileRequest,
   CredentialProfilesResponse,
@@ -183,6 +184,15 @@ export async function setCredentialModelPolicy(
     `/credentials/${id}/model-policy`,
     payload
   )
+  return data
+}
+
+// 设置凭据来源标记
+export async function setCredentialSource(
+  id: number,
+  payload: SetCredentialSourceRequest
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/source`, payload)
   return data
 }
 

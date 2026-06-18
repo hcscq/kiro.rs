@@ -56,6 +56,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [rateLimitRefillPerSecond, setRateLimitRefillPerSecond] = useState('')
   const [machineId, setMachineId] = useState('')
   const [accountType, setAccountType] = useState('')
+  const [sourceSupplierName, setSourceSupplierName] = useState('')
+  const [sourceSupplierId, setSourceSupplierId] = useState('')
+  const [sourceBatch, setSourceBatch] = useState('')
   const [allowedModels, setAllowedModels] = useState<string[]>([])
   const [blockedModels, setBlockedModels] = useState<string[]>([])
   const [proxyMode, setProxyMode] = useState<CredentialProxyMode>('auto')
@@ -108,6 +111,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setRateLimitRefillPerSecond('')
     setMachineId('')
     setAccountType('')
+    setSourceSupplierName('')
+    setSourceSupplierId('')
+    setSourceBatch('')
     setAllowedModels([])
     setBlockedModels([])
     setProxyMode('auto')
@@ -200,6 +206,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         rateLimitRefillPerSecond: parsedRateLimitRefillPerSecond,
         machineId: machineId.trim() || undefined,
         accountType: accountType.trim() || undefined,
+        sourceSupplierName: sourceSupplierName.trim() || undefined,
+        sourceSupplierId: sourceSupplierId.trim() || undefined,
+        sourceBatch: sourceBatch.trim() || undefined,
         allowedModels: allowedModels.length ? allowedModels : undefined,
         blockedModels: blockedModels.length ? blockedModels : undefined,
         proxyId: proxyMode === 'pool' ? proxyId.trim() || undefined : undefined,
@@ -463,6 +472,36 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               description="可选。优先选择内置标准类型；若需特殊灰度，可使用 `power-custom`、`pro-plus-canary` 这类衍生命名。"
               disabled={isPending}
             />
+
+            <div className="space-y-2 rounded-lg border p-3 bg-muted/5">
+              <label className="text-sm font-medium">来源标记</label>
+              <div className="grid gap-2 sm:grid-cols-3">
+                <Input
+                  id="sourceSupplierName"
+                  placeholder="供应商名称"
+                  value={sourceSupplierName}
+                  onChange={(e) => setSourceSupplierName(e.target.value)}
+                  disabled={isPending}
+                />
+                <Input
+                  id="sourceSupplierId"
+                  placeholder="供应商 ID"
+                  value={sourceSupplierId}
+                  onChange={(e) => setSourceSupplierId(e.target.value)}
+                  disabled={isPending}
+                />
+                <Input
+                  id="sourceBatch"
+                  placeholder="批次"
+                  value={sourceBatch}
+                  onChange={(e) => setSourceBatch(e.target.value)}
+                  disabled={isPending}
+                />
+              </div>
+              <p className="text-xs text-muted-foreground">
+                可选，用于按账号来源供应商和导入批次筛选。
+              </p>
+            </div>
 
             <ModelSelector
               label="账号级额外允许模型"

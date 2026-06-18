@@ -21,7 +21,7 @@ use super::types::{
     LoadBalancingModeResponse, ModelCapabilitiesConfigResponse, ModelCatalogItemResponse,
     ModelCatalogResponse, ProxyPoolConfigResponse, ProxyPoolEntryResponse,
     SetCredentialModelPolicyRequest, SetCredentialProfileRequest, SetCredentialProxyRequest,
-    SetLoadBalancingModeRequest, SetModelCapabilitiesConfigRequest,
+    SetCredentialSourceRequest, SetLoadBalancingModeRequest, SetModelCapabilitiesConfigRequest,
     StandardAccountTypePresetResponse,
 };
 
@@ -117,6 +117,9 @@ impl AdminService {
                     subscription_type: entry.subscription_type,
                     auth_account_type: entry.auth_account_type,
                     account_type: entry.account_type,
+                    source_supplier_id: entry.source_supplier_id,
+                    source_supplier_name: entry.source_supplier_name,
+                    source_batch: entry.source_batch,
                     resolved_account_type: entry.resolved_account_type,
                     account_type_source: entry.account_type_source,
                     standard_account_type,
@@ -247,6 +250,23 @@ impl AdminService {
                 req.allowed_models,
                 req.blocked_models,
                 req.clear_runtime_model_restrictions,
+            )
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    pub fn set_source(
+        &self,
+        id: u64,
+        req: SetCredentialSourceRequest,
+    ) -> Result<(), AdminServiceError> {
+        self.ensure_runtime_write_leader()?;
+
+        self.token_manager
+            .set_credential_source(
+                id,
+                req.source_supplier_id,
+                req.source_supplier_name,
+                req.source_batch,
             )
             .map_err(|e| self.classify_error(e, id))
     }
@@ -544,6 +564,9 @@ impl AdminService {
             subscription_title: None, // 将在首次获取使用额度时自动更新
             subscription_type: None,
             account_type: req.account_type,
+            source_supplier_id: req.source_supplier_id,
+            source_supplier_name: req.source_supplier_name,
+            source_batch: req.source_batch,
             allowed_models: req.allowed_models.unwrap_or_default(),
             blocked_models: req.blocked_models.unwrap_or_default(),
             runtime_model_restrictions: Vec::new(),

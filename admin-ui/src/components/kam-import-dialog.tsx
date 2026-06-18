@@ -1,6 +1,6 @@
-import { useState, useMemo } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
-import { CheckCircle2, XCircle, AlertCircle, Loader2, Globe2, Link2, Network, Server, Shuffle } from 'lucide-react'
+import { CheckCircle2, XCircle, AlertCircle, Loader2, Globe2, Link2, Network, Server, Shuffle, Tags } from 'lucide-react'
 import {
   Dialog,
   DialogContent,
@@ -15,6 +15,10 @@ import { useCredentials, useAddCredential, useDeleteCredential, useLoadBalancing
 import { getCredentialBalance, setCredentialDisabled, setCredentialOverageStatus } from '@/api/credentials'
 import type { CredentialProxyMode, ProxyPoolEntry } from '@/types/api'
 import { cn, extractErrorMessage, sha256Hex } from '@/lib/utils'
+import {
+  collectSourceSupplierSuggestions,
+  formatDefaultSourceBatch,
+} from '@/lib/source-metadata'
 
 interface KamImportDialogProps {
   open: boolean
@@ -33,6 +37,12 @@ interface KamAccount {
   nickname?: string
   profileArn?: string
   accountType?: string
+  sourceSupplierId?: string
+  sourceSupplierName?: string
+  sourceBatch?: string
+  source_supplier_id?: string
+  source_supplier_name?: string
+  source_batch?: string
   availableModelIds?: string[]
   availableModels?: unknown[]
   models?: unknown[]
@@ -65,6 +75,12 @@ interface KamAccount {
     scopes?: string | string[]
     audience?: string
     startUrl?: string
+    sourceSupplierId?: string
+    sourceSupplierName?: string
+    sourceBatch?: string
+    source_supplier_id?: string
+    source_supplier_name?: string
+    source_batch?: string
     maxConcurrency?: number
     rateLimitBucketCapacity?: number
     rateLimitRefillPerSecond?: number
@@ -104,8 +120,29 @@ function getString(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined
 }
 
+function getAliasedString(obj: unknown, ...keys: string[]): string | undefined {
+  if (typeof obj !== 'object' || obj === null) return undefined
+  const record = obj as Record<string, unknown>
+  for (const key of keys) {
+    const value = getString(record[key])?.trim()
+    if (value) return value
+  }
+  return undefined
+}
+
 function getNumber(value: unknown): number | undefined {
   return typeof value === 'number' ? value : undefined
+}
+
+function getKamSourceString(
+  account: KamAccount,
+  key: 'sourceSupplierId' | 'sourceSupplierName' | 'sourceBatch',
+  snakeKey: 'source_supplier_id' | 'source_supplier_name' | 'source_batch'
+): string | undefined {
+  return (
+    getAliasedString(account.credentials, key, snakeKey) ??
+    getAliasedString(account, key, snakeKey)
+  )
 }
 
 function getKamDispatchNumber(
@@ -229,6 +266,9 @@ function normalizeKamAccount(item: unknown): unknown {
           : undefined
     const profileArn = typeof obj.profileArn === 'string' ? obj.profileArn : undefined
     const accountType = getString(obj.accountType)
+    const sourceSupplierId = getAliasedString(obj, 'sourceSupplierId', 'source_supplier_id')
+    const sourceSupplierName = getAliasedString(obj, 'sourceSupplierName', 'source_supplier_name')
+    const sourceBatch = getAliasedString(obj, 'sourceBatch', 'source_batch')
     const availableModelIds = Array.isArray(obj.availableModelIds)
       ? obj.availableModelIds.filter((value): value is string => typeof value === 'string')
       : undefined
@@ -269,6 +309,9 @@ function normalizeKamAccount(item: unknown): unknown {
       nickname,
       profileArn,
       accountType,
+      sourceSupplierId,
+      sourceSupplierName,
+      sourceBatch,
       availableModelIds,
       availableModels,
       models,
@@ -292,6 +335,9 @@ function normalizeKamAccount(item: unknown): unknown {
         scopes,
         audience,
         startUrl,
+        sourceSupplierId,
+        sourceSupplierName,
+        sourceBatch,
         priority,
         proxyId,
         proxyUrl,
@@ -363,6 +409,8 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
   const [results, setResults] = useState<VerificationResult[]>([])
   const [defaultPriority, setDefaultPriority] = useState('0')
   const [defaultMaxConcurrency, setDefaultMaxConcurrency] = useState('')
+  const [defaultSourceSupplierName, setDefaultSourceSupplierName] = useState('')
+  const [defaultSourceBatch, setDefaultSourceBatch] = useState(() => formatDefaultSourceBatch())
   const [defaultProxyMode, setDefaultProxyMode] = useState<CredentialProxyMode>('auto')
   const [defaultProxyId, setDefaultProxyId] = useState('')
   const [defaultProxyUrl, setDefaultProxyUrl] = useState('')
@@ -378,6 +426,16 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     loadBalancingData?.proxyPool?.proxies.filter((proxy) => proxy.enabled) ?? []
   const proxyPoolEnabled = loadBalancingData?.proxyPool?.enabled ?? false
   const proxyRequireProxy = loadBalancingData?.proxyPool?.requireProxy ?? false
+  const sourceSupplierSuggestions = useMemo(
+    () => collectSourceSupplierSuggestions(existingCredentials?.credentials),
+    [existingCredentials?.credentials]
+  )
+
+  useEffect(() => {
+    if (open && !importing && !jsonInput.trim() && results.length === 0) {
+      setDefaultSourceBatch(formatDefaultSourceBatch())
+    }
+  }, [importing, jsonInput, open, results.length])
 
   const rollbackCredential = async (id: number): Promise<{ success: boolean; error?: string }> => {
     try {
@@ -400,6 +458,8 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     setResults([])
     setDefaultPriority('0')
     setDefaultMaxConcurrency('')
+    setDefaultSourceSupplierName('')
+    setDefaultSourceBatch(formatDefaultSourceBatch())
     setDefaultProxyMode('auto')
     setDefaultProxyId('')
     setDefaultProxyUrl('')
@@ -461,6 +521,8 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
       toast.error('当前代理池要求新凭据必须绑定代理')
       return
     }
+    const defaultSourceSupplierNameValue = defaultSourceSupplierName.trim()
+    const defaultSourceBatchValue = defaultSourceBatch.trim()
 
     try {
 
@@ -588,6 +650,19 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           const rateLimitRefillPerSecond = getKamDispatchNumber(account, 'rateLimitRefillPerSecond')
           const priority =
             getNumber(account.priority) ?? getNumber(account.credentials.priority) ?? parsedDefaultPriority
+          const sourceSupplierId = getKamSourceString(
+            account,
+            'sourceSupplierId',
+            'source_supplier_id'
+          )
+          const sourceSupplierName = getKamSourceString(
+            account,
+            'sourceSupplierName',
+            'source_supplier_name'
+          ) ?? (defaultSourceSupplierNameValue || undefined)
+          const sourceBatch =
+            getKamSourceString(account, 'sourceBatch', 'source_batch') ??
+            (defaultSourceBatchValue || undefined)
 
           if (authMethod === 'idc' && (!clientId || !clientSecret)) {
             throw new Error('idc 模式需要同时提供 clientId 和 clientSecret')
@@ -657,6 +732,9 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             priority,
             machineId: account.machineId?.trim() || undefined,
             accountType: account.accountType?.trim() || undefined,
+            sourceSupplierId,
+            sourceSupplierName,
+            sourceBatch,
             availableModelIds: availableModelIds.length > 0 ? availableModelIds : undefined,
             maxConcurrency,
             rateLimitBucketCapacity,
@@ -863,6 +941,57 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             <div className="space-y-3 rounded-md border p-3">
               <div className="flex items-center justify-between gap-3">
                 <div className="flex items-center gap-2 text-sm font-medium">
+                  <Tags className="h-4 w-4 text-muted-foreground" />
+                  默认来源标记
+                </div>
+                <span className="text-xs text-muted-foreground">KAM 单账号来源字段优先</span>
+              </div>
+              <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_160px_auto] md:items-end">
+                <div className="space-y-1.5">
+                  <label htmlFor="kamDefaultSourceSupplier" className="text-xs font-medium text-muted-foreground">
+                    默认供应商
+                  </label>
+                  <Input
+                    id="kamDefaultSourceSupplier"
+                    list="kam-source-supplier-options"
+                    placeholder="可输入或选择"
+                    value={defaultSourceSupplierName}
+                    onChange={(e) => setDefaultSourceSupplierName(e.target.value)}
+                    disabled={importing}
+                  />
+                  <datalist id="kam-source-supplier-options">
+                    {sourceSupplierSuggestions.map((supplier) => (
+                      <option key={supplier} value={supplier} />
+                    ))}
+                  </datalist>
+                </div>
+                <div className="space-y-1.5">
+                  <label htmlFor="kamDefaultSourceBatch" className="text-xs font-medium text-muted-foreground">
+                    默认批次
+                  </label>
+                  <Input
+                    id="kamDefaultSourceBatch"
+                    placeholder={formatDefaultSourceBatch()}
+                    value={defaultSourceBatch}
+                    onChange={(e) => setDefaultSourceBatch(e.target.value)}
+                    disabled={importing}
+                  />
+                </div>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  className="h-10 whitespace-nowrap"
+                  onClick={() => setDefaultSourceBatch(formatDefaultSourceBatch())}
+                  disabled={importing}
+                >
+                  当前小时
+                </Button>
+              </div>
+            </div>
+            <div className="space-y-3 rounded-md border p-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2 text-sm font-medium">
                   <Network className="h-4 w-4 text-muted-foreground" />
                   默认代理策略
                 </div>
@@ -950,7 +1079,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
               )}
             </div>
             <textarea
-              placeholder={'粘贴 Kiro Account Manager 导出的 JSON\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "userId": "...",\n    "provider": "Enterprise",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "eu-central-1",\n    "authRegion": "us-east-1",\n    "startUrl": "https://example.awsapps.com/start",\n    "accountType": "power",\n    "maxConcurrency": 20\n  }\n]\n\n（可选的 authMethod 字段会被忽略，系统会根据 clientId/clientSecret 自动判断；未提供 authRegion 时，Enterprise 默认使用 us-east-1 进行 OIDC 刷新）\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "provider": "Enterprise",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "eu-central-1",\n        "authRegion": "us-east-1",\n        "startUrl": "https://example.awsapps.com/start"\n      }\n    }\n  ]\n}'}
+              placeholder={'粘贴 Kiro Account Manager 导出的 JSON\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "userId": "...",\n    "provider": "Enterprise",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "eu-central-1",\n    "authRegion": "us-east-1",\n    "startUrl": "https://example.awsapps.com/start",\n    "accountType": "power",\n    "sourceSupplierName": "供应商A",\n    "sourceBatch": "20260618211",\n    "maxConcurrency": 20\n  }\n]\n\n（可选的 authMethod 字段会被忽略，系统会根据 clientId/clientSecret 自动判断；未提供 authRegion 时，Enterprise 默认使用 us-east-1 进行 OIDC 刷新）\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "provider": "Enterprise",\n      "sourceSupplierName": "供应商A",\n      "sourceBatch": "20260618211",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "eu-central-1",\n        "authRegion": "us-east-1",\n        "startUrl": "https://example.awsapps.com/start"\n      }\n    }\n  ]\n}'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}

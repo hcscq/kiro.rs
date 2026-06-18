@@ -5,6 +5,7 @@ import {
   setCredentialMaxConcurrency,
   setCredentialRateLimitConfig,
   setCredentialModelPolicy,
+  setCredentialSource,
   setCredentialProxy,
   getCredentialProfiles,
   setCredentialProfile,
@@ -26,6 +27,7 @@ import type {
   AddCredentialRequest,
   CredentialsStatusResponse,
   SetCredentialModelPolicyRequest,
+  SetCredentialSourceRequest,
   SetCredentialProxyRequest,
   SetCredentialProfileRequest,
   UpdateLoadBalancingConfigRequest,
@@ -148,6 +150,18 @@ export function useSetCredentialModelPolicy() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
       queryClient.invalidateQueries({ queryKey: ['modelCapabilities'] })
+    },
+  })
+}
+
+// 设置凭据来源标记
+export function useSetCredentialSource() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, payload }: { id: number; payload: SetCredentialSourceRequest }) =>
+      setCredentialSource(id, payload),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
   })
 }

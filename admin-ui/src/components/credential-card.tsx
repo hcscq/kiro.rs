@@ -64,6 +64,7 @@ import {
   useClearCredentialRuntimeModelRestrictions,
   useClearCredentialSuspiciousActivity,
   useSetCredentialModelPolicy,
+  useSetCredentialSource,
   useSetCredentialProxy,
   useCredentialProfiles,
   useSetCredentialProfile,
@@ -377,6 +378,13 @@ export function CredentialCard({
   )
   const [showModelPolicyDialog, setShowModelPolicyDialog] = useState(false)
   const [accountTypeValue, setAccountTypeValue] = useState(credential.accountType ?? '')
+  const [sourceSupplierNameValue, setSourceSupplierNameValue] = useState(
+    credential.sourceSupplierName ?? ''
+  )
+  const [sourceSupplierIdValue, setSourceSupplierIdValue] = useState(
+    credential.sourceSupplierId ?? ''
+  )
+  const [sourceBatchValue, setSourceBatchValue] = useState(credential.sourceBatch ?? '')
   const [allowedModelsValue, setAllowedModelsValue] = useState(credential.allowedModels ?? [])
   const [blockedModelsValue, setBlockedModelsValue] = useState(credential.blockedModels ?? [])
   const [clearRuntimeModelRestrictions, setClearRuntimeModelRestrictions] = useState(false)
@@ -394,6 +402,7 @@ export function CredentialCard({
   const clearRuntimeModelCooldown = useClearCredentialRuntimeModelRestrictions()
   const clearSuspiciousActivity = useClearCredentialSuspiciousActivity()
   const setModelPolicy = useSetCredentialModelPolicy()
+  const setSource = useSetCredentialSource()
   const setProxy = useSetCredentialProxy()
   const profileQuery = useCredentialProfiles(credential.id, showModelPolicyDialog)
   const setProfile = useSetCredentialProfile()
@@ -501,6 +510,9 @@ export function CredentialCard({
         : ''
     )
     setAccountTypeValue(credential.accountType ?? '')
+    setSourceSupplierNameValue(credential.sourceSupplierName ?? '')
+    setSourceSupplierIdValue(credential.sourceSupplierId ?? '')
+    setSourceBatchValue(credential.sourceBatch ?? '')
     setAllowedModelsValue(credential.allowedModels ?? [])
     setBlockedModelsValue(credential.blockedModels ?? [])
     setClearRuntimeModelRestrictions(false)
@@ -554,6 +566,7 @@ export function CredentialCard({
     setRateLimitConfig.isPending ||
     setProfile.isPending ||
     setModelPolicy.isPending ||
+    setSource.isPending ||
     setProxy.isPending
 
   const handleProxySave = async () => {
@@ -708,6 +721,29 @@ export function CredentialCard({
         changed = true
       }
 
+      const currentSourceSupplierName = credential.sourceSupplierName?.trim() ?? ''
+      const currentSourceSupplierId = credential.sourceSupplierId?.trim() ?? ''
+      const currentSourceBatch = credential.sourceBatch?.trim() ?? ''
+      const targetSourceSupplierName = sourceSupplierNameValue.trim()
+      const targetSourceSupplierId = sourceSupplierIdValue.trim()
+      const targetSourceBatch = sourceBatchValue.trim()
+
+      if (
+        currentSourceSupplierName !== targetSourceSupplierName ||
+        currentSourceSupplierId !== targetSourceSupplierId ||
+        currentSourceBatch !== targetSourceBatch
+      ) {
+        await setSource.mutateAsync({
+          id: credential.id,
+          payload: {
+            sourceSupplierName: targetSourceSupplierName || null,
+            sourceSupplierId: targetSourceSupplierId || null,
+            sourceBatch: targetSourceBatch || null,
+          },
+        })
+        changed = true
+      }
+
       if (changed) {
         toast.success('配置已保存')
       } else {
@@ -805,6 +841,17 @@ export function CredentialCard({
   const credentialEmail = credential.email?.trim()
   const credentialEmailParts = credentialEmail ? splitEmailLabel(credentialEmail) : null
   const shouldShowCredentialId = credentialLabel !== `凭据 #${credential.id}`
+  const sourceSupplierNameLabel = credential.sourceSupplierName?.trim() || null
+  const sourceSupplierIdLabel = credential.sourceSupplierId?.trim() || null
+  const sourceSupplierLabel = sourceSupplierNameLabel || sourceSupplierIdLabel
+  const sourceSupplierTitle = [
+    sourceSupplierNameLabel ? `供应商：${sourceSupplierNameLabel}` : null,
+    sourceSupplierIdLabel ? `供应商 ID：${sourceSupplierIdLabel}` : null,
+  ]
+    .filter(Boolean)
+    .join(' / ')
+  const sourceBatchLabel = credential.sourceBatch?.trim() || null
+  const hasSourceMetadata = Boolean(sourceSupplierLabel || sourceBatchLabel)
 
   return (
     <>
@@ -1034,6 +1081,31 @@ export function CredentialCard({
 
           {/* 静态配置标签 */}
           <div className="flex flex-wrap gap-1.5">
+            {sourceSupplierLabel && (
+              <Badge
+                variant="secondary"
+                className="max-w-full truncate px-1.5 py-0 text-[10px]"
+                title={sourceSupplierTitle || sourceSupplierLabel}
+              >
+                <Building2 className="mr-1 h-3 w-3 shrink-0" />
+                供应商: {sourceSupplierLabel}
+              </Badge>
+            )}
+            {sourceBatchLabel && (
+              <Badge
+                variant="outline"
+                className="max-w-full truncate px-1.5 py-0 text-[10px]"
+                title={`批次：${sourceBatchLabel}`}
+              >
+                <Layers className="mr-1 h-3 w-3 shrink-0" />
+                批次: {sourceBatchLabel}
+              </Badge>
+            )}
+            {!hasSourceMetadata && (
+              <Badge variant="outline" className="px-1.5 py-0 text-[10px] text-muted-foreground">
+                来源未标记
+              </Badge>
+            )}
             <Badge variant="secondary" className="text-[10px] px-1.5 py-0">
               策略: {policySummary}
             </Badge>
@@ -1291,6 +1363,53 @@ export function CredentialCard({
                 />
                 <p className="text-[10px] text-muted-foreground">留空表示清除凭据覆盖，继续跟随默认策略</p>
               </div>
+            </div>
+
+            {/* 来源标记配置区 */}
+            <div className="space-y-2 rounded-lg border p-3 bg-muted/5">
+              <div className="text-sm font-medium text-foreground">来源标记</div>
+              <div className="grid gap-3 sm:grid-cols-3">
+                <div className="space-y-1">
+                  <label htmlFor={`source-supplier-name-${credential.id}`} className="text-xs text-muted-foreground">
+                    供应商
+                  </label>
+                  <Input
+                    id={`source-supplier-name-${credential.id}`}
+                    value={sourceSupplierNameValue}
+                    onChange={(e) => setSourceSupplierNameValue(e.target.value)}
+                    className="h-9 text-sm"
+                    placeholder="供应商名称"
+                    disabled={isSaving}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <label htmlFor={`source-supplier-id-${credential.id}`} className="text-xs text-muted-foreground">
+                    供应商 ID
+                  </label>
+                  <Input
+                    id={`source-supplier-id-${credential.id}`}
+                    value={sourceSupplierIdValue}
+                    onChange={(e) => setSourceSupplierIdValue(e.target.value)}
+                    className="h-9 text-sm"
+                    placeholder="可选"
+                    disabled={isSaving}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <label htmlFor={`source-batch-${credential.id}`} className="text-xs text-muted-foreground">
+                    批次
+                  </label>
+                  <Input
+                    id={`source-batch-${credential.id}`}
+                    value={sourceBatchValue}
+                    onChange={(e) => setSourceBatchValue(e.target.value)}
+                    className="h-9 text-sm"
+                    placeholder="如 20260618211"
+                    disabled={isSaving}
+                  />
+                </div>
+              </div>
+              <p className="text-[10px] text-muted-foreground">留空并保存会清除对应来源字段。</p>
             </div>
 
             {/* Profile 选择配置区 */}

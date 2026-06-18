@@ -14,7 +14,7 @@ use super::{
         reset_failure_count, set_credential_disabled, set_credential_max_concurrency,
         set_credential_model_policy, set_credential_overage_status, set_credential_priority,
         set_credential_profile, set_credential_proxy, set_credential_rate_limit_config,
-        set_load_balancing_mode, set_model_capabilities_config,
+        set_credential_source, set_load_balancing_mode, set_model_capabilities_config,
     },
     middleware::{AdminState, admin_auth_middleware, admin_write_routing_middleware},
 };
@@ -30,6 +30,7 @@ use super::{
 /// - `POST /credentials/:id/max-concurrency` - 设置凭据并发上限
 /// - `POST /credentials/:id/rate-limit-config` - 设置凭据级 token bucket 参数
 /// - `POST /credentials/:id/model-policy` - 设置凭据级模型策略
+/// - `POST /credentials/:id/source` - 设置凭据来源标记
 /// - `GET /credentials/:id/profiles` - 获取可用 Profile 列表
 /// - `POST /credentials/:id/profile` - 设置凭据当前 Profile
 /// - `POST /credentials/:id/overage` - 设置凭据超额使用开关
@@ -69,6 +70,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/credentials/{id}/model-policy",
             post(set_credential_model_policy),
         )
+        .route("/credentials/{id}/source", post(set_credential_source))
         .route("/credentials/{id}/proxy", post(set_credential_proxy))
         .route("/credentials/{id}/profiles", get(get_credential_profiles))
         .route("/credentials/{id}/profile", post(set_credential_profile))

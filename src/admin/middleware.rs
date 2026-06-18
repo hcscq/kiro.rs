@@ -337,6 +337,7 @@ fn retryable_credential_admin_action(path: &str) -> bool {
                 | "max-concurrency"
                 | "rate-limit-config"
                 | "model-policy"
+                | "source"
                 | "proxy"
                 | "profile"
                 | "overage"
@@ -381,6 +382,10 @@ mod tests {
         assert!(is_retryable_admin_write_route(
             &Method::POST,
             "/api/admin/credentials/12/model-policy",
+        ));
+        assert!(is_retryable_admin_write_route(
+            &Method::POST,
+            "/api/admin/credentials/12/source",
         ));
         assert!(is_retryable_admin_write_route(
             &Method::POST,

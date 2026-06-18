@@ -188,6 +188,21 @@ pub struct KiroCredentials {
     #[serde(default)]
     pub account_type: Option<String>,
 
+    /// 账号来源供应商 ID（可选，用于兼容 KAM 导入）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub source_supplier_id: Option<String>,
+
+    /// 账号来源供应商名称（可选）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub source_supplier_name: Option<String>,
+
+    /// 账号来源批次标记（可选）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub source_batch: Option<String>,
+
     /// 账号级额外允许的模型列表
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_models: Vec<String>,
@@ -293,6 +308,13 @@ fn non_negative_finite(value: f64) -> Option<f64> {
         .is_finite()
         .then_some(value)
         .filter(|value| *value >= 0.0)
+}
+
+fn normalize_optional_string(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn canonicalize_auth_method_value(value: &str) -> &str {
@@ -745,67 +767,24 @@ impl KiroCredentials {
 
     pub fn normalize_identity_metadata(&mut self) {
         self.provider = self.provider.as_deref().and_then(normalize_provider_value);
-        self.user_id = self
-            .user_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        self.email = self
-            .email
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        self.token_endpoint = self
-            .token_endpoint
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        self.issuer_url = self
-            .issuer_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
+        self.user_id = normalize_optional_string(self.user_id.as_deref());
+        self.email = normalize_optional_string(self.email.as_deref());
+        self.token_endpoint = normalize_optional_string(self.token_endpoint.as_deref());
+        self.issuer_url = normalize_optional_string(self.issuer_url.as_deref());
         self.scopes = self.scopes.as_deref().and_then(normalize_scope_string);
-        self.audience = self
-            .audience
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        self.start_url = self
-            .start_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        self.profile_arn = self
-            .profile_arn
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        self.region = self
-            .region
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        self.auth_region = self
-            .auth_region
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        self.api_region = self
-            .api_region
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
+        self.audience = normalize_optional_string(self.audience.as_deref());
+        self.start_url = normalize_optional_string(self.start_url.as_deref());
+        self.profile_arn = normalize_optional_string(self.profile_arn.as_deref());
+        self.region = normalize_optional_string(self.region.as_deref());
+        self.auth_region = normalize_optional_string(self.auth_region.as_deref());
+        self.api_region = normalize_optional_string(self.api_region.as_deref());
+        self.normalize_source_metadata();
+    }
+
+    pub fn normalize_source_metadata(&mut self) {
+        self.source_supplier_id = normalize_optional_string(self.source_supplier_id.as_deref());
+        self.source_supplier_name = normalize_optional_string(self.source_supplier_name.as_deref());
+        self.source_batch = normalize_optional_string(self.source_batch.as_deref());
     }
 
     pub fn canonicalize_auth_method(&mut self) {
@@ -1301,6 +1280,9 @@ mod tests {
             subscription_title: None,
             subscription_type: None,
             account_type: None,
+            source_supplier_id: None,
+            source_supplier_name: None,
+            source_batch: None,
             allowed_models: vec![],
             blocked_models: vec![],
             runtime_model_restrictions: vec![],
@@ -1735,6 +1717,9 @@ mod tests {
             subscription_title: None,
             subscription_type: None,
             account_type: None,
+            source_supplier_id: None,
+            source_supplier_name: None,
+            source_batch: None,
             allowed_models: vec![],
             blocked_models: vec![],
             runtime_model_restrictions: vec![],
@@ -1793,6 +1778,9 @@ mod tests {
             subscription_title: None,
             subscription_type: None,
             account_type: None,
+            source_supplier_id: None,
+            source_supplier_name: None,
+            source_batch: None,
             allowed_models: vec![],
             blocked_models: vec![],
             runtime_model_restrictions: vec![],
@@ -1933,6 +1921,9 @@ mod tests {
             subscription_title: None,
             subscription_type: None,
             account_type: None,
+            source_supplier_id: None,
+            source_supplier_name: None,
+            source_batch: None,
             allowed_models: vec![],
             blocked_models: vec![],
             runtime_model_restrictions: vec![],

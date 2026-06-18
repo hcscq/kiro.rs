@@ -1,6 +1,6 @@
-import { useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
-import { CheckCircle2, XCircle, AlertCircle, Loader2, Globe2, Link2, Network, Server, Shuffle } from 'lucide-react'
+import { CheckCircle2, XCircle, AlertCircle, Loader2, Globe2, Link2, Network, Server, Shuffle, Tags } from 'lucide-react'
 import {
   Dialog,
   DialogContent,
@@ -15,6 +15,11 @@ import { useCredentials, useAddCredential, useDeleteCredential, useLoadBalancing
 import { getCredentialBalance, setCredentialDisabled, setCredentialOverageStatus } from '@/api/credentials'
 import type { CredentialProxyMode, ProxyPoolEntry } from '@/types/api'
 import { cn, extractErrorMessage, sha256Hex } from '@/lib/utils'
+import {
+  collectSourceSupplierSuggestions,
+  formatDefaultSourceBatch,
+  normalizedSourceString,
+} from '@/lib/source-metadata'
 
 interface BatchImportDialogProps {
   open: boolean
@@ -41,6 +46,12 @@ interface CredentialInput {
   machineId?: string
   startUrl?: string
   accountType?: string
+  sourceSupplierId?: string
+  sourceSupplierName?: string
+  sourceBatch?: string
+  source_supplier_id?: string
+  source_supplier_name?: string
+  source_batch?: string
   availableModelIds?: string[]
   maxConcurrency?: number
   rateLimitBucketCapacity?: number
@@ -117,6 +128,8 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
   const [results, setResults] = useState<VerificationResult[]>([])
   const [defaultPriority, setDefaultPriority] = useState('0')
   const [defaultMaxConcurrency, setDefaultMaxConcurrency] = useState('')
+  const [defaultSourceSupplierName, setDefaultSourceSupplierName] = useState('')
+  const [defaultSourceBatch, setDefaultSourceBatch] = useState(() => formatDefaultSourceBatch())
   const [defaultProxyMode, setDefaultProxyMode] = useState<CredentialProxyMode>('auto')
   const [defaultProxyId, setDefaultProxyId] = useState('')
   const [defaultProxyUrl, setDefaultProxyUrl] = useState('')
@@ -132,6 +145,16 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     loadBalancingData?.proxyPool?.proxies.filter((proxy) => proxy.enabled) ?? []
   const proxyPoolEnabled = loadBalancingData?.proxyPool?.enabled ?? false
   const proxyRequireProxy = loadBalancingData?.proxyPool?.requireProxy ?? false
+  const sourceSupplierSuggestions = useMemo(
+    () => collectSourceSupplierSuggestions(existingCredentials?.credentials),
+    [existingCredentials?.credentials]
+  )
+
+  useEffect(() => {
+    if (open && !importing && !jsonInput.trim() && results.length === 0) {
+      setDefaultSourceBatch(formatDefaultSourceBatch())
+    }
+  }, [importing, jsonInput, open, results.length])
 
   const rollbackCredential = async (id: number): Promise<{ success: boolean; error?: string }> => {
     try {
@@ -161,6 +184,8 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     setResults([])
     setDefaultPriority('0')
     setDefaultMaxConcurrency('')
+    setDefaultSourceSupplierName('')
+    setDefaultSourceBatch(formatDefaultSourceBatch())
     setDefaultProxyMode('auto')
     setDefaultProxyId('')
     setDefaultProxyUrl('')
@@ -217,6 +242,8 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       toast.error('当前代理池要求新凭据必须绑定代理')
       return
     }
+    const defaultSourceSupplierNameValue = defaultSourceSupplierName.trim()
+    const defaultSourceBatchValue = defaultSourceBatch.trim()
 
     try {
       setImporting(true)
@@ -411,6 +438,18 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             priority: typeof cred.priority === 'number' ? cred.priority : parsedDefaultPriority,
             machineId: cred.machineId?.trim() || undefined,
             accountType: cred.accountType?.trim() || undefined,
+            sourceSupplierId:
+              cred.sourceSupplierId?.trim() || cred.source_supplier_id?.trim() || undefined,
+            sourceSupplierName:
+              normalizedSourceString(cred.sourceSupplierName) ||
+              normalizedSourceString(cred.source_supplier_name) ||
+              defaultSourceSupplierNameValue ||
+              undefined,
+            sourceBatch:
+              normalizedSourceString(cred.sourceBatch) ||
+              normalizedSourceString(cred.source_batch) ||
+              defaultSourceBatchValue ||
+              undefined,
             availableModelIds: Array.isArray(cred.availableModelIds)
               ? cred.availableModelIds.filter(modelId => typeof modelId === 'string' && modelId.trim())
               : undefined,
@@ -622,6 +661,57 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             <div className="space-y-3 rounded-md border p-3">
               <div className="flex items-center justify-between gap-3">
                 <div className="flex items-center gap-2 text-sm font-medium">
+                  <Tags className="h-4 w-4 text-muted-foreground" />
+                  默认来源标记
+                </div>
+                <span className="text-xs text-muted-foreground">JSON 单条来源字段优先</span>
+              </div>
+              <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_160px_auto] md:items-end">
+                <div className="space-y-1.5">
+                  <label htmlFor="batchDefaultSourceSupplier" className="text-xs font-medium text-muted-foreground">
+                    默认供应商
+                  </label>
+                  <Input
+                    id="batchDefaultSourceSupplier"
+                    list="batch-source-supplier-options"
+                    placeholder="可输入或选择"
+                    value={defaultSourceSupplierName}
+                    onChange={(e) => setDefaultSourceSupplierName(e.target.value)}
+                    disabled={importing}
+                  />
+                  <datalist id="batch-source-supplier-options">
+                    {sourceSupplierSuggestions.map((supplier) => (
+                      <option key={supplier} value={supplier} />
+                    ))}
+                  </datalist>
+                </div>
+                <div className="space-y-1.5">
+                  <label htmlFor="batchDefaultSourceBatch" className="text-xs font-medium text-muted-foreground">
+                    默认批次
+                  </label>
+                  <Input
+                    id="batchDefaultSourceBatch"
+                    placeholder={formatDefaultSourceBatch()}
+                    value={defaultSourceBatch}
+                    onChange={(e) => setDefaultSourceBatch(e.target.value)}
+                    disabled={importing}
+                  />
+                </div>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  className="h-10 whitespace-nowrap"
+                  onClick={() => setDefaultSourceBatch(formatDefaultSourceBatch())}
+                  disabled={importing}
+                >
+                  当前小时
+                </Button>
+              </div>
+            </div>
+            <div className="space-y-3 rounded-md border p-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2 text-sm font-medium">
                   <Network className="h-4 w-4 text-muted-foreground" />
                   默认代理策略
                 </div>
@@ -709,14 +799,14 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               )}
             </div>
             <textarea
-              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\nEnterprise: [{"email":"user@example.com","provider":"Enterprise","refreshToken":"...","clientId":"...","clientSecret":"...","region":"us-east-1","startUrl":"https://example.awsapps.com/start"}]\nExternalIdp: [{"authMethod":"external_idp","provider":"ExternalIdp","refreshToken":"...","clientId":"...","issuerUrl":"https://login.microsoftonline.com/.../v2.0","tokenEndpoint":"...","scopes":"..."}]\n支持 region 字段自动映射为 authRegion 和 apiRegion'}
+              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\nEnterprise: [{"email":"user@example.com","provider":"Enterprise","refreshToken":"...","clientId":"...","clientSecret":"...","region":"us-east-1","startUrl":"https://example.awsapps.com/start","sourceSupplierName":"供应商A","sourceBatch":"20260618211"}]\nExternalIdp: [{"authMethod":"external_idp","provider":"ExternalIdp","refreshToken":"...","clientId":"...","issuerUrl":"https://login.microsoftonline.com/.../v2.0","tokenEndpoint":"...","scopes":"..."}]\n支持 region 字段自动映射为 authRegion 和 apiRegion'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}
               className="flex min-h-[200px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
             />
             <p className="text-xs text-muted-foreground">
-              支持附带 `email`、`userId`、`provider`、`authMethod`、`startUrl`、`issuerUrl`、`tokenEndpoint`、`scopes`、`accountType`、`availableModelIds`、`maxConcurrency`、`rateLimitBucketCapacity`、`rateLimitRefillPerSecond`。
+              支持附带 `email`、`userId`、`provider`、`authMethod`、`startUrl`、`issuerUrl`、`tokenEndpoint`、`scopes`、`accountType`、`sourceSupplierName`、`sourceSupplierId`、`sourceBatch`、`availableModelIds`、`maxConcurrency`、`rateLimitBucketCapacity`、`rateLimitRefillPerSecond`。
               导入时会自动验活，失败的凭据会被排除。
             </p>
           </div>

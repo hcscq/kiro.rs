@@ -1,11 +1,18 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Zap, ZapOff } from 'lucide-react'
+import { RefreshCw, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Zap, ZapOff, Tags } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { CredentialCard } from '@/components/credential-card'
 import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
@@ -21,13 +28,17 @@ import {
   useModelCapabilitiesConfig,
   useModelCatalog,
 } from '@/hooks/use-credentials'
-import { getCredentialBalance, forceRefreshToken, setCredentialOverageStatus } from '@/api/credentials'
+import { getCredentialBalance, forceRefreshToken, setCredentialOverageStatus, setCredentialSource } from '@/api/credentials'
 import { getCredentialLabel, getCredentialLabelWithId } from '@/lib/credential-label'
 import { cn, extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse, CredentialStatusItem } from '@/types/api'
 
 const ALL_LEVELS = '__all_levels__'
 const UNKNOWN_LEVEL = '__unknown_level__'
+const ALL_SOURCE_SUPPLIERS = '__all_source_suppliers__'
+const UNKNOWN_SOURCE_SUPPLIER = '__unknown_source_supplier__'
+const ALL_SOURCE_BATCHES = '__all_source_batches__'
+const UNKNOWN_SOURCE_BATCH = '__unknown_source_batch__'
 
 type EnabledFilter = 'all' | 'enabled' | 'disabled'
 type AccountStatusFilter = 'all' | 'normal' | 'rate-limited' | 'abnormal'
@@ -74,6 +85,18 @@ function SegmentedTabs({ label, options, value, onChange }: SegmentedTabsProps) 
 function normalizeSubscriptionTitle(credential: CredentialStatusItem): string | null {
   const title = credential.subscriptionTitle?.trim()
   return title ? title : null
+}
+
+function normalizeSourceSupplier(credential: CredentialStatusItem): string | null {
+  const name = credential.sourceSupplierName?.trim()
+  if (name) return name
+  const id = credential.sourceSupplierId?.trim()
+  return id ? id : null
+}
+
+function normalizeSourceBatch(credential: CredentialStatusItem): string | null {
+  const batch = credential.sourceBatch?.trim()
+  return batch ? batch : null
 }
 
 function isRateLimitedCredential(credential: CredentialStatusItem): boolean {
@@ -136,6 +159,12 @@ export function Dashboard() {
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
+  const [sourceDialogOpen, setSourceDialogOpen] = useState(false)
+  const [batchSourceSupplierName, setBatchSourceSupplierName] = useState('')
+  const [batchSourceSupplierId, setBatchSourceSupplierId] = useState('')
+  const [batchSourceBatch, setBatchSourceBatch] = useState('')
+  const [batchSourceUpdating, setBatchSourceUpdating] = useState(false)
+  const [batchSourceProgress, setBatchSourceProgress] = useState({ current: 0, total: 0 })
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false)
   const [verifying, setVerifying] = useState(false)
   const [verifyProgress, setVerifyProgress] = useState({ current: 0, total: 0 })
@@ -151,6 +180,8 @@ export function Dashboard() {
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
   const [levelFilter, setLevelFilter] = useState<string>(ALL_LEVELS)
+  const [sourceSupplierFilter, setSourceSupplierFilter] = useState<string>(ALL_SOURCE_SUPPLIERS)
+  const [sourceBatchFilter, setSourceBatchFilter] = useState<string>(ALL_SOURCE_BATCHES)
   const [enabledFilter, setEnabledFilter] = useState<EnabledFilter>('all')
   const [accountStatusFilter, setAccountStatusFilter] = useState<AccountStatusFilter>('all')
   const [quickFilter, setQuickFilter] = useState<QuickFilter>('all')
@@ -200,6 +231,32 @@ export function Dashboard() {
         label: level === UNKNOWN_LEVEL ? '未知' : level,
       })),
   ]
+  const sourceSupplierOptions = [
+    { value: ALL_SOURCE_SUPPLIERS, label: '全部' },
+    ...Array.from(new Set(credentials.map(credential => normalizeSourceSupplier(credential) ?? UNKNOWN_SOURCE_SUPPLIER)))
+      .sort((a, b) => {
+        if (a === UNKNOWN_SOURCE_SUPPLIER) return 1
+        if (b === UNKNOWN_SOURCE_SUPPLIER) return -1
+        return a.localeCompare(b, 'zh-CN')
+      })
+      .map(supplier => ({
+        value: supplier,
+        label: supplier === UNKNOWN_SOURCE_SUPPLIER ? '未标记' : supplier,
+      })),
+  ]
+  const sourceBatchOptions = [
+    { value: ALL_SOURCE_BATCHES, label: '全部' },
+    ...Array.from(new Set(credentials.map(credential => normalizeSourceBatch(credential) ?? UNKNOWN_SOURCE_BATCH)))
+      .sort((a, b) => {
+        if (a === UNKNOWN_SOURCE_BATCH) return 1
+        if (b === UNKNOWN_SOURCE_BATCH) return -1
+        return a.localeCompare(b, 'zh-CN')
+      })
+      .map(batch => ({
+        value: batch,
+        label: batch === UNKNOWN_SOURCE_BATCH ? '未标记' : batch,
+      })),
+  ]
 
   const enabledOptions: SegmentedOption[] = [
     { value: 'all', label: '全部' },
@@ -230,6 +287,30 @@ export function Dashboard() {
         return false
       }
       if (levelFilter !== ALL_LEVELS && levelFilter !== UNKNOWN_LEVEL && normalizedLevel !== levelFilter) {
+        return false
+      }
+
+      const normalizedSourceSupplier = normalizeSourceSupplier(credential)
+      if (sourceSupplierFilter === UNKNOWN_SOURCE_SUPPLIER && normalizedSourceSupplier !== null) {
+        return false
+      }
+      if (
+        sourceSupplierFilter !== ALL_SOURCE_SUPPLIERS &&
+        sourceSupplierFilter !== UNKNOWN_SOURCE_SUPPLIER &&
+        normalizedSourceSupplier !== sourceSupplierFilter
+      ) {
+        return false
+      }
+
+      const normalizedSourceBatch = normalizeSourceBatch(credential)
+      if (sourceBatchFilter === UNKNOWN_SOURCE_BATCH && normalizedSourceBatch !== null) {
+        return false
+      }
+      if (
+        sourceBatchFilter !== ALL_SOURCE_BATCHES &&
+        sourceBatchFilter !== UNKNOWN_SOURCE_BATCH &&
+        normalizedSourceBatch !== sourceBatchFilter
+      ) {
         return false
       }
 
@@ -264,6 +345,9 @@ export function Dashboard() {
           credential.accountType,
           credential.resolvedAccountType,
           credential.standardAccountType,
+          credential.sourceSupplierName,
+          credential.sourceSupplierId,
+          credential.sourceBatch,
           credential.proxyUrl,
           credential.proxyId,
           credential.disabledReason,
@@ -315,7 +399,18 @@ export function Dashboard() {
   // 当筛选或排序变化时重置到第一页
   useEffect(() => {
     setCurrentPage(1)
-  }, [data?.credentials.length, levelFilter, enabledFilter, accountStatusFilter, quickFilter, searchKeyword, sortField, sortDirection])
+  }, [
+    data?.credentials.length,
+    levelFilter,
+    sourceSupplierFilter,
+    sourceBatchFilter,
+    enabledFilter,
+    accountStatusFilter,
+    quickFilter,
+    searchKeyword,
+    sortField,
+    sortDirection,
+  ])
 
   // 过滤结果变少时自动修正页码
   useEffect(() => {
@@ -397,6 +492,8 @@ export function Dashboard() {
   }
   const resetFilters = () => {
     setLevelFilter(ALL_LEVELS)
+    setSourceSupplierFilter(ALL_SOURCE_SUPPLIERS)
+    setSourceBatchFilter(ALL_SOURCE_BATCHES)
     setEnabledFilter('all')
     setAccountStatusFilter('all')
     setQuickFilter('all')
@@ -633,6 +730,74 @@ export function Dashboard() {
     }
 
     deselectAll()
+  }
+
+  const handleOpenBatchSourceDialog = () => {
+    setBatchSourceSupplierName('')
+    setBatchSourceSupplierId('')
+    setBatchSourceBatch('')
+    setBatchSourceProgress({ current: 0, total: 0 })
+    setSourceDialogOpen(true)
+  }
+
+  const handleBatchSourceSave = async () => {
+    if (selectedIds.size === 0) {
+      toast.error('请先选择要标记的凭据')
+      return
+    }
+
+    const sourceSupplierName = batchSourceSupplierName.trim()
+    const sourceSupplierId = batchSourceSupplierId.trim()
+    const sourceBatch = batchSourceBatch.trim()
+    const payload = {
+      ...(sourceSupplierName ? { sourceSupplierName } : {}),
+      ...(sourceSupplierId ? { sourceSupplierId } : {}),
+      ...(sourceBatch ? { sourceBatch } : {}),
+    }
+
+    if (Object.keys(payload).length === 0) {
+      toast.error('至少填写一个来源字段')
+      return
+    }
+
+    const ids = Array.from(selectedIds)
+    setBatchSourceUpdating(true)
+    setBatchSourceProgress({ current: 0, total: ids.length })
+
+    let successCount = 0
+    let failCount = 0
+    const failedLabels: string[] = []
+
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i]
+      const credential = credentials.find(item => item.id === id)
+      const label = credential ? getCredentialLabelWithId(credential) : `凭据 #${id}`
+
+      try {
+        await setCredentialSource(id, payload)
+        successCount++
+      } catch (error) {
+        failCount++
+        if (failedLabels.length < 3) {
+          failedLabels.push(`${label}: ${extractErrorMessage(error)}`)
+        }
+      }
+
+      setBatchSourceProgress({ current: i + 1, total: ids.length })
+    }
+
+    setBatchSourceUpdating(false)
+    queryClient.invalidateQueries({ queryKey: ['credentials'] })
+
+    if (failCount === 0) {
+      toast.success(`来源标记完成：成功 ${successCount}/${ids.length}`)
+      setSourceDialogOpen(false)
+      deselectAll()
+    } else {
+      toast.warning(
+        `来源标记完成：成功 ${successCount} 个，失败 ${failCount} 个${failedLabels.length > 0 ? `；${failedLabels.join('；')}` : ''}`
+      )
+    }
   }
 
   // 一键清除所有已禁用凭据
@@ -934,8 +1099,8 @@ export function Dashboard() {
 
         {/* 凭据列表 */}
         <div className="space-y-4">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex min-w-0 flex-wrap items-center gap-4">
               <h2 className="text-xl font-semibold">凭据管理</h2>
               {selectedIds.size > 0 && (
                 <div className="flex items-center gap-2">
@@ -946,9 +1111,20 @@ export function Dashboard() {
                 </div>
               )}
             </div>
-            <div className="flex gap-2">
+            <div className="flex flex-wrap justify-end gap-2">
               {selectedIds.size > 0 && (
                 <>
+                  <Button
+                    onClick={handleOpenBatchSourceDialog}
+                    size="sm"
+                    variant="outline"
+                    disabled={batchSourceUpdating}
+                  >
+                    <Tags className={`h-4 w-4 mr-2 ${batchSourceUpdating ? 'animate-pulse' : ''}`} />
+                    {batchSourceUpdating
+                      ? `标记中... ${batchSourceProgress.current}/${batchSourceProgress.total}`
+                      : '标记来源'}
+                  </Button>
                   <Button onClick={handleBatchVerify} size="sm" variant="outline">
                     <CheckCircle2 className="h-4 w-4 mr-2" />
                     批量验活
@@ -957,7 +1133,7 @@ export function Dashboard() {
                     onClick={handleBatchForceRefresh}
                     size="sm"
                     variant="outline"
-                    disabled={batchRefreshing || batchOverageUpdating}
+                    disabled={batchRefreshing || batchOverageUpdating || batchSourceUpdating}
                   >
                     <RefreshCw className={`h-4 w-4 mr-2 ${batchRefreshing ? 'animate-spin' : ''}`} />
                     {batchRefreshing ? `刷新中... ${batchRefreshProgress.current}/${batchRefreshProgress.total}` : '批量刷新 Token'}
@@ -966,7 +1142,7 @@ export function Dashboard() {
                     onClick={() => handleBatchSetOverage(true)}
                     size="sm"
                     variant="outline"
-                    disabled={batchOverageUpdating}
+                    disabled={batchOverageUpdating || batchSourceUpdating}
                   >
                     <Zap className={`h-4 w-4 mr-2 ${batchOverageUpdating ? 'animate-pulse' : ''}`} />
                     {batchOverageUpdating
@@ -977,7 +1153,7 @@ export function Dashboard() {
                     onClick={() => handleBatchSetOverage(false)}
                     size="sm"
                     variant="outline"
-                    disabled={batchOverageUpdating}
+                    disabled={batchOverageUpdating || batchSourceUpdating}
                   >
                     <ZapOff className="h-4 w-4 mr-2" />
                     批量关闭超额
@@ -1050,7 +1226,7 @@ export function Dashboard() {
                   id="credential-search"
                   value={searchKeyword}
                   onChange={(e) => setSearchKeyword(e.target.value)}
-                  placeholder="搜索邮箱 / ID / 订阅 / 账号类型 / 代理 / 禁用原因"
+                  placeholder="搜索邮箱 / ID / 订阅 / 账号类型 / 供应商 / 批次 / 代理"
                   className="h-8 text-sm"
                 />
                 <Button
@@ -1068,6 +1244,40 @@ export function Dashboard() {
               </div>
               <div className="grid grid-cols-1 xl:grid-cols-2 gap-x-6 gap-y-2">
                 <SegmentedTabs label="层级" options={levelOptions} value={levelFilter} onChange={setLevelFilter} />
+                <div className="flex items-center gap-2">
+                  <label htmlFor="source-supplier-filter" className="text-xs font-medium text-muted-foreground whitespace-nowrap">
+                    供应商
+                  </label>
+                  <select
+                    id="source-supplier-filter"
+                    value={sourceSupplierFilter}
+                    onChange={(event) => setSourceSupplierFilter(event.target.value)}
+                    className="h-8 min-w-0 flex-1 rounded-md border border-input bg-background px-2 text-xs ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                  >
+                    {sourceSupplierOptions.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="flex items-center gap-2">
+                  <label htmlFor="source-batch-filter" className="text-xs font-medium text-muted-foreground whitespace-nowrap">
+                    批次
+                  </label>
+                  <select
+                    id="source-batch-filter"
+                    value={sourceBatchFilter}
+                    onChange={(event) => setSourceBatchFilter(event.target.value)}
+                    className="h-8 min-w-0 flex-1 rounded-md border border-input bg-background px-2 text-xs ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                  >
+                    {sourceBatchOptions.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
                 <SegmentedTabs label="启用" options={enabledOptions} value={enabledFilter} onChange={(value) => setEnabledFilter(value as EnabledFilter)} />
                 <SegmentedTabs label="状态" options={accountStatusOptions} value={accountStatusFilter} onChange={(value) => setAccountStatusFilter(value as AccountStatusFilter)} />
                 <div className="flex items-center gap-2 flex-wrap">
@@ -1144,6 +1354,73 @@ export function Dashboard() {
             </>
           )}
         </div>
+
+      {/* 批量来源标记对话框 */}
+      <Dialog open={sourceDialogOpen} onOpenChange={setSourceDialogOpen}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>批量标记来源</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div className="text-sm text-muted-foreground">
+              已选择 {selectedIds.size} 个凭据。空字段保持原值不变。
+            </div>
+            <div className="grid gap-3">
+              <div className="space-y-1.5">
+                <label htmlFor="batch-source-supplier-name" className="text-sm font-medium">
+                  供应商
+                </label>
+                <Input
+                  id="batch-source-supplier-name"
+                  value={batchSourceSupplierName}
+                  onChange={(event) => setBatchSourceSupplierName(event.target.value)}
+                  placeholder="供应商名称"
+                  disabled={batchSourceUpdating}
+                />
+              </div>
+              <div className="space-y-1.5">
+                <label htmlFor="batch-source-supplier-id" className="text-sm font-medium">
+                  供应商 ID
+                </label>
+                <Input
+                  id="batch-source-supplier-id"
+                  value={batchSourceSupplierId}
+                  onChange={(event) => setBatchSourceSupplierId(event.target.value)}
+                  placeholder="可选"
+                  disabled={batchSourceUpdating}
+                />
+              </div>
+              <div className="space-y-1.5">
+                <label htmlFor="batch-source-batch" className="text-sm font-medium">
+                  批次
+                </label>
+                <Input
+                  id="batch-source-batch"
+                  value={batchSourceBatch}
+                  onChange={(event) => setBatchSourceBatch(event.target.value)}
+                  placeholder="如 202606181"
+                  disabled={batchSourceUpdating}
+                />
+              </div>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setSourceDialogOpen(false)}
+              disabled={batchSourceUpdating}
+            >
+              取消
+            </Button>
+            <Button type="button" onClick={handleBatchSourceSave} disabled={batchSourceUpdating}>
+              {batchSourceUpdating
+                ? `保存中 ${batchSourceProgress.current}/${batchSourceProgress.total}`
+                : '保存'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* 余额对话框 */}
       <BalanceDialog

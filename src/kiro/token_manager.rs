@@ -1447,6 +1447,15 @@ pub struct CredentialEntrySnapshot {
     /// 账号类型
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_type: Option<String>,
+    /// 账号来源供应商 ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_supplier_id: Option<String>,
+    /// 账号来源供应商名称
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_supplier_name: Option<String>,
+    /// 账号来源批次
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_batch: Option<String>,
     /// 当前命中的账号类型（显式账号类型或由订阅信息推断）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_account_type: Option<String>,
@@ -8127,6 +8136,9 @@ impl MultiTokenManager {
                         subscription_type: e.credentials.subscription_type.clone(),
                         auth_account_type: e.credentials.detected_auth_account_type(),
                         account_type: e.credentials.account_type.clone(),
+                        source_supplier_id: e.credentials.source_supplier_id.clone(),
+                        source_supplier_name: e.credentials.source_supplier_name.clone(),
+                        source_batch: e.credentials.source_batch.clone(),
                         resolved_account_type: e.credentials.resolved_account_type(),
                         account_type_source: e
                             .credentials
@@ -8426,6 +8438,44 @@ impl MultiTokenManager {
             credential.clear_runtime_model_restrictions();
         }
         credential.normalize_model_capabilities();
+        let updated_credential = credential.clone();
+        self.persist_credentials_snapshot(&persisted)?;
+
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials = updated_credential;
+        }
+
+        self.availability_notify.notify_waiters();
+        Ok(())
+    }
+
+    /// 设置凭据来源标记（Admin API）
+    pub fn set_credential_source(
+        &self,
+        id: u64,
+        source_supplier_id: Option<Option<String>>,
+        source_supplier_name: Option<Option<String>>,
+        source_batch: Option<Option<String>>,
+    ) -> anyhow::Result<()> {
+        let _state_write_guard = self.state_write_lock.lock();
+        let mut persisted = self.persisted_credentials_snapshot();
+        let credential = Self::persisted_credential_mut(&mut persisted, id)?;
+
+        if let Some(value) = source_supplier_id {
+            credential.source_supplier_id = value;
+        }
+        if let Some(value) = source_supplier_name {
+            credential.source_supplier_name = value;
+        }
+        if let Some(value) = source_batch {
+            credential.source_batch = value;
+        }
+        credential.normalize_source_metadata();
         let updated_credential = credential.clone();
         self.persist_credentials_snapshot(&persisted)?;
 
@@ -9171,6 +9221,9 @@ impl MultiTokenManager {
         validated_cred.subscription_title = new_cred.subscription_title;
         validated_cred.subscription_type = new_cred.subscription_type;
         validated_cred.account_type = new_cred.account_type;
+        validated_cred.source_supplier_id = new_cred.source_supplier_id;
+        validated_cred.source_supplier_name = new_cred.source_supplier_name;
+        validated_cred.source_batch = new_cred.source_batch;
         validated_cred.allowed_models = new_cred.allowed_models;
         validated_cred.blocked_models = new_cred.blocked_models;
         validated_cred.runtime_model_restrictions = new_cred.runtime_model_restrictions;
@@ -10788,6 +10841,47 @@ mod tests {
             entry.rate_limit_refill_per_second_source.as_deref(),
             Some("credential")
         );
+    }
+
+    #[test]
+    fn test_set_credential_source_updates_snapshot_and_persisted_metadata() {
+        let config = Config::default();
+        let mut cred = available_credential(0);
+        cred.source_supplier_name = Some(" old supplier ".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+        manager
+            .set_credential_source(
+                1,
+                Some(Some(" supplier-1 ".to_string())),
+                Some(Some(" Vendor A ".to_string())),
+                Some(Some(" 202606181 ".to_string())),
+            )
+            .unwrap();
+
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert_eq!(entry.source_supplier_id.as_deref(), Some("supplier-1"));
+        assert_eq!(entry.source_supplier_name.as_deref(), Some("Vendor A"));
+        assert_eq!(entry.source_batch.as_deref(), Some("202606181"));
+
+        manager
+            .set_credential_source(1, None, Some(Some("  ".to_string())), Some(None))
+            .unwrap();
+
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert_eq!(entry.source_supplier_id.as_deref(), Some("supplier-1"));
+        assert_eq!(entry.source_supplier_name, None);
+        assert_eq!(entry.source_batch, None);
+
+        let persisted = manager.persisted_credentials_snapshot();
+        assert_eq!(
+            persisted[0].source_supplier_id.as_deref(),
+            Some("supplier-1")
+        );
+        assert_eq!(persisted[0].source_supplier_name, None);
+        assert_eq!(persisted[0].source_batch, None);
     }
 
     #[test]
