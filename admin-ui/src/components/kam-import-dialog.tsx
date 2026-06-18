@@ -26,6 +26,10 @@ interface KamAccount {
   email?: string
   userId?: string | null
   provider?: string
+  tokenEndpoint?: string
+  issuerUrl?: string
+  scopes?: string | string[]
+  audience?: string
   nickname?: string
   profileArn?: string
   accountType?: string
@@ -54,7 +58,12 @@ interface KamAccount {
     authRegion?: string
     apiRegion?: string
     profileArn?: string
+    provider?: string
     authMethod?: string
+    tokenEndpoint?: string
+    issuerUrl?: string
+    scopes?: string | string[]
+    audience?: string
     startUrl?: string
     maxConcurrency?: number
     rateLimitBucketCapacity?: number
@@ -152,6 +161,7 @@ function normalizeProvider(provider?: string): string | undefined {
   if (!trimmed) return undefined
   const lower = trimmed.toLowerCase()
   if (lower === 'enterprise') return 'Enterprise'
+  if (lower === 'externalidp' || lower === 'external-idp' || lower === 'external_idp' || lower === 'external idp') return 'ExternalIdp'
   if (lower === 'builderid' || lower === 'builder-id' || lower === 'builder_id') return 'BuilderId'
   if (lower === 'google') return 'Google'
   if (lower === 'github') return 'Github'
@@ -160,6 +170,29 @@ function normalizeProvider(provider?: string): string | undefined {
 
 function isEnterpriseProvider(provider?: string): boolean {
   return provider?.trim().toLowerCase() === 'enterprise'
+}
+
+function isExternalIdpProvider(provider?: string): boolean {
+  const lower = provider?.trim().toLowerCase()
+  return lower === 'externalidp' || lower === 'external-idp' || lower === 'external_idp' || lower === 'external idp'
+}
+
+function normalizeAuthMethod(authMethod?: string): 'social' | 'idc' | 'external_idp' | undefined {
+  const lower = authMethod?.trim().toLowerCase()
+  if (!lower) return undefined
+  if (lower === 'external_idp' || lower === 'external-idp' || lower === 'externalidp') return 'external_idp'
+  if (lower === 'idc' || lower === 'builder-id' || lower === 'iam') return 'idc'
+  if (lower === 'social') return 'social'
+  return undefined
+}
+
+function normalizeScopes(scopes?: string | string[]): string | undefined {
+  if (Array.isArray(scopes)) {
+    const joined = scopes.flatMap(scope => scope.split(/\s+/)).map(scope => scope.trim()).filter(Boolean).join(' ')
+    return joined || undefined
+  }
+  const joined = scopes?.split(/\s+/).map(scope => scope.trim()).filter(Boolean).join(' ')
+  return joined || undefined
 }
 
 function resolveKamRegions(
@@ -217,6 +250,12 @@ function normalizeKamAccount(item: unknown): unknown {
     const authRegion = getString(obj.authRegion)
     const apiRegion = getString(obj.apiRegion)
     const authMethod = getString(obj.authMethod)
+    const tokenEndpoint = getString(obj.tokenEndpoint)
+    const issuerUrl = getString(obj.issuerUrl)
+    const scopes = typeof obj.scopes === 'string' || Array.isArray(obj.scopes)
+      ? obj.scopes as string | string[]
+      : undefined
+    const audience = getString(obj.audience)
     const startUrl = getString(obj.startUrl)
     const proxyId = getString(obj.proxyId)
     const proxyUrl = getString(obj.proxyUrl)
@@ -248,6 +287,10 @@ function normalizeKamAccount(item: unknown): unknown {
         apiRegion,
         profileArn,
         authMethod,
+        tokenEndpoint,
+        issuerUrl,
+        scopes,
+        audience,
         startUrl,
         priority,
         proxyId,
@@ -492,8 +535,19 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
         try {
           const clientId = cred.clientId?.trim() || undefined
           const clientSecret = cred.clientSecret?.trim() || undefined
-          const provider = normalizeProvider(account.provider)
-          const authMethod = clientId && clientSecret ? 'idc' : 'social'
+          const provider = normalizeProvider(account.provider || cred.provider)
+          const tokenEndpoint =
+            cred.tokenEndpoint?.trim() || account.tokenEndpoint?.trim() || undefined
+          const issuerUrl = cred.issuerUrl?.trim() || account.issuerUrl?.trim() || undefined
+          const scopes = normalizeScopes(cred.scopes ?? account.scopes)
+          const audience = cred.audience?.trim() || account.audience?.trim() || undefined
+          const externalIdp =
+            isExternalIdpProvider(provider) ||
+            normalizeAuthMethod(cred.authMethod) === 'external_idp' ||
+            Boolean(issuerUrl)
+          const authMethod =
+            normalizeAuthMethod(cred.authMethod) ||
+            (externalIdp ? 'external_idp' : clientId && clientSecret ? 'idc' : 'social')
           const startUrl = cred.startUrl?.trim() || undefined
           const enterprise = isEnterpriseProvider(provider)
           const { region: kamRegion, authRegion, apiRegion } = resolveKamRegions(cred, enterprise)
@@ -535,9 +589,11 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           const priority =
             getNumber(account.priority) ?? getNumber(account.credentials.priority) ?? parsedDefaultPriority
 
-          // idc 模式下必须同时提供 clientId 和 clientSecret
-          if (authMethod === 'social' && (clientId || clientSecret)) {
+          if (authMethod === 'idc' && (!clientId || !clientSecret)) {
             throw new Error('idc 模式需要同时提供 clientId 和 clientSecret')
+          }
+          if (authMethod === 'social' && (clientId || clientSecret || issuerUrl || tokenEndpoint)) {
+            throw new Error('包含 clientId/clientSecret/issuerUrl/tokenEndpoint 的凭据必须指定 idc 或 external_idp')
           }
           if (enterprise && (!clientId || !clientSecret)) {
             throw new Error('Enterprise 账号必须包含 clientId 和 clientSecret')
@@ -547,6 +603,12 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           }
           if (enterprise && !kamRegion && !authRegion && !apiRegion) {
             throw new Error('Enterprise 账号必须包含 region')
+          }
+          if (externalIdp && !clientId) {
+            throw new Error('ExternalIdp 账号必须包含 clientId')
+          }
+          if (externalIdp && !issuerUrl) {
+            throw new Error('ExternalIdp 账号必须包含 issuerUrl')
           }
 
           if (
@@ -580,13 +642,17 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             email: account.email?.trim() || undefined,
             userId: account.userId?.trim() || undefined,
             authMethod,
-            provider,
+            provider: externalIdp && !provider ? 'ExternalIdp' : provider,
             region: kamRegion,
             authRegion,
             apiRegion,
             profileArn,
             clientId,
             clientSecret,
+            tokenEndpoint,
+            issuerUrl,
+            scopes,
+            audience,
             startUrl,
             priority,
             machineId: account.machineId?.trim() || undefined,
