@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
 import { toast } from 'sonner'
+import { Globe2, Link2, Network, Server, Shuffle } from 'lucide-react'
 import {
   AccountTypeInput,
   ModelSelector,
@@ -21,7 +22,8 @@ import {
   useModelCapabilitiesConfig,
   useModelCatalog,
 } from '@/hooks/use-credentials'
-import { extractErrorMessage } from '@/lib/utils'
+import type { CredentialProxyMode, ProxyPoolEntry } from '@/types/api'
+import { cn, extractErrorMessage } from '@/lib/utils'
 
 interface AddCredentialDialogProps {
   open: boolean
@@ -29,6 +31,10 @@ interface AddCredentialDialogProps {
 }
 
 type AuthMethod = 'social' | 'idc'
+
+function proxyPoolEntryLabel(proxy: ProxyPoolEntry): string {
+  return proxy.expectedEgressIp ? `${proxy.id} (${proxy.expectedEgressIp})` : proxy.id
+}
 
 export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
   const [refreshToken, setRefreshToken] = useState('')
@@ -48,6 +54,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [accountType, setAccountType] = useState('')
   const [allowedModels, setAllowedModels] = useState<string[]>([])
   const [blockedModels, setBlockedModels] = useState<string[]>([])
+  const [proxyMode, setProxyMode] = useState<CredentialProxyMode>('auto')
   const [proxyId, setProxyId] = useState('')
   const [proxyUrl, setProxyUrl] = useState('')
   const [proxyUsername, setProxyUsername] = useState('')
@@ -78,6 +85,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const standardAccountTypePresets = modelCapabilitiesData?.standardAccountTypePresets ?? []
   const proxyPoolOptions =
     loadBalancingData?.proxyPool?.proxies.filter((proxy) => proxy.enabled) ?? []
+  const proxyPoolEnabled = loadBalancingData?.proxyPool?.enabled ?? false
+  const proxyRequireProxy = loadBalancingData?.proxyPool?.requireProxy ?? false
 
   const resetForm = () => {
     setRefreshToken('')
@@ -97,6 +106,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setAccountType('')
     setAllowedModels([])
     setBlockedModels([])
+    setProxyMode('auto')
     setProxyId('')
     setProxyUrl('')
     setProxyUsername('')
@@ -149,6 +159,25 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       toast.error('回填速率必须是大于等于 0 的数字')
       return
     }
+    if (proxyMode === 'pool' && !proxyId.trim()) {
+      toast.error('请选择代理池节点')
+      return
+    }
+    if (proxyMode === 'custom') {
+      const url = proxyUrl.trim()
+      if (!url) {
+        toast.error('请输入代理 URL')
+        return
+      }
+      if (url.toLowerCase() === 'direct') {
+        toast.error('direct 请使用直连模式')
+        return
+      }
+    }
+    if (proxyMode === 'direct' && proxyRequireProxy) {
+      toast.error('当前代理池要求新凭据必须绑定代理')
+      return
+    }
 
     mutate(
       {
@@ -169,10 +198,17 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         accountType: accountType.trim() || undefined,
         allowedModels: allowedModels.length ? allowedModels : undefined,
         blockedModels: blockedModels.length ? blockedModels : undefined,
-        proxyId: proxyUrl.trim() ? undefined : proxyId || undefined,
-        proxyUrl: proxyUrl.trim() || undefined,
-        proxyUsername: proxyUsername.trim() || undefined,
-        proxyPassword: proxyPassword.trim() || undefined,
+        proxyId: proxyMode === 'pool' ? proxyId.trim() || undefined : undefined,
+        proxyUrl:
+          proxyMode === 'custom'
+            ? proxyUrl.trim() || undefined
+            : proxyMode === 'direct'
+              ? 'direct'
+              : undefined,
+        proxyUsername:
+          proxyMode === 'custom' ? proxyUsername.trim() || undefined : undefined,
+        proxyPassword:
+          proxyMode === 'custom' ? proxyPassword.trim() || undefined : undefined,
       },
       {
         onSuccess: (data) => {
@@ -443,50 +479,166 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
             />
 
             {/* 代理配置 */}
-            <div className="space-y-2">
-              <label className="text-sm font-medium">代理配置</label>
-              <select
-                id="proxyId"
-                value={proxyId}
-                onChange={(e) => setProxyId(e.target.value)}
-                disabled={isPending || proxyPoolOptions.length === 0 || Boolean(proxyUrl.trim())}
-                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                <option value="">自动分配代理池节点</option>
-                {proxyPoolOptions.map((proxy) => (
-                  <option key={proxy.id} value={proxy.id}>
-                    {proxy.id}
-                    {proxy.expectedEgressIp ? ` (${proxy.expectedEgressIp})` : ''}
-                  </option>
-                ))}
-              </select>
-              <Input
-                id="proxyUrl"
-                placeholder='代理 URL（留空使用全局配置，"direct" 不使用代理）'
-                value={proxyUrl}
-                onChange={(e) => setProxyUrl(e.target.value)}
-                disabled={isPending}
-              />
-              <div className="grid grid-cols-2 gap-2">
-                <Input
-                  id="proxyUsername"
-                  placeholder="代理用户名"
-                  value={proxyUsername}
-                  onChange={(e) => setProxyUsername(e.target.value)}
-                  disabled={isPending}
-                />
-                <Input
-                  id="proxyPassword"
-                  type="password"
-                  placeholder="代理密码"
-                  value={proxyPassword}
-                  onChange={(e) => setProxyPassword(e.target.value)}
-                  disabled={isPending}
-                />
+            <div className="space-y-3 rounded-lg border p-3 bg-muted/5">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2">
+                  <Network className="h-4 w-4 text-muted-foreground" />
+                  <label className="text-sm font-medium">代理配置</label>
+                </div>
+                <span className="text-xs text-muted-foreground">
+                  默认自动均衡
+                </span>
               </div>
-              <p className="text-xs text-muted-foreground">
-                显式 URL 优先于代理池选择。留空时由后端按代理池策略分配
-              </p>
+
+              <div className="grid gap-2 sm:grid-cols-2">
+                <button
+                  type="button"
+                  onClick={() => setProxyMode('auto')}
+                  disabled={isPending}
+                  className={cn(
+                    'rounded-md border p-3 text-left transition-colors',
+                    proxyMode === 'auto'
+                      ? 'border-primary bg-primary/10 text-primary'
+                      : 'border-input bg-background hover:bg-muted/60'
+                  )}
+                >
+                  <div className="flex items-center gap-2 text-sm font-medium">
+                    <Shuffle className="h-4 w-4" />
+                    自动均衡
+                  </div>
+                  <div className="mt-1 text-xs text-muted-foreground">
+                    导入后按代理池权重和绑定数分配
+                  </div>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setProxyMode('pool')}
+                  disabled={isPending || !proxyPoolEnabled || proxyPoolOptions.length === 0}
+                  className={cn(
+                    'rounded-md border p-3 text-left transition-colors',
+                    proxyMode === 'pool'
+                      ? 'border-primary bg-primary/10 text-primary'
+                      : 'border-input bg-background hover:bg-muted/60',
+                    (!proxyPoolEnabled || proxyPoolOptions.length === 0) &&
+                      'cursor-not-allowed opacity-50'
+                  )}
+                >
+                  <div className="flex items-center gap-2 text-sm font-medium">
+                    <Server className="h-4 w-4" />
+                    指定节点
+                  </div>
+                  <div className="mt-1 text-xs text-muted-foreground">
+                    固定绑定一个代理池出口
+                  </div>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setProxyMode('custom')}
+                  disabled={isPending}
+                  className={cn(
+                    'rounded-md border p-3 text-left transition-colors',
+                    proxyMode === 'custom'
+                      ? 'border-primary bg-primary/10 text-primary'
+                      : 'border-input bg-background hover:bg-muted/60'
+                  )}
+                >
+                  <div className="flex items-center gap-2 text-sm font-medium">
+                    <Link2 className="h-4 w-4" />
+                    自定义代理
+                  </div>
+                  <div className="mt-1 text-xs text-muted-foreground">
+                    使用凭据级 HTTP/SOCKS5 代理
+                  </div>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setProxyMode('direct')}
+                  disabled={isPending || proxyRequireProxy}
+                  className={cn(
+                    'rounded-md border p-3 text-left transition-colors',
+                    proxyMode === 'direct'
+                      ? 'border-primary bg-primary/10 text-primary'
+                      : 'border-input bg-background hover:bg-muted/60',
+                    proxyRequireProxy && 'cursor-not-allowed opacity-50'
+                  )}
+                >
+                  <div className="flex items-center gap-2 text-sm font-medium">
+                    <Globe2 className="h-4 w-4" />
+                    直连
+                  </div>
+                  <div className="mt-1 text-xs text-muted-foreground">
+                    显式绕过全局代理和代理池
+                  </div>
+                </button>
+              </div>
+
+              {proxyMode === 'auto' && (
+                <div className="rounded-md border border-dashed bg-background px-3 py-2 text-xs text-muted-foreground">
+                  {proxyPoolEnabled
+                    ? `当前可用代理节点 ${proxyPoolOptions.length} 个，保存后由后端立即写回分配结果。`
+                    : '当前代理池未启用，导入后会跟随全局代理配置。'}
+                </div>
+              )}
+
+              {proxyMode === 'pool' && (
+                <div className="space-y-2">
+                  <label htmlFor="proxyId" className="text-sm font-medium">
+                    代理池节点
+                  </label>
+                  <select
+                    id="proxyId"
+                    value={proxyId}
+                    onChange={(e) => setProxyId(e.target.value)}
+                    disabled={isPending || proxyPoolOptions.length === 0}
+                    className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <option value="">选择代理池节点</option>
+                    {proxyPoolOptions.map((proxy) => (
+                      <option key={proxy.id} value={proxy.id}>
+                        {proxyPoolEntryLabel(proxy)}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+
+              {proxyMode === 'custom' && (
+                <div className="space-y-2">
+                  <Input
+                    id="proxyUrl"
+                    placeholder="http://proxy:3128 或 socks5://proxy:1080"
+                    value={proxyUrl}
+                    onChange={(e) => setProxyUrl(e.target.value)}
+                    disabled={isPending}
+                  />
+                  <div className="grid grid-cols-2 gap-2">
+                    <Input
+                      id="proxyUsername"
+                      placeholder="代理用户名"
+                      value={proxyUsername}
+                      onChange={(e) => setProxyUsername(e.target.value)}
+                      disabled={isPending}
+                    />
+                    <Input
+                      id="proxyPassword"
+                      type="password"
+                      placeholder="代理密码"
+                      value={proxyPassword}
+                      onChange={(e) => setProxyPassword(e.target.value)}
+                      disabled={isPending}
+                    />
+                  </div>
+                </div>
+              )}
+
+              {proxyRequireProxy && (
+                <div className="text-xs text-amber-600">
+                  当前代理池启用了强制代理，不能选择直连。
+                </div>
+              )}
             </div>
           </div>
 

@@ -250,6 +250,26 @@ pub struct SetCredentialRateLimitConfigRequest {
     pub rate_limit_refill_per_second: Option<Option<f64>>,
 }
 
+/// 修改凭据代理绑定请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCredentialProxyRequest {
+    /// 代理模式：auto / pool / custom / direct / global
+    pub mode: String,
+    /// pool 模式使用的代理池节点 ID
+    #[serde(default)]
+    pub proxy_id: Option<String>,
+    /// custom 模式使用的显式代理 URL
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+    /// custom 模式使用的代理用户名
+    #[serde(default)]
+    pub proxy_username: Option<String>,
+    /// custom 模式使用的代理密码
+    #[serde(default)]
+    pub proxy_password: Option<String>,
+}
+
 /// 修改凭据模型策略请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

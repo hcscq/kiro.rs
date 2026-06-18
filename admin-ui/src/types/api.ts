@@ -167,6 +167,16 @@ export interface SetCredentialModelPolicyRequest {
   clearRuntimeModelRestrictions?: boolean
 }
 
+export type CredentialProxyMode = 'auto' | 'pool' | 'custom' | 'direct' | 'global'
+
+export interface SetCredentialProxyRequest {
+  mode: CredentialProxyMode
+  proxyId?: string
+  proxyUrl?: string
+  proxyUsername?: string
+  proxyPassword?: string
+}
+
 export interface AvailableProfile {
   arn: string
   profileName?: string | null

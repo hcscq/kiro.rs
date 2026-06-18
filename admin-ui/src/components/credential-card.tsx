@@ -7,12 +7,17 @@ import {
   ChevronUp,
   Clock3,
   Eraser,
+  Globe2,
   KeyRound,
   Layers,
+  Link2,
   Loader2,
   MoreVertical,
+  Network,
   RefreshCw,
+  Server,
   ShieldCheck,
+  Shuffle,
   Trash2,
   UserRound,
   Wallet,
@@ -49,7 +54,9 @@ import type {
   CredentialStatusItem,
   BalanceResponse,
   AvailableProfile,
+  CredentialProxyMode,
   ModelCatalogItem,
+  ProxyPoolEntry,
   StandardAccountTypePreset,
 } from '@/types/api'
 import {
@@ -57,6 +64,7 @@ import {
   useClearCredentialRuntimeModelRestrictions,
   useClearCredentialSuspiciousActivity,
   useSetCredentialModelPolicy,
+  useSetCredentialProxy,
   useCredentialProfiles,
   useSetCredentialProfile,
   useSetCredentialRateLimitConfig,
@@ -65,6 +73,7 @@ import {
   useResetFailure,
   useDeleteCredential,
   useForceRefreshToken,
+  useLoadBalancingMode,
 } from '@/hooks/use-credentials'
 import { getCredentialLabel, getCredentialLabelWithId } from '@/lib/credential-label'
 import { cn } from '@/lib/utils'
@@ -295,6 +304,46 @@ function getAuthAccountTypeIcon(
   }
 }
 
+function initialProxyMode(credential: CredentialStatusItem): CredentialProxyMode {
+  const proxyUrl = credential.proxyUrl?.trim()
+  if (proxyUrl) {
+    return proxyUrl.toLowerCase() === 'direct' ? 'direct' : 'custom'
+  }
+  if (credential.proxyId?.trim()) {
+    return 'pool'
+  }
+  return 'global'
+}
+
+function proxyPoolEntryLabel(proxy: ProxyPoolEntry): string {
+  return proxy.expectedEgressIp ? `${proxy.id} (${proxy.expectedEgressIp})` : proxy.id
+}
+
+function credentialProxySummary(
+  credential: CredentialStatusItem,
+  proxyPoolEntries: ProxyPoolEntry[]
+): { label: string; detail: string; tone: 'muted' | 'accent' | 'success' } {
+  const proxyUrl = credential.proxyUrl?.trim()
+  if (proxyUrl) {
+    if (proxyUrl.toLowerCase() === 'direct') {
+      return { label: '直连', detail: '显式绕过全局代理和代理池', tone: 'muted' }
+    }
+    return { label: '自定义代理', detail: proxyUrl, tone: 'accent' }
+  }
+
+  const proxyId = credential.proxyId?.trim()
+  if (proxyId) {
+    const entry = proxyPoolEntries.find((proxy) => proxy.id === proxyId)
+    return {
+      label: entry ? `代理池 ${proxyPoolEntryLabel(entry)}` : `代理池 ${proxyId}`,
+      detail: entry?.url ?? `proxyId: ${proxyId}`,
+      tone: 'success',
+    }
+  }
+
+  return { label: '全局/未绑定', detail: '未设置凭据级代理绑定', tone: 'muted' }
+}
+
 export function CredentialCard({
   credential,
   onViewBalance,
@@ -330,11 +379,18 @@ export function CredentialCard({
   const [selectedProfileArn, setSelectedProfileArn] = useState(credential.profileArn ?? '')
   const [profileSelectionTouched, setProfileSelectionTouched] = useState(false)
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
+  const [showProxyDialog, setShowProxyDialog] = useState(false)
+  const [proxyMode, setProxyMode] = useState<CredentialProxyMode>(initialProxyMode(credential))
+  const [proxyIdValue, setProxyIdValue] = useState(credential.proxyId ?? '')
+  const [proxyUrlValue, setProxyUrlValue] = useState(credential.proxyUrl ?? '')
+  const [proxyUsernameValue, setProxyUsernameValue] = useState('')
+  const [proxyPasswordValue, setProxyPasswordValue] = useState('')
 
   const setDisabled = useSetDisabled()
   const clearRuntimeModelCooldown = useClearCredentialRuntimeModelRestrictions()
   const clearSuspiciousActivity = useClearCredentialSuspiciousActivity()
   const setModelPolicy = useSetCredentialModelPolicy()
+  const setProxy = useSetCredentialProxy()
   const profileQuery = useCredentialProfiles(credential.id, showModelPolicyDialog)
   const setProfile = useSetCredentialProfile()
   const setMaxConcurrency = useSetMaxConcurrency()
@@ -343,6 +399,7 @@ export function CredentialCard({
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
+  const { data: loadBalancingData } = useLoadBalancingMode()
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -448,6 +505,16 @@ export function CredentialCard({
     setShowModelPolicyDialog(true)
   }
 
+  const openProxyDialog = () => {
+    const mode = initialProxyMode(credential)
+    setProxyMode(mode)
+    setProxyIdValue(credential.proxyId ?? '')
+    setProxyUrlValue(mode === 'custom' ? credential.proxyUrl ?? '' : '')
+    setProxyUsernameValue('')
+    setProxyPasswordValue('')
+    setShowProxyDialog(true)
+  }
+
   const allowedModelsSummary = summarizeSelectedModels(allowedModelsValue, modelCatalog)
   const blockedModelsSummary = summarizeSelectedModels(blockedModelsValue, modelCatalog)
   const savedProfileArn = credential.profileArn?.trim() ?? ''
@@ -471,13 +538,60 @@ export function CredentialCard({
     savedProfileArn ||
     ''
   const compactProfileLabel = formatProfileArnCompact(savedProfileArn)
+  const proxyPoolOptions =
+    loadBalancingData?.proxyPool?.proxies.filter((proxy) => proxy.enabled) ?? []
+  const proxyPoolEnabled = loadBalancingData?.proxyPool?.enabled ?? false
+  const proxyRequireProxy = loadBalancingData?.proxyPool?.requireProxy ?? false
+  const proxySummary = credentialProxySummary(credential, loadBalancingData?.proxyPool?.proxies ?? [])
 
   const isSaving =
     setPriority.isPending ||
     setMaxConcurrency.isPending ||
     setRateLimitConfig.isPending ||
     setProfile.isPending ||
-    setModelPolicy.isPending
+    setModelPolicy.isPending ||
+    setProxy.isPending
+
+  const handleProxySave = async () => {
+    if (proxyMode === 'pool' && !proxyIdValue.trim()) {
+      toast.error('请选择代理池节点')
+      return
+    }
+    if (proxyMode === 'custom') {
+      const url = proxyUrlValue.trim()
+      if (!url) {
+        toast.error('请输入代理 URL')
+        return
+      }
+      if (url.toLowerCase() === 'direct') {
+        toast.error('direct 请使用直连模式')
+        return
+      }
+    }
+    if ((proxyMode === 'direct' || proxyMode === 'global') && proxyRequireProxy) {
+      toast.error('当前代理池要求每个凭据必须绑定代理')
+      return
+    }
+
+    try {
+      await setProxy.mutateAsync({
+        id: credential.id,
+        payload: {
+          mode: proxyMode,
+          proxyId: proxyMode === 'pool' ? proxyIdValue.trim() : undefined,
+          proxyUrl: proxyMode === 'custom' ? proxyUrlValue.trim() : undefined,
+          proxyUsername:
+            proxyMode === 'custom' ? proxyUsernameValue.trim() || undefined : undefined,
+          proxyPassword:
+            proxyMode === 'custom' ? proxyPasswordValue.trim() || undefined : undefined,
+        },
+      })
+      toast.success('代理配置已保存')
+      setShowProxyDialog(false)
+    } catch (err) {
+      toast.error('保存代理配置失败: ' + (err as Error).message)
+    }
+  }
 
   const handleModelPolicySave = async () => {
     const newPriority = parseInt(priorityValue, 10)
@@ -1001,14 +1115,32 @@ export function CredentialCard({
             </details>
           )}
 
-          {credential.hasProxy && (credential.proxyUrl || credential.proxyId) && (
-            <details className="text-xs text-muted-foreground cursor-pointer">
-              <summary className="outline-none">代理配置详情</summary>
-              <div className="mt-1 break-all text-foreground bg-muted/20 p-2 rounded border">
-                {credential.proxyUrl || `proxyId: ${credential.proxyId}`}
+          <div className="flex items-center justify-between gap-3 rounded-lg border border-dashed bg-muted/10 px-3 py-2 text-xs">
+            <div className="min-w-0 space-y-1">
+              <div className="flex items-center gap-2">
+                <Network className="h-3.5 w-3.5 text-muted-foreground" />
+                <Badge
+                  variant={proxySummary.tone === 'success' ? 'success' : proxySummary.tone === 'accent' ? 'default' : 'outline'}
+                  className="max-w-[220px] truncate"
+                >
+                  {proxySummary.label}
+                </Badge>
               </div>
-            </details>
-          )}
+              <div className="truncate text-muted-foreground" title={proxySummary.detail}>
+                {proxySummary.detail}
+              </div>
+            </div>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              className="h-7 shrink-0 px-2 text-xs"
+              onClick={openProxyDialog}
+              disabled={isSaving}
+            >
+              代理
+            </Button>
+          </div>
 
           {credential.disabled && (credential.lastErrorSummary || disabledAtSummary) && (
             <div className="space-y-1 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs">
@@ -1329,6 +1461,190 @@ export function CredentialCard({
             <Button onClick={handleModelPolicySave} disabled={isSaving}>
               {isSaving && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
               保存
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* 代理配置对话框 */}
+      <Dialog open={showProxyDialog} onOpenChange={setShowProxyDialog}>
+        <DialogContent className="sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>编辑凭据代理</DialogTitle>
+            <DialogDescription>
+              当前凭据：{credentialLabelWithId}
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4">
+            <div className="grid gap-2 sm:grid-cols-2">
+              {[
+                {
+                  mode: 'auto' as const,
+                  icon: Shuffle,
+                  label: '自动均衡',
+                  desc: '立即按代理池策略重新分配',
+                },
+                {
+                  mode: 'pool' as const,
+                  icon: Server,
+                  label: '指定节点',
+                  desc: '固定绑定到一个代理池节点',
+                },
+                {
+                  mode: 'custom' as const,
+                  icon: Link2,
+                  label: '自定义代理',
+                  desc: '使用凭据级 HTTP/SOCKS5 代理',
+                },
+                {
+                  mode: 'global' as const,
+                  icon: Network,
+                  label: '跟随全局',
+                  desc: '清空凭据级代理配置',
+                },
+              ].map(({ mode, icon: Icon, label, desc }) => {
+                const disabled =
+                  isSaving ||
+                  (mode === 'pool' && (!proxyPoolEnabled || proxyPoolOptions.length === 0)) ||
+                  (mode === 'global' && proxyRequireProxy)
+                return (
+                  <button
+                    key={mode}
+                    type="button"
+                    onClick={() => setProxyMode(mode)}
+                    disabled={disabled}
+                    className={cn(
+                      'rounded-md border p-3 text-left transition-colors',
+                      proxyMode === mode
+                        ? 'border-primary bg-primary/10 text-primary'
+                        : 'border-input bg-background hover:bg-muted/60',
+                      disabled && 'cursor-not-allowed opacity-50'
+                    )}
+                  >
+                    <div className="flex items-center gap-2 text-sm font-medium">
+                      <Icon className="h-4 w-4" />
+                      {label}
+                    </div>
+                    <div className="mt-1 text-xs text-muted-foreground">{desc}</div>
+                  </button>
+                )
+              })}
+              <button
+                type="button"
+                onClick={() => setProxyMode('direct')}
+                disabled={isSaving || proxyRequireProxy}
+                className={cn(
+                  'rounded-md border p-3 text-left transition-colors sm:col-span-2',
+                  proxyMode === 'direct'
+                    ? 'border-primary bg-primary/10 text-primary'
+                    : 'border-input bg-background hover:bg-muted/60',
+                  (isSaving || proxyRequireProxy) && 'cursor-not-allowed opacity-50'
+                )}
+              >
+                <div className="flex items-center gap-2 text-sm font-medium">
+                  <Globe2 className="h-4 w-4" />
+                  直连
+                </div>
+                <div className="mt-1 text-xs text-muted-foreground">
+                  显式绕过代理池和全局代理；启用强制代理时不可用
+                </div>
+              </button>
+            </div>
+
+            {proxyMode === 'auto' && (
+              <div className="rounded-md border border-dashed bg-muted/10 p-3 text-sm">
+                <div className="font-medium">自动均衡分配</div>
+                <div className="mt-1 text-xs text-muted-foreground">
+                  保存后后端会根据当前代理池绑定数量和权重立即选择一个节点，并写回该凭据。
+                </div>
+                {!proxyPoolEnabled && (
+                  <div className="mt-2 text-xs text-amber-600">
+                    当前代理池未启用，保存后会清空凭据级代理并跟随全局配置。
+                  </div>
+                )}
+              </div>
+            )}
+
+            {proxyMode === 'pool' && (
+              <div className="space-y-2">
+                <label htmlFor={`proxy-id-${credential.id}`} className="text-sm font-medium">
+                  代理池节点
+                </label>
+                <select
+                  id={`proxy-id-${credential.id}`}
+                  value={proxyIdValue}
+                  onChange={(e) => setProxyIdValue(e.target.value)}
+                  disabled={isSaving || proxyPoolOptions.length === 0}
+                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <option value="">选择代理池节点</option>
+                  {proxyPoolOptions.map((proxy) => (
+                    <option key={proxy.id} value={proxy.id}>
+                      {proxyPoolEntryLabel(proxy)}
+                    </option>
+                  ))}
+                </select>
+                {proxyPoolOptions.length === 0 && (
+                  <div className="text-xs text-amber-600">当前没有启用的代理池节点。</div>
+                )}
+              </div>
+            )}
+
+            {proxyMode === 'custom' && (
+              <div className="space-y-3">
+                <div className="space-y-2">
+                  <label htmlFor={`proxy-url-${credential.id}`} className="text-sm font-medium">
+                    代理 URL
+                  </label>
+                  <Input
+                    id={`proxy-url-${credential.id}`}
+                    placeholder="http://proxy:3128 或 socks5://proxy:1080"
+                    value={proxyUrlValue}
+                    onChange={(e) => setProxyUrlValue(e.target.value)}
+                    disabled={isSaving}
+                  />
+                </div>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <Input
+                    placeholder="用户名"
+                    value={proxyUsernameValue}
+                    onChange={(e) => setProxyUsernameValue(e.target.value)}
+                    disabled={isSaving}
+                  />
+                  <Input
+                    type="password"
+                    placeholder="密码"
+                    value={proxyPasswordValue}
+                    onChange={(e) => setProxyPasswordValue(e.target.value)}
+                    disabled={isSaving}
+                  />
+                </div>
+                <div className="text-xs text-muted-foreground">
+                  出于安全考虑，已保存的代理密码不会回显；修改自定义代理时需要重新填写认证信息。
+                </div>
+              </div>
+            )}
+
+            {proxyRequireProxy && (
+              <div className="rounded-md border border-amber-300 bg-amber-500/5 px-3 py-2 text-xs text-amber-700">
+                当前代理池启用了强制代理，不能保存为跟随全局或直连。
+              </div>
+            )}
+          </div>
+
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setShowProxyDialog(false)}
+              disabled={isSaving}
+            >
+              取消
+            </Button>
+            <Button type="button" onClick={handleProxySave} disabled={isSaving}>
+              {setProxy.isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+              保存代理
             </Button>
           </DialogFooter>
         </DialogContent>

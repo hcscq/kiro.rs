@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { CheckCircle2, XCircle, AlertCircle, Loader2 } from 'lucide-react'
+import { CheckCircle2, XCircle, AlertCircle, Loader2, Globe2, Link2, Network, Server, Shuffle } from 'lucide-react'
 import {
   Dialog,
   DialogContent,
@@ -11,9 +11,10 @@ import {
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
-import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
+import { useCredentials, useAddCredential, useDeleteCredential, useLoadBalancingMode } from '@/hooks/use-credentials'
 import { getCredentialBalance, setCredentialDisabled, setCredentialOverageStatus } from '@/api/credentials'
-import { extractErrorMessage, sha256Hex } from '@/lib/utils'
+import type { CredentialProxyMode, ProxyPoolEntry } from '@/types/api'
+import { cn, extractErrorMessage, sha256Hex } from '@/lib/utils'
 
 interface BatchImportDialogProps {
   open: boolean
@@ -56,6 +57,9 @@ interface VerificationResult {
   rollbackError?: string
 }
 
+function proxyPoolEntryLabel(proxy: ProxyPoolEntry): string {
+  return proxy.expectedEgressIp ? `${proxy.id} (${proxy.expectedEgressIp})` : proxy.id
+}
 
 function normalizeProvider(provider?: string): string | undefined {
   const trimmed = provider?.trim()
@@ -81,11 +85,21 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
   const [results, setResults] = useState<VerificationResult[]>([])
   const [defaultPriority, setDefaultPriority] = useState('0')
   const [defaultMaxConcurrency, setDefaultMaxConcurrency] = useState('')
+  const [defaultProxyMode, setDefaultProxyMode] = useState<CredentialProxyMode>('auto')
+  const [defaultProxyId, setDefaultProxyId] = useState('')
+  const [defaultProxyUrl, setDefaultProxyUrl] = useState('')
+  const [defaultProxyUsername, setDefaultProxyUsername] = useState('')
+  const [defaultProxyPassword, setDefaultProxyPassword] = useState('')
   const [autoEnableOverage, setAutoEnableOverage] = useState(false)
 
   const { data: existingCredentials } = useCredentials()
+  const { data: loadBalancingData } = useLoadBalancingMode()
   const { mutateAsync: addCredential } = useAddCredential()
   const { mutateAsync: deleteCredential } = useDeleteCredential()
+  const proxyPoolOptions =
+    loadBalancingData?.proxyPool?.proxies.filter((proxy) => proxy.enabled) ?? []
+  const proxyPoolEnabled = loadBalancingData?.proxyPool?.enabled ?? false
+  const proxyRequireProxy = loadBalancingData?.proxyPool?.requireProxy ?? false
 
   const rollbackCredential = async (id: number): Promise<{ success: boolean; error?: string }> => {
     try {
@@ -115,6 +129,11 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     setResults([])
     setDefaultPriority('0')
     setDefaultMaxConcurrency('')
+    setDefaultProxyMode('auto')
+    setDefaultProxyId('')
+    setDefaultProxyUrl('')
+    setDefaultProxyUsername('')
+    setDefaultProxyPassword('')
     setAutoEnableOverage(false)
   }
 
@@ -148,6 +167,22 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       (!Number.isInteger(parsedDefaultMaxConcurrency) || parsedDefaultMaxConcurrency <= 0)
     ) {
       toast.error('默认并发数必须是大于 0 的整数，留空表示不限制')
+      return
+    }
+    if (defaultProxyMode === 'pool' && !defaultProxyId.trim()) {
+      toast.error('请选择默认代理池节点')
+      return
+    }
+    if (defaultProxyMode === 'custom' && !defaultProxyUrl.trim()) {
+      toast.error('请输入默认代理 URL')
+      return
+    }
+    if (defaultProxyMode === 'custom' && defaultProxyUrl.trim().toLowerCase() === 'direct') {
+      toast.error('direct 请使用直连模式')
+      return
+    }
+    if (defaultProxyMode === 'direct' && proxyRequireProxy) {
+      toast.error('当前代理池要求新凭据必须绑定代理')
       return
     }
 
@@ -276,6 +311,35 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           ) {
             throw new Error('rateLimitRefillPerSecond 必须是大于等于 0 的数字')
           }
+          const explicitProxyUrl = cred.proxyUrl?.trim()
+          const explicitProxyId = cred.proxyId?.trim()
+          const resolvedProxyUrl = explicitProxyUrl
+            ? explicitProxyUrl
+            : explicitProxyId
+              ? undefined
+              : defaultProxyMode === 'custom'
+                ? defaultProxyUrl.trim()
+                : defaultProxyMode === 'direct'
+                  ? 'direct'
+                  : undefined
+          const resolvedProxyId = resolvedProxyUrl
+            ? undefined
+            : explicitProxyId ||
+              (defaultProxyMode === 'pool' ? defaultProxyId.trim() || undefined : undefined)
+          const resolvedProxyUsername = resolvedProxyUrl
+            ? explicitProxyUrl
+              ? cred.proxyUsername?.trim() || undefined
+              : defaultProxyMode === 'custom'
+                ? defaultProxyUsername.trim() || undefined
+                : undefined
+            : undefined
+          const resolvedProxyPassword = resolvedProxyUrl
+            ? explicitProxyUrl
+              ? cred.proxyPassword?.trim() || undefined
+              : defaultProxyMode === 'custom'
+                ? defaultProxyPassword.trim() || undefined
+                : undefined
+            : undefined
 
           const addedCred = await addCredential({
             refreshToken: token,
@@ -308,10 +372,10 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               typeof cred.rateLimitRefillPerSecond === 'number'
                 ? cred.rateLimitRefillPerSecond
                 : undefined,
-            proxyId: cred.proxyUrl?.trim() ? undefined : cred.proxyId?.trim() || undefined,
-            proxyUrl: cred.proxyUrl?.trim() || undefined,
-            proxyUsername: cred.proxyUsername?.trim() || undefined,
-            proxyPassword: cred.proxyPassword?.trim() || undefined,
+            proxyId: resolvedProxyId,
+            proxyUrl: resolvedProxyUrl,
+            proxyUsername: resolvedProxyUsername,
+            proxyPassword: resolvedProxyPassword,
           })
 
           addedCredId = addedCred.credentialId
@@ -500,6 +564,95 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
                   disabled={importing}
                 />
               </div>
+            </div>
+            <div className="space-y-3 rounded-md border p-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2 text-sm font-medium">
+                  <Network className="h-4 w-4 text-muted-foreground" />
+                  默认代理策略
+                </div>
+                <span className="text-xs text-muted-foreground">
+                  JSON 单条代理字段优先
+                </span>
+              </div>
+              <div className="grid gap-2 md:grid-cols-4">
+                {([
+                  ['auto', Shuffle, '自动均衡'],
+                  ['pool', Server, '指定节点'],
+                  ['custom', Link2, '自定义'],
+                  ['direct', Globe2, '直连'],
+                ] as const).map(([mode, Icon, label]) => (
+                  <button
+                    key={mode}
+                    type="button"
+                    onClick={() => setDefaultProxyMode(mode)}
+                    disabled={
+                      importing ||
+                      (mode === 'pool' && (!proxyPoolEnabled || proxyPoolOptions.length === 0)) ||
+                      (mode === 'direct' && proxyRequireProxy)
+                    }
+                    className={cn(
+                      'flex h-10 items-center justify-center gap-2 rounded-md border px-3 text-sm transition-colors',
+                      defaultProxyMode === mode
+                        ? 'border-primary bg-primary/10 text-primary'
+                        : 'border-input bg-background hover:bg-muted/60',
+                      ((mode === 'pool' && (!proxyPoolEnabled || proxyPoolOptions.length === 0)) ||
+                        (mode === 'direct' && proxyRequireProxy)) &&
+                        'cursor-not-allowed opacity-50'
+                    )}
+                  >
+                    <Icon className="h-4 w-4" />
+                    {label}
+                  </button>
+                ))}
+              </div>
+              {defaultProxyMode === 'auto' && (
+                <div className="text-xs text-muted-foreground">
+                  {proxyPoolEnabled
+                    ? `未指定代理的凭据会自动分配到 ${proxyPoolOptions.length} 个可用代理池节点。`
+                    : '代理池未启用时，未指定代理的凭据会跟随全局代理配置。'}
+                </div>
+              )}
+              {defaultProxyMode === 'pool' && (
+                <select
+                  value={defaultProxyId}
+                  onChange={(e) => setDefaultProxyId(e.target.value)}
+                  disabled={importing || proxyPoolOptions.length === 0}
+                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <option value="">选择默认代理池节点</option>
+                  {proxyPoolOptions.map((proxy) => (
+                    <option key={proxy.id} value={proxy.id}>
+                      {proxyPoolEntryLabel(proxy)}
+                    </option>
+                  ))}
+                </select>
+              )}
+              {defaultProxyMode === 'custom' && (
+                <div className="space-y-2">
+                  <Input
+                    placeholder="默认代理 URL"
+                    value={defaultProxyUrl}
+                    onChange={(e) => setDefaultProxyUrl(e.target.value)}
+                    disabled={importing}
+                  />
+                  <div className="grid grid-cols-2 gap-2">
+                    <Input
+                      placeholder="默认代理用户名"
+                      value={defaultProxyUsername}
+                      onChange={(e) => setDefaultProxyUsername(e.target.value)}
+                      disabled={importing}
+                    />
+                    <Input
+                      type="password"
+                      placeholder="默认代理密码"
+                      value={defaultProxyPassword}
+                      onChange={(e) => setDefaultProxyPassword(e.target.value)}
+                      disabled={importing}
+                    />
+                  </div>
+                </div>
+              )}
             </div>
             <textarea
               placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n例如: [{"email":"user@example.com","provider":"Enterprise","refreshToken":"...","clientId":"...","clientSecret":"...","region":"us-east-1","startUrl":"https://example.awsapps.com/start"}]\n支持 region 字段自动映射为 authRegion 和 apiRegion'}

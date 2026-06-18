@@ -2363,6 +2363,176 @@ impl MultiTokenManager {
         }
     }
 
+    fn trim_optional_string(value: Option<String>) -> Option<String> {
+        value
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    }
+
+    fn validate_explicit_proxy_url(proxy_url: &str) -> anyhow::Result<()> {
+        if proxy_url.eq_ignore_ascii_case(KiroCredentials::PROXY_DIRECT) {
+            anyhow::bail!("自定义代理 URL 不能为 direct，请使用 direct 模式");
+        }
+        reqwest::Proxy::all(proxy_url)
+            .map(|_| ())
+            .map_err(|err| anyhow::anyhow!("代理 URL 无效: {}", err))
+    }
+
+    pub fn set_credential_proxy(
+        &self,
+        id: u64,
+        mode: String,
+        proxy_id: Option<String>,
+        proxy_url: Option<String>,
+        proxy_username: Option<String>,
+        proxy_password: Option<String>,
+    ) -> anyhow::Result<()> {
+        let mode = mode.trim().to_ascii_lowercase();
+        let dispatch = self.dispatch_config();
+        let pool = &dispatch.proxy_pool;
+        let now = Instant::now();
+
+        let _state_write_guard = self.state_write_lock.lock();
+        let mut persisted = self.persisted_credentials_snapshot();
+        let position = persisted
+            .iter()
+            .position(|credential| credential.id == Some(id))
+            .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+
+        let mut updated = persisted[position].clone();
+        let previous_proxy_id = updated
+            .proxy_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+
+        match mode.as_str() {
+            "auto" => {
+                updated.proxy_url = None;
+                updated.proxy_username = None;
+                updated.proxy_password = None;
+                updated.proxy_id = None;
+
+                if pool.enabled {
+                    let mut assignment_snapshot = persisted.clone();
+                    assignment_snapshot[position].proxy_url = None;
+                    assignment_snapshot[position].proxy_username = None;
+                    assignment_snapshot[position].proxy_password = None;
+                    assignment_snapshot[position].proxy_id = None;
+
+                    let selected = self.select_proxy_id_from_pool(
+                        pool,
+                        &assignment_snapshot,
+                        None,
+                        updated.refresh_token.as_deref(),
+                    );
+                    match selected {
+                        Some(proxy_id) => updated.proxy_id = Some(proxy_id),
+                        None if pool.require_proxy => {
+                            anyhow::bail!("proxyPool.requireProxy=true，但当前没有可用的代理池节点")
+                        }
+                        None => {}
+                    }
+                } else if pool.require_proxy {
+                    anyhow::bail!("proxyPool.requireProxy=true，但代理池未启用");
+                }
+            }
+            "pool" => {
+                if !pool.enabled {
+                    anyhow::bail!("代理池未启用，不能绑定代理池节点");
+                }
+                let proxy_id = Self::trim_optional_string(proxy_id)
+                    .ok_or_else(|| anyhow::anyhow!("proxyId 不能为空"))?;
+                let exists = pool
+                    .proxies
+                    .iter()
+                    .any(|entry| entry.enabled && entry.id.trim() == proxy_id);
+                if !exists {
+                    anyhow::bail!("指定的代理池 ID 不存在或未启用: {}", proxy_id);
+                }
+                if let Some(unavailable_until) = self.proxy_pool_unavailable_until(&proxy_id, now) {
+                    let remaining_ms = unavailable_until
+                        .saturating_duration_since(Instant::now())
+                        .as_millis();
+                    anyhow::bail!(
+                        "代理池节点 {} 正在冷却中（剩余约 {} ms）",
+                        proxy_id,
+                        remaining_ms
+                    );
+                }
+
+                updated.proxy_url = None;
+                updated.proxy_username = None;
+                updated.proxy_password = None;
+                updated.proxy_id = Some(proxy_id);
+            }
+            "custom" => {
+                let proxy_url = Self::trim_optional_string(proxy_url)
+                    .ok_or_else(|| anyhow::anyhow!("proxyUrl 不能为空"))?;
+                Self::validate_explicit_proxy_url(&proxy_url)?;
+                updated.proxy_url = Some(proxy_url);
+                updated.proxy_username = Self::trim_optional_string(proxy_username);
+                updated.proxy_password = Self::trim_optional_string(proxy_password);
+                updated.proxy_id = None;
+            }
+            "direct" => {
+                if pool.enabled && pool.require_proxy {
+                    anyhow::bail!("proxyPool.requireProxy=true 时凭据不能使用 direct");
+                }
+                updated.proxy_url = Some(KiroCredentials::PROXY_DIRECT.to_string());
+                updated.proxy_username = None;
+                updated.proxy_password = None;
+                updated.proxy_id = None;
+            }
+            "global" => {
+                if pool.enabled && pool.require_proxy {
+                    anyhow::bail!("proxyPool.requireProxy=true 时凭据不能清空代理绑定");
+                }
+                updated.proxy_url = None;
+                updated.proxy_username = None;
+                updated.proxy_password = None;
+                updated.proxy_id = None;
+            }
+            _ => anyhow::bail!("不支持的代理模式: {}", mode),
+        }
+
+        let next_proxy_id = updated
+            .proxy_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+
+        persisted[position] = updated.clone();
+        self.persist_credentials_snapshot(&persisted)?;
+
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.proxy_url = updated.proxy_url;
+            entry.credentials.proxy_username = updated.proxy_username;
+            entry.credentials.proxy_password = updated.proxy_password;
+            entry.credentials.proxy_id = updated.proxy_id;
+        }
+
+        if let Some(proxy_id) = &next_proxy_id {
+            self.proxy_health.lock().remove(proxy_id);
+        }
+        self.availability_notify.notify_waiters();
+        tracing::info!(
+            credential_id = id,
+            mode,
+            previous_proxy_id = ?previous_proxy_id,
+            next_proxy_id = ?next_proxy_id,
+            "凭据代理配置已更新"
+        );
+        Ok(())
+    }
+
     fn pool_proxy_id_for_credential(&self, id: u64) -> Option<String> {
         let entries = self.entries.lock();
         let credentials = &entries.iter().find(|entry| entry.id == id)?.credentials;
@@ -9688,6 +9858,123 @@ mod tests {
         let err = pool.validate().unwrap_err().to_string();
 
         assert!(err.contains("url 无效"));
+    }
+
+    #[test]
+    fn set_credential_proxy_auto_assigns_and_persists_pool_binding() {
+        let credentials_path = temp_credentials_path("set-proxy-auto");
+        let mut config = Config::default();
+        config.proxy_pool = proxy_pool_config_for_tests();
+
+        let mut current = available_credential(0);
+        current.id = Some(1);
+        current.refresh_token = Some("refresh-token-for-current-auto-proxy".repeat(4));
+        current.proxy_id = Some("node-a".to_string());
+        let mut existing = available_credential(1);
+        existing.id = Some(2);
+        existing.refresh_token = Some("refresh-token-for-existing-auto-proxy".repeat(4));
+        existing.proxy_id = Some("node-a".to_string());
+        write_credentials_file(&credentials_path, &[current.clone(), existing.clone()]);
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![current, existing],
+            None,
+            Some(credentials_path.clone()),
+            true,
+        )
+        .unwrap();
+
+        manager
+            .set_credential_proxy(1, "auto".to_string(), None, None, None, None)
+            .unwrap();
+
+        assert_eq!(
+            manager.current_credentials(1).unwrap().proxy_id.as_deref(),
+            Some("node-b")
+        );
+        let persisted = CredentialsConfig::load(&credentials_path)
+            .unwrap()
+            .into_sorted_credentials();
+        assert_eq!(persisted[0].proxy_id.as_deref(), Some("node-b"));
+        assert!(persisted[0].proxy_url.is_none());
+
+        std::fs::remove_file(credentials_path).unwrap();
+    }
+
+    #[test]
+    fn set_credential_proxy_custom_clears_pool_binding() {
+        let credentials_path = temp_credentials_path("set-proxy-custom");
+        let mut config = Config::default();
+        config.proxy_pool = proxy_pool_config_for_tests();
+
+        let mut credential = available_credential(0);
+        credential.id = Some(1);
+        credential.proxy_id = Some("node-a".to_string());
+        write_credentials_file(&credentials_path, &[credential.clone()]);
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![credential],
+            None,
+            Some(credentials_path.clone()),
+            true,
+        )
+        .unwrap();
+
+        manager
+            .set_credential_proxy(
+                1,
+                "custom".to_string(),
+                None,
+                Some("http://custom-proxy.local:3128".to_string()),
+                Some(" user ".to_string()),
+                Some(" pass ".to_string()),
+            )
+            .unwrap();
+
+        let current = manager.current_credentials(1).unwrap();
+        assert_eq!(
+            current.proxy_url.as_deref(),
+            Some("http://custom-proxy.local:3128")
+        );
+        assert_eq!(current.proxy_username.as_deref(), Some("user"));
+        assert_eq!(current.proxy_password.as_deref(), Some("pass"));
+        assert!(current.proxy_id.is_none());
+
+        let persisted = CredentialsConfig::load(&credentials_path)
+            .unwrap()
+            .into_sorted_credentials();
+        assert_eq!(
+            persisted[0].proxy_url.as_deref(),
+            Some("http://custom-proxy.local:3128")
+        );
+        assert!(persisted[0].proxy_id.is_none());
+
+        std::fs::remove_file(credentials_path).unwrap();
+    }
+
+    #[test]
+    fn set_credential_proxy_require_proxy_rejects_direct_and_global() {
+        let mut config = Config::default();
+        config.proxy_pool = proxy_pool_config_for_tests();
+
+        let mut credential = available_credential(0);
+        credential.id = Some(1);
+        credential.proxy_id = Some("node-a".to_string());
+        let manager = MultiTokenManager::new(config, vec![credential], None, None, false).unwrap();
+
+        let direct_err = manager
+            .set_credential_proxy(1, "direct".to_string(), None, None, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(direct_err.contains("不能使用 direct"));
+
+        let global_err = manager
+            .set_credential_proxy(1, "global".to_string(), None, None, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(global_err.contains("不能清空代理绑定"));
     }
 
     #[test]

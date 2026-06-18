@@ -10,9 +10,9 @@ use super::{
     middleware::AdminState,
     types::{
         AddCredentialRequest, SetCredentialModelPolicyRequest, SetCredentialProfileRequest,
-        SetCredentialRateLimitConfigRequest, SetDisabledRequest, SetLoadBalancingModeRequest,
-        SetMaxConcurrencyRequest, SetModelCapabilitiesConfigRequest, SetOverageStatusRequest,
-        SetPriorityRequest, SuccessResponse,
+        SetCredentialProxyRequest, SetCredentialRateLimitConfigRequest, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetMaxConcurrencyRequest, SetModelCapabilitiesConfigRequest,
+        SetOverageStatusRequest, SetPriorityRequest, SuccessResponse,
     },
 };
 
@@ -113,6 +113,19 @@ pub async fn set_credential_model_policy(
 ) -> impl IntoResponse {
     match state.service.set_model_policy(id, payload) {
         Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 模型策略已更新", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/proxy
+/// 设置凭据代理绑定
+pub async fn set_credential_proxy(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetCredentialProxyRequest>,
+) -> impl IntoResponse {
+    match state.service.set_proxy(id, payload) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 代理配置已更新", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

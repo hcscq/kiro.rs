@@ -13,8 +13,8 @@ use super::{
         get_load_balancing_mode, get_model_capabilities_config, get_model_catalog,
         reset_failure_count, set_credential_disabled, set_credential_max_concurrency,
         set_credential_model_policy, set_credential_overage_status, set_credential_priority,
-        set_credential_profile, set_credential_rate_limit_config, set_load_balancing_mode,
-        set_model_capabilities_config,
+        set_credential_profile, set_credential_proxy, set_credential_rate_limit_config,
+        set_load_balancing_mode, set_model_capabilities_config,
     },
     middleware::{AdminState, admin_auth_middleware, admin_write_routing_middleware},
 };
@@ -69,6 +69,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/credentials/{id}/model-policy",
             post(set_credential_model_policy),
         )
+        .route("/credentials/{id}/proxy", post(set_credential_proxy))
         .route("/credentials/{id}/profiles", get(get_credential_profiles))
         .route("/credentials/{id}/profile", post(set_credential_profile))
         .route(

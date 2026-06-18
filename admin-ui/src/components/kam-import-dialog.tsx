@@ -1,6 +1,6 @@
 import { useState, useMemo } from 'react'
 import { toast } from 'sonner'
-import { CheckCircle2, XCircle, AlertCircle, Loader2 } from 'lucide-react'
+import { CheckCircle2, XCircle, AlertCircle, Loader2, Globe2, Link2, Network, Server, Shuffle } from 'lucide-react'
 import {
   Dialog,
   DialogContent,
@@ -11,9 +11,10 @@ import {
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
-import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
+import { useCredentials, useAddCredential, useDeleteCredential, useLoadBalancingMode } from '@/hooks/use-credentials'
 import { getCredentialBalance, setCredentialDisabled, setCredentialOverageStatus } from '@/api/credentials'
-import { extractErrorMessage, sha256Hex } from '@/lib/utils'
+import type { CredentialProxyMode, ProxyPoolEntry } from '@/types/api'
+import { cn, extractErrorMessage, sha256Hex } from '@/lib/utils'
 
 interface KamImportDialogProps {
   open: boolean
@@ -81,6 +82,10 @@ interface VerificationResult {
 
 const KAM_DEFAULT_AUTH_REGION = 'us-east-1'
 
+
+function proxyPoolEntryLabel(proxy: ProxyPoolEntry): string {
+  return proxy.expectedEgressIp ? `${proxy.id} (${proxy.expectedEgressIp})` : proxy.id
+}
 
 function getString(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined
@@ -311,11 +316,21 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
   const [results, setResults] = useState<VerificationResult[]>([])
   const [defaultPriority, setDefaultPriority] = useState('0')
   const [defaultMaxConcurrency, setDefaultMaxConcurrency] = useState('')
+  const [defaultProxyMode, setDefaultProxyMode] = useState<CredentialProxyMode>('auto')
+  const [defaultProxyId, setDefaultProxyId] = useState('')
+  const [defaultProxyUrl, setDefaultProxyUrl] = useState('')
+  const [defaultProxyUsername, setDefaultProxyUsername] = useState('')
+  const [defaultProxyPassword, setDefaultProxyPassword] = useState('')
   const [autoEnableOverage, setAutoEnableOverage] = useState(false)
 
   const { data: existingCredentials } = useCredentials()
+  const { data: loadBalancingData } = useLoadBalancingMode()
   const { mutateAsync: addCredential } = useAddCredential()
   const { mutateAsync: deleteCredential } = useDeleteCredential()
+  const proxyPoolOptions =
+    loadBalancingData?.proxyPool?.proxies.filter((proxy) => proxy.enabled) ?? []
+  const proxyPoolEnabled = loadBalancingData?.proxyPool?.enabled ?? false
+  const proxyRequireProxy = loadBalancingData?.proxyPool?.requireProxy ?? false
 
   const rollbackCredential = async (id: number): Promise<{ success: boolean; error?: string }> => {
     try {
@@ -338,6 +353,11 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     setResults([])
     setDefaultPriority('0')
     setDefaultMaxConcurrency('')
+    setDefaultProxyMode('auto')
+    setDefaultProxyId('')
+    setDefaultProxyUrl('')
+    setDefaultProxyUsername('')
+    setDefaultProxyPassword('')
     setAutoEnableOverage(false)
   }
 
@@ -376,6 +396,22 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
       (!Number.isInteger(parsedDefaultMaxConcurrency) || parsedDefaultMaxConcurrency <= 0)
     ) {
       toast.error('默认并发数必须是大于 0 的整数，留空表示不限制')
+      return
+    }
+    if (defaultProxyMode === 'pool' && !defaultProxyId.trim()) {
+      toast.error('请选择默认代理池节点')
+      return
+    }
+    if (defaultProxyMode === 'custom' && !defaultProxyUrl.trim()) {
+      toast.error('请输入默认代理 URL')
+      return
+    }
+    if (defaultProxyMode === 'custom' && defaultProxyUrl.trim().toLowerCase() === 'direct') {
+      toast.error('direct 请使用直连模式')
+      return
+    }
+    if (defaultProxyMode === 'direct' && proxyRequireProxy) {
+      toast.error('当前代理池要求新凭据必须绑定代理')
       return
     }
 
@@ -458,14 +494,35 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           const enterprise = isEnterpriseProvider(provider)
           const { region: kamRegion, authRegion, apiRegion } = resolveKamRegions(cred, enterprise)
           const profileArn = account.profileArn?.trim() || cred.profileArn?.trim() || undefined
-          const proxyUrl = cred.proxyUrl?.trim() || account.proxyUrl?.trim() || undefined
+          const explicitProxyUrl = cred.proxyUrl?.trim() || account.proxyUrl?.trim() || undefined
+          const explicitProxyId = cred.proxyId?.trim() || account.proxyId?.trim() || undefined
+          const proxyUrl = explicitProxyUrl
+            ? explicitProxyUrl
+            : explicitProxyId
+              ? undefined
+              : defaultProxyMode === 'custom'
+                ? defaultProxyUrl.trim()
+                : defaultProxyMode === 'direct'
+                  ? 'direct'
+                  : undefined
           const proxyId = proxyUrl
             ? undefined
-            : cred.proxyId?.trim() || account.proxyId?.trim() || undefined
-          const proxyUsername =
-            cred.proxyUsername?.trim() || account.proxyUsername?.trim() || undefined
-          const proxyPassword =
-            cred.proxyPassword?.trim() || account.proxyPassword?.trim() || undefined
+            : explicitProxyId ||
+              (defaultProxyMode === 'pool' ? defaultProxyId.trim() || undefined : undefined)
+          const proxyUsername = proxyUrl
+            ? explicitProxyUrl
+              ? cred.proxyUsername?.trim() || account.proxyUsername?.trim() || undefined
+              : defaultProxyMode === 'custom'
+                ? defaultProxyUsername.trim() || undefined
+                : undefined
+            : undefined
+          const proxyPassword = proxyUrl
+            ? explicitProxyUrl
+              ? cred.proxyPassword?.trim() || account.proxyPassword?.trim() || undefined
+              : defaultProxyMode === 'custom'
+                ? defaultProxyPassword.trim() || undefined
+                : undefined
+            : undefined
           const availableModelIds = extractAvailableModelIds(account)
           const maxConcurrency =
             getKamDispatchNumber(account, 'maxConcurrency') ?? parsedDefaultMaxConcurrency
@@ -732,6 +789,95 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
                   disabled={importing}
                 />
               </div>
+            </div>
+            <div className="space-y-3 rounded-md border p-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2 text-sm font-medium">
+                  <Network className="h-4 w-4 text-muted-foreground" />
+                  默认代理策略
+                </div>
+                <span className="text-xs text-muted-foreground">
+                  KAM 单账号代理字段优先
+                </span>
+              </div>
+              <div className="grid gap-2 md:grid-cols-4">
+                {([
+                  ['auto', Shuffle, '自动均衡'],
+                  ['pool', Server, '指定节点'],
+                  ['custom', Link2, '自定义'],
+                  ['direct', Globe2, '直连'],
+                ] as const).map(([mode, Icon, label]) => (
+                  <button
+                    key={mode}
+                    type="button"
+                    onClick={() => setDefaultProxyMode(mode)}
+                    disabled={
+                      importing ||
+                      (mode === 'pool' && (!proxyPoolEnabled || proxyPoolOptions.length === 0)) ||
+                      (mode === 'direct' && proxyRequireProxy)
+                    }
+                    className={cn(
+                      'flex h-10 items-center justify-center gap-2 rounded-md border px-3 text-sm transition-colors',
+                      defaultProxyMode === mode
+                        ? 'border-primary bg-primary/10 text-primary'
+                        : 'border-input bg-background hover:bg-muted/60',
+                      ((mode === 'pool' && (!proxyPoolEnabled || proxyPoolOptions.length === 0)) ||
+                        (mode === 'direct' && proxyRequireProxy)) &&
+                        'cursor-not-allowed opacity-50'
+                    )}
+                  >
+                    <Icon className="h-4 w-4" />
+                    {label}
+                  </button>
+                ))}
+              </div>
+              {defaultProxyMode === 'auto' && (
+                <div className="text-xs text-muted-foreground">
+                  {proxyPoolEnabled
+                    ? `未指定代理的账号会自动分配到 ${proxyPoolOptions.length} 个可用代理池节点。`
+                    : '代理池未启用时，未指定代理的账号会跟随全局代理配置。'}
+                </div>
+              )}
+              {defaultProxyMode === 'pool' && (
+                <select
+                  value={defaultProxyId}
+                  onChange={(e) => setDefaultProxyId(e.target.value)}
+                  disabled={importing || proxyPoolOptions.length === 0}
+                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <option value="">选择默认代理池节点</option>
+                  {proxyPoolOptions.map((proxy) => (
+                    <option key={proxy.id} value={proxy.id}>
+                      {proxyPoolEntryLabel(proxy)}
+                    </option>
+                  ))}
+                </select>
+              )}
+              {defaultProxyMode === 'custom' && (
+                <div className="space-y-2">
+                  <Input
+                    placeholder="默认代理 URL"
+                    value={defaultProxyUrl}
+                    onChange={(e) => setDefaultProxyUrl(e.target.value)}
+                    disabled={importing}
+                  />
+                  <div className="grid grid-cols-2 gap-2">
+                    <Input
+                      placeholder="默认代理用户名"
+                      value={defaultProxyUsername}
+                      onChange={(e) => setDefaultProxyUsername(e.target.value)}
+                      disabled={importing}
+                    />
+                    <Input
+                      type="password"
+                      placeholder="默认代理密码"
+                      value={defaultProxyPassword}
+                      onChange={(e) => setDefaultProxyPassword(e.target.value)}
+                      disabled={importing}
+                    />
+                  </div>
+                </div>
+              )}
             </div>
             <textarea
               placeholder={'粘贴 Kiro Account Manager 导出的 JSON\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "userId": "...",\n    "provider": "Enterprise",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "eu-central-1",\n    "authRegion": "us-east-1",\n    "startUrl": "https://example.awsapps.com/start",\n    "accountType": "power",\n    "maxConcurrency": 20\n  }\n]\n\n（可选的 authMethod 字段会被忽略，系统会根据 clientId/clientSecret 自动判断；未提供 authRegion 时，Enterprise 默认使用 us-east-1 进行 OIDC 刷新）\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "provider": "Enterprise",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "eu-central-1",\n        "authRegion": "us-east-1",\n        "startUrl": "https://example.awsapps.com/start"\n      }\n    }\n  ]\n}'}

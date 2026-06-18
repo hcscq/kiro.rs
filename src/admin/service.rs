@@ -20,7 +20,7 @@ use super::types::{
     CredentialProfilesResponse, CredentialStatusItem, CredentialsStatusResponse,
     LoadBalancingModeResponse, ModelCapabilitiesConfigResponse, ModelCatalogItemResponse,
     ModelCatalogResponse, SetCredentialModelPolicyRequest, SetCredentialProfileRequest,
-    SetLoadBalancingModeRequest, SetModelCapabilitiesConfigRequest,
+    SetCredentialProxyRequest, SetLoadBalancingModeRequest, SetModelCapabilitiesConfigRequest,
     StandardAccountTypePresetResponse,
 };
 
@@ -246,6 +246,25 @@ impl AdminService {
                 req.allowed_models,
                 req.blocked_models,
                 req.clear_runtime_model_restrictions,
+            )
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    pub fn set_proxy(
+        &self,
+        id: u64,
+        req: SetCredentialProxyRequest,
+    ) -> Result<(), AdminServiceError> {
+        self.ensure_runtime_write_leader()?;
+
+        self.token_manager
+            .set_credential_proxy(
+                id,
+                req.mode,
+                req.proxy_id,
+                req.proxy_url,
+                req.proxy_username,
+                req.proxy_password,
             )
             .map_err(|e| self.classify_error(e, id))
     }

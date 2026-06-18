@@ -8,6 +8,7 @@ import type {
   SetPriorityRequest,
   SetCredentialRateLimitConfigRequest,
   SetCredentialModelPolicyRequest,
+  SetCredentialProxyRequest,
   SetCredentialProfileRequest,
   CredentialProfilesResponse,
   AddCredentialRequest,
@@ -182,6 +183,15 @@ export async function setCredentialModelPolicy(
     `/credentials/${id}/model-policy`,
     payload
   )
+  return data
+}
+
+// 设置凭据代理绑定
+export async function setCredentialProxy(
+  id: number,
+  payload: SetCredentialProxyRequest
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/proxy`, payload)
   return data
 }
 
