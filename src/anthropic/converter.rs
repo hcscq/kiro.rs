@@ -605,10 +605,12 @@ const DOCUMENT_RENDER_LINE_PX: u32 = 10 * DOCUMENT_RENDER_SCALE;
 const MAX_TOOL_RESULT_TEXT_CHARS: usize = 120_000;
 const TOOL_RESULT_HEAD_CHARS: usize = 80_000;
 const TOOL_RESULT_TAIL_CHARS: usize = 40_000;
-// Real Kiro upstream traffic accepted 16 retained historical structured tool
-// pairs but still rejected 20 with REQUEST_BODY_INVALID. Older pairs are kept
-// as text, so this trades exact old tool structure for upstream compatibility.
-const MAX_STRUCTURED_HISTORY_TOOL_PAIRS: usize = 16;
+// 0 disables count-based collapsing. The old unconditional limit of 16 was
+// based on mixed real-traffic 400s, but later direct upstream probes accepted
+// at least 64 adjacent historical structured tool pairs. Keep the workaround
+// available as an operational rollback knob without degrading normal history.
+const DEFAULT_STRUCTURED_HISTORY_TOOL_PAIR_LIMIT: usize = 0;
+const STRUCTURED_HISTORY_TOOL_PAIR_LIMIT_ENV: &str = "KIRO_MAX_STRUCTURED_HISTORY_TOOL_PAIRS";
 const COLLAPSED_HISTORY_TOOL_TEXT_CHARS: usize = 16_000;
 const KIRO_REENCODE_IMAGE_BYTES: usize = 200_000;
 const KIRO_IMAGE_JPEG_QUALITY: u8 = 85;
@@ -797,6 +799,26 @@ pub fn convert_request_with_probe(
     req: &MessagesRequest,
     probe: UpstreamProbe,
 ) -> Result<ConversionResult, ConversionError> {
+    convert_request_with_options(req, probe, structured_history_tool_pair_limit())
+}
+
+fn structured_history_tool_pair_limit() -> usize {
+    match std::env::var(STRUCTURED_HISTORY_TOOL_PAIR_LIMIT_ENV) {
+        Ok(value) => parse_structured_history_tool_pair_limit(&value)
+            .unwrap_or(DEFAULT_STRUCTURED_HISTORY_TOOL_PAIR_LIMIT),
+        Err(_) => DEFAULT_STRUCTURED_HISTORY_TOOL_PAIR_LIMIT,
+    }
+}
+
+fn parse_structured_history_tool_pair_limit(raw: &str) -> Option<usize> {
+    raw.trim().parse::<usize>().ok()
+}
+
+fn convert_request_with_options(
+    req: &MessagesRequest,
+    probe: UpstreamProbe,
+    structured_history_tool_pair_limit: usize,
+) -> Result<ConversionResult, ConversionError> {
     // 1. 映射模型
     let model_id = map_model(&req.model)
         .ok_or_else(|| ConversionError::UnsupportedModel(req.model.clone()))?;
@@ -908,7 +930,7 @@ pub fn convert_request_with_probe(
     collapse_old_structured_history_tool_pairs_for_kiro(
         &mut history,
         &validated_tool_results,
-        MAX_STRUCTURED_HISTORY_TOOL_PAIRS,
+        structured_history_tool_pair_limit,
     );
     coalesce_split_history_tool_results_for_kiro(&mut history);
     repair_history_tool_result_pairing_for_kiro(&mut history, &validated_tool_results);
@@ -5345,8 +5367,18 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_request_collapses_old_history_tool_pairs_over_kiro_limit() {
-        let mut messages = tool_pair_messages(MAX_STRUCTURED_HISTORY_TOOL_PAIRS + 3);
+    fn test_parse_structured_history_tool_pair_limit() {
+        assert_eq!(parse_structured_history_tool_pair_limit("64"), Some(64));
+        assert_eq!(parse_structured_history_tool_pair_limit(" 16 "), Some(16));
+        assert_eq!(parse_structured_history_tool_pair_limit("0"), Some(0));
+        assert_eq!(parse_structured_history_tool_pair_limit(""), None);
+        assert_eq!(parse_structured_history_tool_pair_limit("nope"), None);
+    }
+
+    #[test]
+    fn test_convert_request_preserves_history_tool_pairs_without_legacy_limit() {
+        let pair_count = 64;
+        let mut messages = tool_pair_messages(pair_count);
         messages.push(super::super::types::Message {
             role: "user".to_string(),
             content: serde_json::json!("continue"),
@@ -5364,11 +5396,56 @@ mod tests {
             .tool_results
             .len();
 
-        assert_eq!(tool_uses, MAX_STRUCTURED_HISTORY_TOOL_PAIRS);
-        assert_eq!(
-            tool_results + current_tool_results,
-            MAX_STRUCTURED_HISTORY_TOOL_PAIRS
+        assert_eq!(tool_uses, pair_count);
+        assert_eq!(tool_results + current_tool_results, pair_count);
+        assert!(
+            !history.iter().any(|msg| matches!(
+                msg,
+                Message::Assistant(assistant_msg)
+                    if assistant_msg
+                        .assistant_response_message
+                        .content
+                        .contains("Previous tool call:")
+            )),
+            "structured tool_use entries should remain structured by default"
         );
+        assert!(
+            !history.iter().any(|msg| matches!(
+                msg,
+                Message::User(user_msg)
+                    if user_msg
+                        .user_input_message
+                        .content
+                        .contains("Previous tool result:")
+            )),
+            "structured tool_result entries should remain structured by default"
+        );
+    }
+
+    #[test]
+    fn test_convert_request_collapses_old_history_tool_pairs_when_limit_configured() {
+        let configured_limit = 16;
+        let mut messages = tool_pair_messages(configured_limit + 3);
+        messages.push(super::super::types::Message {
+            role: "user".to_string(),
+            content: serde_json::json!("continue"),
+        });
+        let req = request_from_messages(messages);
+
+        let result = convert_request_with_options(&req, UpstreamProbe::default(), configured_limit)
+            .expect("conversion should succeed");
+        let state = result.conversation_state;
+        let history = &state.history;
+        let (tool_uses, tool_results) = history_structured_tool_counts(history);
+        let current_tool_results = state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tool_results
+            .len();
+
+        assert_eq!(tool_uses, configured_limit);
+        assert_eq!(tool_results + current_tool_results, configured_limit);
         assert!(
             history.iter().any(|msg| matches!(
                 msg,
@@ -5453,7 +5530,8 @@ mod tests {
 
     #[test]
     fn test_convert_request_keeps_pending_current_tool_result_pair_when_collapsing() {
-        let mut messages = tool_pair_messages(MAX_STRUCTURED_HISTORY_TOOL_PAIRS + 2);
+        let configured_limit = 16;
+        let mut messages = tool_pair_messages(configured_limit + 2);
         messages.push(super::super::types::Message {
             role: "assistant".to_string(),
             content: serde_json::json!([
@@ -5468,7 +5546,8 @@ mod tests {
         });
         let req = request_from_messages(messages);
 
-        let result = convert_request(&req).expect("conversion should succeed");
+        let result = convert_request_with_options(&req, UpstreamProbe::default(), configured_limit)
+            .expect("conversion should succeed");
         let state = result.conversation_state;
         let (tool_uses, history_tool_results) = history_structured_tool_counts(&state.history);
         let current_tool_results = &state
@@ -5477,8 +5556,8 @@ mod tests {
             .user_input_message_context
             .tool_results;
 
-        assert_eq!(tool_uses, MAX_STRUCTURED_HISTORY_TOOL_PAIRS);
-        assert_eq!(history_tool_results, MAX_STRUCTURED_HISTORY_TOOL_PAIRS - 1);
+        assert_eq!(tool_uses, configured_limit);
+        assert_eq!(history_tool_results, configured_limit - 1);
         assert_eq!(current_tool_results.len(), 1);
         assert_eq!(current_tool_results[0].tool_use_id, "toolu_pending");
         assert!(

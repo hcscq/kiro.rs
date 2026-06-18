@@ -241,6 +241,7 @@ GitHub Actions 镜像构建：
 | `suspiciousActivityAutoClearSuccessThreshold` | number | `10` | 隔离结束后连续成功达到该次数时清除标记；`0` 表示不按成功次数清除 |
 | `suspiciousActivityAutoClearAfterMs` | number | `604800000` | 最近一次命中后超过该时间未再命中时清除标记；`0` 表示不按时间清除 |
 | `modelCooldownEnabled` | boolean | `true` | 是否启用“模型不支持”后的运行时模型冷却；关闭后不再记录 `INVALID_MODEL_ID` 触发的账号级临时模型限制 |
+| `KIRO_MAX_STRUCTURED_HISTORY_TOOL_PAIRS` | env | `0` | 历史结构化 `tool_use/tool_result` 对的兼容性折叠上限；`0` 表示不按数量折叠。若上游再次因结构化工具历史返回 malformed 400，可临时设为 `16` 恢复旧保护 |
 | `rateLimitBucketCapacity` | number | `6.0` | 单账号 token bucket 容量；默认允许连续承接两次以上重请求，`<= 0` 表示禁用 token bucket |
 | `rateLimitRefillPerSecond` | number | `2.0` | 单账号 token bucket 基础回填速率（token/s）；默认与轻/重请求加权联动调优，`<= 0` 表示禁用 token bucket |
 | `rateLimitRefillMinPerSecond` | number | `1.0` | 遭遇 `429` 后允许降到的最小回填速率（token/s） |
