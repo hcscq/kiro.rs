@@ -1532,6 +1532,14 @@ pub struct CredentialEntrySnapshot {
     /// suspicious activity 隔离剩余时间（毫秒）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suspicious_activity_quarantine_remaining_ms: Option<u64>,
+    /// 当前生效的 429 冷却与 bucket 退避开关
+    pub rate_limit_cooldown_enabled: bool,
+    /// 凭据级 429 冷却与 bucket 退避开关覆盖
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_cooldown_enabled_override: Option<bool>,
+    /// 当前 429 冷却与 bucket 退避开关来源：credential / global-default
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_cooldown_enabled_source: Option<String>,
     /// 429 限流冷却剩余时间（毫秒）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cooldown_remaining_ms: Option<u64>,
@@ -1781,6 +1789,19 @@ impl DispatchConfig {
                 self.default_max_concurrency,
                 self.account_type_dispatch_policy_for(credentials),
             )
+            .map(|source| source.as_str().to_string())
+    }
+
+    fn rate_limit_cooldown_enabled_for(&self, credentials: &KiroCredentials) -> bool {
+        credentials.effective_rate_limit_cooldown_enabled(self.rate_limit_cooldown_enabled)
+    }
+
+    fn rate_limit_cooldown_enabled_source_for(
+        &self,
+        credentials: &KiroCredentials,
+    ) -> Option<String> {
+        credentials
+            .effective_rate_limit_cooldown_enabled_source()
             .map(|source| source.as_str().to_string())
     }
 
@@ -2212,9 +2233,7 @@ impl MultiTokenManager {
         manager.load_stats();
 
         let initial_dispatch = manager.dispatch_config();
-        if !initial_dispatch.rate_limit_cooldown_enabled {
-            manager.clear_all_rate_limit_penalties(&initial_dispatch);
-        }
+        manager.clear_disabled_rate_limit_penalties(&initial_dispatch);
         if !initial_dispatch.model_cooldown_enabled {
             if let Err(err) = manager.clear_all_runtime_model_restrictions() {
                 tracing::warn!("启动时清理运行时模型限制失败: {}", err);
@@ -3308,13 +3327,16 @@ impl MultiTokenManager {
         }
     }
 
-    fn clear_all_rate_limit_penalties(&self, dispatch: &DispatchConfig) {
+    fn clear_disabled_rate_limit_penalties(&self, dispatch: &DispatchConfig) {
         let now = Instant::now();
         let mut shared_bucket_policies = Vec::new();
 
         {
             let mut entries = self.entries.lock();
             for entry in entries.iter_mut() {
+                if dispatch.rate_limit_cooldown_enabled_for(&entry.credentials) {
+                    continue;
+                }
                 Self::clear_rate_limit_penalty_runtime(entry, dispatch, now);
                 shared_bucket_policies.push((
                     entry.id,
@@ -3333,6 +3355,28 @@ impl MultiTokenManager {
                 ) {
                     tracing::warn!("清理共享调度 429 惩罚失败（credentialId={}）: {}", id, err);
                 }
+            }
+        }
+    }
+
+    fn clear_rate_limit_penalty_for_credential(&self, id: u64, dispatch: &DispatchConfig) {
+        let now = Instant::now();
+        let shared_bucket_policy = {
+            let mut entries = self.entries.lock();
+            let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) else {
+                return;
+            };
+            Self::clear_rate_limit_penalty_runtime(entry, dispatch, now);
+            dispatch.shared_bucket_policy_for(&entry.credentials)
+        };
+
+        if self.shared_dispatch_runtime_enabled() {
+            if let Err(err) = self.state_store.clear_dispatch_rate_limit_penalty(
+                id,
+                shared_bucket_policy,
+                current_epoch_ms(),
+            ) {
+                tracing::warn!("清理共享调度 429 惩罚失败（credentialId={}）: {}", id, err);
             }
         }
     }
@@ -6274,8 +6318,8 @@ impl MultiTokenManager {
 
         *self.dispatch_config.lock() = next.clone();
 
-        if previous.rate_limit_cooldown_enabled && !next.rate_limit_cooldown_enabled {
-            self.clear_all_rate_limit_penalties(&next);
+        if previous.rate_limit_cooldown_enabled != next.rate_limit_cooldown_enabled {
+            self.clear_disabled_rate_limit_penalties(&next);
         } else if previous.rate_limit_cooldown_ms != next.rate_limit_cooldown_ms
             && next.rate_limit_cooldown_ms == 0
         {
@@ -6730,9 +6774,17 @@ impl MultiTokenManager {
     /// 对单账号施加短暂冷却，避免重试流量持续打到同一个受限账号上。
     pub fn report_rate_limited(&self, id: u64) {
         let dispatch = self.dispatch_config();
-        if !dispatch.rate_limit_cooldown_enabled {
+        let effective_enabled = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .map(|entry| dispatch.rate_limit_cooldown_enabled_for(&entry.credentials))
+                .unwrap_or(dispatch.rate_limit_cooldown_enabled)
+        };
+        if !effective_enabled {
             tracing::info!(
-                "凭据 #{} 遭遇上游 429，但 429 冷却与 bucket 退避已全局关闭",
+                "凭据 #{} 遭遇上游 429，但 429 冷却与 bucket 退避对该凭据已关闭",
                 id
             );
             return;
@@ -6758,7 +6810,15 @@ impl MultiTokenManager {
                 "凭据 #{} 遭遇上游 suspicious activity 429，但 suspicious activity 全局冷却已关闭，回退普通 429 处理",
                 id
             );
-            let cooldown_ms = if dispatch.rate_limit_cooldown_enabled {
+            let effective_enabled = {
+                let entries = self.entries.lock();
+                entries
+                    .iter()
+                    .find(|entry| entry.id == id)
+                    .map(|entry| dispatch.rate_limit_cooldown_enabled_for(&entry.credentials))
+                    .unwrap_or(dispatch.rate_limit_cooldown_enabled)
+            };
+            let cooldown_ms = if effective_enabled {
                 self.record_rate_limit_penalty(
                     id,
                     &dispatch,
@@ -8196,6 +8256,13 @@ impl MultiTokenManager {
                             .credentials
                             .suspicious_activity_recovery_success_count,
                         suspicious_activity_quarantine_remaining_ms,
+                        rate_limit_cooldown_enabled: dispatch
+                            .rate_limit_cooldown_enabled_for(&e.credentials),
+                        rate_limit_cooldown_enabled_override: e
+                            .credentials
+                            .rate_limit_cooldown_enabled_override(),
+                        rate_limit_cooldown_enabled_source: dispatch
+                            .rate_limit_cooldown_enabled_source_for(&e.credentials),
                         cooldown_remaining_ms,
                         rate_limit_bucket_tokens: shared_runtime
                             .as_ref()
@@ -8364,6 +8431,7 @@ impl MultiTokenManager {
     pub fn set_rate_limit_config(
         &self,
         id: u64,
+        rate_limit_cooldown_enabled: Option<Option<bool>>,
         rate_limit_bucket_capacity: Option<Option<f64>>,
         rate_limit_refill_per_second: Option<Option<f64>>,
     ) -> anyhow::Result<()> {
@@ -8379,6 +8447,9 @@ impl MultiTokenManager {
         let _state_write_guard = self.state_write_lock.lock();
         let mut persisted = self.persisted_credentials_snapshot();
         let credential = Self::persisted_credential_mut(&mut persisted, id)?;
+        if let Some(rate_limit_cooldown_enabled) = rate_limit_cooldown_enabled {
+            credential.rate_limit_cooldown_enabled = rate_limit_cooldown_enabled;
+        }
         if let Some(rate_limit_bucket_capacity) = rate_limit_bucket_capacity {
             credential.rate_limit_bucket_capacity = rate_limit_bucket_capacity;
         }
@@ -8393,6 +8464,9 @@ impl MultiTokenManager {
                 .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            if let Some(rate_limit_cooldown_enabled) = rate_limit_cooldown_enabled {
+                entry.credentials.rate_limit_cooldown_enabled = rate_limit_cooldown_enabled;
+            }
             if let Some(rate_limit_bucket_capacity) = rate_limit_bucket_capacity {
                 entry.credentials.rate_limit_bucket_capacity = rate_limit_bucket_capacity;
             }
@@ -8400,6 +8474,19 @@ impl MultiTokenManager {
                 entry.credentials.rate_limit_refill_per_second = rate_limit_refill_per_second;
             }
             Self::sync_rate_limit_bucket_runtime(entry, &dispatch, now);
+        }
+        if rate_limit_cooldown_enabled.is_some() {
+            let should_clear = {
+                let entries = self.entries.lock();
+                entries
+                    .iter()
+                    .find(|entry| entry.id == id)
+                    .map(|entry| !dispatch.rate_limit_cooldown_enabled_for(&entry.credentials))
+                    .unwrap_or(false)
+            };
+            if should_clear {
+                self.clear_rate_limit_penalty_for_credential(id, &dispatch);
+            }
         }
 
         self.availability_notify.notify_waiters();
@@ -9233,6 +9320,7 @@ impl MultiTokenManager {
             .imported_at
             .or_else(|| Some(Utc::now().to_rfc3339()));
         validated_cred.max_concurrency = new_cred.max_concurrency;
+        validated_cred.rate_limit_cooldown_enabled = new_cred.rate_limit_cooldown_enabled;
         validated_cred.rate_limit_bucket_capacity = new_cred.rate_limit_bucket_capacity;
         validated_cred.rate_limit_refill_per_second = new_cred.rate_limit_refill_per_second;
         validated_cred.proxy_url = new_cred.proxy_url;
@@ -9871,8 +9959,8 @@ impl MultiTokenManager {
             return Err(err);
         }
 
-        if previous.rate_limit_cooldown_enabled && !next.rate_limit_cooldown_enabled {
-            self.clear_all_rate_limit_penalties(&next);
+        if previous.rate_limit_cooldown_enabled != next.rate_limit_cooldown_enabled {
+            self.clear_disabled_rate_limit_penalties(&next);
         } else if previous.rate_limit_cooldown_ms != next.rate_limit_cooldown_ms
             && next.rate_limit_cooldown_ms == 0
         {
@@ -12275,7 +12363,7 @@ mod tests {
 
         manager.report_rate_limited(1);
         manager
-            .set_rate_limit_config(1, Some(Some(7.0)), None)
+            .set_rate_limit_config(1, None, Some(Some(7.0)), None)
             .unwrap();
 
         let snapshot = manager.snapshot();
@@ -12784,6 +12872,58 @@ mod tests {
     }
 
     #[test]
+    fn test_credential_rate_limit_cooldown_override_can_enable_when_global_disabled() {
+        let mut config = Config::default();
+        config.rate_limit_cooldown_enabled = false;
+        config.rate_limit_cooldown_ms = 4_000;
+        config.rate_limit_bucket_capacity = 4.0;
+        config.rate_limit_refill_per_second = 2.0;
+        config.rate_limit_refill_min_per_second = 1.0;
+        config.rate_limit_refill_backoff_factor = 0.5;
+
+        let mut credential = available_credential(0);
+        credential.rate_limit_cooldown_enabled = Some(true);
+
+        let manager = MultiTokenManager::new(config, vec![credential], None, None, false).unwrap();
+        manager.report_rate_limited(1);
+
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert!(entry.rate_limit_cooldown_enabled);
+        assert_eq!(entry.rate_limit_cooldown_enabled_override, Some(true));
+        assert_eq!(
+            entry.rate_limit_cooldown_enabled_source.as_deref(),
+            Some("credential")
+        );
+        assert!(entry.cooldown_remaining_ms.unwrap_or_default() > 0);
+        assert_eq!(entry.rate_limit_hit_streak, 1);
+        assert!(entry.rate_limit_refill_per_second.unwrap_or_default() < 2.0);
+    }
+
+    #[test]
+    fn test_credential_rate_limit_cooldown_override_can_disable_when_global_enabled() {
+        let mut config = Config::default();
+        config.rate_limit_cooldown_enabled = true;
+        config.rate_limit_cooldown_ms = 4_000;
+        config.rate_limit_bucket_capacity = 4.0;
+        config.rate_limit_refill_per_second = 2.0;
+
+        let mut credential = available_credential(0);
+        credential.rate_limit_cooldown_enabled = Some(false);
+
+        let manager = MultiTokenManager::new(config, vec![credential], None, None, false).unwrap();
+        manager.report_rate_limited(1);
+
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert!(!entry.rate_limit_cooldown_enabled);
+        assert_eq!(entry.rate_limit_cooldown_enabled_override, Some(false));
+        assert_eq!(entry.cooldown_remaining_ms, None);
+        assert_eq!(entry.rate_limit_hit_streak, 0);
+        assert_eq!(entry.rate_limit_refill_per_second, Some(2.0));
+    }
+
+    #[test]
     fn test_disabling_rate_limit_cooldown_resets_runtime_state() {
         let mut config = Config::default();
         config.rate_limit_cooldown_enabled = true;
@@ -12836,6 +12976,36 @@ mod tests {
 
         let snapshot = manager.snapshot();
         let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert_eq!(entry.cooldown_remaining_ms, None);
+        assert_eq!(entry.rate_limit_hit_streak, 0);
+        assert_eq!(
+            entry.rate_limit_refill_per_second,
+            entry.rate_limit_refill_base_per_second
+        );
+    }
+
+    #[test]
+    fn test_set_rate_limit_cooldown_override_false_clears_existing_penalty() {
+        let mut config = Config::default();
+        config.rate_limit_cooldown_enabled = true;
+        config.rate_limit_cooldown_ms = 4_000;
+        config.rate_limit_bucket_capacity = 4.0;
+        config.rate_limit_refill_per_second = 2.0;
+        config.rate_limit_refill_min_per_second = 1.0;
+        config.rate_limit_refill_backoff_factor = 0.5;
+
+        let manager =
+            MultiTokenManager::new(config, vec![available_credential(0)], None, None, false)
+                .unwrap();
+        manager.report_rate_limited(1);
+        manager
+            .set_rate_limit_config(1, Some(Some(false)), None, None)
+            .unwrap();
+
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert!(!entry.rate_limit_cooldown_enabled);
+        assert_eq!(entry.rate_limit_cooldown_enabled_override, Some(false));
         assert_eq!(entry.cooldown_remaining_ms, None);
         assert_eq!(entry.rate_limit_hit_streak, 0);
         assert_eq!(

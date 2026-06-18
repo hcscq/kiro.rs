@@ -124,14 +124,17 @@ export function useSetCredentialRateLimitConfig() {
   return useMutation({
     mutationFn: ({
       id,
+      rateLimitCooldownEnabled,
       rateLimitBucketCapacity,
       rateLimitRefillPerSecond,
     }: {
       id: number
+      rateLimitCooldownEnabled: boolean | null
       rateLimitBucketCapacity: number | null
       rateLimitRefillPerSecond: number | null
     }) =>
       setCredentialRateLimitConfig(id, {
+        rateLimitCooldownEnabled,
         rateLimitBucketCapacity,
         rateLimitRefillPerSecond,
       }),

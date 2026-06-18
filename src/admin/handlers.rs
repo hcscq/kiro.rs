@@ -93,14 +93,11 @@ pub async fn set_credential_rate_limit_config(
 ) -> impl IntoResponse {
     match state.service.set_rate_limit_config(
         id,
+        payload.rate_limit_cooldown_enabled,
         payload.rate_limit_bucket_capacity,
         payload.rate_limit_refill_per_second,
     ) {
-        Ok(_) => Json(SuccessResponse::new(format!(
-            "凭据 #{} token bucket 参数已更新",
-            id
-        )))
-        .into_response(),
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 限速配置已更新", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

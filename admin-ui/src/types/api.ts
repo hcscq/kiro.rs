@@ -58,6 +58,9 @@ export interface CredentialStatusItem {
   suspiciousActivityQuarantineUntil?: string | null
   suspiciousActivityRecoverySuccessCount: number
   suspiciousActivityQuarantineRemainingMs?: number | null
+  rateLimitCooldownEnabled: boolean
+  rateLimitCooldownEnabledOverride?: boolean | null
+  rateLimitCooldownEnabledSource?: 'credential' | 'global-default' | null
   cooldownRemainingMs?: number | null
   rateLimitBucketTokens?: number | null
   rateLimitBucketCapacity?: number | null
@@ -124,6 +127,7 @@ export interface SetPriorityRequest {
 }
 
 export interface SetCredentialRateLimitConfigRequest {
+  rateLimitCooldownEnabled?: boolean | null
   rateLimitBucketCapacity?: number | null
   rateLimitRefillPerSecond?: number | null
 }
@@ -216,6 +220,7 @@ export interface AddCredentialRequest {
   audience?: string
   priority?: number
   maxConcurrency?: number
+  rateLimitCooldownEnabled?: boolean
   rateLimitBucketCapacity?: number
   rateLimitRefillPerSecond?: number
   region?: string

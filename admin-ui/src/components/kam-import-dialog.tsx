@@ -53,6 +53,7 @@ interface KamAccount {
     modelProvider?: string | null
   } | null
   maxConcurrency?: number
+  rateLimitCooldownEnabled?: boolean
   rateLimitBucketCapacity?: number
   rateLimitRefillPerSecond?: number
   priority?: number
@@ -82,6 +83,7 @@ interface KamAccount {
     source_supplier_name?: string
     source_batch?: string
     maxConcurrency?: number
+    rateLimitCooldownEnabled?: boolean
     rateLimitBucketCapacity?: number
     rateLimitRefillPerSecond?: number
     priority?: number
@@ -105,8 +107,15 @@ interface VerificationResult {
   rollbackError?: string
 }
 
+type RateLimitCooldownMode = 'global' | 'enabled' | 'disabled'
+
 const KAM_DEFAULT_AUTH_REGION = 'us-east-1'
 
+function rateLimitCooldownValueFromMode(mode: RateLimitCooldownMode): boolean | undefined {
+  if (mode === 'enabled') return true
+  if (mode === 'disabled') return false
+  return undefined
+}
 
 function proxyPoolEntryLabel(proxy: ProxyPoolEntry): string {
   const egress = proxy.expectedEgressIp ? ` (${proxy.expectedEgressIp})` : ''
@@ -134,6 +143,10 @@ function getNumber(value: unknown): number | undefined {
   return typeof value === 'number' ? value : undefined
 }
 
+function getBoolean(value: unknown): boolean | undefined {
+  return typeof value === 'boolean' ? value : undefined
+}
+
 function getKamSourceString(
   account: KamAccount,
   key: 'sourceSupplierId' | 'sourceSupplierName' | 'sourceBatch',
@@ -150,6 +163,25 @@ function getKamDispatchNumber(
   key: 'maxConcurrency' | 'rateLimitBucketCapacity' | 'rateLimitRefillPerSecond'
 ): number | undefined {
   return getNumber(account[key]) ?? getNumber(account.credentials[key])
+}
+
+function getKamDispatchBoolean(
+  account: KamAccount,
+  key: 'rateLimitCooldownEnabled'
+): boolean | undefined {
+  return getBoolean(account[key]) ?? getBoolean(account.credentials[key])
+}
+
+function hasInvalidKamDispatchBoolean(
+  account: KamAccount,
+  key: 'rateLimitCooldownEnabled'
+): boolean {
+  const topLevel = account[key]
+  const nested = account.credentials[key]
+  return (
+    (topLevel !== undefined && typeof topLevel !== 'boolean') ||
+    (nested !== undefined && typeof nested !== 'boolean')
+  )
 }
 
 function extractModelId(value: unknown): string | undefined {
@@ -279,6 +311,7 @@ function normalizeKamAccount(item: unknown): unknown {
         ? obj.availableModelsCache as KamAccount['availableModelsCache']
         : undefined
     const maxConcurrency = getNumber(obj.maxConcurrency)
+    const rateLimitCooldownEnabled = getBoolean(obj.rateLimitCooldownEnabled)
     const rateLimitBucketCapacity = getNumber(obj.rateLimitBucketCapacity)
     const rateLimitRefillPerSecond = getNumber(obj.rateLimitRefillPerSecond)
     const priority = getNumber(obj.priority)
@@ -317,6 +350,7 @@ function normalizeKamAccount(item: unknown): unknown {
       models,
       availableModelsCache,
       maxConcurrency,
+      rateLimitCooldownEnabled,
       rateLimitBucketCapacity,
       rateLimitRefillPerSecond,
       status,
@@ -339,6 +373,7 @@ function normalizeKamAccount(item: unknown): unknown {
         sourceSupplierName,
         sourceBatch,
         priority,
+        rateLimitCooldownEnabled,
         proxyId,
         proxyUrl,
         proxyUsername,
@@ -409,6 +444,8 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
   const [results, setResults] = useState<VerificationResult[]>([])
   const [defaultPriority, setDefaultPriority] = useState('0')
   const [defaultMaxConcurrency, setDefaultMaxConcurrency] = useState('')
+  const [defaultRateLimitCooldownMode, setDefaultRateLimitCooldownMode] =
+    useState<RateLimitCooldownMode>('global')
   const [defaultSourceSupplierName, setDefaultSourceSupplierName] = useState('')
   const [defaultSourceBatch, setDefaultSourceBatch] = useState(() => formatDefaultSourceBatch())
   const [defaultProxyMode, setDefaultProxyMode] = useState<CredentialProxyMode>('auto')
@@ -458,6 +495,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     setResults([])
     setDefaultPriority('0')
     setDefaultMaxConcurrency('')
+    setDefaultRateLimitCooldownMode('global')
     setDefaultSourceSupplierName('')
     setDefaultSourceBatch(formatDefaultSourceBatch())
     setDefaultProxyMode('auto')
@@ -646,6 +684,9 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           const availableModelIds = extractAvailableModelIds(account)
           const maxConcurrency =
             getKamDispatchNumber(account, 'maxConcurrency') ?? parsedDefaultMaxConcurrency
+          const rateLimitCooldownEnabled =
+            getKamDispatchBoolean(account, 'rateLimitCooldownEnabled') ??
+            rateLimitCooldownValueFromMode(defaultRateLimitCooldownMode)
           const rateLimitBucketCapacity = getKamDispatchNumber(account, 'rateLimitBucketCapacity')
           const rateLimitRefillPerSecond = getKamDispatchNumber(account, 'rateLimitRefillPerSecond')
           const priority =
@@ -698,6 +739,11 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             throw new Error('maxConcurrency 必须是大于 0 的整数')
           }
           if (
+            hasInvalidKamDispatchBoolean(account, 'rateLimitCooldownEnabled')
+          ) {
+            throw new Error('rateLimitCooldownEnabled 必须是布尔值')
+          }
+          if (
             rateLimitBucketCapacity !== undefined &&
             (!Number.isFinite(rateLimitBucketCapacity) ||
               rateLimitBucketCapacity < 0)
@@ -737,6 +783,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             sourceBatch,
             availableModelIds: availableModelIds.length > 0 ? availableModelIds : undefined,
             maxConcurrency,
+            rateLimitCooldownEnabled,
             rateLimitBucketCapacity,
             rateLimitRefillPerSecond,
             proxyId,
@@ -901,7 +948,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
         <div className="flex-1 overflow-y-auto space-y-4 py-4">
           <div className="space-y-2">
             <label className="text-sm font-medium">KAM 导出 JSON</label>
-            <div className="grid gap-3 rounded-md border p-3 md:grid-cols-3">
+            <div className="grid gap-3 rounded-md border p-3 md:grid-cols-4">
               <div className="space-y-1.5">
                 <label htmlFor="kamDefaultPriority" className="text-xs font-medium text-muted-foreground">
                   默认优先级
@@ -928,6 +975,24 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
                   onChange={(e) => setDefaultMaxConcurrency(e.target.value)}
                   disabled={importing}
                 />
+              </div>
+              <div className="space-y-1.5">
+                <label htmlFor="kamDefaultRateLimitCooldown" className="text-xs font-medium text-muted-foreground">
+                  429 退避
+                </label>
+                <select
+                  id="kamDefaultRateLimitCooldown"
+                  value={defaultRateLimitCooldownMode}
+                  onChange={(e) =>
+                    setDefaultRateLimitCooldownMode(e.target.value as RateLimitCooldownMode)
+                  }
+                  disabled={importing}
+                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <option value="global">跟随全局</option>
+                  <option value="enabled">强制开启</option>
+                  <option value="disabled">强制关闭</option>
+                </select>
               </div>
               <div className="flex items-center justify-between gap-3 rounded-md bg-muted/30 px-3 py-2">
                 <div className="text-sm font-medium">自动超额</div>
@@ -1079,7 +1144,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
               )}
             </div>
             <textarea
-              placeholder={'粘贴 Kiro Account Manager 导出的 JSON\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "userId": "...",\n    "provider": "Enterprise",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "eu-central-1",\n    "authRegion": "us-east-1",\n    "startUrl": "https://example.awsapps.com/start",\n    "accountType": "power",\n    "sourceSupplierName": "供应商A",\n    "sourceBatch": "20260618211",\n    "maxConcurrency": 20\n  }\n]\n\n（可选的 authMethod 字段会被忽略，系统会根据 clientId/clientSecret 自动判断；未提供 authRegion 时，Enterprise 默认使用 us-east-1 进行 OIDC 刷新）\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "provider": "Enterprise",\n      "sourceSupplierName": "供应商A",\n      "sourceBatch": "20260618211",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "eu-central-1",\n        "authRegion": "us-east-1",\n        "startUrl": "https://example.awsapps.com/start"\n      }\n    }\n  ]\n}'}
+              placeholder={'粘贴 Kiro Account Manager 导出的 JSON\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "userId": "...",\n    "provider": "Enterprise",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "eu-central-1",\n    "authRegion": "us-east-1",\n    "startUrl": "https://example.awsapps.com/start",\n    "accountType": "power",\n    "sourceSupplierName": "供应商A",\n    "sourceBatch": "20260618211",\n    "maxConcurrency": 20,\n    "rateLimitCooldownEnabled": true\n  }\n]\n\n（可选的 authMethod 字段会被忽略，系统会根据 clientId/clientSecret 自动判断；未提供 authRegion 时，Enterprise 默认使用 us-east-1 进行 OIDC 刷新）\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "provider": "Enterprise",\n      "sourceSupplierName": "供应商A",\n      "sourceBatch": "20260618211",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "eu-central-1",\n        "authRegion": "us-east-1",\n        "startUrl": "https://example.awsapps.com/start"\n      }\n    }\n  ]\n}'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}

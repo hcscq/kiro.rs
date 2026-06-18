@@ -91,6 +91,20 @@ interface CredentialCardProps {
   modelCatalog: ModelCatalogItem[]
 }
 
+type RateLimitCooldownMode = 'global' | 'enabled' | 'disabled'
+
+function rateLimitCooldownModeFromOverride(value: boolean | null | undefined): RateLimitCooldownMode {
+  if (value === true) return 'enabled'
+  if (value === false) return 'disabled'
+  return 'global'
+}
+
+function rateLimitCooldownOverrideFromMode(mode: RateLimitCooldownMode): boolean | null {
+  if (mode === 'enabled') return true
+  if (mode === 'disabled') return false
+  return null
+}
+
 function formatLastUsed(lastUsedAt: string | null): string {
   if (!lastUsedAt) return '从未使用'
   const date = new Date(lastUsedAt)
@@ -175,7 +189,10 @@ function CompactPill({
 }
 
 function formatDispatchSourceLabel(
-  source: CredentialStatusItem['maxConcurrencySource'] | CredentialStatusItem['rateLimitBucketCapacitySource']
+  source:
+    | CredentialStatusItem['maxConcurrencySource']
+    | CredentialStatusItem['rateLimitBucketCapacitySource']
+    | CredentialStatusItem['rateLimitCooldownEnabledSource']
 ): string | null {
   switch (source) {
     case 'credential':
@@ -364,6 +381,9 @@ export function CredentialCard({
   const [maxConcurrencyValue, setMaxConcurrencyValue] = useState(
     credential.maxConcurrencyOverride ? String(credential.maxConcurrencyOverride) : ''
   )
+  const [rateLimitCooldownMode, setRateLimitCooldownMode] = useState<RateLimitCooldownMode>(
+    rateLimitCooldownModeFromOverride(credential.rateLimitCooldownEnabledOverride)
+  )
   const [bucketCapacityValue, setBucketCapacityValue] = useState(
     credential.rateLimitBucketCapacityOverride !== undefined &&
     credential.rateLimitBucketCapacityOverride !== null
@@ -496,6 +516,9 @@ export function CredentialCard({
       credential.maxConcurrencyOverride !== undefined && credential.maxConcurrencyOverride !== null
         ? String(credential.maxConcurrencyOverride)
         : ''
+    )
+    setRateLimitCooldownMode(
+      rateLimitCooldownModeFromOverride(credential.rateLimitCooldownEnabledOverride)
     )
     setBucketCapacityValue(
       credential.rateLimitBucketCapacityOverride !== undefined &&
@@ -671,11 +694,19 @@ export function CredentialCard({
 
       const currentBucketOverride = credential.rateLimitBucketCapacityOverride ?? null
       const currentRefillOverride = credential.rateLimitRefillPerSecondOverride ?? null
+      const currentRateLimitCooldownOverride = credential.rateLimitCooldownEnabledOverride ?? null
+      const targetRateLimitCooldownOverride =
+        rateLimitCooldownOverrideFromMode(rateLimitCooldownMode)
       const targetBucketOverride = parsedBucketCapacity ?? null
       const targetRefillOverride = parsedRefillPerSecond ?? null
-      if (currentBucketOverride !== targetBucketOverride || currentRefillOverride !== targetRefillOverride) {
+      if (
+        currentRateLimitCooldownOverride !== targetRateLimitCooldownOverride ||
+        currentBucketOverride !== targetBucketOverride ||
+        currentRefillOverride !== targetRefillOverride
+      ) {
         await setRateLimitConfig.mutateAsync({
           id: credential.id,
+          rateLimitCooldownEnabled: targetRateLimitCooldownOverride,
           rateLimitBucketCapacity: targetBucketOverride,
           rateLimitRefillPerSecond: targetRefillOverride,
         })
@@ -763,6 +794,12 @@ export function CredentialCard({
   const accountTypeSourceLabel = formatAccountTypeSourceLabel(credential.accountTypeSource)
   const accountTypeSourceShortLabel = formatAccountTypeSourceShortLabel(credential.accountTypeSource)
   const rateLimitOverrideSummary = [
+    credential.rateLimitCooldownEnabledOverride === undefined ||
+    credential.rateLimitCooldownEnabledOverride === null
+      ? `429退避跟随${formatDispatchSourceLabel(credential.rateLimitCooldownEnabledSource) ?? '全局默认'}(${credential.rateLimitCooldownEnabled ? '开' : '关'})`
+      : credential.rateLimitCooldownEnabled
+        ? '429退避强制开启'
+        : '429退避强制关闭',
     credential.rateLimitBucketCapacityOverride === undefined ||
     credential.rateLimitBucketCapacityOverride === null
       ? `Bucket 跟随${formatDispatchSourceLabel(credential.rateLimitBucketCapacitySource) ?? '全局默认'}`
@@ -1466,7 +1503,21 @@ export function CredentialCard({
             {/* 限速覆盖配置区 */}
             <div className="space-y-2 rounded-lg border border-dashed p-3 bg-muted/5">
               <div className="text-sm font-medium">凭据级限速配置覆盖</div>
-              <div className="grid grid-cols-2 gap-4">
+              <div className="grid gap-4 md:grid-cols-3">
+                <div className="space-y-1">
+                  <label htmlFor={`rate-limit-cooldown-${credential.id}`} className="text-xs text-muted-foreground">429 退避</label>
+                  <select
+                    id={`rate-limit-cooldown-${credential.id}`}
+                    value={rateLimitCooldownMode}
+                    onChange={(e) => setRateLimitCooldownMode(e.target.value as RateLimitCooldownMode)}
+                    disabled={isSaving}
+                    className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <option value="global">跟随全局</option>
+                    <option value="enabled">强制开启</option>
+                    <option value="disabled">强制关闭</option>
+                  </select>
+                </div>
                 <div className="space-y-1">
                   <label htmlFor={`bucket-${credential.id}`} className="text-xs text-muted-foreground">Bucket 容量</label>
                   <Input
@@ -1497,7 +1548,7 @@ export function CredentialCard({
                 </div>
               </div>
               <p className="text-[10px] text-muted-foreground">
-                留空跟随全局或账号类型配置。输入 0 会针对此账号禁用 token bucket 限制。
+                429 退避留空跟随全局；Bucket/回填留空跟随全局或账号类型配置，输入 0 会针对此账号禁用 token bucket 限制。
               </p>
             </div>
 

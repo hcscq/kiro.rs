@@ -223,6 +223,14 @@ pub struct CredentialStatusItem {
     /// suspicious activity 隔离剩余时间（毫秒）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suspicious_activity_quarantine_remaining_ms: Option<u64>,
+    /// 当前生效的 429 冷却与 bucket 退避开关
+    pub rate_limit_cooldown_enabled: bool,
+    /// 凭据级 429 冷却与 bucket 退避开关覆盖
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_cooldown_enabled_override: Option<bool>,
+    /// 当前 429 冷却与 bucket 退避开关来源
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_cooldown_enabled_source: Option<String>,
     /// 429 冷却剩余时间（毫秒）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cooldown_remaining_ms: Option<u64>,
@@ -300,6 +308,10 @@ pub struct SetMaxConcurrencyRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetCredentialRateLimitConfigRequest {
+    /// 凭据级 429 冷却与 bucket 退避开关覆盖
+    /// 字段缺失表示不修改；null 表示跟随全局；true/false 表示凭据级强制开启/关闭
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub rate_limit_cooldown_enabled: Option<Option<bool>>,
     /// 凭据级 bucket 容量覆盖
     /// 字段缺失表示不修改；null 表示跟随全局；0 表示仅对该账号禁用 bucket
     #[serde(default, deserialize_with = "deserialize_optional_nullable")]
@@ -433,6 +445,9 @@ pub struct AddCredentialRequest {
 
     /// 单账号并发上限（可选）
     pub max_concurrency: Option<u32>,
+
+    /// 凭据级 429 冷却与 bucket 退避开关覆盖（可选）
+    pub rate_limit_cooldown_enabled: Option<bool>,
 
     /// 凭据级 token bucket 容量覆盖（可选）
     pub rate_limit_bucket_capacity: Option<f64>,
@@ -896,26 +911,31 @@ mod tests {
     #[test]
     fn set_credential_rate_limit_config_request_distinguishes_missing_null_and_values() {
         let missing: SetCredentialRateLimitConfigRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!(missing.rate_limit_cooldown_enabled, None);
         assert_eq!(missing.rate_limit_bucket_capacity, None);
         assert_eq!(missing.rate_limit_refill_per_second, None);
 
         let nulls: SetCredentialRateLimitConfigRequest = serde_json::from_str(
             r#"{
+                "rateLimitCooldownEnabled": null,
                 "rateLimitBucketCapacity": null,
                 "rateLimitRefillPerSecond": null
             }"#,
         )
         .unwrap();
+        assert_eq!(nulls.rate_limit_cooldown_enabled, Some(None));
         assert_eq!(nulls.rate_limit_bucket_capacity, Some(None));
         assert_eq!(nulls.rate_limit_refill_per_second, Some(None));
 
         let values: SetCredentialRateLimitConfigRequest = serde_json::from_str(
             r#"{
+                "rateLimitCooldownEnabled": false,
                 "rateLimitBucketCapacity": 0,
                 "rateLimitRefillPerSecond": 1.5
             }"#,
         )
         .unwrap();
+        assert_eq!(values.rate_limit_cooldown_enabled, Some(Some(false)));
         assert_eq!(values.rate_limit_bucket_capacity, Some(Some(0.0)));
         assert_eq!(values.rate_limit_refill_per_second, Some(Some(1.5)));
     }

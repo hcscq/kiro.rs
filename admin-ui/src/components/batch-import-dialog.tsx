@@ -54,6 +54,7 @@ interface CredentialInput {
   source_batch?: string
   availableModelIds?: string[]
   maxConcurrency?: number
+  rateLimitCooldownEnabled?: boolean
   rateLimitBucketCapacity?: number
   rateLimitRefillPerSecond?: number
   proxyId?: string
@@ -71,6 +72,14 @@ interface VerificationResult {
   credentialId?: number
   rollbackStatus?: 'success' | 'failed' | 'skipped'
   rollbackError?: string
+}
+
+type RateLimitCooldownMode = 'global' | 'enabled' | 'disabled'
+
+function rateLimitCooldownValueFromMode(mode: RateLimitCooldownMode): boolean | undefined {
+  if (mode === 'enabled') return true
+  if (mode === 'disabled') return false
+  return undefined
 }
 
 function proxyPoolEntryLabel(proxy: ProxyPoolEntry): string {
@@ -128,6 +137,8 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
   const [results, setResults] = useState<VerificationResult[]>([])
   const [defaultPriority, setDefaultPriority] = useState('0')
   const [defaultMaxConcurrency, setDefaultMaxConcurrency] = useState('')
+  const [defaultRateLimitCooldownMode, setDefaultRateLimitCooldownMode] =
+    useState<RateLimitCooldownMode>('global')
   const [defaultSourceSupplierName, setDefaultSourceSupplierName] = useState('')
   const [defaultSourceBatch, setDefaultSourceBatch] = useState(() => formatDefaultSourceBatch())
   const [defaultProxyMode, setDefaultProxyMode] = useState<CredentialProxyMode>('auto')
@@ -184,6 +195,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     setResults([])
     setDefaultPriority('0')
     setDefaultMaxConcurrency('')
+    setDefaultRateLimitCooldownMode('global')
     setDefaultSourceSupplierName('')
     setDefaultSourceBatch(formatDefaultSourceBatch())
     setDefaultProxyMode('auto')
@@ -376,6 +388,12 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             throw new Error('maxConcurrency 必须是大于 0 的整数')
           }
           if (
+            cred.rateLimitCooldownEnabled !== undefined &&
+            typeof cred.rateLimitCooldownEnabled !== 'boolean'
+          ) {
+            throw new Error('rateLimitCooldownEnabled 必须是布尔值')
+          }
+          if (
             cred.rateLimitBucketCapacity !== undefined &&
             (!Number.isFinite(cred.rateLimitBucketCapacity) || cred.rateLimitBucketCapacity < 0)
           ) {
@@ -457,6 +475,10 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               typeof cred.maxConcurrency === 'number'
                 ? cred.maxConcurrency
                 : parsedDefaultMaxConcurrency,
+            rateLimitCooldownEnabled:
+              typeof cred.rateLimitCooldownEnabled === 'boolean'
+                ? cred.rateLimitCooldownEnabled
+                : rateLimitCooldownValueFromMode(defaultRateLimitCooldownMode),
             rateLimitBucketCapacity:
               typeof cred.rateLimitBucketCapacity === 'number'
                 ? cred.rateLimitBucketCapacity
@@ -621,7 +643,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             <label className="text-sm font-medium">
               JSON 格式凭据
             </label>
-            <div className="grid gap-3 rounded-md border p-3 md:grid-cols-3">
+            <div className="grid gap-3 rounded-md border p-3 md:grid-cols-4">
               <div className="space-y-1.5">
                 <label htmlFor="batchDefaultPriority" className="text-xs font-medium text-muted-foreground">
                   默认优先级
@@ -648,6 +670,24 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
                   onChange={(e) => setDefaultMaxConcurrency(e.target.value)}
                   disabled={importing}
                 />
+              </div>
+              <div className="space-y-1.5">
+                <label htmlFor="batchDefaultRateLimitCooldown" className="text-xs font-medium text-muted-foreground">
+                  429 退避
+                </label>
+                <select
+                  id="batchDefaultRateLimitCooldown"
+                  value={defaultRateLimitCooldownMode}
+                  onChange={(e) =>
+                    setDefaultRateLimitCooldownMode(e.target.value as RateLimitCooldownMode)
+                  }
+                  disabled={importing}
+                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <option value="global">跟随全局</option>
+                  <option value="enabled">强制开启</option>
+                  <option value="disabled">强制关闭</option>
+                </select>
               </div>
               <div className="flex items-center justify-between gap-3 rounded-md bg-muted/30 px-3 py-2">
                 <div className="text-sm font-medium">自动超额</div>
@@ -806,7 +846,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               className="flex min-h-[200px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
             />
             <p className="text-xs text-muted-foreground">
-              支持附带 `email`、`userId`、`provider`、`authMethod`、`startUrl`、`issuerUrl`、`tokenEndpoint`、`scopes`、`accountType`、`sourceSupplierName`、`sourceSupplierId`、`sourceBatch`、`availableModelIds`、`maxConcurrency`、`rateLimitBucketCapacity`、`rateLimitRefillPerSecond`。
+              支持附带 `email`、`userId`、`provider`、`authMethod`、`startUrl`、`issuerUrl`、`tokenEndpoint`、`scopes`、`accountType`、`sourceSupplierName`、`sourceSupplierId`、`sourceBatch`、`availableModelIds`、`maxConcurrency`、`rateLimitCooldownEnabled`、`rateLimitBucketCapacity`、`rateLimitRefillPerSecond`。
               导入时会自动验活，失败的凭据会被排除。
             </p>
           </div>

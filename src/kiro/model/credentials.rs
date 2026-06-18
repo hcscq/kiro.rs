@@ -136,6 +136,11 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_concurrency: Option<u32>,
 
+    /// 凭据级 429 冷却与 bucket 退避开关覆盖（可选）
+    /// 未配置时回退到 config.json / Admin API 的全局值
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_cooldown_enabled: Option<bool>,
+
     /// 凭据级 token bucket 容量覆盖（可选）
     /// 未配置时回退到 config.json / Admin API 的全局值
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -935,6 +940,24 @@ impl KiroCredentials {
             .and_then(non_negative_finite)
     }
 
+    /// 获取凭据级 429 冷却与 bucket 退避开关覆盖
+    pub fn rate_limit_cooldown_enabled_override(&self) -> Option<bool> {
+        self.rate_limit_cooldown_enabled
+    }
+
+    pub fn effective_rate_limit_cooldown_enabled(&self, default_enabled: bool) -> bool {
+        self.rate_limit_cooldown_enabled_override()
+            .unwrap_or(default_enabled)
+    }
+
+    pub fn effective_rate_limit_cooldown_enabled_source(&self) -> Option<DispatchSettingSource> {
+        if self.rate_limit_cooldown_enabled_override().is_some() {
+            Some(DispatchSettingSource::Credential)
+        } else {
+            Some(DispatchSettingSource::GlobalDefault)
+        }
+    }
+
     pub fn effective_rate_limit_bucket_capacity_source(
         &self,
         default_capacity: f64,
@@ -1269,6 +1292,7 @@ mod tests {
             start_url: None,
             priority: 0,
             max_concurrency: None,
+            rate_limit_cooldown_enabled: None,
             rate_limit_bucket_capacity: None,
             rate_limit_refill_per_second: None,
             region: None,
@@ -1706,6 +1730,7 @@ mod tests {
             start_url: None,
             priority: 0,
             max_concurrency: None,
+            rate_limit_cooldown_enabled: None,
             rate_limit_bucket_capacity: None,
             rate_limit_refill_per_second: None,
             region: Some("eu-west-1".to_string()),
@@ -1767,6 +1792,7 @@ mod tests {
             start_url: None,
             priority: 0,
             max_concurrency: None,
+            rate_limit_cooldown_enabled: None,
             rate_limit_bucket_capacity: None,
             rate_limit_refill_per_second: None,
             region: None,
@@ -1910,6 +1936,7 @@ mod tests {
             start_url: None,
             priority: 3,
             max_concurrency: None,
+            rate_limit_cooldown_enabled: None,
             rate_limit_bucket_capacity: None,
             rate_limit_refill_per_second: None,
             region: Some("us-west-2".to_string()),

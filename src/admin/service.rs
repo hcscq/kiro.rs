@@ -152,6 +152,10 @@ impl AdminService {
                         .suspicious_activity_recovery_success_count,
                     suspicious_activity_quarantine_remaining_ms: entry
                         .suspicious_activity_quarantine_remaining_ms,
+                    rate_limit_cooldown_enabled: entry.rate_limit_cooldown_enabled,
+                    rate_limit_cooldown_enabled_override: entry
+                        .rate_limit_cooldown_enabled_override,
+                    rate_limit_cooldown_enabled_source: entry.rate_limit_cooldown_enabled_source,
                     cooldown_remaining_ms: entry.cooldown_remaining_ms,
                     rate_limit_bucket_tokens: entry.rate_limit_bucket_tokens,
                     rate_limit_bucket_capacity: entry.rate_limit_bucket_capacity,
@@ -226,13 +230,19 @@ impl AdminService {
     pub fn set_rate_limit_config(
         &self,
         id: u64,
+        rate_limit_cooldown_enabled: Option<Option<bool>>,
         rate_limit_bucket_capacity: Option<Option<f64>>,
         rate_limit_refill_per_second: Option<Option<f64>>,
     ) -> Result<(), AdminServiceError> {
         self.ensure_runtime_write_leader()?;
 
         self.token_manager
-            .set_rate_limit_config(id, rate_limit_bucket_capacity, rate_limit_refill_per_second)
+            .set_rate_limit_config(
+                id,
+                rate_limit_cooldown_enabled,
+                rate_limit_bucket_capacity,
+                rate_limit_refill_per_second,
+            )
             .map_err(|e| self.classify_error(e, id))
     }
 
@@ -553,6 +563,7 @@ impl AdminService {
             start_url: req.start_url,
             priority: req.priority,
             max_concurrency: req.max_concurrency,
+            rate_limit_cooldown_enabled: req.rate_limit_cooldown_enabled,
             rate_limit_bucket_capacity: req.rate_limit_bucket_capacity,
             rate_limit_refill_per_second: req.rate_limit_refill_per_second,
             region: req.region,

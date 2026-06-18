@@ -31,6 +31,13 @@ interface AddCredentialDialogProps {
 }
 
 type AuthMethod = 'social' | 'idc'
+type RateLimitCooldownMode = 'global' | 'enabled' | 'disabled'
+
+function rateLimitCooldownValueFromMode(mode: RateLimitCooldownMode): boolean | undefined {
+  if (mode === 'enabled') return true
+  if (mode === 'disabled') return false
+  return undefined
+}
 
 function proxyPoolEntryLabel(proxy: ProxyPoolEntry): string {
   const egress = proxy.expectedEgressIp ? ` (${proxy.expectedEgressIp})` : ''
@@ -52,6 +59,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [startUrl, setStartUrl] = useState('')
   const [priority, setPriority] = useState('0')
   const [maxConcurrency, setMaxConcurrency] = useState('')
+  const [rateLimitCooldownMode, setRateLimitCooldownMode] =
+    useState<RateLimitCooldownMode>('global')
   const [rateLimitBucketCapacity, setRateLimitBucketCapacity] = useState('')
   const [rateLimitRefillPerSecond, setRateLimitRefillPerSecond] = useState('')
   const [machineId, setMachineId] = useState('')
@@ -107,6 +116,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setStartUrl('')
     setPriority('0')
     setMaxConcurrency('')
+    setRateLimitCooldownMode('global')
     setRateLimitBucketCapacity('')
     setRateLimitRefillPerSecond('')
     setMachineId('')
@@ -202,6 +212,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         startUrl: startUrl.trim() || undefined,
         priority: parseInt(priority) || 0,
         maxConcurrency: parsedMaxConcurrency,
+        rateLimitCooldownEnabled: rateLimitCooldownValueFromMode(rateLimitCooldownMode),
         rateLimitBucketCapacity: parsedRateLimitBucketCapacity,
         rateLimitRefillPerSecond: parsedRateLimitRefillPerSecond,
         machineId: machineId.trim() || undefined,
@@ -417,7 +428,18 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
 
             <div className="space-y-2">
               <label className="text-sm font-medium">凭据级限速覆盖</label>
-              <div className="grid grid-cols-2 gap-2">
+              <div className="grid gap-2 md:grid-cols-3">
+                <select
+                  id="rateLimitCooldownEnabled"
+                  value={rateLimitCooldownMode}
+                  onChange={(e) => setRateLimitCooldownMode(e.target.value as RateLimitCooldownMode)}
+                  disabled={isPending}
+                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <option value="global">429 退避跟随全局</option>
+                  <option value="enabled">429 退避强制开启</option>
+                  <option value="disabled">429 退避强制关闭</option>
+                </select>
                 <Input
                   id="rateLimitBucketCapacity"
                   type="number"
@@ -440,7 +462,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 />
               </div>
               <p className="text-xs text-muted-foreground">
-                留空表示跟随全局，填 `0` 表示只对该账号禁用 token bucket
+                429 退避默认跟随全局。Bucket/回填留空表示跟随全局，填 `0` 表示只对该账号禁用 token bucket
               </p>
             </div>
 
