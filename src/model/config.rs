@@ -598,6 +598,10 @@ impl ProxyPoolConfig {
             }
         }
 
+        if self.require_proxy && !self.enabled {
+            anyhow::bail!("proxyPool.requireProxy=true 时必须启用 proxyPool.enabled");
+        }
+
         if self.enabled && self.proxies.iter().all(|proxy| !proxy.enabled) {
             anyhow::bail!("proxyPool.enabled=true 时至少需要一个启用的代理");
         }
@@ -1535,6 +1539,16 @@ mod tests {
         let err = config.validate().unwrap_err().to_string();
 
         assert!(err.contains("requestWeighting.maxWeight"));
+    }
+
+    #[test]
+    fn validate_rejects_require_proxy_without_enabled_pool() {
+        let mut config = Config::default();
+        config.proxy_pool.require_proxy = true;
+
+        let err = config.validate().unwrap_err().to_string();
+
+        assert!(err.contains("proxyPool.requireProxy"));
     }
 
     #[test]

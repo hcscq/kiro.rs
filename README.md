@@ -214,6 +214,7 @@ GitHub Actions 镜像构建：
 | `proxyUrl` | string | - | HTTP/SOCKS5 代理地址 |
 | `proxyUsername` | string | - | 代理用户名 |
 | `proxyPassword` | string | - | 代理密码 |
+| `proxyPool` | object | disabled | 代理池配置；`requireProxy=true` 时必须同时启用代理池 |
 | `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
 | `stateBackend` | string | `file` | 状态存储后端：`file` 或 `postgres` |
 | `statePostgresUrl` | string | - | PostgreSQL 连接串；当 `stateBackend=postgres` 时必填 |
@@ -459,6 +460,7 @@ kiro-rs \
 | `blockedModels` | array | 账号级额外禁用模型列表（可选）                           |
 | `availableModelIds` | array | 从 Kiro/KAM 可用模型列表导入的模型缓存（可选）         |
 | `proxyUrl`     | string | 凭据级代理 URL（可选，特殊值 `direct` 表示不使用代理）       |
+| `proxyId`      | string | 代理池节点 ID（可选，由代理池自动分配或手动绑定）             |
 | `proxyUsername`| string | 凭据级代理用户名（可选）                                |
 | `proxyPassword`| string | 凭据级代理密码（可选）                                 |
 
@@ -564,15 +566,17 @@ kiro-rs \
 
 ### 代理配置
 
-支持全局代理和凭据级代理，凭据级代理会覆盖该凭据产生的所有出站连接（API 请求、Token 刷新、额度查询）。
+支持全局代理、代理池和凭据级代理，凭据级代理会覆盖该凭据产生的所有出站连接（API 请求、Token 刷新、额度查询）。
 
-**代理优先级**：`凭据.proxyUrl` > `config.proxyUrl` > 无代理
+**代理优先级**：`凭据.proxyUrl` > `凭据.proxyId` 绑定的代理池节点 > `config.proxyUrl` > 无代理
 
 | 凭据 `proxyUrl` 值 | 行为 |
 |---|---|
 | 具体 URL（如 `http://proxy:8080`、`socks5://proxy:1080`） | 使用凭据指定的代理 |
 | `direct` | 显式不使用代理（即使全局配置了代理） |
-| 未配置（留空） | 回退到全局代理配置 |
+| 未配置（留空） | 如果配置了 `proxyId`，使用对应代理池节点；否则回退到全局代理配置 |
+
+`proxyPool.enabled=true` 时，未显式配置 `proxyUrl` 或 `proxyId` 的新凭据会按代理池策略自动绑定节点。`proxyPool.requireProxy=true` 时必须同时启用代理池，并且凭据不能使用 `proxyUrl: "direct"` 或清空代理绑定。
 
 凭据级代理示例：
 

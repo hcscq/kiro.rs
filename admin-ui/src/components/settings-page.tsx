@@ -417,6 +417,7 @@ function SwitchSettingCard({
   onCheckedChange,
   ariaLabel,
   disabledLabel = '已关闭',
+  disabled = false,
   warning,
 }: {
   title: string
@@ -425,10 +426,15 @@ function SwitchSettingCard({
   onCheckedChange: (checked: boolean) => void
   ariaLabel: string
   disabledLabel?: string
+  disabled?: boolean
   warning?: string
 }) {
   return (
-    <div className="flex flex-col gap-3 rounded-lg border bg-background/70 p-4">
+    <div
+      className={`flex flex-col gap-3 rounded-lg border bg-background/70 p-4${
+        disabled ? ' opacity-60' : ''
+      }`}
+    >
       <div className="flex items-center justify-between gap-3">
         <div className="flex min-w-0 items-center gap-2">
           <div className="text-sm font-medium">{title}</div>
@@ -442,6 +448,7 @@ function SwitchSettingCard({
             checked={checked}
             onCheckedChange={onCheckedChange}
             aria-label={ariaLabel}
+            disabled={disabled}
           />
         </div>
       </div>
@@ -909,6 +916,11 @@ export function SettingsPage() {
       return
     }
 
+    if (parsedProxyPool.requireProxy && !parsedProxyPool.enabled) {
+      toast.error('强制代理需要先启用代理池')
+      return
+    }
+
     if (
       parsedProxyPool.failover.enabled &&
       (!Number.isFinite(parsedProxyPool.failover.failureThreshold) ||
@@ -1026,7 +1038,12 @@ export function SettingsPage() {
                 <SwitchSettingCard
                   title="启用代理池"
                   checked={proxyPool.enabled}
-                  onCheckedChange={(checked) => updateProxyPool({ enabled: Boolean(checked) })}
+                  onCheckedChange={(checked) =>
+                    updateProxyPool({
+                      enabled: Boolean(checked),
+                      requireProxy: checked ? proxyPool.requireProxy : false,
+                    })
+                  }
                   ariaLabel="切换代理池"
                   description="未显式配置代理的新凭据会绑定到池内节点。"
                 />
@@ -1035,6 +1052,8 @@ export function SettingsPage() {
                   checked={proxyPool.requireProxy}
                   onCheckedChange={(checked) => updateProxyPool({ requireProxy: Boolean(checked) })}
                   ariaLabel="切换强制代理"
+                  disabled={!proxyPool.enabled}
+                  disabledLabel={proxyPool.enabled ? '已关闭' : '需启用代理池'}
                   description="启用后，新凭据不能在没有可用代理节点时导入。"
                 />
                 <SwitchSettingCard
