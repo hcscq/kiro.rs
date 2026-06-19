@@ -443,6 +443,39 @@ fn string_list_contains(values: &[String], expected: &str) -> bool {
         .any(|value| value.trim().eq_ignore_ascii_case(expected))
 }
 
+fn external_idp_public_token_auth_supported(summary: &ExternalIdpOidcDiscoverySummary) -> bool {
+    string_list_contains(&summary.token_endpoint_auth_methods_supported, "none")
+}
+
+fn external_idp_device_code_secret_requirement_message(
+    summary: &ExternalIdpOidcDiscoverySummary,
+) -> Option<String> {
+    if external_idp_public_token_auth_supported(summary) {
+        return None;
+    }
+
+    let methods = if summary.token_endpoint_auth_methods_supported.is_empty() {
+        "未声明".to_string()
+    } else {
+        summary.token_endpoint_auth_methods_supported.join(", ")
+    };
+    Some(format!(
+        "OIDC discovery 的 token_endpoint_auth_methods_supported 为 {methods}，未包含 none；该 Azure/OIDC client 很可能需要 client_secret 或 client_assertion。当前 kiro.rs 没有 Kiro/Azure 应用密钥，无法用 External IdP device-code 完成 token exchange。"
+    ))
+}
+
+fn external_idp_secret_required_error_message(description: &str) -> Option<String> {
+    let lower = description.to_ascii_lowercase();
+    if lower.contains("aadsts7000218")
+        || (lower.contains("client_assertion") && lower.contains("client_secret"))
+    {
+        return Some(
+            "ExternalIdP device-code 已完成浏览器授权，但 Azure token endpoint 要求 client_secret 或 client_assertion。当前 kiro.rs 没有 Kiro/Azure 应用密钥，无法完成该机密客户端的 token exchange。".to_string(),
+        );
+    }
+    None
+}
+
 fn aws_oidc_error_message(body: &str) -> String {
     if let Ok(parsed) = serde_json::from_str::<AwsOidcErrorResponse>(body) {
         if let Some(description) = parsed.error_description.filter(|value| !value.is_empty()) {
@@ -937,9 +970,9 @@ impl AdminService {
         let device_code_supported = oidc
             .as_ref()
             .is_some_and(|summary| summary.device_authorization_endpoint.is_some());
-        let refresh_without_client_secret_likely_supported = oidc.as_ref().is_some_and(|summary| {
-            string_list_contains(&summary.token_endpoint_auth_methods_supported, "none")
-        });
+        let refresh_without_client_secret_likely_supported = oidc
+            .as_ref()
+            .is_some_and(external_idp_public_token_auth_supported);
 
         if oidc_discovery_status == ExternalIdpProbeStatus::Ok {
             if !authorization_code_supported {
@@ -957,7 +990,7 @@ impl AdminService {
             }
             if !refresh_without_client_secret_likely_supported {
                 recommendations.push(
-                    "token_endpoint_auth_methods_supported 未包含 none；当前 external_idp 刷新不发送 client_secret，需要端到端验证 refresh_token 是否可用".to_string(),
+                    "token_endpoint_auth_methods_supported 未包含 none；当前 kiro.rs 不持有 Kiro/Azure 应用密钥，External IdP device-code token exchange 和后续 refresh 很可能无法完成".to_string(),
                 );
             }
             if pkce_s256_supported && client_id.is_some() && !scopes.is_empty() {
@@ -986,7 +1019,7 @@ impl AdminService {
         })
     }
 
-    /// 启动 External IdP 在线登录。默认优先 device-code，必要时可回退 PKCE。
+    /// 启动 External IdP 在线登录。auto 只在 public token exchange 明确可用时使用 device-code。
     pub async fn start_external_idp_login(
         &self,
         mut req: StartExternalIdpLoginRequest,
@@ -1742,6 +1775,11 @@ impl AdminService {
 
         if session.flow != ExternalIdpLoginFlow::Pkce {
             if discovery.device_authorization_endpoint.is_some() {
+                if let Some(message) =
+                    external_idp_device_code_secret_requirement_message(&discovery)
+                {
+                    return Err(AdminServiceError::InvalidCredential(message));
+                }
                 return self
                     .prepare_external_idp_device_authorization(client, session, discovery)
                     .await;
@@ -2441,9 +2479,11 @@ impl AdminService {
                     "用户拒绝了 External IdP 授权请求".to_string(),
                 ))
             }
-            _ => Ok(ExternalIdpDeviceTokenPollResult::Failed(format!(
-                "ExternalIdP device token 失败 ({status}): {description}"
-            ))),
+            _ => Ok(ExternalIdpDeviceTokenPollResult::Failed(
+                external_idp_secret_required_error_message(description).unwrap_or_else(|| {
+                    format!("ExternalIdP device token 失败 ({status}): {description}")
+                }),
+            )),
         }
     }
 
@@ -3966,6 +4006,44 @@ mod tests {
             document.code_challenge_methods_supported.unwrap(),
             vec!["S256".to_string()]
         );
+    }
+
+    #[test]
+    fn external_idp_device_code_requires_public_token_auth() {
+        let mut summary = ExternalIdpOidcDiscoverySummary {
+            issuer: Some("https://login.example.com/tenant/v2.0".to_string()),
+            authorization_endpoint: Some("https://login.example.com/authorize".to_string()),
+            token_endpoint: Some("https://login.example.com/token".to_string()),
+            device_authorization_endpoint: Some("https://login.example.com/devicecode".to_string()),
+            code_challenge_methods_supported: vec!["S256".to_string()],
+            grant_types_supported: Vec::new(),
+            response_types_supported: vec!["code".to_string()],
+            scopes_supported: Vec::new(),
+            token_endpoint_auth_methods_supported: vec![
+                "client_secret_post".to_string(),
+                "private_key_jwt".to_string(),
+            ],
+        };
+
+        assert!(!external_idp_public_token_auth_supported(&summary));
+        let message = external_idp_device_code_secret_requirement_message(&summary).unwrap();
+        assert!(message.contains("client_secret"));
+        assert!(message.contains("client_assertion"));
+
+        summary.token_endpoint_auth_methods_supported = vec!["none".to_string()];
+        assert!(external_idp_public_token_auth_supported(&summary));
+        assert!(external_idp_device_code_secret_requirement_message(&summary).is_none());
+    }
+
+    #[test]
+    fn external_idp_device_token_secret_required_error_is_classified() {
+        let message = external_idp_secret_required_error_message(
+            "AADSTS7000218: The request body must contain the following parameter: 'client_assertion' or 'client_secret'.",
+        )
+        .unwrap();
+
+        assert!(message.contains("client_secret"));
+        assert!(message.contains("token exchange"));
     }
 
     #[test]

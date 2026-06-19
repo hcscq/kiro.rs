@@ -830,7 +830,7 @@ pub struct StartExternalIdpLoginRequest {
     #[serde(default)]
     pub login_hint: Option<String>,
 
-    /// 登录方式；auto 默认优先 device-code，必要时回退 PKCE
+    /// 登录方式；auto 只在 discovery 明确支持无密钥 token exchange 时使用 device-code
     #[serde(default)]
     pub flow: ExternalIdpLoginFlow,
 

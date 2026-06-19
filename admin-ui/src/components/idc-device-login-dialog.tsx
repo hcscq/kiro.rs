@@ -310,7 +310,7 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
       scopes: scopes || undefined,
       audience: externalAudience.trim() || undefined,
       loginHint: workEmail || undefined,
-      flow: 'device-code',
+      flow: 'auto',
       callbackBaseUrl: window.location.origin,
       apiRegion: apiRegion.trim() || undefined,
       priority: parsedPriority,
@@ -653,6 +653,14 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
                       </Badge>
                       <Badge variant={boolStatusVariant(externalProbe.deviceCodeSupported)}>
                         Device code {boolStatusText(externalProbe.deviceCodeSupported)}
+                      </Badge>
+                      <Badge
+                        variant={boolStatusVariant(
+                          externalProbe.refreshWithoutClientSecretLikelySupported
+                        )}
+                      >
+                        No-secret token{' '}
+                        {externalProbe.refreshWithoutClientSecretLikelySupported ? '支持' : '需密钥'}
                       </Badge>
                     </div>
 
