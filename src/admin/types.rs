@@ -830,6 +830,10 @@ pub struct StartExternalIdpLoginRequest {
     #[serde(default)]
     pub login_hint: Option<String>,
 
+    /// 登录方式；auto 默认优先 device-code，必要时回退 PKCE
+    #[serde(default)]
+    pub flow: ExternalIdpLoginFlow,
+
     /// 浏览器可访问的 kiro.rs origin，例如 https://example.com
     #[serde(default)]
     pub callback_base_url: Option<String>,
@@ -891,6 +895,16 @@ pub struct StartExternalIdpLoginRequest {
     pub proxy_id: Option<String>,
 }
 
+/// External IdP 登录方式
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExternalIdpLoginFlow {
+    #[default]
+    Auto,
+    DeviceCode,
+    Pkce,
+}
+
 /// External IdP 浏览器登录状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -907,6 +921,7 @@ pub enum ExternalIdpLoginStatus {
 #[serde(rename_all = "kebab-case")]
 pub enum ExternalIdpLoginPhase {
     PortalDiscovery,
+    DeviceAuthorization,
     IdpAuthorization,
     Completed,
 }
@@ -918,6 +933,7 @@ pub struct ExternalIdpLoginStartResponse {
     pub session_id: String,
     pub status: ExternalIdpLoginStatus,
     pub phase: ExternalIdpLoginPhase,
+    pub flow: ExternalIdpLoginFlow,
     pub provider: String,
     pub auth_url: String,
     pub callback_url: String,
@@ -932,6 +948,12 @@ pub struct ExternalIdpLoginStartResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audience: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification_uri_complete: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
 
@@ -942,6 +964,7 @@ pub struct ExternalIdpLoginStatusResponse {
     pub session_id: String,
     pub status: ExternalIdpLoginStatus,
     pub phase: ExternalIdpLoginPhase,
+    pub flow: ExternalIdpLoginFlow,
     pub provider: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_url: Option<String>,
@@ -957,6 +980,12 @@ pub struct ExternalIdpLoginStatusResponse {
     pub scopes: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audience: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification_uri_complete: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

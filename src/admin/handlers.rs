@@ -362,12 +362,16 @@ pub async fn start_external_idp_login(
 }
 
 /// POST /api/admin/auth/external-idp/:session_id/status
-/// 查询 External IdP 浏览器登录状态
+/// 查询 External IdP 在线登录状态
 pub async fn get_external_idp_login_status(
     State(state): State<AdminState>,
     Path(session_id): Path<String>,
 ) -> impl IntoResponse {
-    match state.service.get_external_idp_login_status(&session_id) {
+    match state
+        .service
+        .get_external_idp_login_status(&session_id)
+        .await
+    {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

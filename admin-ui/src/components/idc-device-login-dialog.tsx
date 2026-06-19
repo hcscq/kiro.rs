@@ -62,6 +62,10 @@ function sessionEmail(session: LoginSession): string | undefined {
   return 'email' in session ? session.email : undefined
 }
 
+function sessionUserCode(session: LoginSession): string | undefined {
+  return 'userCode' in session ? session.userCode : undefined
+}
+
 function isIdcSession(
   session: LoginSession
 ): session is IdcDeviceLoginStartResponse | IdcDeviceLoginStatusResponse {
@@ -87,7 +91,7 @@ function sessionAuthUrl(session: LoginSession): string | undefined {
     return session.verificationUriComplete || session.verificationUri
   }
   if (isExternalIdpSession(session)) {
-    return session.authUrl
+    return session.verificationUriComplete || session.authUrl || session.verificationUri
   }
   return undefined
 }
@@ -306,6 +310,7 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
       scopes: scopes || undefined,
       audience: externalAudience.trim() || undefined,
       loginHint: workEmail || undefined,
+      flow: 'device-code',
       callbackBaseUrl: window.location.origin,
       apiRegion: apiRegion.trim() || undefined,
       priority: parsedPriority,
@@ -377,7 +382,7 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
   }, [open, sessionMode, session?.sessionId, session?.status, session?.intervalSeconds, session?.message])
 
   const handleCopyCode = async () => {
-    const userCode = session && isIdcSession(session) ? session.userCode : undefined
+    const userCode = session ? sessionUserCode(session) : undefined
     if (!userCode) return
     try {
       await navigator.clipboard.writeText(userCode)
@@ -397,7 +402,7 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
   const email = session ? sessionEmail(session) : undefined
   const secondaryText = session ? sessionSecondaryText(session) : ''
   const authUrl = session ? sessionAuthUrl(session) : undefined
-  const userCode = session && isIdcSession(session) ? session.userCode : undefined
+  const userCode = session ? sessionUserCode(session) : undefined
 
   return (
     <Dialog open={open} onOpenChange={handleDialogOpenChange}>
@@ -810,7 +815,11 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
                   rel="noreferrer"
                 >
                   <ExternalLink className="h-4 w-4" />
-                  {sessionMode === 'external_idp' ? '打开登录页面' : '打开验证页面'}
+                  {sessionMode === 'external_idp' &&
+                  isExternalIdpSession(session) &&
+                  session.flow === 'pkce'
+                    ? '打开登录页面'
+                    : '打开验证页面'}
                 </a>
               </Button>
             ) : null}

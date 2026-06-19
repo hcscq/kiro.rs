@@ -379,8 +379,11 @@ export type ExternalIdpLoginStatus =
 
 export type ExternalIdpLoginPhase =
   | 'portal-discovery'
+  | 'device-authorization'
   | 'idp-authorization'
   | 'completed'
+
+export type ExternalIdpLoginFlow = 'auto' | 'device-code' | 'pkce'
 
 export interface StartExternalIdpLoginRequest {
   workEmail?: string
@@ -390,6 +393,7 @@ export interface StartExternalIdpLoginRequest {
   scopes?: string
   audience?: string
   loginHint?: string
+  flow?: ExternalIdpLoginFlow
   callbackBaseUrl?: string
   profileArn?: string
   priority?: number
@@ -411,6 +415,7 @@ export interface ExternalIdpLoginStartResponse {
   sessionId: string
   status: ExternalIdpLoginStatus
   phase: ExternalIdpLoginPhase
+  flow: ExternalIdpLoginFlow
   provider: string
   authUrl: string
   callbackUrl: string
@@ -420,6 +425,9 @@ export interface ExternalIdpLoginStartResponse {
   clientId?: string
   scopes?: string
   audience?: string
+  userCode?: string
+  verificationUri?: string
+  verificationUriComplete?: string
   message?: string
 }
 
@@ -427,6 +435,7 @@ export interface ExternalIdpLoginStatusResponse {
   sessionId: string
   status: ExternalIdpLoginStatus
   phase: ExternalIdpLoginPhase
+  flow: ExternalIdpLoginFlow
   provider: string
   authUrl?: string
   callbackUrl: string
@@ -436,6 +445,9 @@ export interface ExternalIdpLoginStatusResponse {
   clientId?: string
   scopes?: string
   audience?: string
+  userCode?: string
+  verificationUri?: string
+  verificationUriComplete?: string
   message?: string
   credentialId?: number
   email?: string
