@@ -6,7 +6,7 @@ use std::sync::Arc;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -45,8 +45,8 @@ const IDC_DEVICE_LOGIN_CLIENT_NAME: &str = "Kiro IDE";
 const EXTERNAL_IDP_LOGIN_SESSION_SECS: i64 = 10 * 60;
 const EXTERNAL_IDP_LOGIN_POLL_INTERVAL_SECS: u64 = 3;
 const KIRO_AUTH_PORTAL_URL: &str = "https://app.kiro.dev";
-const KIRO_WEB_PORTAL_ENDPOINT: &str = "https://app.kiro.dev/";
-const KIRO_GET_LOGIN_METADATA_TARGET: &str = "KiroWebPortalService.GetLoginMetadata";
+const KIRO_WEB_PORTAL_ENDPOINT: &str =
+    "https://app.kiro.dev/service/KiroWebPortalService/operation/GetLoginMetadata";
 const UPSTREAM_ERROR_EXCERPT_CHARS: usize = 240;
 const IDC_GRANT_SCOPES: &[&str] = &[
     "codewhisperer:completions",
@@ -160,6 +160,12 @@ struct KiroLoginMetadataPayload {
     scopes: Option<Vec<String>>,
     #[serde(default)]
     audience: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KiroGetLoginMetadataRequest {
+    domain_name: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -346,12 +352,19 @@ fn oidc_discovery_url(issuer_url: &str) -> Result<String, AdminServiceError> {
     Ok(format!("{issuer_url}/.well-known/openid-configuration"))
 }
 
+#[cfg(test)]
 fn parse_kiro_login_metadata_payload(
     body: &str,
 ) -> Result<KiroLoginMetadataPayload, AdminServiceError> {
     let value: serde_json::Value = serde_json::from_str(body).map_err(|err| {
         AdminServiceError::UpstreamError(format!("解析 GetLoginMetadata 响应失败: {err}"))
     })?;
+    parse_kiro_login_metadata_payload_value(value)
+}
+
+fn parse_kiro_login_metadata_payload_value(
+    value: serde_json::Value,
+) -> Result<KiroLoginMetadataPayload, AdminServiceError> {
     let payload = value.get("Output").unwrap_or(&value).clone();
     if let Some(error_type) = payload
         .get("__type")
@@ -365,6 +378,32 @@ fn parse_kiro_login_metadata_payload(
     serde_json::from_value(payload).map_err(|err| {
         AdminServiceError::UpstreamError(format!("解析 GetLoginMetadata 响应失败: {err}"))
     })
+}
+
+fn parse_kiro_login_metadata_payload_cbor(
+    body: &[u8],
+) -> Result<KiroLoginMetadataPayload, AdminServiceError> {
+    let value: serde_json::Value = serde_cbor::from_slice(body).map_err(|err| {
+        AdminServiceError::UpstreamError(format!("解析 GetLoginMetadata CBOR 响应失败: {err}"))
+    })?;
+    parse_kiro_login_metadata_payload_value(value)
+}
+
+fn kiro_login_metadata_error_message(body: &[u8]) -> String {
+    if let Ok(value) = serde_cbor::from_slice::<serde_json::Value>(body) {
+        if let Some(message) = value
+            .get("message")
+            .or_else(|| value.get("Message"))
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+        {
+            return message.to_string();
+        }
+        if let Ok(text) = serde_json::to_string(&value) {
+            return text;
+        }
+    }
+    String::from_utf8_lossy(body).trim().to_string()
 }
 
 fn string_list_contains(values: &[String], expected: &str) -> bool {
@@ -940,11 +979,13 @@ impl AdminService {
         req.proxy_password = normalize_optional_string(req.proxy_password.as_deref());
         req.proxy_id = normalize_optional_string(req.proxy_id.as_deref());
 
-        if let Some(email) = req.work_email.as_deref() {
-            let _ = domain_from_work_email(email)?;
+        let discovery_domain = if let Some(email) = req.work_email.as_deref() {
+            Some(domain_from_work_email(email)?)
         } else if let Some(domain) = req.domain_name.as_deref() {
-            let _ = normalize_domain_name(domain)?;
-        }
+            Some(normalize_domain_name(domain)?)
+        } else {
+            None
+        };
 
         let callback_url = resolve_external_idp_callback_url(req.callback_base_url.as_deref())?;
         let config = self.token_manager.config();
@@ -988,6 +1029,33 @@ impl AdminService {
         };
 
         if direct_idp {
+            self.prepare_external_idp_authorization(&client, &mut session)
+                .await?;
+        } else if let Some(domain_name) = discovery_domain.as_deref() {
+            let metadata = self.fetch_kiro_login_metadata(&client, domain_name).await?;
+            if !metadata.found {
+                return Err(AdminServiceError::InvalidCredential(
+                    "Kiro 未发现该工作邮箱域名的组织登录 metadata".to_string(),
+                ));
+            }
+            if session.issuer_url.is_none() {
+                session.issuer_url =
+                    normalize_optional_url(metadata.issuer_url.as_deref(), "Issuer URL")?;
+            }
+            if session.client_id.is_none() {
+                session.client_id = normalize_optional_string(metadata.client_id.as_deref());
+            }
+            if session.scopes.is_none() {
+                let scopes = normalize_scope_list(metadata.scopes);
+                if !scopes.is_empty() {
+                    session.scopes = Some(normalize_scope_string_with_offline_access(
+                        &scopes.join(" "),
+                    )?);
+                }
+            }
+            if session.audience.is_none() {
+                session.audience = normalize_optional_string(metadata.audience.as_deref());
+            }
             self.prepare_external_idp_authorization(&client, &mut session)
                 .await?;
         } else {
@@ -1734,12 +1802,19 @@ impl AdminService {
         client: &reqwest::Client,
         domain_name: &str,
     ) -> Result<KiroLoginMetadataPayload, AdminServiceError> {
+        let body = serde_cbor::to_vec(&KiroGetLoginMetadataRequest {
+            domain_name: domain_name.to_string(),
+        })
+        .map_err(|err| {
+            AdminServiceError::InternalError(format!("构造 GetLoginMetadata CBOR 请求失败: {err}"))
+        })?;
+
         let response = client
             .post(KIRO_WEB_PORTAL_ENDPOINT)
-            .header("content-type", "application/x-amz-json-1.0")
-            .header("x-amz-target", KIRO_GET_LOGIN_METADATA_TARGET)
-            .header("accept", "application/json")
-            .json(&serde_json::json!({ "domainName": domain_name }))
+            .header("content-type", "application/cbor")
+            .header("accept", "application/cbor")
+            .header("smithy-protocol", "rpc-v2-cbor")
+            .body(body)
             .send()
             .await
             .map_err(|err| {
@@ -1747,16 +1822,17 @@ impl AdminService {
             })?;
 
         let status = response.status();
-        let text = response.text().await.unwrap_or_default();
+        let bytes = response.bytes().await.unwrap_or_default();
         if !status.is_success() {
+            let body_text = kiro_login_metadata_error_message(&bytes);
             let message =
-                summarize_upstream_error(status.as_u16(), &text, UPSTREAM_ERROR_EXCERPT_CHARS);
+                summarize_upstream_error(status.as_u16(), &body_text, UPSTREAM_ERROR_EXCERPT_CHARS);
             return Err(AdminServiceError::UpstreamError(format!(
                 "GetLoginMetadata 失败 ({status}): {message}"
             )));
         }
 
-        parse_kiro_login_metadata_payload(&text)
+        parse_kiro_login_metadata_payload_cbor(&bytes)
     }
 
     async fn fetch_oidc_discovery(
@@ -3351,6 +3427,30 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn parse_kiro_login_metadata_accepts_cbor_payload() {
+        let body = serde_cbor::to_vec(&serde_json::json!({
+            "found": true,
+            "issuerUrl": "https://login.example.com",
+            "clientId": "client",
+            "scopes": ["openid", "profile"],
+        }))
+        .unwrap();
+        let payload = parse_kiro_login_metadata_payload_cbor(&body).unwrap();
+
+        assert!(payload.found);
+        assert_eq!(payload.client_id.as_deref(), Some("client"));
+        assert_eq!(payload.scopes.unwrap(), vec!["openid", "profile"]);
+
+        let indefinite =
+            hex::decode("bf65666f756e64f56673636f7065739f666f70656e69646770726f66696c65ffff")
+                .unwrap();
+        let payload = parse_kiro_login_metadata_payload_cbor(&indefinite).unwrap();
+
+        assert!(payload.found);
+        assert_eq!(payload.scopes.unwrap(), vec!["openid", "profile"]);
     }
 
     #[test]
