@@ -169,7 +169,7 @@ struct KiroGetLoginMetadataRequest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 struct OidcDiscoveryDocument {
     issuer: Option<String>,
     authorization_endpoint: Option<String>,
@@ -3451,6 +3451,38 @@ mod tests {
 
         assert!(payload.found);
         assert_eq!(payload.scopes.unwrap(), vec!["openid", "profile"]);
+    }
+
+    #[test]
+    fn oidc_discovery_document_parses_standard_snake_case_fields() {
+        let document: OidcDiscoveryDocument = serde_json::from_str(
+            r#"{
+                "issuer": "https://login.example.com/tenant/v2.0",
+                "authorization_endpoint": "https://login.example.com/tenant/oauth2/v2.0/authorize",
+                "token_endpoint": "https://login.example.com/tenant/oauth2/v2.0/token",
+                "response_types_supported": ["code"],
+                "code_challenge_methods_supported": ["S256"],
+                "token_endpoint_auth_methods_supported": ["none"]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            document.authorization_endpoint.as_deref(),
+            Some("https://login.example.com/tenant/oauth2/v2.0/authorize")
+        );
+        assert_eq!(
+            document.token_endpoint.as_deref(),
+            Some("https://login.example.com/tenant/oauth2/v2.0/token")
+        );
+        assert_eq!(
+            document.response_types_supported.unwrap(),
+            vec!["code".to_string()]
+        );
+        assert_eq!(
+            document.code_challenge_methods_supported.unwrap(),
+            vec!["S256".to_string()]
+        );
     }
 
     #[test]
