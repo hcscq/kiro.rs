@@ -257,6 +257,195 @@ export interface AddCredentialResponse {
   resolvedAccountType?: string | null
 }
 
+export type IdcDeviceLoginStatus =
+  | 'pending'
+  | 'completed'
+  | 'failed'
+  | 'expired'
+  | 'cancelled'
+
+export interface StartIdcDeviceLoginRequest {
+  provider: 'BuilderId' | 'Enterprise'
+  startUrl?: string
+  region?: string
+  authRegion?: string
+  apiRegion?: string
+  profileArn?: string
+  priority?: number
+  maxConcurrency?: number
+  machineId?: string
+  accountType?: string
+  sourceSupplierId?: string
+  sourceSupplierName?: string
+  sourceBatch?: string
+  proxyUrl?: string
+  proxyUsername?: string
+  proxyPassword?: string
+  proxyId?: string
+}
+
+export interface IdcDeviceLoginStartResponse {
+  sessionId: string
+  status: IdcDeviceLoginStatus
+  provider: string
+  startUrl: string
+  region: string
+  userCode: string
+  verificationUri: string
+  verificationUriComplete?: string
+  expiresAt: string
+  intervalSeconds: number
+  message?: string
+}
+
+export interface IdcDeviceLoginStatusResponse {
+  sessionId: string
+  status: IdcDeviceLoginStatus
+  provider: string
+  startUrl: string
+  region: string
+  userCode?: string
+  verificationUri?: string
+  verificationUriComplete?: string
+  expiresAt?: string
+  intervalSeconds: number
+  message?: string
+  credentialId?: number
+  email?: string
+  userId?: string
+  subscriptionTitle?: string | null
+  subscriptionType?: string | null
+  authAccountType?: 'social' | 'builder-id' | 'enterprise' | 'idc' | string | null
+  resolvedAccountType?: string | null
+}
+
+export type ExternalIdpProbeStatus =
+  | 'ok'
+  | 'not-found'
+  | 'skipped'
+  | 'failed'
+
+export interface ExternalIdpProbeRequest {
+  workEmail?: string
+  domainName?: string
+  issuerUrl?: string
+  clientId?: string
+  scopes?: string
+  audience?: string
+  probeOidc?: boolean
+  proxyUrl?: string
+  proxyUsername?: string
+  proxyPassword?: string
+  proxyId?: string
+}
+
+export interface ExternalIdpOidcDiscoverySummary {
+  issuer?: string
+  authorizationEndpoint?: string
+  tokenEndpoint?: string
+  deviceAuthorizationEndpoint?: string
+  codeChallengeMethodsSupported?: string[]
+  grantTypesSupported?: string[]
+  responseTypesSupported?: string[]
+  scopesSupported?: string[]
+  tokenEndpointAuthMethodsSupported?: string[]
+}
+
+export interface ExternalIdpProbeResponse {
+  domainName: string
+  workEmail?: string
+  kiroMetadataStatus: ExternalIdpProbeStatus
+  oidcDiscoveryStatus: ExternalIdpProbeStatus
+  found: boolean
+  issuerUrl?: string
+  clientId?: string
+  scopes?: string[]
+  audience?: string
+  oidc?: ExternalIdpOidcDiscoverySummary
+  pkceS256Supported: boolean
+  deviceCodeSupported: boolean
+  authorizationCodeSupported: boolean
+  refreshWithoutClientSecretLikelySupported: boolean
+  recommendations?: string[]
+  message?: string
+}
+
+export type ExternalIdpLoginStatus =
+  | 'pending'
+  | 'completed'
+  | 'failed'
+  | 'expired'
+  | 'cancelled'
+
+export type ExternalIdpLoginPhase =
+  | 'portal-discovery'
+  | 'idp-authorization'
+  | 'completed'
+
+export interface StartExternalIdpLoginRequest {
+  workEmail?: string
+  domainName?: string
+  issuerUrl?: string
+  clientId?: string
+  scopes?: string
+  audience?: string
+  loginHint?: string
+  callbackBaseUrl?: string
+  profileArn?: string
+  priority?: number
+  maxConcurrency?: number
+  authRegion?: string
+  apiRegion?: string
+  machineId?: string
+  accountType?: string
+  sourceSupplierId?: string
+  sourceSupplierName?: string
+  sourceBatch?: string
+  proxyUrl?: string
+  proxyUsername?: string
+  proxyPassword?: string
+  proxyId?: string
+}
+
+export interface ExternalIdpLoginStartResponse {
+  sessionId: string
+  status: ExternalIdpLoginStatus
+  phase: ExternalIdpLoginPhase
+  provider: string
+  authUrl: string
+  callbackUrl: string
+  expiresAt: string
+  intervalSeconds: number
+  issuerUrl?: string
+  clientId?: string
+  scopes?: string
+  audience?: string
+  message?: string
+}
+
+export interface ExternalIdpLoginStatusResponse {
+  sessionId: string
+  status: ExternalIdpLoginStatus
+  phase: ExternalIdpLoginPhase
+  provider: string
+  authUrl?: string
+  callbackUrl: string
+  expiresAt?: string
+  intervalSeconds: number
+  issuerUrl?: string
+  clientId?: string
+  scopes?: string
+  audience?: string
+  message?: string
+  credentialId?: number
+  email?: string
+  userId?: string
+  subscriptionTitle?: string | null
+  subscriptionType?: string | null
+  authAccountType?: 'social' | 'builder-id' | 'enterprise' | 'idc' | string | null
+  resolvedAccountType?: string | null
+}
+
 export interface RequestWeightingConfig {
   enabled: boolean
   baseWeight: number

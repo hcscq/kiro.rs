@@ -14,6 +14,14 @@ import type {
   CredentialProfilesResponse,
   AddCredentialRequest,
   AddCredentialResponse,
+  ExternalIdpProbeRequest,
+  ExternalIdpProbeResponse,
+  StartExternalIdpLoginRequest,
+  ExternalIdpLoginStartResponse,
+  ExternalIdpLoginStatusResponse,
+  StartIdcDeviceLoginRequest,
+  IdcDeviceLoginStartResponse,
+  IdcDeviceLoginStatusResponse,
   LoadBalancingConfigResponse,
   ModelCatalogResponse,
   ModelCapabilitiesConfigResponse,
@@ -281,6 +289,72 @@ export async function addCredential(
   req: AddCredentialRequest
 ): Promise<AddCredentialResponse> {
   const { data } = await api.post<AddCredentialResponse>('/credentials', req)
+  return data
+}
+
+export async function startIdcDeviceLogin(
+  req: StartIdcDeviceLoginRequest
+): Promise<IdcDeviceLoginStartResponse> {
+  const { data } = await api.post<IdcDeviceLoginStartResponse>(
+    '/auth/idc-device/start',
+    req
+  )
+  return data
+}
+
+export async function getIdcDeviceLoginStatus(
+  sessionId: string
+): Promise<IdcDeviceLoginStatusResponse> {
+  const { data } = await api.post<IdcDeviceLoginStatusResponse>(
+    `/auth/idc-device/${encodeURIComponent(sessionId)}/status`
+  )
+  return data
+}
+
+export async function cancelIdcDeviceLogin(
+  sessionId: string
+): Promise<IdcDeviceLoginStatusResponse> {
+  const { data } = await api.post<IdcDeviceLoginStatusResponse>(
+    `/auth/idc-device/${encodeURIComponent(sessionId)}/cancel`
+  )
+  return data
+}
+
+export async function probeExternalIdp(
+  req: ExternalIdpProbeRequest
+): Promise<ExternalIdpProbeResponse> {
+  const { data } = await api.post<ExternalIdpProbeResponse>(
+    '/auth/external-idp/probe',
+    req
+  )
+  return data
+}
+
+export async function startExternalIdpLogin(
+  req: StartExternalIdpLoginRequest
+): Promise<ExternalIdpLoginStartResponse> {
+  const { data } = await api.post<ExternalIdpLoginStartResponse>(
+    '/auth/external-idp/start',
+    req
+  )
+  return data
+}
+
+export async function getExternalIdpLoginStatus(
+  sessionId: string
+): Promise<ExternalIdpLoginStatusResponse> {
+  const { data } = await api.post<ExternalIdpLoginStatusResponse>(
+    `/auth/external-idp/${encodeURIComponent(sessionId)}/status`
+  )
+  return data
+}
+
+export async function cancelExternalIdpLogin(
+  sessionId: string
+): Promise<ExternalIdpLoginStatusResponse> {
+  const { data } = await api.post<ExternalIdpLoginStatusResponse>(
+    `/auth/external-idp/${encodeURIComponent(sessionId)}/cancel`
+  )
   return data
 }
 

@@ -1,21 +1,63 @@
 //! Admin API HTTP 处理器
 
+use std::collections::HashMap;
+
 use axum::{
     Json,
-    extract::{Path, State},
-    response::IntoResponse,
+    extract::{Path, Query, State},
+    response::{Html, IntoResponse, Redirect, Response},
 };
 
 use super::{
     middleware::AdminState,
+    service::ExternalIdpCallbackAction,
     types::{
-        AddCredentialRequest, SetCredentialModelPolicyRequest, SetCredentialProfileRequest,
-        SetCredentialProxyRequest, SetCredentialRateLimitConfigRequest, SetCredentialSourceRequest,
-        SetDisabledRequest, SetLoadBalancingModeRequest, SetMaxConcurrencyRequest,
-        SetModelCapabilitiesConfigRequest, SetOverageStatusRequest, SetPriorityRequest,
-        SuccessResponse,
+        AddCredentialRequest, ExternalIdpProbeRequest, SetCredentialModelPolicyRequest,
+        SetCredentialProfileRequest, SetCredentialProxyRequest,
+        SetCredentialRateLimitConfigRequest, SetCredentialSourceRequest, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetMaxConcurrencyRequest, SetModelCapabilitiesConfigRequest,
+        SetOverageStatusRequest, SetPriorityRequest, StartExternalIdpLoginRequest,
+        StartIdcDeviceLoginRequest, SuccessResponse,
     },
 };
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+fn external_idp_callback_html(success: bool, title: &str, message: &str) -> Html<String> {
+    let color = if success { "#166534" } else { "#991b1b" };
+    let title = html_escape(title);
+    let message = html_escape(message);
+    Html(format!(
+        r#"<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <style>
+    body {{ font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f8fafc; color: #0f172a; }}
+    main {{ width: min(520px, calc(100vw - 32px)); border: 1px solid #e2e8f0; border-radius: 8px; background: white; padding: 24px; box-shadow: 0 10px 30px rgba(15, 23, 42, 0.08); }}
+    h1 {{ margin: 0 0 12px; font-size: 20px; color: {color}; }}
+    p {{ margin: 0; line-height: 1.6; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{title}</h1>
+    <p>{message}</p>
+  </main>
+  <script>setTimeout(() => window.close(), 1200)</script>
+</body>
+</html>"#
+    ))
+}
 
 /// GET /api/admin/credentials
 /// 获取所有凭据状态
@@ -256,6 +298,108 @@ pub async fn add_credential(
     match state.service.add_credential(payload).await {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/auth/idc-device/start
+/// 启动 BuilderId / Enterprise device-code 在线登录
+pub async fn start_idc_device_login(
+    State(state): State<AdminState>,
+    Json(payload): Json<StartIdcDeviceLoginRequest>,
+) -> impl IntoResponse {
+    match state.service.start_idc_device_login(payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/auth/idc-device/:session_id/status
+/// 查询并推进 device-code 在线登录状态
+pub async fn get_idc_device_login_status(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    match state.service.get_idc_device_login_status(&session_id).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/auth/idc-device/:session_id/cancel
+/// 取消 device-code 在线登录
+pub async fn cancel_idc_device_login(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    match state.service.cancel_idc_device_login(&session_id) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/auth/external-idp/probe
+/// 探测 Kiro external IdP 组织发现和 OIDC 能力
+pub async fn probe_external_idp(
+    State(state): State<AdminState>,
+    Json(payload): Json<ExternalIdpProbeRequest>,
+) -> impl IntoResponse {
+    match state.service.probe_external_idp(payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/auth/external-idp/start
+/// 启动 External IdP 浏览器 PKCE 登录
+pub async fn start_external_idp_login(
+    State(state): State<AdminState>,
+    Json(payload): Json<StartExternalIdpLoginRequest>,
+) -> impl IntoResponse {
+    match state.service.start_external_idp_login(payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/auth/external-idp/:session_id/status
+/// 查询 External IdP 浏览器登录状态
+pub async fn get_external_idp_login_status(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    match state.service.get_external_idp_login_status(&session_id) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/auth/external-idp/:session_id/cancel
+/// 取消 External IdP 浏览器登录
+pub async fn cancel_external_idp_login(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    match state.service.cancel_external_idp_login(&session_id) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/auth/external-idp/callback
+/// 接收 Kiro portal / External IdP 浏览器回调
+pub async fn handle_external_idp_callback(
+    State(state): State<AdminState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    match state.service.handle_external_idp_callback(params).await {
+        Ok(ExternalIdpCallbackAction::Redirect(url)) => Redirect::temporary(&url).into_response(),
+        Ok(ExternalIdpCallbackAction::Html {
+            success,
+            title,
+            message,
+        }) => external_idp_callback_html(success, &title, &message).into_response(),
+        Err(e) => external_idp_callback_html(false, "External IdP 登录失败", &e.to_string())
+            .into_response(),
     }
 }
 

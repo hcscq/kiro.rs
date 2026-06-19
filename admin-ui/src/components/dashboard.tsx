@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Zap, ZapOff, Tags } from 'lucide-react'
+import { RefreshCw, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Zap, ZapOff, Tags, LogIn } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -16,6 +16,7 @@ import {
 import { CredentialCard } from '@/components/credential-card'
 import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
+import { IdcDeviceLoginDialog } from '@/components/idc-device-login-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
@@ -156,6 +157,7 @@ export function Dashboard() {
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
+  const [idcLoginDialogOpen, setIdcLoginDialogOpen] = useState(false)
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
@@ -1209,6 +1211,10 @@ export function Dashboard() {
                 <FileUp className="h-4 w-4 mr-2" />
                 Kiro Account Manager 导入
               </Button>
+              <Button onClick={() => setIdcLoginDialogOpen(true)} size="sm" variant="outline">
+                <LogIn className="h-4 w-4 mr-2" />
+                在线登录
+              </Button>
               <Button onClick={() => setBatchImportDialogOpen(true)} size="sm" variant="outline">
                 <Upload className="h-4 w-4 mr-2" />
                 批量导入
@@ -1441,6 +1447,12 @@ export function Dashboard() {
       <AddCredentialDialog
         open={addDialogOpen}
         onOpenChange={setAddDialogOpen}
+      />
+
+      {/* 在线登录对话框 */}
+      <IdcDeviceLoginDialog
+        open={idcLoginDialogOpen}
+        onOpenChange={setIdcLoginDialogOpen}
       />
 
       {/* 批量导入对话框 */}

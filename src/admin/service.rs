@@ -3,9 +3,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use chrono::Utc;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
+use crate::common::logging::summarize_upstream_error;
+use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::account_type_preset::{
@@ -18,15 +24,37 @@ use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CachedBalanceResponse,
     CredentialProfilesResponse, CredentialStatusItem, CredentialsStatusResponse,
-    LoadBalancingModeResponse, ModelCapabilitiesConfigResponse, ModelCatalogItemResponse,
-    ModelCatalogResponse, ProxyPoolConfigResponse, ProxyPoolEntryResponse,
-    SetCredentialModelPolicyRequest, SetCredentialProfileRequest, SetCredentialProxyRequest,
-    SetCredentialSourceRequest, SetLoadBalancingModeRequest, SetModelCapabilitiesConfigRequest,
-    StandardAccountTypePresetResponse,
+    ExternalIdpLoginPhase, ExternalIdpLoginStartResponse, ExternalIdpLoginStatus,
+    ExternalIdpLoginStatusResponse, ExternalIdpOidcDiscoverySummary, ExternalIdpProbeRequest,
+    ExternalIdpProbeResponse, ExternalIdpProbeStatus, IdcDeviceLoginStartResponse,
+    IdcDeviceLoginStatus, IdcDeviceLoginStatusResponse, LoadBalancingModeResponse,
+    ModelCapabilitiesConfigResponse, ModelCatalogItemResponse, ModelCatalogResponse,
+    ProxyPoolConfigResponse, ProxyPoolEntryResponse, SetCredentialModelPolicyRequest,
+    SetCredentialProfileRequest, SetCredentialProxyRequest, SetCredentialSourceRequest,
+    SetLoadBalancingModeRequest, SetModelCapabilitiesConfigRequest,
+    StandardAccountTypePresetResponse, StartExternalIdpLoginRequest, StartIdcDeviceLoginRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
+const IDC_DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
+const IDC_REFRESH_GRANT_TYPE: &str = "refresh_token";
+const BUILDER_ID_START_URL: &str = "https://view.awsapps.com/start";
+const IDC_LOGIN_SESSION_RETENTION_SECS: i64 = 15 * 60;
+const IDC_DEVICE_LOGIN_CLIENT_NAME: &str = "Kiro IDE";
+const EXTERNAL_IDP_LOGIN_SESSION_SECS: i64 = 10 * 60;
+const EXTERNAL_IDP_LOGIN_POLL_INTERVAL_SECS: u64 = 3;
+const KIRO_AUTH_PORTAL_URL: &str = "https://app.kiro.dev";
+const KIRO_WEB_PORTAL_ENDPOINT: &str = "https://app.kiro.dev/";
+const KIRO_GET_LOGIN_METADATA_TARGET: &str = "KiroWebPortalService.GetLoginMetadata";
+const UPSTREAM_ERROR_EXCERPT_CHARS: usize = 240;
+const IDC_GRANT_SCOPES: &[&str] = &[
+    "codewhisperer:completions",
+    "codewhisperer:analysis",
+    "codewhisperer:conversations",
+    "codewhisperer:transformations",
+    "codewhisperer:taskassist",
+];
 
 /// Admin 服务
 ///
@@ -35,6 +63,522 @@ pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
     balance_cache: Mutex<HashMap<u64, CachedBalanceRecord>>,
     last_balance_cache_revision: Mutex<u64>,
+    idc_device_login_sessions: Mutex<HashMap<String, IdcDeviceLoginSession>>,
+    external_idp_login_sessions: Mutex<HashMap<String, ExternalIdpLoginSession>>,
+}
+
+#[derive(Debug, Clone)]
+struct IdcDeviceLoginSession {
+    session_id: String,
+    status: IdcDeviceLoginStatus,
+    provider: String,
+    start_url: String,
+    region: String,
+    client_id: String,
+    client_secret: String,
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    verification_uri_complete: Option<String>,
+    interval_seconds: u64,
+    next_poll_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    request: StartIdcDeviceLoginRequest,
+    message: Option<String>,
+    credential_result: Option<AddCredentialResponse>,
+    polling: bool,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+struct ExternalIdpLoginSession {
+    session_id: String,
+    status: ExternalIdpLoginStatus,
+    phase: ExternalIdpLoginPhase,
+    provider: String,
+    auth_url: Option<String>,
+    callback_url: String,
+    expires_at: DateTime<Utc>,
+    request: StartExternalIdpLoginRequest,
+    portal_state: Option<String>,
+    portal_code_verifier: Option<String>,
+    idp_state: Option<String>,
+    idp_code_verifier: Option<String>,
+    issuer_url: Option<String>,
+    client_id: Option<String>,
+    scopes: Option<String>,
+    audience: Option<String>,
+    login_hint: Option<String>,
+    token_endpoint: Option<String>,
+    idp_callback_consumed: bool,
+    message: Option<String>,
+    credential_result: Option<AddCredentialResponse>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AwsClientRegistrationResponse {
+    client_id: String,
+    client_secret: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AwsStartDeviceAuthorizationResponse {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    #[serde(default)]
+    verification_uri_complete: Option<String>,
+    expires_in: i64,
+    interval: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AwsCreateTokenResponse {
+    refresh_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AwsOidcErrorResponse {
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KiroLoginMetadataPayload {
+    #[serde(default)]
+    found: bool,
+    #[serde(default)]
+    issuer_url: Option<String>,
+    #[serde(default)]
+    client_id: Option<String>,
+    #[serde(default)]
+    scopes: Option<Vec<String>>,
+    #[serde(default)]
+    audience: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OidcDiscoveryDocument {
+    issuer: Option<String>,
+    authorization_endpoint: Option<String>,
+    token_endpoint: Option<String>,
+    device_authorization_endpoint: Option<String>,
+    code_challenge_methods_supported: Option<Vec<String>>,
+    grant_types_supported: Option<Vec<String>>,
+    response_types_supported: Option<Vec<String>>,
+    scopes_supported: Option<Vec<String>>,
+    token_endpoint_auth_methods_supported: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExternalIdpAuthorizationCodeTokenResponse {
+    refresh_token: Option<String>,
+}
+
+#[derive(Debug)]
+enum DeviceTokenPollResult {
+    Pending,
+    SlowDown,
+    Expired(String),
+    Failed(String),
+    Completed(AwsCreateTokenResponse),
+}
+
+fn normalize_optional_string(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn normalize_idc_device_provider(provider: &str) -> Result<String, AdminServiceError> {
+    let provider = provider.trim();
+    if provider.eq_ignore_ascii_case("builderid")
+        || provider.eq_ignore_ascii_case("builder-id")
+        || provider.eq_ignore_ascii_case("builder id")
+    {
+        return Ok("BuilderId".to_string());
+    }
+    if provider.eq_ignore_ascii_case("enterprise") {
+        return Ok("Enterprise".to_string());
+    }
+    Err(AdminServiceError::InvalidCredential(
+        "在线登录当前仅支持 BuilderId 或 Enterprise".to_string(),
+    ))
+}
+
+fn resolve_idc_device_start_url(
+    provider: &str,
+    start_url: Option<&str>,
+) -> Result<String, AdminServiceError> {
+    if provider.eq_ignore_ascii_case("BuilderId") {
+        return Ok(start_url.unwrap_or(BUILDER_ID_START_URL).trim().to_string());
+    }
+
+    let Some(start_url) = start_url.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Err(AdminServiceError::InvalidCredential(
+            "Enterprise 在线登录必须提供 IAM Identity Center Start URL".to_string(),
+        ));
+    };
+    let parsed = url::Url::parse(start_url)
+        .map_err(|err| AdminServiceError::InvalidCredential(format!("Start URL 无效: {err}")))?;
+    if parsed.scheme() != "https" {
+        return Err(AdminServiceError::InvalidCredential(
+            "Start URL 必须使用 https".to_string(),
+        ));
+    }
+    Ok(start_url.to_string())
+}
+
+fn normalize_domain_name(domain: &str) -> Result<String, AdminServiceError> {
+    let domain = domain.trim().trim_start_matches('@').to_ascii_lowercase();
+    if domain.is_empty()
+        || domain.contains(char::is_whitespace)
+        || domain.contains('/')
+        || domain.contains(':')
+        || domain.starts_with('.')
+        || domain.ends_with('.')
+        || !domain.contains('.')
+    {
+        return Err(AdminServiceError::InvalidCredential(
+            "External IdP 探测需要有效的工作邮箱或域名".to_string(),
+        ));
+    }
+    Ok(domain)
+}
+
+fn domain_from_work_email(email: &str) -> Result<String, AdminServiceError> {
+    let email = email.trim();
+    let Some((local, domain)) = email.rsplit_once('@') else {
+        return Err(AdminServiceError::InvalidCredential(
+            "工作邮箱格式无效".to_string(),
+        ));
+    };
+    if local.trim().is_empty() {
+        return Err(AdminServiceError::InvalidCredential(
+            "工作邮箱格式无效".to_string(),
+        ));
+    }
+    normalize_domain_name(domain)
+}
+
+fn resolve_external_idp_probe_domain(
+    req: &ExternalIdpProbeRequest,
+) -> Result<String, AdminServiceError> {
+    if let Some(email) = req
+        .work_email
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return domain_from_work_email(email);
+    }
+    if let Some(domain) = req
+        .domain_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return normalize_domain_name(domain);
+    }
+    if req
+        .issuer_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+    {
+        return Ok("direct-issuer".to_string());
+    }
+    Err(AdminServiceError::InvalidCredential(
+        "External IdP 探测需要 workEmail、domainName 或 issuerUrl".to_string(),
+    ))
+}
+
+fn normalize_scope_list_from_str(value: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    for scope in value.split_whitespace().map(str::trim) {
+        if !scope.is_empty() && !result.iter().any(|existing| existing == scope) {
+            result.push(scope.to_string());
+        }
+    }
+    result
+}
+
+fn normalize_scope_list(values: Option<Vec<String>>) -> Vec<String> {
+    let mut result = Vec::new();
+    for value in values.unwrap_or_default() {
+        for scope in normalize_scope_list_from_str(&value) {
+            if !result.iter().any(|existing| existing == &scope) {
+                result.push(scope);
+            }
+        }
+    }
+    result
+}
+
+fn normalize_optional_url(
+    value: Option<&str>,
+    label: &str,
+) -> Result<Option<String>, AdminServiceError> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let parsed = url::Url::parse(value)
+        .map_err(|err| AdminServiceError::InvalidCredential(format!("{label} 无效: {err}")))?;
+    if parsed.scheme() != "https" {
+        return Err(AdminServiceError::InvalidCredential(format!(
+            "{label} 必须使用 https"
+        )));
+    }
+    Ok(Some(value.trim_end_matches('/').to_string()))
+}
+
+fn oidc_discovery_url(issuer_url: &str) -> Result<String, AdminServiceError> {
+    let issuer_url = normalize_optional_url(Some(issuer_url), "Issuer URL")?
+        .ok_or_else(|| AdminServiceError::InvalidCredential("Issuer URL 不能为空".to_string()))?;
+    Ok(format!("{issuer_url}/.well-known/openid-configuration"))
+}
+
+fn parse_kiro_login_metadata_payload(
+    body: &str,
+) -> Result<KiroLoginMetadataPayload, AdminServiceError> {
+    let value: serde_json::Value = serde_json::from_str(body).map_err(|err| {
+        AdminServiceError::UpstreamError(format!("解析 GetLoginMetadata 响应失败: {err}"))
+    })?;
+    let payload = value.get("Output").unwrap_or(&value).clone();
+    if let Some(error_type) = payload
+        .get("__type")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+    {
+        return Err(AdminServiceError::UpstreamError(format!(
+            "GetLoginMetadata 返回错误: {error_type}"
+        )));
+    }
+    serde_json::from_value(payload).map_err(|err| {
+        AdminServiceError::UpstreamError(format!("解析 GetLoginMetadata 响应失败: {err}"))
+    })
+}
+
+fn string_list_contains(values: &[String], expected: &str) -> bool {
+    values
+        .iter()
+        .any(|value| value.trim().eq_ignore_ascii_case(expected))
+}
+
+fn aws_oidc_error_message(body: &str) -> String {
+    if let Ok(parsed) = serde_json::from_str::<AwsOidcErrorResponse>(body) {
+        if let Some(description) = parsed.error_description.filter(|value| !value.is_empty()) {
+            return description;
+        }
+        if let Some(error) = parsed.error.filter(|value| !value.is_empty()) {
+            return error;
+        }
+    }
+    if body.trim().is_empty() {
+        "空响应".to_string()
+    } else {
+        body.trim().chars().take(500).collect()
+    }
+}
+
+fn idc_device_login_status_response(
+    session: &IdcDeviceLoginSession,
+) -> IdcDeviceLoginStatusResponse {
+    let credential = session.credential_result.as_ref();
+    IdcDeviceLoginStatusResponse {
+        session_id: session.session_id.clone(),
+        status: session.status,
+        provider: session.provider.clone(),
+        start_url: session.start_url.clone(),
+        region: session.region.clone(),
+        user_code: (session.status == IdcDeviceLoginStatus::Pending)
+            .then(|| session.user_code.clone()),
+        verification_uri: (session.status == IdcDeviceLoginStatus::Pending)
+            .then(|| session.verification_uri.clone()),
+        verification_uri_complete: (session.status == IdcDeviceLoginStatus::Pending)
+            .then(|| session.verification_uri_complete.clone())
+            .flatten(),
+        expires_at: (session.status == IdcDeviceLoginStatus::Pending).then_some(session.expires_at),
+        interval_seconds: session.interval_seconds,
+        message: session.message.clone(),
+        credential_id: credential.map(|value| value.credential_id),
+        email: credential.and_then(|value| value.email.clone()),
+        user_id: credential.and_then(|value| value.user_id.clone()),
+        subscription_title: credential.and_then(|value| value.subscription_title.clone()),
+        subscription_type: credential.and_then(|value| value.subscription_type.clone()),
+        auth_account_type: credential.and_then(|value| value.auth_account_type.clone()),
+        resolved_account_type: credential.and_then(|value| value.resolved_account_type.clone()),
+    }
+}
+
+fn external_idp_login_status_response(
+    session: &ExternalIdpLoginSession,
+) -> ExternalIdpLoginStatusResponse {
+    let credential = session.credential_result.as_ref();
+    ExternalIdpLoginStatusResponse {
+        session_id: session.session_id.clone(),
+        status: session.status,
+        phase: session.phase,
+        provider: session.provider.clone(),
+        auth_url: (session.status == ExternalIdpLoginStatus::Pending)
+            .then(|| session.auth_url.clone())
+            .flatten(),
+        callback_url: session.callback_url.clone(),
+        expires_at: (session.status == ExternalIdpLoginStatus::Pending)
+            .then_some(session.expires_at),
+        interval_seconds: EXTERNAL_IDP_LOGIN_POLL_INTERVAL_SECS,
+        issuer_url: session.issuer_url.clone(),
+        client_id: session.client_id.clone(),
+        scopes: session.scopes.clone(),
+        audience: session.audience.clone(),
+        message: session.message.clone(),
+        credential_id: credential.map(|value| value.credential_id),
+        email: credential.and_then(|value| value.email.clone()),
+        user_id: credential.and_then(|value| value.user_id.clone()),
+        subscription_title: credential.and_then(|value| value.subscription_title.clone()),
+        subscription_type: credential.and_then(|value| value.subscription_type.clone()),
+        auth_account_type: credential.and_then(|value| value.auth_account_type.clone()),
+        resolved_account_type: credential.and_then(|value| value.resolved_account_type.clone()),
+    }
+}
+
+fn random_urlsafe_bytes(len: usize) -> Result<String, AdminServiceError> {
+    let mut bytes = vec![0_u8; len];
+    getrandom::getrandom(&mut bytes).map_err(|err| {
+        AdminServiceError::InternalError(format!("生成 OAuth 随机参数失败: {err}"))
+    })?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn random_oauth_state() -> Result<String, AdminServiceError> {
+    random_urlsafe_bytes(32)
+}
+
+fn random_pkce_code_verifier() -> Result<String, AdminServiceError> {
+    random_urlsafe_bytes(32)
+}
+
+fn pkce_s256_challenge(code_verifier: &str) -> String {
+    let digest = Sha256::digest(code_verifier.as_bytes());
+    URL_SAFE_NO_PAD.encode(digest)
+}
+
+fn normalize_scope_string_with_offline_access(value: &str) -> Result<String, AdminServiceError> {
+    let mut scopes = normalize_scope_list_from_str(value);
+    if scopes.is_empty() {
+        return Err(AdminServiceError::InvalidCredential(
+            "ExternalIdP 登录必须提供 scopes".to_string(),
+        ));
+    }
+    if !scopes
+        .iter()
+        .any(|scope| scope.eq_ignore_ascii_case("offline_access"))
+    {
+        scopes.push("offline_access".to_string());
+    }
+    Ok(scopes.join(" "))
+}
+
+fn resolve_external_idp_callback_url(
+    callback_base_url: Option<&str>,
+) -> Result<String, AdminServiceError> {
+    let Some(callback_base_url) = callback_base_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Err(AdminServiceError::InvalidCredential(
+            "ExternalIdP 登录需要 callbackBaseUrl".to_string(),
+        ));
+    };
+
+    let parsed = url::Url::parse(callback_base_url).map_err(|err| {
+        AdminServiceError::InvalidCredential(format!("callbackBaseUrl 无效: {err}"))
+    })?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err(AdminServiceError::InvalidCredential(
+            "callbackBaseUrl 必须使用 http 或 https".to_string(),
+        ));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(AdminServiceError::InvalidCredential(
+            "callbackBaseUrl 不能包含用户名或密码".to_string(),
+        ));
+    }
+
+    let origin = parsed.origin().ascii_serialization();
+    Ok(format!(
+        "{}/api/admin/auth/external-idp/callback",
+        origin.trim_end_matches('/')
+    ))
+}
+
+fn build_kiro_portal_auth_url(
+    state: &str,
+    code_challenge: &str,
+    redirect_uri: &str,
+) -> Result<String, AdminServiceError> {
+    let mut url = url::Url::parse(KIRO_AUTH_PORTAL_URL)
+        .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+    url.set_path("signin");
+    url.query_pairs_mut()
+        .append_pair("state", state)
+        .append_pair("code_challenge", code_challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("redirect_from", "KiroIDE");
+    Ok(url.to_string())
+}
+
+fn build_external_idp_authorization_url(
+    authorization_endpoint: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    scopes: &str,
+    state: &str,
+    code_challenge: &str,
+    login_hint: Option<&str>,
+    audience: Option<&str>,
+) -> Result<String, AdminServiceError> {
+    let mut url = url::Url::parse(authorization_endpoint).map_err(|err| {
+        AdminServiceError::InvalidCredential(format!("authorization_endpoint 无效: {err}"))
+    })?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs
+            .append_pair("client_id", client_id)
+            .append_pair("redirect_uri", redirect_uri)
+            .append_pair("response_type", "code")
+            .append_pair("scope", scopes)
+            .append_pair("code_challenge", code_challenge)
+            .append_pair("code_challenge_method", "S256")
+            .append_pair("response_mode", "query")
+            .append_pair("state", state);
+        if let Some(login_hint) = login_hint.map(str::trim).filter(|value| !value.is_empty()) {
+            pairs.append_pair("login_hint", login_hint);
+        }
+        if let Some(audience) = audience.map(str::trim).filter(|value| !value.is_empty()) {
+            pairs.append_pair("audience", audience);
+        }
+    }
+    Ok(url.to_string())
+}
+
+#[derive(Debug)]
+pub enum ExternalIdpCallbackAction {
+    Redirect(String),
+    Html {
+        success: bool,
+        title: String,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +609,8 @@ impl AdminService {
             token_manager,
             balance_cache: Mutex::new(balance_cache),
             last_balance_cache_revision: Mutex::new(balance_cache_revision),
+            idc_device_login_sessions: Mutex::new(HashMap::new()),
+            external_idp_login_sessions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -183,6 +729,1415 @@ impl AdminService {
             current_id,
             credentials,
         })
+    }
+
+    /// 探测 Kiro external IdP 组织发现和 OIDC 能力
+    pub async fn probe_external_idp(
+        &self,
+        mut req: ExternalIdpProbeRequest,
+    ) -> Result<ExternalIdpProbeResponse, AdminServiceError> {
+        req.work_email = normalize_optional_string(req.work_email.as_deref());
+        req.domain_name = normalize_optional_string(req.domain_name.as_deref());
+        req.issuer_url = normalize_optional_string(req.issuer_url.as_deref());
+        req.client_id = normalize_optional_string(req.client_id.as_deref());
+        req.audience = normalize_optional_string(req.audience.as_deref());
+        req.proxy_url = normalize_optional_string(req.proxy_url.as_deref());
+        req.proxy_username = normalize_optional_string(req.proxy_username.as_deref());
+        req.proxy_password = normalize_optional_string(req.proxy_password.as_deref());
+        req.proxy_id = normalize_optional_string(req.proxy_id.as_deref());
+
+        let domain_name = resolve_external_idp_probe_domain(&req)?;
+        let config = self.token_manager.config();
+        let proxy = self.login_proxy_for_external_idp_probe(&req)?;
+        let client = build_client(proxy.as_ref(), 60, config.tls_backend)
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+
+        let mut kiro_metadata_status = ExternalIdpProbeStatus::Skipped;
+        let mut oidc_discovery_status = ExternalIdpProbeStatus::Skipped;
+        let mut found = false;
+        let mut issuer_url = normalize_optional_url(req.issuer_url.as_deref(), "Issuer URL")?;
+        let mut client_id = req.client_id.clone();
+        let mut scopes = req
+            .scopes
+            .as_deref()
+            .map(normalize_scope_list_from_str)
+            .unwrap_or_default();
+        let mut audience = req.audience.clone();
+        let mut oidc = None;
+        let mut recommendations = Vec::new();
+        let mut message = None;
+
+        if domain_name != "direct-issuer" {
+            match self.fetch_kiro_login_metadata(&client, &domain_name).await {
+                Ok(metadata) => {
+                    found = metadata.found;
+                    if metadata.found {
+                        kiro_metadata_status = ExternalIdpProbeStatus::Ok;
+                        if issuer_url.is_none() {
+                            issuer_url = normalize_optional_url(
+                                metadata.issuer_url.as_deref(),
+                                "Issuer URL",
+                            )?;
+                        }
+                        if client_id.is_none() {
+                            client_id = normalize_optional_string(metadata.client_id.as_deref());
+                        }
+                        if scopes.is_empty() {
+                            scopes = normalize_scope_list(metadata.scopes);
+                        }
+                        if audience.is_none() {
+                            audience = normalize_optional_string(metadata.audience.as_deref());
+                        }
+                    } else {
+                        kiro_metadata_status = ExternalIdpProbeStatus::NotFound;
+                        message = Some("Kiro 未发现该域名的组织登录 metadata".to_string());
+                        recommendations
+                            .push("确认该工作邮箱域名已在 Kiro 组织登录中配置".to_string());
+                    }
+                }
+                Err(err) => {
+                    kiro_metadata_status = ExternalIdpProbeStatus::Failed;
+                    message = Some(err.to_string());
+                    recommendations.push(
+                        "需要用 Kiro IDE 或浏览器开发者工具抓取 GetLoginMetadata 的实际请求路径/headers"
+                            .to_string(),
+                    );
+                }
+            }
+        } else {
+            recommendations.push("已跳过 Kiro 组织发现，仅测试手动提供的 OIDC issuer".to_string());
+        }
+
+        if let Some(issuer) = issuer_url.as_deref() {
+            if req.probe_oidc {
+                match self.fetch_oidc_discovery(&client, issuer).await {
+                    Ok(summary) => {
+                        oidc_discovery_status = ExternalIdpProbeStatus::Ok;
+                        oidc = Some(summary);
+                    }
+                    Err(err) => {
+                        oidc_discovery_status = ExternalIdpProbeStatus::Failed;
+                        if message.is_none() {
+                            message = Some(err.to_string());
+                        }
+                        recommendations.push(
+                            "OIDC discovery 失败时需要确认 issuerUrl 是否可公网访问且指向 .well-known/openid-configuration 的上级 issuer".to_string(),
+                        );
+                    }
+                }
+            } else {
+                recommendations.push("已按请求跳过 OIDC discovery".to_string());
+            }
+        } else {
+            recommendations
+                .push("缺少 issuerUrl，无法测试 PKCE/token/device-code 能力".to_string());
+        }
+
+        if client_id.is_none() {
+            recommendations.push("缺少 clientId，后续无法构造 PKCE authorization URL".to_string());
+        }
+        if scopes.is_empty() {
+            recommendations
+                .push("缺少 scopes，后续需要从 Kiro metadata 或手动配置补齐".to_string());
+        }
+
+        let authorization_code_supported = oidc.as_ref().is_some_and(|summary| {
+            string_list_contains(&summary.response_types_supported, "code")
+                || summary.response_types_supported.iter().any(|value| {
+                    value
+                        .split_whitespace()
+                        .any(|part| part.eq_ignore_ascii_case("code"))
+                })
+        });
+        let pkce_s256_supported = oidc.as_ref().is_some_and(|summary| {
+            summary.authorization_endpoint.is_some()
+                && summary.token_endpoint.is_some()
+                && string_list_contains(&summary.code_challenge_methods_supported, "S256")
+        });
+        let device_code_supported = oidc
+            .as_ref()
+            .is_some_and(|summary| summary.device_authorization_endpoint.is_some());
+        let refresh_without_client_secret_likely_supported = oidc.as_ref().is_some_and(|summary| {
+            string_list_contains(&summary.token_endpoint_auth_methods_supported, "none")
+        });
+
+        if oidc_discovery_status == ExternalIdpProbeStatus::Ok {
+            if !authorization_code_supported {
+                recommendations.push(
+                    "OIDC metadata 未明确支持 authorization_code/code response，PKCE 登录需实测"
+                        .to_string(),
+                );
+            }
+            if !pkce_s256_supported {
+                recommendations.push("OIDC metadata 未明确支持 PKCE S256".to_string());
+            }
+            if !device_code_supported {
+                recommendations
+                    .push("未发现 device_authorization_endpoint，External IdP device-code 不可作为默认方案".to_string());
+            }
+            if !refresh_without_client_secret_likely_supported {
+                recommendations.push(
+                    "token_endpoint_auth_methods_supported 未包含 none；当前 external_idp 刷新不发送 client_secret，需要端到端验证 refresh_token 是否可用".to_string(),
+                );
+            }
+            if pkce_s256_supported && client_id.is_some() && !scopes.is_empty() {
+                recommendations
+                    .push("可以进入浏览器 PKCE 回调测试；密码只在组织 IdP 页面输入".to_string());
+            }
+        }
+
+        Ok(ExternalIdpProbeResponse {
+            domain_name,
+            work_email: req.work_email,
+            kiro_metadata_status,
+            oidc_discovery_status,
+            found,
+            issuer_url,
+            client_id,
+            scopes,
+            audience,
+            oidc,
+            pkce_s256_supported,
+            device_code_supported,
+            authorization_code_supported,
+            refresh_without_client_secret_likely_supported,
+            recommendations,
+            message,
+        })
+    }
+
+    /// 启动 External IdP 浏览器 PKCE 登录
+    pub async fn start_external_idp_login(
+        &self,
+        mut req: StartExternalIdpLoginRequest,
+    ) -> Result<ExternalIdpLoginStartResponse, AdminServiceError> {
+        self.ensure_runtime_write_leader()?;
+        self.prune_external_idp_login_sessions();
+
+        req.work_email = normalize_optional_string(req.work_email.as_deref());
+        req.domain_name = normalize_optional_string(req.domain_name.as_deref());
+        req.issuer_url = normalize_optional_string(req.issuer_url.as_deref());
+        req.client_id = normalize_optional_string(req.client_id.as_deref());
+        req.scopes = req
+            .scopes
+            .as_deref()
+            .map(normalize_scope_string_with_offline_access)
+            .transpose()?;
+        req.audience = normalize_optional_string(req.audience.as_deref());
+        req.login_hint =
+            normalize_optional_string(req.login_hint.as_deref()).or_else(|| req.work_email.clone());
+        req.callback_base_url = normalize_optional_string(req.callback_base_url.as_deref());
+        req.profile_arn = normalize_optional_string(req.profile_arn.as_deref());
+        req.auth_region = normalize_optional_string(req.auth_region.as_deref());
+        req.api_region = normalize_optional_string(req.api_region.as_deref());
+        req.machine_id = normalize_optional_string(req.machine_id.as_deref());
+        req.account_type = normalize_optional_string(req.account_type.as_deref());
+        req.source_supplier_id = normalize_optional_string(req.source_supplier_id.as_deref());
+        req.source_supplier_name = normalize_optional_string(req.source_supplier_name.as_deref());
+        req.source_batch = normalize_optional_string(req.source_batch.as_deref());
+        req.proxy_url = normalize_optional_string(req.proxy_url.as_deref());
+        req.proxy_username = normalize_optional_string(req.proxy_username.as_deref());
+        req.proxy_password = normalize_optional_string(req.proxy_password.as_deref());
+        req.proxy_id = normalize_optional_string(req.proxy_id.as_deref());
+
+        if let Some(email) = req.work_email.as_deref() {
+            let _ = domain_from_work_email(email)?;
+        } else if let Some(domain) = req.domain_name.as_deref() {
+            let _ = normalize_domain_name(domain)?;
+        }
+
+        let callback_url = resolve_external_idp_callback_url(req.callback_base_url.as_deref())?;
+        let config = self.token_manager.config();
+        let proxy = self.login_proxy_for_external_idp_login(&req)?;
+        let client = build_client(proxy.as_ref(), 60, config.tls_backend)
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+
+        let now = Utc::now();
+        let expires_at = now + Duration::seconds(EXTERNAL_IDP_LOGIN_SESSION_SECS);
+        let session_id = Uuid::new_v4().to_string();
+        let direct_idp =
+            req.issuer_url.is_some() && req.client_id.is_some() && req.scopes.is_some();
+
+        let mut session = ExternalIdpLoginSession {
+            session_id: session_id.clone(),
+            status: ExternalIdpLoginStatus::Pending,
+            phase: if direct_idp {
+                ExternalIdpLoginPhase::IdpAuthorization
+            } else {
+                ExternalIdpLoginPhase::PortalDiscovery
+            },
+            provider: "ExternalIdp".to_string(),
+            auth_url: None,
+            callback_url: callback_url.clone(),
+            expires_at,
+            request: req.clone(),
+            portal_state: None,
+            portal_code_verifier: None,
+            idp_state: None,
+            idp_code_verifier: None,
+            issuer_url: req.issuer_url.clone(),
+            client_id: req.client_id.clone(),
+            scopes: req.scopes.clone(),
+            audience: req.audience.clone(),
+            login_hint: req.login_hint.clone(),
+            token_endpoint: None,
+            idp_callback_consumed: false,
+            message: None,
+            credential_result: None,
+            updated_at: now,
+        };
+
+        if direct_idp {
+            self.prepare_external_idp_authorization(&client, &mut session)
+                .await?;
+        } else {
+            let portal_state = random_oauth_state()?;
+            let portal_code_verifier = random_pkce_code_verifier()?;
+            let code_challenge = pkce_s256_challenge(&portal_code_verifier);
+            let auth_url =
+                build_kiro_portal_auth_url(&portal_state, &code_challenge, &callback_url)?;
+            session.portal_state = Some(portal_state);
+            session.portal_code_verifier = Some(portal_code_verifier);
+            session.auth_url = Some(auth_url);
+            session.message = Some("等待 Kiro portal 返回组织 External IdP metadata".to_string());
+        }
+
+        let auth_url = session.auth_url.clone().ok_or_else(|| {
+            AdminServiceError::InternalError("ExternalIdP 登录 URL 未生成".to_string())
+        })?;
+        let response = ExternalIdpLoginStartResponse {
+            session_id: session.session_id.clone(),
+            status: session.status,
+            phase: session.phase,
+            provider: session.provider.clone(),
+            auth_url,
+            callback_url: session.callback_url.clone(),
+            expires_at: session.expires_at,
+            interval_seconds: EXTERNAL_IDP_LOGIN_POLL_INTERVAL_SECS,
+            issuer_url: session.issuer_url.clone(),
+            client_id: session.client_id.clone(),
+            scopes: session.scopes.clone(),
+            audience: session.audience.clone(),
+            message: session.message.clone(),
+        };
+
+        self.external_idp_login_sessions
+            .lock()
+            .insert(session_id, session);
+
+        Ok(response)
+    }
+
+    /// 查询 External IdP 浏览器登录状态
+    pub fn get_external_idp_login_status(
+        &self,
+        session_id: &str,
+    ) -> Result<ExternalIdpLoginStatusResponse, AdminServiceError> {
+        self.ensure_runtime_write_leader()?;
+        self.prune_external_idp_login_sessions();
+
+        let mut sessions = self.external_idp_login_sessions.lock();
+        let session = sessions.get_mut(session_id).ok_or_else(|| {
+            AdminServiceError::InvalidCredential("ExternalIdP 登录会话不存在或已过期".to_string())
+        })?;
+        if session.status == ExternalIdpLoginStatus::Pending && Utc::now() >= session.expires_at {
+            session.status = ExternalIdpLoginStatus::Expired;
+            session.message = Some("ExternalIdP 登录会话已过期，请重新开始登录".to_string());
+            session.updated_at = Utc::now();
+        }
+        Ok(external_idp_login_status_response(session))
+    }
+
+    /// 取消 External IdP 浏览器登录
+    pub fn cancel_external_idp_login(
+        &self,
+        session_id: &str,
+    ) -> Result<ExternalIdpLoginStatusResponse, AdminServiceError> {
+        self.ensure_runtime_write_leader()?;
+        let mut sessions = self.external_idp_login_sessions.lock();
+        let session = sessions.get_mut(session_id).ok_or_else(|| {
+            AdminServiceError::InvalidCredential("ExternalIdP 登录会话不存在或已过期".to_string())
+        })?;
+        if session.status == ExternalIdpLoginStatus::Pending {
+            session.status = ExternalIdpLoginStatus::Cancelled;
+            session.message = Some("ExternalIdP 登录已取消".to_string());
+            session.updated_at = Utc::now();
+        }
+        Ok(external_idp_login_status_response(session))
+    }
+
+    /// 处理 Kiro portal 或 External IdP 的浏览器回调
+    pub async fn handle_external_idp_callback(
+        &self,
+        params: HashMap<String, String>,
+    ) -> Result<ExternalIdpCallbackAction, AdminServiceError> {
+        self.ensure_runtime_write_leader()?;
+        self.prune_external_idp_login_sessions();
+
+        let state = params
+            .get("state")
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                AdminServiceError::InvalidCredential("OAuth 回调缺少 state".to_string())
+            })?
+            .to_string();
+
+        if let Some(error) = params
+            .get("error")
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let description = params
+                .get("error_description")
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(error);
+            self.fail_external_idp_session_by_state(&state, description);
+            return Ok(ExternalIdpCallbackAction::Html {
+                success: false,
+                title: "External IdP 登录失败".to_string(),
+                message: description.to_string(),
+            });
+        }
+
+        let session = self.clone_external_idp_session_by_state(&state)?;
+        if session.portal_state.as_deref() == Some(state.as_str())
+            && session.phase == ExternalIdpLoginPhase::PortalDiscovery
+        {
+            self.handle_external_idp_portal_callback(session, params)
+                .await
+        } else if session.idp_state.as_deref() == Some(state.as_str())
+            && session.phase == ExternalIdpLoginPhase::IdpAuthorization
+        {
+            self.handle_external_idp_authorization_callback(session, params)
+                .await
+        } else {
+            Err(AdminServiceError::InvalidCredential(
+                "OAuth 回调 state 与登录阶段不匹配".to_string(),
+            ))
+        }
+    }
+
+    /// 启动 AWS IdC device-code 在线登录
+    pub async fn start_idc_device_login(
+        &self,
+        mut req: StartIdcDeviceLoginRequest,
+    ) -> Result<IdcDeviceLoginStartResponse, AdminServiceError> {
+        self.ensure_runtime_write_leader()?;
+        self.prune_idc_device_login_sessions();
+
+        let provider = normalize_idc_device_provider(&req.provider)?;
+        req.provider = provider.clone();
+        req.start_url = normalize_optional_string(req.start_url.as_deref());
+        req.region = normalize_optional_string(req.region.as_deref());
+        req.auth_region = normalize_optional_string(req.auth_region.as_deref());
+        req.api_region = normalize_optional_string(req.api_region.as_deref());
+        req.profile_arn = normalize_optional_string(req.profile_arn.as_deref());
+        req.machine_id = normalize_optional_string(req.machine_id.as_deref());
+        req.account_type = normalize_optional_string(req.account_type.as_deref());
+        req.source_supplier_id = normalize_optional_string(req.source_supplier_id.as_deref());
+        req.source_supplier_name = normalize_optional_string(req.source_supplier_name.as_deref());
+        req.source_batch = normalize_optional_string(req.source_batch.as_deref());
+        req.proxy_url = normalize_optional_string(req.proxy_url.as_deref());
+        req.proxy_username = normalize_optional_string(req.proxy_username.as_deref());
+        req.proxy_password = normalize_optional_string(req.proxy_password.as_deref());
+        req.proxy_id = normalize_optional_string(req.proxy_id.as_deref());
+
+        let start_url = resolve_idc_device_start_url(&provider, req.start_url.as_deref())?;
+        req.start_url = Some(start_url.clone());
+
+        let config = self.token_manager.config();
+        let region = req
+            .auth_region
+            .as_deref()
+            .or(req.region.as_deref())
+            .unwrap_or_else(|| config.effective_auth_region())
+            .trim()
+            .to_string();
+        if region.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "登录 region 不能为空".to_string(),
+            ));
+        }
+
+        let proxy = self.login_proxy_for_request(&req)?;
+        let client = build_client(proxy.as_ref(), 60, config.tls_backend)
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+
+        let client_registration = self
+            .register_idc_device_client(&client, &region, &start_url)
+            .await?;
+        let device_authorization = self
+            .start_idc_device_authorization(
+                &client,
+                &region,
+                &client_registration.client_id,
+                &client_registration.client_secret,
+                &start_url,
+            )
+            .await?;
+
+        let now = Utc::now();
+        let interval_seconds = device_authorization.interval.unwrap_or(5).max(1);
+        let expires_at = now + Duration::seconds(device_authorization.expires_in.max(1));
+        let session_id = Uuid::new_v4().to_string();
+        let session = IdcDeviceLoginSession {
+            session_id: session_id.clone(),
+            status: IdcDeviceLoginStatus::Pending,
+            provider: provider.clone(),
+            start_url: start_url.clone(),
+            region: region.clone(),
+            client_id: client_registration.client_id,
+            client_secret: client_registration.client_secret,
+            device_code: device_authorization.device_code,
+            user_code: device_authorization.user_code.clone(),
+            verification_uri: device_authorization.verification_uri.clone(),
+            verification_uri_complete: device_authorization.verification_uri_complete.clone(),
+            interval_seconds,
+            next_poll_at: now,
+            expires_at,
+            request: req,
+            message: Some("等待用户完成授权".to_string()),
+            credential_result: None,
+            polling: false,
+            updated_at: now,
+        };
+
+        self.idc_device_login_sessions
+            .lock()
+            .insert(session_id.clone(), session);
+
+        Ok(IdcDeviceLoginStartResponse {
+            session_id,
+            status: IdcDeviceLoginStatus::Pending,
+            provider,
+            start_url,
+            region,
+            user_code: device_authorization.user_code,
+            verification_uri: device_authorization.verification_uri,
+            verification_uri_complete: device_authorization.verification_uri_complete,
+            expires_at,
+            interval_seconds,
+            message: Some("等待用户完成授权".to_string()),
+        })
+    }
+
+    /// 查询并推进 AWS IdC device-code 在线登录状态
+    pub async fn get_idc_device_login_status(
+        &self,
+        session_id: &str,
+    ) -> Result<IdcDeviceLoginStatusResponse, AdminServiceError> {
+        self.ensure_runtime_write_leader()?;
+        self.prune_idc_device_login_sessions();
+
+        let poll_session = {
+            let mut sessions = self.idc_device_login_sessions.lock();
+            let session = sessions.get_mut(session_id).ok_or_else(|| {
+                AdminServiceError::InvalidCredential("登录会话不存在或已过期".to_string())
+            })?;
+
+            if session.status != IdcDeviceLoginStatus::Pending {
+                return Ok(idc_device_login_status_response(session));
+            }
+
+            let now = Utc::now();
+            if now >= session.expires_at {
+                session.status = IdcDeviceLoginStatus::Expired;
+                session.message = Some("授权码已过期，请重新开始登录".to_string());
+                session.updated_at = now;
+                return Ok(idc_device_login_status_response(session));
+            }
+
+            if session.polling || now < session.next_poll_at {
+                return Ok(idc_device_login_status_response(session));
+            }
+
+            session.polling = true;
+            session.updated_at = now;
+            session.clone()
+        };
+
+        let config = self.token_manager.config();
+        let proxy = self.login_proxy_for_request(&poll_session.request)?;
+        let client = build_client(proxy.as_ref(), 60, config.tls_backend)
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        let poll_result = self.poll_idc_device_token(&client, &poll_session).await;
+
+        match poll_result {
+            Ok(DeviceTokenPollResult::Pending) => {
+                let mut sessions = self.idc_device_login_sessions.lock();
+                let session = sessions.get_mut(session_id).ok_or_else(|| {
+                    AdminServiceError::InvalidCredential("登录会话不存在或已过期".to_string())
+                })?;
+                session.polling = false;
+                session.next_poll_at =
+                    Utc::now() + Duration::seconds(session.interval_seconds as i64);
+                session.message = Some("等待用户完成授权".to_string());
+                session.updated_at = Utc::now();
+                Ok(idc_device_login_status_response(session))
+            }
+            Ok(DeviceTokenPollResult::SlowDown) => {
+                let mut sessions = self.idc_device_login_sessions.lock();
+                let session = sessions.get_mut(session_id).ok_or_else(|| {
+                    AdminServiceError::InvalidCredential("登录会话不存在或已过期".to_string())
+                })?;
+                session.polling = false;
+                session.interval_seconds = session.interval_seconds.saturating_add(5).max(1);
+                session.next_poll_at =
+                    Utc::now() + Duration::seconds(session.interval_seconds as i64);
+                session.message = Some("AWS 要求降低轮询频率，继续等待授权".to_string());
+                session.updated_at = Utc::now();
+                Ok(idc_device_login_status_response(session))
+            }
+            Ok(DeviceTokenPollResult::Expired(message)) => {
+                let mut sessions = self.idc_device_login_sessions.lock();
+                let session = sessions.get_mut(session_id).ok_or_else(|| {
+                    AdminServiceError::InvalidCredential("登录会话不存在或已过期".to_string())
+                })?;
+                session.polling = false;
+                session.status = IdcDeviceLoginStatus::Expired;
+                session.message = Some(message);
+                session.updated_at = Utc::now();
+                Ok(idc_device_login_status_response(session))
+            }
+            Ok(DeviceTokenPollResult::Failed(message)) => {
+                let mut sessions = self.idc_device_login_sessions.lock();
+                let session = sessions.get_mut(session_id).ok_or_else(|| {
+                    AdminServiceError::InvalidCredential("登录会话不存在或已过期".to_string())
+                })?;
+                session.polling = false;
+                session.status = IdcDeviceLoginStatus::Failed;
+                session.message = Some(message);
+                session.updated_at = Utc::now();
+                Ok(idc_device_login_status_response(session))
+            }
+            Ok(DeviceTokenPollResult::Completed(token)) => {
+                let add_req = self.build_idc_device_add_credential_request(&poll_session, token);
+                match self.add_credential(add_req).await {
+                    Ok(add_response) => {
+                        let mut sessions = self.idc_device_login_sessions.lock();
+                        let session = sessions.get_mut(session_id).ok_or_else(|| {
+                            AdminServiceError::InvalidCredential(
+                                "登录会话不存在或已过期".to_string(),
+                            )
+                        })?;
+                        session.polling = false;
+                        session.status = IdcDeviceLoginStatus::Completed;
+                        session.message = Some(add_response.message.clone());
+                        session.credential_result = Some(add_response);
+                        session.updated_at = Utc::now();
+                        Ok(idc_device_login_status_response(session))
+                    }
+                    Err(err) => {
+                        let mut sessions = self.idc_device_login_sessions.lock();
+                        if let Some(session) = sessions.get_mut(session_id) {
+                            session.polling = false;
+                            session.status = IdcDeviceLoginStatus::Failed;
+                            session.message = Some(err.to_string());
+                            session.updated_at = Utc::now();
+                            return Ok(idc_device_login_status_response(session));
+                        }
+                        Err(err)
+                    }
+                }
+            }
+            Err(err) => {
+                let mut sessions = self.idc_device_login_sessions.lock();
+                if let Some(session) = sessions.get_mut(session_id) {
+                    session.polling = false;
+                    session.next_poll_at =
+                        Utc::now() + Duration::seconds(session.interval_seconds as i64);
+                    session.message = Some(err.to_string());
+                    session.updated_at = Utc::now();
+                    return Ok(idc_device_login_status_response(session));
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// 取消 AWS IdC device-code 在线登录
+    pub fn cancel_idc_device_login(
+        &self,
+        session_id: &str,
+    ) -> Result<IdcDeviceLoginStatusResponse, AdminServiceError> {
+        self.ensure_runtime_write_leader()?;
+        let mut sessions = self.idc_device_login_sessions.lock();
+        let session = sessions.get_mut(session_id).ok_or_else(|| {
+            AdminServiceError::InvalidCredential("登录会话不存在或已过期".to_string())
+        })?;
+        if session.status == IdcDeviceLoginStatus::Pending {
+            session.status = IdcDeviceLoginStatus::Cancelled;
+            session.message = Some("登录已取消".to_string());
+            session.polling = false;
+            session.updated_at = Utc::now();
+        }
+        Ok(idc_device_login_status_response(session))
+    }
+
+    fn prune_idc_device_login_sessions(&self) {
+        let now = Utc::now();
+        self.idc_device_login_sessions.lock().retain(|_, session| {
+            let stale_terminal = session.status != IdcDeviceLoginStatus::Pending
+                && now - session.updated_at > Duration::seconds(IDC_LOGIN_SESSION_RETENTION_SECS);
+            let stale_pending = session.status == IdcDeviceLoginStatus::Pending
+                && now - session.expires_at > Duration::seconds(IDC_LOGIN_SESSION_RETENTION_SECS);
+            !(stale_terminal || stale_pending)
+        });
+    }
+
+    fn prune_external_idp_login_sessions(&self) {
+        let now = Utc::now();
+        self.external_idp_login_sessions
+            .lock()
+            .retain(|_, session| {
+                let stale_terminal = session.status != ExternalIdpLoginStatus::Pending
+                    && now - session.updated_at
+                        > Duration::seconds(IDC_LOGIN_SESSION_RETENTION_SECS);
+                let stale_pending = session.status == ExternalIdpLoginStatus::Pending
+                    && now - session.expires_at
+                        > Duration::seconds(IDC_LOGIN_SESSION_RETENTION_SECS);
+                !(stale_terminal || stale_pending)
+            });
+    }
+
+    fn clone_external_idp_session_by_state(
+        &self,
+        state: &str,
+    ) -> Result<ExternalIdpLoginSession, AdminServiceError> {
+        let sessions = self.external_idp_login_sessions.lock();
+        sessions
+            .values()
+            .find(|session| {
+                session.portal_state.as_deref() == Some(state)
+                    || session.idp_state.as_deref() == Some(state)
+            })
+            .cloned()
+            .ok_or_else(|| {
+                AdminServiceError::InvalidCredential(
+                    "ExternalIdP 登录会话不存在、已过期或 state 无效".to_string(),
+                )
+            })
+    }
+
+    fn fail_external_idp_session_by_state(&self, state: &str, message: &str) {
+        let mut sessions = self.external_idp_login_sessions.lock();
+        if let Some(session) = sessions.values_mut().find(|session| {
+            session.portal_state.as_deref() == Some(state)
+                || session.idp_state.as_deref() == Some(state)
+        }) {
+            session.status = ExternalIdpLoginStatus::Failed;
+            session.message = Some(message.to_string());
+            session.updated_at = Utc::now();
+        }
+    }
+
+    fn fail_external_idp_session_by_id(&self, session_id: &str, message: &str) {
+        let mut sessions = self.external_idp_login_sessions.lock();
+        if let Some(session) = sessions.get_mut(session_id) {
+            session.status = ExternalIdpLoginStatus::Failed;
+            session.message = Some(message.to_string());
+            session.updated_at = Utc::now();
+        }
+    }
+
+    async fn prepare_external_idp_authorization(
+        &self,
+        client: &reqwest::Client,
+        session: &mut ExternalIdpLoginSession,
+    ) -> Result<(), AdminServiceError> {
+        let issuer_url = normalize_optional_url(session.issuer_url.as_deref(), "Issuer URL")?
+            .ok_or_else(|| {
+                AdminServiceError::InvalidCredential("ExternalIdP 登录缺少 issuerUrl".to_string())
+            })?;
+        let client_id =
+            normalize_optional_string(session.client_id.as_deref()).ok_or_else(|| {
+                AdminServiceError::InvalidCredential("ExternalIdP 登录缺少 clientId".to_string())
+            })?;
+        let scopes = normalize_scope_string_with_offline_access(
+            session.scopes.as_deref().unwrap_or_default(),
+        )?;
+
+        let discovery = self.fetch_oidc_discovery(client, &issuer_url).await?;
+        let authorization_endpoint = discovery.authorization_endpoint.clone().ok_or_else(|| {
+            AdminServiceError::InvalidCredential(
+                "OIDC discovery 未返回 authorization_endpoint".to_string(),
+            )
+        })?;
+        let token_endpoint = discovery.token_endpoint.clone().ok_or_else(|| {
+            AdminServiceError::InvalidCredential("OIDC discovery 未返回 token_endpoint".to_string())
+        })?;
+
+        let state = random_oauth_state()?;
+        let code_verifier = random_pkce_code_verifier()?;
+        let code_challenge = pkce_s256_challenge(&code_verifier);
+        let auth_url = build_external_idp_authorization_url(
+            &authorization_endpoint,
+            &client_id,
+            &session.callback_url,
+            &scopes,
+            &state,
+            &code_challenge,
+            session.login_hint.as_deref(),
+            session.audience.as_deref(),
+        )?;
+
+        session.phase = ExternalIdpLoginPhase::IdpAuthorization;
+        session.auth_url = Some(auth_url);
+        session.idp_state = Some(state);
+        session.idp_code_verifier = Some(code_verifier);
+        session.issuer_url = Some(issuer_url);
+        session.client_id = Some(client_id);
+        session.scopes = Some(scopes);
+        session.token_endpoint = Some(token_endpoint);
+        session.message = Some("等待用户在组织 IdP 页面完成登录".to_string());
+        session.updated_at = Utc::now();
+        Ok(())
+    }
+
+    async fn handle_external_idp_portal_callback(
+        &self,
+        mut session: ExternalIdpLoginSession,
+        params: HashMap<String, String>,
+    ) -> Result<ExternalIdpCallbackAction, AdminServiceError> {
+        if Utc::now() >= session.expires_at {
+            self.fail_external_idp_session_by_id(&session.session_id, "ExternalIdP 登录会话已过期");
+            return Ok(ExternalIdpCallbackAction::Html {
+                success: false,
+                title: "External IdP 登录已过期".to_string(),
+                message: "请回到管理页面重新开始登录".to_string(),
+            });
+        }
+
+        let login_option = params
+            .get("login_option")
+            .map(String::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        if !login_option.eq_ignore_ascii_case("external_idp") {
+            let message = if login_option.is_empty() {
+                "Kiro portal 回调缺少 login_option".to_string()
+            } else {
+                format!("当前流程只支持 external_idp，收到 login_option={login_option}")
+            };
+            self.fail_external_idp_session_by_id(&session.session_id, &message);
+            return Ok(ExternalIdpCallbackAction::Html {
+                success: false,
+                title: "External IdP 登录失败".to_string(),
+                message,
+            });
+        }
+
+        session.issuer_url =
+            normalize_optional_url(params.get("issuer_url").map(String::as_str), "Issuer URL")?
+                .or(session.issuer_url);
+        session.client_id = normalize_optional_string(params.get("client_id").map(String::as_str))
+            .or(session.client_id);
+        session.scopes = params
+            .get("scopes")
+            .map(String::as_str)
+            .map(normalize_scope_string_with_offline_access)
+            .transpose()?
+            .or(session.scopes);
+        session.login_hint =
+            normalize_optional_string(params.get("login_hint").map(String::as_str))
+                .or(session.login_hint);
+        session.audience = normalize_optional_string(params.get("audience").map(String::as_str))
+            .or(session.audience);
+
+        let config = self.token_manager.config();
+        let proxy = self.login_proxy_for_external_idp_login(&session.request)?;
+        let client = build_client(proxy.as_ref(), 60, config.tls_backend)
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        self.prepare_external_idp_authorization(&client, &mut session)
+            .await?;
+
+        let auth_url = session.auth_url.clone().ok_or_else(|| {
+            AdminServiceError::InternalError("ExternalIdP 登录 URL 未生成".to_string())
+        })?;
+
+        let mut sessions = self.external_idp_login_sessions.lock();
+        let current = sessions.get_mut(&session.session_id).ok_or_else(|| {
+            AdminServiceError::InvalidCredential("ExternalIdP 登录会话不存在或已过期".to_string())
+        })?;
+        if current.status != ExternalIdpLoginStatus::Pending {
+            return Ok(ExternalIdpCallbackAction::Html {
+                success: false,
+                title: "External IdP 登录已结束".to_string(),
+                message: current
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| "当前登录会话已结束".to_string()),
+            });
+        }
+        *current = session;
+
+        Ok(ExternalIdpCallbackAction::Redirect(auth_url))
+    }
+
+    async fn handle_external_idp_authorization_callback(
+        &self,
+        session: ExternalIdpLoginSession,
+        params: HashMap<String, String>,
+    ) -> Result<ExternalIdpCallbackAction, AdminServiceError> {
+        let code = params
+            .get("code")
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| AdminServiceError::InvalidCredential("OAuth 回调缺少 code".to_string()))?
+            .to_string();
+
+        let exchange_session = {
+            let mut sessions = self.external_idp_login_sessions.lock();
+            let current = sessions.get_mut(&session.session_id).ok_or_else(|| {
+                AdminServiceError::InvalidCredential(
+                    "ExternalIdP 登录会话不存在或已过期".to_string(),
+                )
+            })?;
+            if current.status != ExternalIdpLoginStatus::Pending {
+                return Ok(ExternalIdpCallbackAction::Html {
+                    success: current.status == ExternalIdpLoginStatus::Completed,
+                    title: "External IdP 登录已结束".to_string(),
+                    message: current
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| "当前登录会话已结束".to_string()),
+                });
+            }
+            if Utc::now() >= current.expires_at {
+                current.status = ExternalIdpLoginStatus::Expired;
+                current.message = Some("ExternalIdP 登录会话已过期，请重新开始登录".to_string());
+                current.updated_at = Utc::now();
+                return Ok(ExternalIdpCallbackAction::Html {
+                    success: false,
+                    title: "External IdP 登录已过期".to_string(),
+                    message: "请回到管理页面重新开始登录".to_string(),
+                });
+            }
+            if current.idp_callback_consumed {
+                return Ok(ExternalIdpCallbackAction::Html {
+                    success: false,
+                    title: "External IdP 回调已处理".to_string(),
+                    message: "请回到管理页面查看登录状态".to_string(),
+                });
+            }
+            current.idp_callback_consumed = true;
+            current.message = Some("已收到授权码，正在交换 token".to_string());
+            current.updated_at = Utc::now();
+            current.clone()
+        };
+
+        let result: Result<AddCredentialResponse, AdminServiceError> = async {
+            let config = self.token_manager.config();
+            let proxy = self.login_proxy_for_external_idp_login(&exchange_session.request)?;
+            let client = build_client(proxy.as_ref(), 60, config.tls_backend)
+                .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+            let token = self
+                .exchange_external_idp_authorization_code(&client, &exchange_session, &code)
+                .await?;
+            let add_req = self.build_external_idp_add_credential_request(&exchange_session, token);
+            self.add_credential(add_req).await
+        }
+        .await;
+
+        match result {
+            Ok(add_response) => {
+                let message = add_response.message.clone();
+                let mut sessions = self.external_idp_login_sessions.lock();
+                if let Some(current) = sessions.get_mut(&session.session_id) {
+                    current.status = ExternalIdpLoginStatus::Completed;
+                    current.phase = ExternalIdpLoginPhase::Completed;
+                    current.message = Some(message.clone());
+                    current.credential_result = Some(add_response);
+                    current.updated_at = Utc::now();
+                }
+                Ok(ExternalIdpCallbackAction::Html {
+                    success: true,
+                    title: "External IdP 登录完成".to_string(),
+                    message,
+                })
+            }
+            Err(err) => {
+                let message = err.to_string();
+                self.fail_external_idp_session_by_id(&session.session_id, &message);
+                Ok(ExternalIdpCallbackAction::Html {
+                    success: false,
+                    title: "External IdP 登录失败".to_string(),
+                    message,
+                })
+            }
+        }
+    }
+
+    fn login_proxy_for_request(
+        &self,
+        req: &StartIdcDeviceLoginRequest,
+    ) -> Result<Option<ProxyConfig>, AdminServiceError> {
+        self.login_proxy_for_values(
+            req.proxy_url.clone(),
+            req.proxy_username.clone(),
+            req.proxy_password.clone(),
+            req.proxy_id.clone(),
+        )
+    }
+
+    fn login_proxy_for_external_idp_probe(
+        &self,
+        req: &ExternalIdpProbeRequest,
+    ) -> Result<Option<ProxyConfig>, AdminServiceError> {
+        self.login_proxy_for_values(
+            req.proxy_url.clone(),
+            req.proxy_username.clone(),
+            req.proxy_password.clone(),
+            req.proxy_id.clone(),
+        )
+    }
+
+    fn login_proxy_for_external_idp_login(
+        &self,
+        req: &StartExternalIdpLoginRequest,
+    ) -> Result<Option<ProxyConfig>, AdminServiceError> {
+        self.login_proxy_for_values(
+            req.proxy_url.clone(),
+            req.proxy_username.clone(),
+            req.proxy_password.clone(),
+            req.proxy_id.clone(),
+        )
+    }
+
+    fn login_proxy_for_values(
+        &self,
+        proxy_url: Option<String>,
+        proxy_username: Option<String>,
+        proxy_password: Option<String>,
+        proxy_id: Option<String>,
+    ) -> Result<Option<ProxyConfig>, AdminServiceError> {
+        let credentials = KiroCredentials {
+            proxy_url,
+            proxy_username,
+            proxy_password,
+            proxy_id,
+            ..Default::default()
+        };
+        self.token_manager
+            .effective_proxy_for_credentials(&credentials)
+            .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))
+    }
+
+    async fn fetch_kiro_login_metadata(
+        &self,
+        client: &reqwest::Client,
+        domain_name: &str,
+    ) -> Result<KiroLoginMetadataPayload, AdminServiceError> {
+        let response = client
+            .post(KIRO_WEB_PORTAL_ENDPOINT)
+            .header("content-type", "application/x-amz-json-1.0")
+            .header("x-amz-target", KIRO_GET_LOGIN_METADATA_TARGET)
+            .header("accept", "application/json")
+            .json(&serde_json::json!({ "domainName": domain_name }))
+            .send()
+            .await
+            .map_err(|err| {
+                AdminServiceError::UpstreamError(format!("GetLoginMetadata 请求失败: {err}"))
+            })?;
+
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            let message =
+                summarize_upstream_error(status.as_u16(), &text, UPSTREAM_ERROR_EXCERPT_CHARS);
+            return Err(AdminServiceError::UpstreamError(format!(
+                "GetLoginMetadata 失败 ({status}): {message}"
+            )));
+        }
+
+        parse_kiro_login_metadata_payload(&text)
+    }
+
+    async fn fetch_oidc_discovery(
+        &self,
+        client: &reqwest::Client,
+        issuer_url: &str,
+    ) -> Result<ExternalIdpOidcDiscoverySummary, AdminServiceError> {
+        let discovery_url = oidc_discovery_url(issuer_url)?;
+        let response = client
+            .get(discovery_url)
+            .header("accept", "application/json")
+            .send()
+            .await
+            .map_err(|err| {
+                AdminServiceError::UpstreamError(format!("OIDC discovery 请求失败: {err}"))
+            })?;
+
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            let message =
+                summarize_upstream_error(status.as_u16(), &text, UPSTREAM_ERROR_EXCERPT_CHARS);
+            return Err(AdminServiceError::UpstreamError(format!(
+                "OIDC discovery 失败 ({status}): {message}"
+            )));
+        }
+
+        let document: OidcDiscoveryDocument = serde_json::from_str(&text).map_err(|err| {
+            AdminServiceError::UpstreamError(format!("解析 OIDC discovery 响应失败: {err}"))
+        })?;
+
+        Ok(ExternalIdpOidcDiscoverySummary {
+            issuer: normalize_optional_string(document.issuer.as_deref()),
+            authorization_endpoint: normalize_optional_string(
+                document.authorization_endpoint.as_deref(),
+            ),
+            token_endpoint: normalize_optional_string(document.token_endpoint.as_deref()),
+            device_authorization_endpoint: normalize_optional_string(
+                document.device_authorization_endpoint.as_deref(),
+            ),
+            code_challenge_methods_supported: document
+                .code_challenge_methods_supported
+                .unwrap_or_default(),
+            grant_types_supported: document.grant_types_supported.unwrap_or_default(),
+            response_types_supported: document.response_types_supported.unwrap_or_default(),
+            scopes_supported: document.scopes_supported.unwrap_or_default(),
+            token_endpoint_auth_methods_supported: document
+                .token_endpoint_auth_methods_supported
+                .unwrap_or_default(),
+        })
+    }
+
+    async fn exchange_external_idp_authorization_code(
+        &self,
+        client: &reqwest::Client,
+        session: &ExternalIdpLoginSession,
+        code: &str,
+    ) -> Result<ExternalIdpAuthorizationCodeTokenResponse, AdminServiceError> {
+        let token_endpoint = session
+            .token_endpoint
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                AdminServiceError::InvalidCredential(
+                    "ExternalIdP token exchange 缺少 tokenEndpoint".to_string(),
+                )
+            })?;
+        let client_id = session
+            .client_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                AdminServiceError::InvalidCredential(
+                    "ExternalIdP token exchange 缺少 clientId".to_string(),
+                )
+            })?;
+        let code_verifier = session
+            .idp_code_verifier
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                AdminServiceError::InvalidCredential(
+                    "ExternalIdP token exchange 缺少 PKCE verifier".to_string(),
+                )
+            })?;
+
+        let form = [
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", session.callback_url.as_str()),
+            ("client_id", client_id),
+            ("code_verifier", code_verifier),
+        ];
+
+        let response = client
+            .post(token_endpoint)
+            .header("accept", "application/json")
+            .form(&form)
+            .send()
+            .await
+            .map_err(|err| {
+                AdminServiceError::UpstreamError(format!(
+                    "ExternalIdP token exchange 请求失败: {err}"
+                ))
+            })?;
+
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            let message =
+                summarize_upstream_error(status.as_u16(), &text, UPSTREAM_ERROR_EXCERPT_CHARS);
+            return Err(AdminServiceError::UpstreamError(format!(
+                "ExternalIdP token exchange 失败 ({status}): {message}"
+            )));
+        }
+
+        let token: ExternalIdpAuthorizationCodeTokenResponse = serde_json::from_str(&text)
+            .map_err(|err| {
+                AdminServiceError::UpstreamError(format!(
+                    "解析 ExternalIdP token exchange 响应失败: {err}"
+                ))
+            })?;
+        if token
+            .refresh_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none()
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "ExternalIdP 未返回 refresh_token；需要 IdP 允许 offline_access/refresh token"
+                    .to_string(),
+            ));
+        }
+
+        Ok(token)
+    }
+
+    async fn register_idc_device_client(
+        &self,
+        client: &reqwest::Client,
+        region: &str,
+        start_url: &str,
+    ) -> Result<AwsClientRegistrationResponse, AdminServiceError> {
+        let url = format!("https://oidc.{region}.amazonaws.com/client/register");
+        let scopes: Vec<_> = IDC_GRANT_SCOPES
+            .iter()
+            .map(|scope| (*scope).to_string())
+            .collect();
+        let body = serde_json::json!({
+            "clientName": IDC_DEVICE_LOGIN_CLIENT_NAME,
+            "clientType": "public",
+            "scopes": scopes,
+            "grantTypes": [IDC_DEVICE_GRANT_TYPE, IDC_REFRESH_GRANT_TYPE],
+            "issuerUrl": start_url
+        });
+        self.post_aws_oidc_json(client, region, &url, body, "RegisterClient")
+            .await
+    }
+
+    async fn start_idc_device_authorization(
+        &self,
+        client: &reqwest::Client,
+        region: &str,
+        client_id: &str,
+        client_secret: &str,
+        start_url: &str,
+    ) -> Result<AwsStartDeviceAuthorizationResponse, AdminServiceError> {
+        let url = format!("https://oidc.{region}.amazonaws.com/device_authorization");
+        let body = serde_json::json!({
+            "clientId": client_id,
+            "clientSecret": client_secret,
+            "startUrl": start_url
+        });
+        self.post_aws_oidc_json(client, region, &url, body, "StartDeviceAuthorization")
+            .await
+    }
+
+    async fn poll_idc_device_token(
+        &self,
+        client: &reqwest::Client,
+        session: &IdcDeviceLoginSession,
+    ) -> Result<DeviceTokenPollResult, AdminServiceError> {
+        let url = format!("https://oidc.{}.amazonaws.com/token", session.region);
+        let body = serde_json::json!({
+            "clientId": session.client_id,
+            "clientSecret": session.client_secret,
+            "grantType": IDC_DEVICE_GRANT_TYPE,
+            "deviceCode": session.device_code
+        });
+
+        let response = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("x-amz-user-agent", "aws-sdk-js/3.980.0 KiroIDE")
+            .header("user-agent", self.aws_sso_user_agent())
+            .header("host", format!("oidc.{}.amazonaws.com", session.region))
+            .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
+            .header("amz-sdk-request", "attempt=1; max=4")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|err| {
+                AdminServiceError::UpstreamError(format!("CreateToken 请求失败: {err}"))
+            })?;
+
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        if status.is_success() {
+            let token = serde_json::from_str::<AwsCreateTokenResponse>(&text).map_err(|err| {
+                AdminServiceError::UpstreamError(format!("解析 CreateToken 响应失败: {err}"))
+            })?;
+            return Ok(DeviceTokenPollResult::Completed(token));
+        }
+
+        let parsed_error = serde_json::from_str::<AwsOidcErrorResponse>(&text).ok();
+        let code = parsed_error
+            .as_ref()
+            .and_then(|value| value.error.as_deref())
+            .unwrap_or_default();
+        let description = parsed_error
+            .as_ref()
+            .and_then(|value| value.error_description.as_deref())
+            .unwrap_or_else(|| text.as_str());
+
+        match code {
+            "authorization_pending" => Ok(DeviceTokenPollResult::Pending),
+            "slow_down" => Ok(DeviceTokenPollResult::SlowDown),
+            "expired_token" => Ok(DeviceTokenPollResult::Expired(
+                "授权码已过期，请重新开始登录".to_string(),
+            )),
+            "access_denied" => Ok(DeviceTokenPollResult::Failed(
+                "用户拒绝了授权请求".to_string(),
+            )),
+            _ => Ok(DeviceTokenPollResult::Failed(format!(
+                "CreateToken 失败 ({status}): {description}"
+            ))),
+        }
+    }
+
+    async fn post_aws_oidc_json<T>(
+        &self,
+        client: &reqwest::Client,
+        region: &str,
+        url: &str,
+        body: serde_json::Value,
+        api: &'static str,
+    ) -> Result<T, AdminServiceError>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        let response = client
+            .post(url)
+            .header("content-type", "application/json")
+            .header("x-amz-user-agent", "aws-sdk-js/3.980.0 KiroIDE")
+            .header("user-agent", self.aws_sso_user_agent())
+            .header("host", format!("oidc.{region}.amazonaws.com"))
+            .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
+            .header("amz-sdk-request", "attempt=1; max=4")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|err| AdminServiceError::UpstreamError(format!("{api} 请求失败: {err}")))?;
+
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            let message = aws_oidc_error_message(&text);
+            let full = format!("{api} 失败 ({status}): {message}");
+            if status.as_u16() == 400 {
+                return Err(AdminServiceError::InvalidCredential(full));
+            }
+            return Err(AdminServiceError::UpstreamError(full));
+        }
+
+        serde_json::from_str(&text)
+            .map_err(|err| AdminServiceError::UpstreamError(format!("解析 {api} 响应失败: {err}")))
+    }
+
+    fn aws_sso_user_agent(&self) -> String {
+        let config = self.token_manager.config();
+        format!(
+            "aws-sdk-js/3.980.0 ua/2.1 os/{} lang/js md/nodejs#{} api/sso-oidc#3.980.0 m/E KiroIDE",
+            config.system_version, config.node_version
+        )
+    }
+
+    fn build_idc_device_add_credential_request(
+        &self,
+        session: &IdcDeviceLoginSession,
+        token: AwsCreateTokenResponse,
+    ) -> AddCredentialRequest {
+        let req = &session.request;
+        AddCredentialRequest {
+            refresh_token: token.refresh_token,
+            auth_method: "idc".to_string(),
+            provider: Some(session.provider.clone()),
+            profile_arn: req.profile_arn.clone(),
+            client_id: Some(session.client_id.clone()),
+            client_secret: Some(session.client_secret.clone()),
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
+            audience: None,
+            priority: req.priority,
+            max_concurrency: req.max_concurrency,
+            rate_limit_cooldown_enabled: None,
+            rate_limit_bucket_capacity: None,
+            rate_limit_refill_per_second: None,
+            region: Some(req.region.clone().unwrap_or_else(|| session.region.clone())),
+            auth_region: req.auth_region.clone(),
+            api_region: req.api_region.clone(),
+            machine_id: req.machine_id.clone(),
+            start_url: if session.provider.eq_ignore_ascii_case("Enterprise") {
+                Some(session.start_url.clone())
+            } else {
+                None
+            },
+            email: None,
+            user_id: None,
+            account_type: req.account_type.clone(),
+            source_supplier_id: req.source_supplier_id.clone(),
+            source_supplier_name: req.source_supplier_name.clone(),
+            source_batch: req.source_batch.clone(),
+            allowed_models: None,
+            blocked_models: None,
+            available_model_ids: None,
+            proxy_url: req.proxy_url.clone(),
+            proxy_username: req.proxy_username.clone(),
+            proxy_password: req.proxy_password.clone(),
+            proxy_id: req.proxy_id.clone(),
+        }
+    }
+
+    fn build_external_idp_add_credential_request(
+        &self,
+        session: &ExternalIdpLoginSession,
+        token: ExternalIdpAuthorizationCodeTokenResponse,
+    ) -> AddCredentialRequest {
+        let req = &session.request;
+        AddCredentialRequest {
+            refresh_token: token.refresh_token.unwrap_or_default(),
+            auth_method: "external_idp".to_string(),
+            provider: Some("ExternalIdp".to_string()),
+            profile_arn: req.profile_arn.clone(),
+            client_id: session.client_id.clone(),
+            client_secret: None,
+            token_endpoint: session.token_endpoint.clone(),
+            issuer_url: session.issuer_url.clone(),
+            scopes: session.scopes.clone(),
+            audience: session.audience.clone(),
+            priority: req.priority,
+            max_concurrency: req.max_concurrency,
+            rate_limit_cooldown_enabled: None,
+            rate_limit_bucket_capacity: None,
+            rate_limit_refill_per_second: None,
+            region: None,
+            auth_region: req.auth_region.clone(),
+            api_region: req.api_region.clone(),
+            machine_id: req.machine_id.clone(),
+            start_url: None,
+            email: req
+                .work_email
+                .clone()
+                .or_else(|| session.login_hint.clone()),
+            user_id: None,
+            account_type: req.account_type.clone(),
+            source_supplier_id: req.source_supplier_id.clone(),
+            source_supplier_name: req.source_supplier_name.clone(),
+            source_batch: req.source_batch.clone(),
+            allowed_models: None,
+            blocked_models: None,
+            available_model_ids: None,
+            proxy_url: req.proxy_url.clone(),
+            proxy_username: req.proxy_username.clone(),
+            proxy_password: req.proxy_password.clone(),
+            proxy_id: req.proxy_id.clone(),
+        }
     }
 
     /// 设置凭据禁用状态
@@ -1257,6 +3212,212 @@ mod tests {
         credentials.access_token = Some("token-1".to_string());
         credentials.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
         credentials
+    }
+
+    #[test]
+    fn normalize_idc_device_provider_accepts_builder_aliases() {
+        assert_eq!(
+            normalize_idc_device_provider("builder-id").unwrap(),
+            "BuilderId"
+        );
+        assert_eq!(
+            normalize_idc_device_provider("Builder ID").unwrap(),
+            "BuilderId"
+        );
+        assert_eq!(
+            normalize_idc_device_provider("enterprise").unwrap(),
+            "Enterprise"
+        );
+        assert!(normalize_idc_device_provider("Google").is_err());
+    }
+
+    #[test]
+    fn resolve_idc_device_start_url_requires_enterprise_url() {
+        assert_eq!(
+            resolve_idc_device_start_url("BuilderId", None).unwrap(),
+            BUILDER_ID_START_URL
+        );
+        assert!(resolve_idc_device_start_url("Enterprise", None).is_err());
+        assert!(
+            resolve_idc_device_start_url("Enterprise", Some("http://example.com/start")).is_err()
+        );
+        assert_eq!(
+            resolve_idc_device_start_url(
+                "Enterprise",
+                Some("https://d-1234567890.awsapps.com/start")
+            )
+            .unwrap(),
+            "https://d-1234567890.awsapps.com/start"
+        );
+    }
+
+    #[test]
+    fn external_idp_probe_domain_accepts_work_email_or_domain() {
+        assert_eq!(
+            domain_from_work_email("User@Example.COM").unwrap(),
+            "example.com"
+        );
+        assert_eq!(
+            normalize_domain_name("@Example.COM").unwrap(),
+            "example.com"
+        );
+        assert!(domain_from_work_email("missing-at").is_err());
+        assert!(normalize_domain_name("https://example.com").is_err());
+    }
+
+    #[test]
+    fn external_idp_scopes_append_offline_access_once() {
+        assert_eq!(
+            normalize_scope_string_with_offline_access("openid profile").unwrap(),
+            "openid profile offline_access"
+        );
+        assert_eq!(
+            normalize_scope_string_with_offline_access("openid offline_access profile").unwrap(),
+            "openid offline_access profile"
+        );
+        assert!(normalize_scope_string_with_offline_access("   ").is_err());
+    }
+
+    #[test]
+    fn external_idp_callback_url_uses_origin() {
+        assert_eq!(
+            resolve_external_idp_callback_url(Some("https://example.com/admin?x=1")).unwrap(),
+            "https://example.com/api/admin/auth/external-idp/callback"
+        );
+        assert_eq!(
+            resolve_external_idp_callback_url(Some("http://127.0.0.1:3000")).unwrap(),
+            "http://127.0.0.1:3000/api/admin/auth/external-idp/callback"
+        );
+        assert!(resolve_external_idp_callback_url(Some("ftp://example.com")).is_err());
+        assert!(resolve_external_idp_callback_url(Some("https://user@example.com")).is_err());
+    }
+
+    #[test]
+    fn external_idp_authorization_url_contains_pkce_parameters() {
+        let url = build_external_idp_authorization_url(
+            "https://login.example.com/oauth2/v1/authorize?existing=1",
+            "client-1",
+            "https://proxy.example.com/api/admin/auth/external-idp/callback",
+            "openid profile offline_access",
+            "state-1",
+            "challenge-1",
+            Some("user@example.com"),
+            Some("aud-1"),
+        )
+        .unwrap();
+        let parsed = url::Url::parse(&url).unwrap();
+        let pairs: HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+
+        assert_eq!(pairs.get("existing").map(String::as_str), Some("1"));
+        assert_eq!(pairs.get("client_id").map(String::as_str), Some("client-1"));
+        assert_eq!(pairs.get("response_type").map(String::as_str), Some("code"));
+        assert_eq!(
+            pairs.get("scope").map(String::as_str),
+            Some("openid profile offline_access")
+        );
+        assert_eq!(
+            pairs.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
+        assert_eq!(
+            pairs.get("login_hint").map(String::as_str),
+            Some("user@example.com")
+        );
+        assert_eq!(pairs.get("audience").map(String::as_str), Some("aud-1"));
+    }
+
+    #[test]
+    fn parse_kiro_login_metadata_accepts_direct_and_wrapped_payloads() {
+        let direct = parse_kiro_login_metadata_payload(
+            r#"{"found":true,"issuerUrl":"https://login.example.com","clientId":"client","scopes":["openid","email profile"],"audience":"aud"}"#,
+        )
+        .unwrap();
+        assert!(direct.found);
+        assert_eq!(
+            direct.issuer_url.as_deref(),
+            Some("https://login.example.com")
+        );
+        assert_eq!(direct.client_id.as_deref(), Some("client"));
+        assert_eq!(direct.scopes.unwrap().len(), 2);
+
+        let wrapped =
+            parse_kiro_login_metadata_payload(r#"{"Output":{"found":false},"Version":"1.0"}"#)
+                .unwrap();
+        assert!(!wrapped.found);
+
+        assert!(
+            parse_kiro_login_metadata_payload(
+                r#"{"Output":{"__type":"com.amazon.coral.service#UnknownOperationException"}}"#,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn idc_device_login_status_response_hides_codes_after_completion() {
+        let now = Utc::now();
+        let session = IdcDeviceLoginSession {
+            session_id: "session-1".to_string(),
+            status: IdcDeviceLoginStatus::Completed,
+            provider: "BuilderId".to_string(),
+            start_url: BUILDER_ID_START_URL.to_string(),
+            region: "us-east-1".to_string(),
+            client_id: "client".to_string(),
+            client_secret: "secret".to_string(),
+            device_code: "device".to_string(),
+            user_code: "USER-CODE".to_string(),
+            verification_uri: "https://device.sso.aws.amazon.com/".to_string(),
+            verification_uri_complete: Some(
+                "https://device.sso.aws.amazon.com/?user_code=USER-CODE".to_string(),
+            ),
+            interval_seconds: 5,
+            next_poll_at: now,
+            expires_at: now + Duration::minutes(10),
+            request: StartIdcDeviceLoginRequest {
+                provider: "BuilderId".to_string(),
+                start_url: None,
+                region: None,
+                auth_region: None,
+                api_region: None,
+                profile_arn: None,
+                priority: 0,
+                max_concurrency: None,
+                machine_id: None,
+                account_type: None,
+                source_supplier_id: None,
+                source_supplier_name: None,
+                source_batch: None,
+                proxy_url: None,
+                proxy_username: None,
+                proxy_password: None,
+                proxy_id: None,
+            },
+            message: Some("ok".to_string()),
+            credential_result: Some(AddCredentialResponse {
+                success: true,
+                message: "added".to_string(),
+                credential_id: 9,
+                email: Some("user@example.com".to_string()),
+                user_id: None,
+                provider: Some("BuilderId".to_string()),
+                subscription_title: None,
+                subscription_type: None,
+                auth_account_type: Some("builder-id".to_string()),
+                resolved_account_type: None,
+            }),
+            polling: false,
+            updated_at: now,
+        };
+
+        let response = idc_device_login_status_response(&session);
+
+        assert_eq!(response.status, IdcDeviceLoginStatus::Completed);
+        assert_eq!(response.credential_id, Some(9));
+        assert_eq!(response.email.as_deref(), Some("user@example.com"));
+        assert_eq!(response.user_code, None);
+        assert_eq!(response.verification_uri, None);
+        assert_eq!(response.verification_uri_complete, None);
+        assert_eq!(response.expires_at, None);
     }
 
     #[test]

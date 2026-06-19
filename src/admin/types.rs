@@ -517,7 +517,7 @@ fn default_auth_method() -> String {
 }
 
 /// 添加凭据成功响应
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddCredentialResponse {
     pub success: bool,
@@ -531,6 +531,440 @@ pub struct AddCredentialResponse {
     pub user_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_account_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_account_type: Option<String>,
+}
+
+// ============ 在线登录 ============
+
+/// AWS IdC device-code 登录请求
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartIdcDeviceLoginRequest {
+    /// Provider：BuilderId 或 Enterprise
+    pub provider: String,
+
+    /// Enterprise 必填；BuilderId 留空时使用 https://view.awsapps.com/start
+    #[serde(default)]
+    pub start_url: Option<String>,
+
+    /// AWS SSO OIDC Region。留空时使用 config.authRegion/config.region
+    #[serde(default)]
+    pub region: Option<String>,
+
+    /// 凭据级 Auth Region（用于后续刷新）
+    #[serde(default)]
+    pub auth_region: Option<String>,
+
+    /// 凭据级 API Region（用于后续 API 请求）
+    #[serde(default)]
+    pub api_region: Option<String>,
+
+    /// Profile ARN（可选；Enterprise 可留空由后端自动发现）
+    #[serde(default)]
+    pub profile_arn: Option<String>,
+
+    /// 优先级（可选，默认 0）
+    #[serde(default)]
+    pub priority: u32,
+
+    /// 单账号并发上限（可选）
+    #[serde(default)]
+    pub max_concurrency: Option<u32>,
+
+    /// 凭据级 Machine ID（可选）
+    #[serde(default)]
+    pub machine_id: Option<String>,
+
+    /// 账号类型（可选）
+    #[serde(default)]
+    pub account_type: Option<String>,
+
+    /// 账号来源供应商 ID（可选）
+    #[serde(default)]
+    pub source_supplier_id: Option<String>,
+
+    /// 账号来源供应商名称（可选）
+    #[serde(default)]
+    pub source_supplier_name: Option<String>,
+
+    /// 账号来源批次（可选）
+    #[serde(default)]
+    pub source_batch: Option<String>,
+
+    /// 凭据级代理 URL（可选，特殊值 "direct" 表示不使用代理）
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+
+    /// 凭据级代理认证用户名（可选）
+    #[serde(default)]
+    pub proxy_username: Option<String>,
+
+    /// 凭据级代理认证密码（可选）
+    #[serde(default)]
+    pub proxy_password: Option<String>,
+
+    /// 代理池 ID（可选）
+    #[serde(default)]
+    pub proxy_id: Option<String>,
+}
+
+/// AWS IdC device-code 登录状态
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IdcDeviceLoginStatus {
+    Pending,
+    Completed,
+    Failed,
+    Expired,
+    Cancelled,
+}
+
+/// AWS IdC device-code 登录启动响应
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdcDeviceLoginStartResponse {
+    pub session_id: String,
+    pub status: IdcDeviceLoginStatus,
+    pub provider: String,
+    pub start_url: String,
+    pub region: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification_uri_complete: Option<String>,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+    pub interval_seconds: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// AWS IdC device-code 登录状态响应
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdcDeviceLoginStatusResponse {
+    pub session_id: String,
+    pub status: IdcDeviceLoginStatus,
+    pub provider: String,
+    pub start_url: String,
+    pub region: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification_uri_complete: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub interval_seconds: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_account_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_account_type: Option<String>,
+}
+
+/// External IdP 兼容性探测请求
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalIdpProbeRequest {
+    /// 工作邮箱；后端会提取 @ 后的域名做 Kiro 组织发现
+    #[serde(default)]
+    pub work_email: Option<String>,
+
+    /// 直接指定组织域名；优先级低于 workEmail
+    #[serde(default)]
+    pub domain_name: Option<String>,
+
+    /// 直接指定 Issuer URL；用于绕过 Kiro metadata 后单独测试 OIDC discovery
+    #[serde(default)]
+    pub issuer_url: Option<String>,
+
+    /// 直接指定 OIDC Client ID；用于后续 PKCE 流程验证
+    #[serde(default)]
+    pub client_id: Option<String>,
+
+    /// 直接指定 scopes；未指定时使用 Kiro metadata 返回值
+    #[serde(default, deserialize_with = "deserialize_optional_scope_string")]
+    pub scopes: Option<String>,
+
+    /// 直接指定 audience；未指定时使用 Kiro metadata 返回值
+    #[serde(default)]
+    pub audience: Option<String>,
+
+    /// 是否抓取 issuer 的 OIDC discovery 文档，默认 true
+    #[serde(default = "default_probe_oidc")]
+    pub probe_oidc: bool,
+
+    /// 凭据级代理 URL（可选，特殊值 "direct" 表示不使用代理）
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+
+    /// 凭据级代理认证用户名（可选）
+    #[serde(default)]
+    pub proxy_username: Option<String>,
+
+    /// 凭据级代理认证密码（可选）
+    #[serde(default)]
+    pub proxy_password: Option<String>,
+
+    /// 代理池 ID（可选）
+    #[serde(default)]
+    pub proxy_id: Option<String>,
+}
+
+fn default_probe_oidc() -> bool {
+    true
+}
+
+/// External IdP 探测阶段状态
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExternalIdpProbeStatus {
+    Ok,
+    NotFound,
+    Skipped,
+    Failed,
+}
+
+/// External IdP OIDC discovery 摘要
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalIdpOidcDiscoverySummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_authorization_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub code_challenge_methods_supported: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grant_types_supported: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub response_types_supported: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes_supported: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub token_endpoint_auth_methods_supported: Vec<String>,
+}
+
+/// External IdP 兼容性探测响应
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalIdpProbeResponse {
+    pub domain_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub work_email: Option<String>,
+    pub kiro_metadata_status: ExternalIdpProbeStatus,
+    pub oidc_discovery_status: ExternalIdpProbeStatus,
+    pub found: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audience: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oidc: Option<ExternalIdpOidcDiscoverySummary>,
+    pub pkce_s256_supported: bool,
+    pub device_code_supported: bool,
+    pub authorization_code_supported: bool,
+    pub refresh_without_client_secret_likely_supported: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recommendations: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// External IdP 浏览器登录请求
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartExternalIdpLoginRequest {
+    /// 工作邮箱；手动 issuer/client/scopes 不完整时会走 Kiro portal 组织发现
+    #[serde(default)]
+    pub work_email: Option<String>,
+
+    /// 组织域名；用于展示/记录，portal 模式仍由 Kiro portal 让用户确认组织
+    #[serde(default)]
+    pub domain_name: Option<String>,
+
+    /// 直接指定 Issuer URL；issuer/client/scopes 齐全时跳过 Kiro portal
+    #[serde(default)]
+    pub issuer_url: Option<String>,
+
+    /// 直接指定 OIDC Client ID
+    #[serde(default)]
+    pub client_id: Option<String>,
+
+    /// 直接指定 scopes；未包含 offline_access 时后端会自动追加
+    #[serde(default, deserialize_with = "deserialize_optional_scope_string")]
+    pub scopes: Option<String>,
+
+    /// 可选 OIDC audience
+    #[serde(default)]
+    pub audience: Option<String>,
+
+    /// 可选 login_hint；留空时使用 workEmail
+    #[serde(default)]
+    pub login_hint: Option<String>,
+
+    /// 浏览器可访问的 kiro.rs origin，例如 https://example.com
+    #[serde(default)]
+    pub callback_base_url: Option<String>,
+
+    /// Profile ARN（可选；留空由后端自动发现）
+    #[serde(default)]
+    pub profile_arn: Option<String>,
+
+    /// 优先级（可选，默认 0）
+    #[serde(default)]
+    pub priority: u32,
+
+    /// 单账号并发上限（可选）
+    #[serde(default)]
+    pub max_concurrency: Option<u32>,
+
+    /// 凭据级 Auth Region（通常留空；External IdP 刷新不依赖 AWS OIDC region）
+    #[serde(default)]
+    pub auth_region: Option<String>,
+
+    /// 凭据级 API Region（用于后续 API 请求）
+    #[serde(default)]
+    pub api_region: Option<String>,
+
+    /// 凭据级 Machine ID（可选）
+    #[serde(default)]
+    pub machine_id: Option<String>,
+
+    /// 账号类型（可选）
+    #[serde(default)]
+    pub account_type: Option<String>,
+
+    /// 账号来源供应商 ID（可选）
+    #[serde(default)]
+    pub source_supplier_id: Option<String>,
+
+    /// 账号来源供应商名称（可选）
+    #[serde(default)]
+    pub source_supplier_name: Option<String>,
+
+    /// 账号来源批次（可选）
+    #[serde(default)]
+    pub source_batch: Option<String>,
+
+    /// 凭据级代理 URL（可选，特殊值 "direct" 表示不使用代理）
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+
+    /// 凭据级代理认证用户名（可选）
+    #[serde(default)]
+    pub proxy_username: Option<String>,
+
+    /// 凭据级代理认证密码（可选）
+    #[serde(default)]
+    pub proxy_password: Option<String>,
+
+    /// 代理池 ID（可选）
+    #[serde(default)]
+    pub proxy_id: Option<String>,
+}
+
+/// External IdP 浏览器登录状态
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExternalIdpLoginStatus {
+    Pending,
+    Completed,
+    Failed,
+    Expired,
+    Cancelled,
+}
+
+/// External IdP 浏览器登录阶段
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExternalIdpLoginPhase {
+    PortalDiscovery,
+    IdpAuthorization,
+    Completed,
+}
+
+/// External IdP 浏览器登录启动响应
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalIdpLoginStartResponse {
+    pub session_id: String,
+    pub status: ExternalIdpLoginStatus,
+    pub phase: ExternalIdpLoginPhase,
+    pub provider: String,
+    pub auth_url: String,
+    pub callback_url: String,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+    pub interval_seconds: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audience: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// External IdP 浏览器登录状态响应
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalIdpLoginStatusResponse {
+    pub session_id: String,
+    pub status: ExternalIdpLoginStatus,
+    pub phase: ExternalIdpLoginPhase,
+    pub provider: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_url: Option<String>,
+    pub callback_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub interval_seconds: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audience: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subscription_title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

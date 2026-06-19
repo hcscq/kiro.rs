@@ -270,6 +270,10 @@ pub async fn admin_auth_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    if is_public_admin_callback_route(request.method(), admin_request_path(&request)) {
+        return next.run(request).await;
+    }
+
     let api_key = auth::extract_api_key(&request);
 
     match api_key {
@@ -281,12 +285,31 @@ pub async fn admin_auth_middleware(
     }
 }
 
+fn admin_request_path(request: &Request<Body>) -> &str {
+    request
+        .extensions()
+        .get::<OriginalUri>()
+        .map(|value| value.0.path())
+        .unwrap_or_else(|| request.uri().path())
+}
+
+fn is_public_admin_callback_route(method: &Method, path: &str) -> bool {
+    if *method != Method::GET {
+        return false;
+    }
+    let path = path
+        .strip_prefix("/api/admin")
+        .unwrap_or(path)
+        .trim_end_matches('/');
+    path == "/auth/external-idp/callback"
+}
+
 pub async fn admin_write_routing_middleware(
     State(state): State<AdminState>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    if !requires_leader_routing(request.method())
+    if !requires_leader_routing(request.method(), admin_request_path(&request))
         || request.headers().contains_key(ADMIN_FORWARDED_HEADER)
     {
         return next.run(request).await;
@@ -303,8 +326,9 @@ pub async fn admin_write_routing_middleware(
     }
 }
 
-fn requires_leader_routing(method: &Method) -> bool {
-    !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
+fn requires_leader_routing(method: &Method, path: &str) -> bool {
+    is_public_admin_callback_route(method, path)
+        || !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
 }
 
 fn is_retryable_admin_write_route(method: &Method, path: &str) -> bool {
@@ -423,6 +447,30 @@ mod tests {
         assert!(!is_retryable_admin_write_route(
             &Method::POST,
             "/api/admin/credentials/12/refresh",
+        ));
+    }
+
+    #[test]
+    fn public_external_idp_callback_is_leader_routed_but_not_retryable() {
+        assert!(is_public_admin_callback_route(
+            &Method::GET,
+            "/api/admin/auth/external-idp/callback",
+        ));
+        assert!(requires_leader_routing(
+            &Method::GET,
+            "/api/admin/auth/external-idp/callback",
+        ));
+        assert!(!is_retryable_admin_write_route(
+            &Method::GET,
+            "/api/admin/auth/external-idp/callback",
+        ));
+        assert!(!is_public_admin_callback_route(
+            &Method::POST,
+            "/api/admin/auth/external-idp/callback",
+        ));
+        assert!(!requires_leader_routing(
+            &Method::GET,
+            "/api/admin/credentials",
         ));
     }
 }

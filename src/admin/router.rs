@@ -7,14 +7,17 @@ use axum::{
 
 use super::{
     handlers::{
-        add_credential, clear_credential_runtime_model_restrictions,
-        clear_credential_suspicious_activity, delete_credential, force_refresh_token,
-        get_all_credentials, get_credential_balance, get_credential_profiles,
+        add_credential, cancel_external_idp_login, cancel_idc_device_login,
+        clear_credential_runtime_model_restrictions, clear_credential_suspicious_activity,
+        delete_credential, force_refresh_token, get_all_credentials, get_credential_balance,
+        get_credential_profiles, get_external_idp_login_status, get_idc_device_login_status,
         get_load_balancing_mode, get_model_capabilities_config, get_model_catalog,
-        reset_failure_count, set_credential_disabled, set_credential_max_concurrency,
-        set_credential_model_policy, set_credential_overage_status, set_credential_priority,
-        set_credential_profile, set_credential_proxy, set_credential_rate_limit_config,
-        set_credential_source, set_load_balancing_mode, set_model_capabilities_config,
+        handle_external_idp_callback, probe_external_idp, reset_failure_count,
+        set_credential_disabled, set_credential_max_concurrency, set_credential_model_policy,
+        set_credential_overage_status, set_credential_priority, set_credential_profile,
+        set_credential_proxy, set_credential_rate_limit_config, set_credential_source,
+        set_load_balancing_mode, set_model_capabilities_config, start_external_idp_login,
+        start_idc_device_login,
     },
     middleware::{AdminState, admin_auth_middleware, admin_write_routing_middleware},
 };
@@ -44,6 +47,9 @@ use super::{
 /// - `GET /config/model-capabilities` - 获取账号类型模型策略
 /// - `GET /config/model-catalog` - 获取内置模型目录
 /// - `PUT /config/model-capabilities` - 设置账号类型模型策略
+/// - `POST /auth/external-idp/probe` - 探测 External IdP discovery/PKCE/device-code 兼容性
+/// - `POST /auth/external-idp/start` - 启动 External IdP 浏览器 PKCE 登录
+/// - `GET /auth/external-idp/callback` - External IdP 浏览器回调
 ///
 /// # 认证
 /// 需要 Admin API Key 认证，支持：
@@ -54,6 +60,29 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/credentials",
             get(get_all_credentials).post(add_credential),
+        )
+        .route("/auth/idc-device/start", post(start_idc_device_login))
+        .route(
+            "/auth/idc-device/{session_id}/status",
+            post(get_idc_device_login_status),
+        )
+        .route(
+            "/auth/idc-device/{session_id}/cancel",
+            post(cancel_idc_device_login),
+        )
+        .route("/auth/external-idp/probe", post(probe_external_idp))
+        .route("/auth/external-idp/start", post(start_external_idp_login))
+        .route(
+            "/auth/external-idp/{session_id}/status",
+            post(get_external_idp_login_status),
+        )
+        .route(
+            "/auth/external-idp/{session_id}/cancel",
+            post(cancel_external_idp_login),
+        )
+        .route(
+            "/auth/external-idp/callback",
+            get(handle_external_idp_callback),
         )
         .route("/credentials/{id}", delete(delete_credential))
         .route("/credentials/{id}/disabled", post(set_credential_disabled))

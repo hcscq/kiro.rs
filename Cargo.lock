@@ -1332,6 +1332,7 @@ dependencies = [
  "fastrand",
  "font8x8",
  "futures",
+ "getrandom 0.2.16",
  "hex",
  "html2text",
  "http",
