@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error as StdError;
 use std::fmt;
 use std::future::Future;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -21,7 +22,7 @@ use std::time::{Duration as StdDuration, Instant};
 
 use crate::admin::types::BalanceResponse;
 use crate::common::logging::summarize_upstream_error;
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::{ProxyConfig, build_client, build_client_no_redirect};
 use crate::kiro::machine_id;
 use crate::kiro::model::available_models::ListAvailableModelsResponse;
 use crate::kiro::model::available_profiles::{AvailableProfile, ListAvailableProfilesResponse};
@@ -342,14 +343,50 @@ async fn refresh_social_token(
 }
 
 fn oidc_discovery_url(issuer_url: &str) -> anyhow::Result<url::Url> {
-    let mut url = url::Url::parse(issuer_url)
-        .map_err(|err| anyhow::anyhow!("ExternalIdP issuerUrl 无效: {}", err))?;
+    let mut url = normalize_external_idp_issuer_url(issuer_url)?;
     let mut path = url.path().trim_end_matches('/').to_string();
     path.push_str("/.well-known/openid-configuration");
     url.set_path(&path);
     url.set_query(None);
     url.set_fragment(None);
     Ok(url)
+}
+
+fn normalize_external_idp_url(raw_url: &str, label: &str) -> anyhow::Result<url::Url> {
+    let parsed = url::Url::parse(raw_url.trim())
+        .map_err(|err| anyhow::anyhow!("ExternalIdP {label} 无效: {err}"))?;
+    if parsed.scheme() != "https" {
+        bail!("ExternalIdP {label} 必须使用 https");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        bail!("ExternalIdP {label} 不能包含用户名或密码");
+    }
+    if parsed.fragment().is_some() {
+        bail!("ExternalIdP {label} 不能包含 fragment");
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("ExternalIdP {label} 必须包含主机名"))?
+        .trim()
+        .to_ascii_lowercase();
+    if host == "localhost" || host.ends_with(".localhost") {
+        bail!("ExternalIdP {label} 不能指向 localhost");
+    }
+    if host.trim_matches(['[', ']']).parse::<IpAddr>().is_ok() {
+        bail!("ExternalIdP {label} 不能使用 IP literal 主机");
+    }
+    Ok(parsed)
+}
+
+fn normalize_external_idp_issuer_url(raw_url: &str) -> anyhow::Result<url::Url> {
+    let mut parsed = normalize_external_idp_url(raw_url, "issuerUrl")?;
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    Ok(parsed)
+}
+
+fn normalize_external_idp_endpoint(raw_url: &str, label: &str) -> anyhow::Result<String> {
+    Ok(normalize_external_idp_url(raw_url, label)?.to_string())
 }
 
 fn external_idp_token_type_header(
@@ -382,10 +419,12 @@ async fn discover_external_idp_token_endpoint(
     }
 
     let data: ExternalIdpDiscoveryResponse = response.json().await?;
-    data.token_endpoint
+    let token_endpoint = data
+        .token_endpoint
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("ExternalIdP OIDC discovery 未返回 token_endpoint"))
+        .ok_or_else(|| anyhow::anyhow!("ExternalIdP OIDC discovery 未返回 token_endpoint"))?;
+    normalize_external_idp_endpoint(&token_endpoint, "token_endpoint")
 }
 
 /// 刷新 External IdP Token
@@ -410,7 +449,7 @@ async fn refresh_external_idp_token(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow::anyhow!("ExternalIdP 刷新需要 clientId"))?;
 
-    let client = build_client(proxy, 60, config.tls_backend)?;
+    let client = build_client_no_redirect(proxy, 60, config.tls_backend)?;
     let token_endpoint = match discover_external_idp_token_endpoint(&client, issuer_url).await {
         Ok(endpoint) => endpoint,
         Err(err) => {
@@ -424,7 +463,7 @@ async fn refresh_external_idp_token(
                     "ExternalIdP OIDC discovery 失败，将回退到缓存的 tokenEndpoint: {}",
                     err
                 );
-                endpoint.to_string()
+                normalize_external_idp_endpoint(endpoint, "token_endpoint")?
             } else {
                 return Err(err);
             }
@@ -10061,6 +10100,36 @@ mod tests {
         credentials.access_token = Some(format!("token-{priority}"));
         credentials.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
         credentials
+    }
+
+    #[test]
+    fn external_idp_cached_token_endpoint_is_validated() {
+        assert_eq!(
+            normalize_external_idp_endpoint(
+                "https://login.example.com/tenant/oauth2/v2.0/token",
+                "token_endpoint"
+            )
+            .unwrap(),
+            "https://login.example.com/tenant/oauth2/v2.0/token"
+        );
+
+        assert!(
+            normalize_external_idp_endpoint("http://login.example.com/token", "token_endpoint")
+                .is_err()
+        );
+        assert!(
+            normalize_external_idp_endpoint(
+                "https://user@login.example.com/token",
+                "token_endpoint"
+            )
+            .is_err()
+        );
+        assert!(
+            normalize_external_idp_endpoint("https://localhost/token", "token_endpoint").is_err()
+        );
+        assert!(
+            normalize_external_idp_endpoint("https://127.0.0.1/token", "token_endpoint").is_err()
+        );
     }
 
     fn proxy_pool_config_for_tests() -> ProxyPoolConfig {

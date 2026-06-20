@@ -2,7 +2,7 @@
 //!
 //! 提供统一的 HTTP Client 构建功能，支持代理配置
 
-use reqwest::{Client, Proxy};
+use reqwest::{Client, Proxy, redirect::Policy};
 use std::time::Duration;
 
 use crate::model::config::TlsBackend;
@@ -49,12 +49,37 @@ pub fn build_client(
     timeout_secs: u64,
     tls_backend: TlsBackend,
 ) -> anyhow::Result<Client> {
+    build_client_with_redirect_policy(proxy, timeout_secs, tls_backend, true)
+}
+
+/// 构建不自动跟随重定向的 HTTP Client。
+///
+/// OAuth/OIDC discovery 和 token endpoint 不应依赖重定向；禁用自动跳转可以
+/// 避免由 discovery 文档或 issuer URL 引入的非预期目标请求。
+pub fn build_client_no_redirect(
+    proxy: Option<&ProxyConfig>,
+    timeout_secs: u64,
+    tls_backend: TlsBackend,
+) -> anyhow::Result<Client> {
+    build_client_with_redirect_policy(proxy, timeout_secs, tls_backend, false)
+}
+
+fn build_client_with_redirect_policy(
+    proxy: Option<&ProxyConfig>,
+    timeout_secs: u64,
+    tls_backend: TlsBackend,
+    follow_redirects: bool,
+) -> anyhow::Result<Client> {
     let mut builder = Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .pool_idle_timeout(Duration::from_secs(90))
         .pool_max_idle_per_host(32)
         .tcp_keepalive(Duration::from_secs(60))
         .timeout(Duration::from_secs(timeout_secs));
+
+    if !follow_redirects {
+        builder = builder.redirect(Policy::none());
+    }
 
     if tls_backend == TlsBackend::Rustls {
         builder = builder.use_rustls_tls();
@@ -105,6 +130,12 @@ mod tests {
     fn test_build_client_with_proxy() {
         let config = ProxyConfig::new("http://127.0.0.1:7890");
         let client = build_client(Some(&config), 30, TlsBackend::Rustls);
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn test_build_client_no_redirect() {
+        let client = build_client_no_redirect(None, 30, TlsBackend::Rustls);
         assert!(client.is_ok());
     }
 }

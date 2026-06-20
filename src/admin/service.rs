@@ -1,6 +1,7 @@
 //! Admin API 业务逻辑服务
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -11,7 +12,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::common::logging::summarize_upstream_error;
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::{ProxyConfig, build_client, build_client_no_redirect};
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::account_type_preset::{
@@ -370,6 +371,17 @@ fn normalize_optional_url(
     let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);
     };
+    let mut parsed = parse_external_idp_url(value, label)?;
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    let mut normalized = parsed.to_string();
+    while normalized.ends_with('/') {
+        normalized.pop();
+    }
+    Ok(Some(normalized))
+}
+
+fn parse_external_idp_url(value: &str, label: &str) -> Result<url::Url, AdminServiceError> {
     let parsed = url::Url::parse(value)
         .map_err(|err| AdminServiceError::InvalidCredential(format!("{label} 无效: {err}")))?;
     if parsed.scheme() != "https" {
@@ -377,13 +389,54 @@ fn normalize_optional_url(
             "{label} 必须使用 https"
         )));
     }
-    Ok(Some(value.trim_end_matches('/').to_string()))
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(AdminServiceError::InvalidCredential(format!(
+            "{label} 不能包含用户名或密码"
+        )));
+    }
+    if parsed.fragment().is_some() {
+        return Err(AdminServiceError::InvalidCredential(format!(
+            "{label} 不能包含 fragment"
+        )));
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| AdminServiceError::InvalidCredential(format!("{label} 必须包含主机名")))?;
+    let host = host.trim().to_ascii_lowercase();
+    if host == "localhost" || host.ends_with(".localhost") {
+        return Err(AdminServiceError::InvalidCredential(format!(
+            "{label} 不能指向 localhost"
+        )));
+    }
+    if host.trim_matches(['[', ']']).parse::<IpAddr>().is_ok() {
+        return Err(AdminServiceError::InvalidCredential(format!(
+            "{label} 不能使用 IP literal 主机"
+        )));
+    }
+    Ok(parsed)
+}
+
+fn normalize_external_idp_endpoint_url(
+    value: Option<&str>,
+    label: &str,
+) -> Result<Option<String>, AdminServiceError> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    Ok(Some(parse_external_idp_url(value, label)?.to_string()))
 }
 
 fn oidc_discovery_url(issuer_url: &str) -> Result<String, AdminServiceError> {
     let issuer_url = normalize_optional_url(Some(issuer_url), "Issuer URL")?
         .ok_or_else(|| AdminServiceError::InvalidCredential("Issuer URL 不能为空".to_string()))?;
-    Ok(format!("{issuer_url}/.well-known/openid-configuration"))
+    let mut parsed = url::Url::parse(&issuer_url)
+        .map_err(|err| AdminServiceError::InvalidCredential(format!("Issuer URL 无效: {err}")))?;
+    let mut path = parsed.path().trim_end_matches('/').to_string();
+    path.push_str("/.well-known/openid-configuration");
+    parsed.set_path(&path);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    Ok(parsed.to_string())
 }
 
 #[cfg(test)]
@@ -634,6 +687,29 @@ fn external_idp_submit_callback_params(
     Ok(params)
 }
 
+fn external_idp_portal_descriptor_error(params: &HashMap<String, String>) -> Option<String> {
+    let login_option = params
+        .get("login_option")
+        .map(String::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let has_issuer_url = params
+        .get("issuer_url")
+        .map(String::as_str)
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+
+    if !login_option.is_empty() && !login_option.eq_ignore_ascii_case("external_idp") {
+        Some(format!(
+            "当前流程只支持 external_idp，收到 login_option={login_option}"
+        ))
+    } else if login_option.is_empty() && !has_issuer_url {
+        Some("Kiro portal 回调缺少 login_option 或 issuer_url".to_string())
+    } else {
+        None
+    }
+}
+
 fn random_urlsafe_bytes(len: usize) -> Result<String, AdminServiceError> {
     let mut bytes = vec![0_u8; len];
     getrandom::getrandom(&mut bytes).map_err(|err| {
@@ -753,6 +829,26 @@ fn build_external_idp_authorization_url(
         }
     }
     Ok(url.to_string())
+}
+
+fn build_external_idp_authorization_code_token_form(
+    client_id: &str,
+    code: &str,
+    redirect_uri: &str,
+    code_verifier: &str,
+    scopes: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let mut form = vec![
+        ("grant_type", "authorization_code".to_string()),
+        ("code", code.to_string()),
+        ("redirect_uri", redirect_uri.to_string()),
+        ("client_id", client_id.to_string()),
+        ("code_verifier", code_verifier.to_string()),
+    ];
+    if let Some(scopes) = scopes.map(str::trim).filter(|value| !value.is_empty()) {
+        form.push(("scope", scopes.to_string()));
+    }
+    form
 }
 
 #[derive(Debug)]
@@ -933,7 +1029,7 @@ impl AdminService {
         let domain_name = resolve_external_idp_probe_domain(&req)?;
         let config = self.token_manager.config();
         let proxy = self.login_proxy_for_external_idp_probe(&req)?;
-        let client = build_client(proxy.as_ref(), 60, config.tls_backend)
+        let client = build_client_no_redirect(proxy.as_ref(), 60, config.tls_backend)
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
 
         let mut kiro_metadata_status = ExternalIdpProbeStatus::Skipped;
@@ -1134,7 +1230,7 @@ impl AdminService {
 
         let config = self.token_manager.config();
         let proxy = self.login_proxy_for_external_idp_login(&req)?;
-        let client = build_client(proxy.as_ref(), 60, config.tls_backend)
+        let client = build_client_no_redirect(proxy.as_ref(), 60, config.tls_backend)
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
 
         let now = Utc::now();
@@ -1315,7 +1411,7 @@ impl AdminService {
 
         let config = self.token_manager.config();
         let proxy = self.login_proxy_for_external_idp_login(&poll_session.request)?;
-        let client = build_client(proxy.as_ref(), 60, config.tls_backend)
+        let client = build_client_no_redirect(proxy.as_ref(), 60, config.tls_backend)
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
         let poll_result = self
             .poll_external_idp_device_token(&client, &poll_session)
@@ -1536,7 +1632,7 @@ impl AdminService {
         let result: Result<AddCredentialResponse, AdminServiceError> = async {
             let config = self.token_manager.config();
             let proxy = self.login_proxy_for_external_idp_login(&exchange_session.request)?;
-            let client = build_client(proxy.as_ref(), 60, config.tls_backend)
+            let client = build_client_no_redirect(proxy.as_ref(), 60, config.tls_backend)
                 .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
             let token = self
                 .exchange_external_idp_authorization_code(&client, &exchange_session, &code)
@@ -2162,17 +2258,7 @@ impl AdminService {
             });
         }
 
-        let login_option = params
-            .get("login_option")
-            .map(String::as_str)
-            .map(str::trim)
-            .unwrap_or_default();
-        if !login_option.eq_ignore_ascii_case("external_idp") {
-            let message = if login_option.is_empty() {
-                "Kiro portal 回调缺少 login_option".to_string()
-            } else {
-                format!("当前流程只支持 external_idp，收到 login_option={login_option}")
-            };
+        if let Some(message) = external_idp_portal_descriptor_error(&params) {
             self.fail_external_idp_session_by_id(&session.session_id, &message);
             return Ok(ExternalIdpCallbackAction::Html {
                 success: false,
@@ -2200,7 +2286,7 @@ impl AdminService {
 
         let config = self.token_manager.config();
         let proxy = self.login_proxy_for_external_idp_login(&session.request)?;
-        let client = build_client(proxy.as_ref(), 60, config.tls_backend)
+        let client = build_client_no_redirect(proxy.as_ref(), 60, config.tls_backend)
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
         self.prepare_external_idp_login(&client, &mut session)
             .await?;
@@ -2284,7 +2370,7 @@ impl AdminService {
         let result: Result<AddCredentialResponse, AdminServiceError> = async {
             let config = self.token_manager.config();
             let proxy = self.login_proxy_for_external_idp_login(&exchange_session.request)?;
-            let client = build_client(proxy.as_ref(), 60, config.tls_backend)
+            let client = build_client_no_redirect(proxy.as_ref(), 60, config.tls_backend)
                 .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
             let token = self
                 .exchange_external_idp_authorization_code(&client, &exchange_session, &code)
@@ -2446,14 +2532,19 @@ impl AdminService {
         })?;
 
         Ok(ExternalIdpOidcDiscoverySummary {
-            issuer: normalize_optional_string(document.issuer.as_deref()),
-            authorization_endpoint: normalize_optional_string(
+            issuer: normalize_optional_url(document.issuer.as_deref(), "issuer")?,
+            authorization_endpoint: normalize_external_idp_endpoint_url(
                 document.authorization_endpoint.as_deref(),
-            ),
-            token_endpoint: normalize_optional_string(document.token_endpoint.as_deref()),
-            device_authorization_endpoint: normalize_optional_string(
+                "authorization_endpoint",
+            )?,
+            token_endpoint: normalize_external_idp_endpoint_url(
+                document.token_endpoint.as_deref(),
+                "token_endpoint",
+            )?,
+            device_authorization_endpoint: normalize_external_idp_endpoint_url(
                 document.device_authorization_endpoint.as_deref(),
-            ),
+                "device_authorization_endpoint",
+            )?,
             code_challenge_methods_supported: document
                 .code_challenge_methods_supported
                 .unwrap_or_default(),
@@ -2514,13 +2605,13 @@ impl AdminService {
                 )
             })?;
 
-        let form = [
-            ("grant_type", "authorization_code"),
-            ("code", code),
-            ("redirect_uri", redirect_uri),
-            ("client_id", client_id),
-            ("code_verifier", code_verifier),
-        ];
+        let form = build_external_idp_authorization_code_token_form(
+            client_id,
+            code,
+            redirect_uri,
+            code_verifier,
+            session.scopes.as_deref(),
+        );
 
         let response = client
             .post(token_endpoint)
@@ -4099,6 +4190,33 @@ mod tests {
     }
 
     #[test]
+    fn external_idp_url_validation_rejects_unsafe_targets() {
+        assert_eq!(
+            normalize_optional_url(
+                Some("https://login.example.com/tenant/v2.0/?ignored=1"),
+                "Issuer URL"
+            )
+            .unwrap()
+            .as_deref(),
+            Some("https://login.example.com/tenant/v2.0")
+        );
+        assert_eq!(
+            oidc_discovery_url("https://login.example.com/tenant/v2.0/?ignored=1").unwrap(),
+            "https://login.example.com/tenant/v2.0/.well-known/openid-configuration"
+        );
+        assert!(normalize_optional_url(Some("http://login.example.com"), "Issuer URL").is_err());
+        assert!(
+            normalize_optional_url(Some("https://user@login.example.com"), "Issuer URL").is_err()
+        );
+        assert!(normalize_optional_url(Some("https://127.0.0.1/tenant"), "Issuer URL").is_err());
+        assert!(normalize_optional_url(Some("https://localhost/tenant"), "Issuer URL").is_err());
+        assert!(
+            normalize_external_idp_endpoint_url(Some("https://[::1]/token"), "token_endpoint")
+                .is_err()
+        );
+    }
+
+    #[test]
     fn external_idp_scopes_append_offline_access_once() {
         assert_eq!(
             normalize_scope_string_with_offline_access("openid profile").unwrap(),
@@ -4123,6 +4241,23 @@ mod tests {
         );
         assert!(resolve_external_idp_callback_url(Some("ftp://example.com")).is_err());
         assert!(resolve_external_idp_callback_url(Some("https://user@example.com")).is_err());
+    }
+
+    #[test]
+    fn external_idp_portal_descriptor_accepts_issuer_without_login_option() {
+        let mut params = HashMap::new();
+        params.insert(
+            "issuer_url".to_string(),
+            "https://login.example.com/tenant/v2.0".to_string(),
+        );
+        assert!(external_idp_portal_descriptor_error(&params).is_none());
+
+        params.insert("login_option".to_string(), "external_idp".to_string());
+        assert!(external_idp_portal_descriptor_error(&params).is_none());
+
+        params.insert("login_option".to_string(), "google".to_string());
+        let message = external_idp_portal_descriptor_error(&params).unwrap();
+        assert!(message.contains("login_option=google"));
     }
 
     #[test]
@@ -4171,6 +4306,38 @@ mod tests {
             Some("user@example.com")
         );
         assert_eq!(pairs.get("audience").map(String::as_str), Some("aud-1"));
+    }
+
+    #[test]
+    fn external_idp_token_exchange_form_includes_scope_when_present() {
+        let form = build_external_idp_authorization_code_token_form(
+            "client-1",
+            "code-1",
+            KIRO_IDE_EXTERNAL_IDP_REDIRECT_URI,
+            "verifier-1",
+            Some("openid profile offline_access"),
+        );
+        let pairs: HashMap<_, _> = form.into_iter().collect();
+
+        assert_eq!(pairs.get("client_id").map(String::as_str), Some("client-1"));
+        assert_eq!(
+            pairs.get("grant_type").map(String::as_str),
+            Some("authorization_code")
+        );
+        assert_eq!(
+            pairs.get("scope").map(String::as_str),
+            Some("openid profile offline_access")
+        );
+
+        let form = build_external_idp_authorization_code_token_form(
+            "client-1",
+            "code-1",
+            KIRO_IDE_EXTERNAL_IDP_REDIRECT_URI,
+            "verifier-1",
+            Some("   "),
+        );
+        let pairs: HashMap<_, _> = form.into_iter().collect();
+        assert!(!pairs.contains_key("scope"));
     }
 
     #[test]
