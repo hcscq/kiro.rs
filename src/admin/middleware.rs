@@ -301,7 +301,20 @@ fn is_public_admin_callback_route(method: &Method, path: &str) -> bool {
         .strip_prefix("/api/admin")
         .unwrap_or(path)
         .trim_end_matches('/');
-    path == "/auth/external-idp/callback"
+    if path == "/auth/external-idp/callback" {
+        return true;
+    }
+
+    if *method != Method::POST {
+        return false;
+    }
+
+    let segments: Vec<_> = path.trim_matches('/').split('/').collect();
+    segments.len() == 4
+        && segments[0] == "auth"
+        && segments[1] == "external-idp"
+        && !segments[2].is_empty()
+        && segments[3] == "callback"
 }
 
 pub async fn admin_write_routing_middleware(
@@ -460,6 +473,14 @@ mod tests {
             &Method::POST,
             "/api/admin/auth/external-idp/callback",
         ));
+        assert!(is_public_admin_callback_route(
+            &Method::POST,
+            "/api/admin/auth/external-idp/session-1/callback",
+        ));
+        assert!(!is_public_admin_callback_route(
+            &Method::GET,
+            "/api/admin/auth/external-idp/session-1/callback",
+        ));
         assert!(requires_leader_routing(
             &Method::GET,
             "/api/admin/auth/external-idp/callback",
@@ -468,6 +489,10 @@ mod tests {
             &Method::POST,
             "/api/admin/auth/external-idp/callback",
         ));
+        assert!(requires_leader_routing(
+            &Method::POST,
+            "/api/admin/auth/external-idp/session-1/callback",
+        ));
         assert!(!is_retryable_admin_write_route(
             &Method::GET,
             "/api/admin/auth/external-idp/callback",
@@ -475,6 +500,10 @@ mod tests {
         assert!(!is_retryable_admin_write_route(
             &Method::POST,
             "/api/admin/auth/external-idp/callback",
+        ));
+        assert!(!is_retryable_admin_write_route(
+            &Method::POST,
+            "/api/admin/auth/external-idp/session-1/callback",
         ));
         assert!(!requires_leader_routing(
             &Method::GET,

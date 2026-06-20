@@ -77,9 +77,12 @@ function isExternalIdpSession(session: LoginSession): session is ExternalIdpSess
   return 'phase' in session
 }
 
-function buildWindowsExternalIdpCallbackHelperScript(origin: string): string {
-  const endpoint = `${origin.replace(/\/+$/, '')}/api/admin/auth/external-idp/callback`
-  return `$Endpoint = ${JSON.stringify(endpoint)}
+function buildWindowsExternalIdpCallbackHelperScript(origin: string, sessionId: string): string {
+  const baseUrl = origin.replace(/\/+$/, '')
+  const stateEndpoint = `${baseUrl}/api/admin/auth/external-idp/callback`
+  const sessionEndpoint = `${baseUrl}/api/admin/auth/external-idp/${encodeURIComponent(sessionId)}/callback`
+  return `$StateEndpoint = ${JSON.stringify(stateEndpoint)}
+$SessionEndpoint = ${JSON.stringify(sessionEndpoint)}
 $InstallDir = Join-Path $env:LOCALAPPDATA "kiro-rs-callback"
 New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 $ScriptPath = Join-Path $InstallDir "kiro-callback.ps1"
@@ -87,18 +90,30 @@ $ScriptBody = @'
 param([string]$CallbackUrl)
 $ErrorActionPreference = "Stop"
 if ([string]::IsNullOrWhiteSpace($CallbackUrl)) { exit 1 }
-$Endpoint = "__ENDPOINT__"
+$StateEndpoint = "__STATE_ENDPOINT__"
+$SessionEndpoint = "__SESSION_ENDPOINT__"
 $LogPath = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "callback.log"
 try {
+  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+  Add-Type -AssemblyName System.Web
   $Body = @{ callbackUrl = $CallbackUrl } | ConvertTo-Json -Compress
-  Invoke-RestMethod -Method Post -Uri $Endpoint -ContentType "application/json" -Body $Body | Out-Null
-  Add-Content -Path $LogPath -Value ("{0} submitted callback" -f (Get-Date).ToString("s"))
+  $Uri = [Uri]$CallbackUrl
+  $Params = [System.Web.HttpUtility]::ParseQueryString($Uri.Query)
+  $Endpoint = if ([string]::IsNullOrWhiteSpace($Params["state"])) { $SessionEndpoint } else { $StateEndpoint }
+  $Response = Invoke-RestMethod -Method Post -Uri $Endpoint -ContentType "application/json" -Body $Body
+  Add-Content -Path $LogPath -Value ("{0} submitted callback endpoint={1} status={2}" -f (Get-Date).ToString("s"), $Endpoint, $Response.status)
 } catch {
-  Add-Content -Path $LogPath -Value ("{0} {1}" -f (Get-Date).ToString("s"), $_.Exception.Message)
-  throw
+  $Message = $_.Exception.Message
+  Add-Content -Path $LogPath -Value ("{0} failed: {1}" -f (Get-Date).ToString("s"), $Message)
+  try {
+    $Shell = New-Object -ComObject WScript.Shell
+    $PopupMessage = "kiro-rs callback failed. See " + $LogPath + [Environment]::NewLine + $Message
+    $Shell.Popup($PopupMessage, 12, "kiro-rs callback", 48) | Out-Null
+  } catch {}
+  exit 1
 }
 '@
-$ScriptBody = $ScriptBody.Replace("__ENDPOINT__", $Endpoint)
+$ScriptBody = $ScriptBody.Replace("__STATE_ENDPOINT__", $StateEndpoint).Replace("__SESSION_ENDPOINT__", $SessionEndpoint)
 Set-Content -Path $ScriptPath -Value $ScriptBody -Encoding UTF8
 New-Item -Path "HKCU:\\Software\\Classes\\kiro" -Force | Out-Null
 Set-Item -Path "HKCU:\\Software\\Classes\\kiro" -Value "URL:Kiro OAuth Callback"
@@ -127,8 +142,8 @@ function chunkString(value: string, size: number): string[] {
   return chunks
 }
 
-function buildWindowsExternalIdpCallbackHelperInstaller(origin: string): string {
-  const installerScript = buildWindowsExternalIdpCallbackHelperScript(origin)
+function buildWindowsExternalIdpCallbackHelperInstaller(origin: string, sessionId: string): string {
+  const installerScript = buildWindowsExternalIdpCallbackHelperScript(origin, sessionId)
   const chunks = chunkString(base64EncodeUtf8(installerScript), 76)
     .map((chunk) => `echo ${chunk}`)
     .join('\r\n')
@@ -527,10 +542,15 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
   }
 
   const handleDownloadExternalCallbackHelper = () => {
+    if (!session || sessionMode !== 'external_idp' || !isExternalIdpSession(session)) {
+      toast.error('请先开始 External IdP 登录')
+      return
+    }
+
     try {
       downloadTextFile(
         'install-kiro-rs-callback-helper.cmd',
-        buildWindowsExternalIdpCallbackHelperInstaller(window.location.origin)
+        buildWindowsExternalIdpCallbackHelperInstaller(window.location.origin, session.sessionId)
       )
       toast.success('Windows 捕获器安装器已下载')
     } catch {
