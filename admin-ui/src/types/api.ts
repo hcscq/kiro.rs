@@ -383,7 +383,7 @@ export type ExternalIdpLoginPhase =
   | 'idp-authorization'
   | 'completed'
 
-export type ExternalIdpLoginFlow = 'auto' | 'device-code' | 'pkce'
+export type ExternalIdpLoginFlow = 'auto' | 'device-code' | 'pkce' | 'kiro-pkce'
 
 export interface StartExternalIdpLoginRequest {
   workEmail?: string
@@ -456,6 +456,12 @@ export interface ExternalIdpLoginStatusResponse {
   subscriptionType?: string | null
   authAccountType?: 'social' | 'builder-id' | 'enterprise' | 'idc' | string | null
   resolvedAccountType?: string | null
+}
+
+export interface SubmitExternalIdpCallbackRequest {
+  callbackUrl?: string
+  code?: string
+  state?: string
 }
 
 export interface RequestWeightingConfig {

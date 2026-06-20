@@ -19,6 +19,7 @@ import type {
   StartExternalIdpLoginRequest,
   ExternalIdpLoginStartResponse,
   ExternalIdpLoginStatusResponse,
+  SubmitExternalIdpCallbackRequest,
   StartIdcDeviceLoginRequest,
   IdcDeviceLoginStartResponse,
   IdcDeviceLoginStatusResponse,
@@ -345,6 +346,17 @@ export async function getExternalIdpLoginStatus(
 ): Promise<ExternalIdpLoginStatusResponse> {
   const { data } = await api.post<ExternalIdpLoginStatusResponse>(
     `/auth/external-idp/${encodeURIComponent(sessionId)}/status`
+  )
+  return data
+}
+
+export async function submitExternalIdpCallback(
+  sessionId: string,
+  req: SubmitExternalIdpCallbackRequest
+): Promise<ExternalIdpLoginStatusResponse> {
+  const { data } = await api.post<ExternalIdpLoginStatusResponse>(
+    `/auth/external-idp/${encodeURIComponent(sessionId)}/callback`,
+    req
   )
   return data
 }

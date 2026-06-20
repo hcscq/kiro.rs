@@ -903,6 +903,7 @@ pub enum ExternalIdpLoginFlow {
     Auto,
     DeviceCode,
     Pkce,
+    KiroPkce,
 }
 
 /// External IdP 浏览器登录状态
@@ -1002,6 +1003,23 @@ pub struct ExternalIdpLoginStatusResponse {
     pub auth_account_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_account_type: Option<String>,
+}
+
+/// External IdP 手动提交授权回调请求
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmitExternalIdpCallbackRequest {
+    /// 完整回调 URL，例如 kiro://kiro.oauth/callback?code=...&state=...
+    #[serde(default)]
+    pub callback_url: Option<String>,
+
+    /// 仅授权码；提供完整 callbackUrl 时可留空
+    #[serde(default)]
+    pub code: Option<String>,
+
+    /// 可选 state；提供完整 callbackUrl 时会从 URL 中读取
+    #[serde(default)]
+    pub state: Option<String>,
 }
 
 // ============ 余额查询 ============

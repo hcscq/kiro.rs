@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
-import { CheckCircle2, Copy, ExternalLink, Loader2, LogIn, Search, XCircle } from 'lucide-react'
+import { CheckCircle2, Copy, ExternalLink, Loader2, LogIn, Search, Send, XCircle } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import {
@@ -20,6 +20,7 @@ import {
   probeExternalIdp,
   startExternalIdpLogin,
   startIdcDeviceLogin,
+  submitExternalIdpCallback,
 } from '@/api/credentials'
 import { cn, extractErrorMessage } from '@/lib/utils'
 import type {
@@ -148,6 +149,8 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
   const [externalAudience, setExternalAudience] = useState('')
   const [externalProbe, setExternalProbe] = useState<ExternalIdpProbeResponse | null>(null)
   const [externalProbing, setExternalProbing] = useState(false)
+  const [externalCallbackInput, setExternalCallbackInput] = useState('')
+  const [submittingCallback, setSubmittingCallback] = useState(false)
   const [session, setSession] = useState<LoginSession | null>(null)
   const [sessionMode, setSessionMode] = useState<LoginMode>('idc')
   const [starting, setStarting] = useState(false)
@@ -172,6 +175,8 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
     setExternalAudience('')
     setExternalProbe(null)
     setExternalProbing(false)
+    setExternalCallbackInput('')
+    setSubmittingCallback(false)
     setSession(null)
     setSessionMode('idc')
     setStarting(false)
@@ -310,7 +315,7 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
       scopes: scopes || undefined,
       audience: externalAudience.trim() || undefined,
       loginHint: workEmail || undefined,
-      flow: 'auto',
+      flow: 'kiro-pkce',
       callbackBaseUrl: window.location.origin,
       apiRegion: apiRegion.trim() || undefined,
       priority: parsedPriority,
@@ -368,6 +373,47 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
     }
   }
 
+  const handleExternalCallbackSubmit = async (event: FormEvent) => {
+    event.preventDefault()
+    if (!session || sessionMode !== 'external_idp' || !isExternalIdpSession(session)) {
+      return
+    }
+
+    const value = externalCallbackInput.trim()
+    if (!value) {
+      toast.error('需要填写回调 URL 或授权码')
+      return
+    }
+
+    setSubmittingCallback(true)
+    try {
+      const response = await submitExternalIdpCallback(
+        session.sessionId,
+        value.includes('://') || value.includes('=') || value.startsWith('?')
+          ? { callbackUrl: value }
+          : { code: value }
+      )
+      setSession(response)
+      if (response.status === 'completed' && completedSessionRef.current !== response.sessionId) {
+        completedSessionRef.current = response.sessionId
+        setExternalCallbackInput('')
+        toast.success(response.message || '登录完成')
+        queryClient.invalidateQueries({ queryKey: ['credentials'] })
+        queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
+      } else if (response.status === 'failed') {
+        toast.error(response.message || '登录失败')
+      } else if (response.status === 'expired') {
+        toast.error(response.message || '授权码已过期')
+      } else {
+        toast.success(response.message || '回调已提交')
+      }
+    } catch (error) {
+      toast.error(`提交回调失败: ${extractErrorMessage(error)}`)
+    } finally {
+      setSubmittingCallback(false)
+    }
+  }
+
   useEffect(() => {
     if (!open || !session || session.status !== 'pending') {
       return
@@ -403,6 +449,12 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
   const secondaryText = session ? sessionSecondaryText(session) : ''
   const authUrl = session ? sessionAuthUrl(session) : undefined
   const userCode = session ? sessionUserCode(session) : undefined
+  const externalSession = session && isExternalIdpSession(session) ? session : null
+  const needsManualExternalCallback =
+    sessionMode === 'external_idp' &&
+    externalSession?.status === 'pending' &&
+    externalSession.flow === 'kiro-pkce' &&
+    externalSession.phase === 'idp-authorization'
 
   return (
     <Dialog open={open} onOpenChange={handleDialogOpenChange}>
@@ -659,7 +711,7 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
                           externalProbe.refreshWithoutClientSecretLikelySupported
                         )}
                       >
-                        No-secret token{' '}
+                        Device token{' '}
                         {externalProbe.refreshWithoutClientSecretLikelySupported ? '支持' : '需密钥'}
                       </Badge>
                     </div>
@@ -825,11 +877,44 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
                   <ExternalLink className="h-4 w-4" />
                   {sessionMode === 'external_idp' &&
                   isExternalIdpSession(session) &&
-                  session.flow === 'pkce'
+                  (session.flow === 'pkce' || session.flow === 'kiro-pkce')
                     ? '打开登录页面'
                     : '打开验证页面'}
                 </a>
               </Button>
+            ) : null}
+
+            {needsManualExternalCallback && externalSession ? (
+              <form onSubmit={handleExternalCallbackSubmit} className="space-y-3 rounded-md border p-4">
+                {externalSession.callbackUrl && (
+                  <div className="flex justify-between gap-3 text-sm">
+                    <span className="text-muted-foreground">Redirect URI</span>
+                    <span className="break-all text-right">{externalSession.callbackUrl}</span>
+                  </div>
+                )}
+                <div className="space-y-1.5">
+                  <label htmlFor="external-callback" className="text-sm font-medium">
+                    回调 URL 或授权码
+                  </label>
+                  <textarea
+                    id="external-callback"
+                    value={externalCallbackInput}
+                    onChange={(event) => setExternalCallbackInput(event.target.value)}
+                    placeholder="kiro://kiro.oauth/callback?code=...&state=..."
+                    disabled={submittingCallback}
+                    rows={3}
+                    className="flex w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                  />
+                </div>
+                <Button type="submit" className="w-full" disabled={submittingCallback}>
+                  {submittingCallback ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Send className="h-4 w-4" />
+                  )}
+                  提交回调
+                </Button>
+              </form>
             ) : null}
 
             <DialogFooter>
@@ -839,11 +924,15 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
                     type="button"
                     variant="outline"
                     onClick={() => void handleDialogOpenChange(false)}
-                    disabled={polling}
+                    disabled={polling || submittingCallback}
                   >
                     取消登录
                   </Button>
-                  <Button type="button" onClick={() => void pollStatus()} disabled={polling}>
+                  <Button
+                    type="button"
+                    onClick={() => void pollStatus()}
+                    disabled={polling || submittingCallback}
+                  >
                     {polling && <Loader2 className="h-4 w-4 animate-spin" />}
                     刷新状态
                   </Button>

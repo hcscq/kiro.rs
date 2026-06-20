@@ -17,7 +17,7 @@ use super::{
         SetCredentialRateLimitConfigRequest, SetCredentialSourceRequest, SetDisabledRequest,
         SetLoadBalancingModeRequest, SetMaxConcurrencyRequest, SetModelCapabilitiesConfigRequest,
         SetOverageStatusRequest, SetPriorityRequest, StartExternalIdpLoginRequest,
-        StartIdcDeviceLoginRequest, SuccessResponse,
+        StartIdcDeviceLoginRequest, SubmitExternalIdpCallbackRequest, SuccessResponse,
     },
 };
 
@@ -384,6 +384,23 @@ pub async fn cancel_external_idp_login(
     Path(session_id): Path<String>,
 ) -> impl IntoResponse {
     match state.service.cancel_external_idp_login(&session_id) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/auth/external-idp/:session_id/callback
+/// 手动提交 External IdP 自定义 scheme 回调 URL 或授权码
+pub async fn submit_external_idp_callback(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+    Json(payload): Json<SubmitExternalIdpCallbackRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .submit_external_idp_callback(&session_id, payload)
+        .await
+    {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

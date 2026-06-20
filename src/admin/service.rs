@@ -33,6 +33,7 @@ use super::types::{
     SetCredentialModelPolicyRequest, SetCredentialProfileRequest, SetCredentialProxyRequest,
     SetCredentialSourceRequest, SetLoadBalancingModeRequest, SetModelCapabilitiesConfigRequest,
     StandardAccountTypePresetResponse, StartExternalIdpLoginRequest, StartIdcDeviceLoginRequest,
+    SubmitExternalIdpCallbackRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -45,6 +46,7 @@ const IDC_DEVICE_LOGIN_CLIENT_NAME: &str = "Kiro IDE";
 const EXTERNAL_IDP_LOGIN_SESSION_SECS: i64 = 10 * 60;
 const EXTERNAL_IDP_LOGIN_POLL_INTERVAL_SECS: u64 = 3;
 const KIRO_AUTH_PORTAL_URL: &str = "https://app.kiro.dev";
+const KIRO_IDE_EXTERNAL_IDP_REDIRECT_URI: &str = "kiro://kiro.oauth/callback";
 const KIRO_WEB_PORTAL_ENDPOINT: &str =
     "https://app.kiro.dev/service/KiroWebPortalService/operation/GetLoginMetadata";
 const UPSTREAM_ERROR_EXCERPT_CHARS: usize = 240;
@@ -99,6 +101,7 @@ struct ExternalIdpLoginSession {
     provider: String,
     auth_url: Option<String>,
     callback_url: Option<String>,
+    idp_redirect_uri: Option<String>,
     expires_at: DateTime<Utc>,
     request: StartExternalIdpLoginRequest,
     portal_state: Option<String>,
@@ -470,7 +473,7 @@ fn external_idp_secret_required_error_message(description: &str) -> Option<Strin
         || (lower.contains("client_assertion") && lower.contains("client_secret"))
     {
         return Some(
-            "ExternalIdP device-code 已完成浏览器授权，但 Azure token endpoint 要求 client_secret 或 client_assertion。当前 kiro.rs 没有 Kiro/Azure 应用密钥，无法完成该机密客户端的 token exchange。".to_string(),
+            "ExternalIdP token exchange 收到 Azure 机密客户端要求：需要 client_secret 或 client_assertion。当前 kiro.rs 没有 Kiro/Azure 应用密钥，无法完成这条 token exchange。".to_string(),
         );
     }
     None
@@ -535,7 +538,7 @@ fn external_idp_login_status_response(
         auth_url: (session.status == ExternalIdpLoginStatus::Pending)
             .then(|| session.auth_url.clone())
             .flatten(),
-        callback_url: session.callback_url.clone().unwrap_or_default(),
+        callback_url: external_idp_display_callback_url(session),
         expires_at: (session.status == ExternalIdpLoginStatus::Pending)
             .then_some(session.expires_at),
         interval_seconds: session.interval_seconds,
@@ -561,6 +564,74 @@ fn external_idp_login_status_response(
         auth_account_type: credential.and_then(|value| value.auth_account_type.clone()),
         resolved_account_type: credential.and_then(|value| value.resolved_account_type.clone()),
     }
+}
+
+fn external_idp_display_callback_url(session: &ExternalIdpLoginSession) -> String {
+    session
+        .idp_redirect_uri
+        .clone()
+        .or_else(|| session.callback_url.clone())
+        .unwrap_or_default()
+}
+
+fn parse_external_idp_callback_params(value: &str) -> HashMap<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return HashMap::new();
+    }
+
+    if let Ok(parsed) = url::Url::parse(value) {
+        let mut params: HashMap<String, String> = parsed.query_pairs().into_owned().collect();
+        if let Some(fragment) = parsed.fragment().filter(|fragment| !fragment.is_empty()) {
+            for (key, value) in url::form_urlencoded::parse(fragment.as_bytes()) {
+                params.entry(key.into_owned()).or_insert(value.into_owned());
+            }
+        }
+        return params;
+    }
+
+    let query = value
+        .strip_prefix('?')
+        .or_else(|| value.split_once('?').map(|(_, query)| query))
+        .unwrap_or(value);
+    url::form_urlencoded::parse(query.as_bytes())
+        .into_owned()
+        .collect()
+}
+
+fn external_idp_submit_callback_params(
+    req: &SubmitExternalIdpCallbackRequest,
+) -> Result<HashMap<String, String>, AdminServiceError> {
+    let mut params = req
+        .callback_url
+        .as_deref()
+        .map(parse_external_idp_callback_params)
+        .unwrap_or_default();
+
+    if let Some(code) = normalize_optional_string(req.code.as_deref()) {
+        params.insert("code".to_string(), code);
+    }
+    if let Some(state) = normalize_optional_string(req.state.as_deref()) {
+        params.insert("state".to_string(), state);
+    }
+
+    let has_code = params
+        .get("code")
+        .map(String::as_str)
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    let has_error = params
+        .get("error")
+        .map(String::as_str)
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    if !has_code && !has_error {
+        return Err(AdminServiceError::InvalidCredential(
+            "需要粘贴 External IdP 回调 URL 或授权码".to_string(),
+        ));
+    }
+
+    Ok(params)
 }
 
 fn random_urlsafe_bytes(len: usize) -> Result<String, AdminServiceError> {
@@ -990,12 +1061,12 @@ impl AdminService {
             }
             if !refresh_without_client_secret_likely_supported {
                 recommendations.push(
-                    "token_endpoint_auth_methods_supported 未包含 none；当前 kiro.rs 不持有 Kiro/Azure 应用密钥，External IdP device-code token exchange 和后续 refresh 很可能无法完成".to_string(),
+                    "token_endpoint_auth_methods_supported 未包含 none；External IdP device-code token exchange 很可能需要 Kiro/Azure 应用密钥。IDE-style PKCE 使用已注册的 kiro://kiro.oauth/callback，仍可继续实测".to_string(),
                 );
             }
             if pkce_s256_supported && client_id.is_some() && !scopes.is_empty() {
                 recommendations
-                    .push("可以进入浏览器 PKCE 回调测试；密码只在组织 IdP 页面输入".to_string());
+                    .push("建议使用 Kiro PKCE 手动回调测试；密码只在组织 IdP 页面输入，授权后粘贴 kiro:// 回调 URL 或授权码".to_string());
             }
         }
 
@@ -1072,7 +1143,9 @@ impl AdminService {
         let direct_idp =
             req.issuer_url.is_some() && req.client_id.is_some() && req.scopes.is_some();
         let requested_flow = req.flow;
-        let callback_url = if requested_flow == ExternalIdpLoginFlow::Pkce {
+        let needs_portal_callback = !direct_idp && discovery_domain.is_none();
+        let needs_https_idp_callback = requested_flow == ExternalIdpLoginFlow::Pkce;
+        let callback_url = if needs_https_idp_callback || needs_portal_callback {
             Some(resolve_external_idp_callback_url(
                 req.callback_base_url.as_deref(),
             )?)
@@ -1095,6 +1168,7 @@ impl AdminService {
             provider: "ExternalIdp".to_string(),
             auth_url: None,
             callback_url,
+            idp_redirect_uri: None,
             expires_at,
             request: req.clone(),
             portal_state: None,
@@ -1178,7 +1252,7 @@ impl AdminService {
             flow: session.flow,
             provider: session.provider.clone(),
             auth_url,
-            callback_url: session.callback_url.clone().unwrap_or_default(),
+            callback_url: external_idp_display_callback_url(&session),
             expires_at: session.expires_at,
             interval_seconds: session.interval_seconds,
             issuer_url: session.issuer_url.clone(),
@@ -1364,6 +1438,131 @@ impl AdminService {
             session.message = Some("ExternalIdP 登录已取消".to_string());
             session.polling = false;
             session.updated_at = Utc::now();
+        }
+        Ok(external_idp_login_status_response(session))
+    }
+
+    /// 手动提交 External IdP 自定义 scheme 回调 URL 或授权码
+    pub async fn submit_external_idp_callback(
+        &self,
+        session_id: &str,
+        payload: SubmitExternalIdpCallbackRequest,
+    ) -> Result<ExternalIdpLoginStatusResponse, AdminServiceError> {
+        self.ensure_runtime_write_leader()?;
+        self.prune_external_idp_login_sessions();
+
+        let params = external_idp_submit_callback_params(&payload)?;
+        if let Some(error) = params
+            .get("error")
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let description = params
+                .get("error_description")
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(error);
+            let mut sessions = self.external_idp_login_sessions.lock();
+            let session = sessions.get_mut(session_id).ok_or_else(|| {
+                AdminServiceError::InvalidCredential(
+                    "ExternalIdP 登录会话不存在或已过期".to_string(),
+                )
+            })?;
+            session.status = ExternalIdpLoginStatus::Failed;
+            session.message = Some(description.to_string());
+            session.updated_at = Utc::now();
+            return Ok(external_idp_login_status_response(session));
+        }
+
+        let code = params
+            .get("code")
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| AdminServiceError::InvalidCredential("OAuth 回调缺少 code".to_string()))?
+            .to_string();
+        let submitted_state = params
+            .get("state")
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+
+        let exchange_session = {
+            let mut sessions = self.external_idp_login_sessions.lock();
+            let current = sessions.get_mut(session_id).ok_or_else(|| {
+                AdminServiceError::InvalidCredential(
+                    "ExternalIdP 登录会话不存在或已过期".to_string(),
+                )
+            })?;
+            if current.status != ExternalIdpLoginStatus::Pending {
+                return Ok(external_idp_login_status_response(current));
+            }
+            if Utc::now() >= current.expires_at {
+                current.status = ExternalIdpLoginStatus::Expired;
+                current.message = Some("ExternalIdP 登录会话已过期，请重新开始登录".to_string());
+                current.updated_at = Utc::now();
+                return Ok(external_idp_login_status_response(current));
+            }
+            if current.phase != ExternalIdpLoginPhase::IdpAuthorization {
+                current.message = Some("当前 External IdP 会话尚未进入 IdP 授权阶段".to_string());
+                current.updated_at = Utc::now();
+                return Err(AdminServiceError::InvalidCredential(
+                    "当前 External IdP 会话尚未进入 IdP 授权阶段".to_string(),
+                ));
+            }
+            if let Some(submitted_state) = submitted_state {
+                if current.idp_state.as_deref() != Some(submitted_state) {
+                    current.message = Some(
+                        "提交的 OAuth state 与当前登录会话不匹配，请重新复制回调 URL".to_string(),
+                    );
+                    current.updated_at = Utc::now();
+                    return Err(AdminServiceError::InvalidCredential(
+                        "提交的 OAuth state 与当前登录会话不匹配".to_string(),
+                    ));
+                }
+            }
+            if current.idp_callback_consumed {
+                return Ok(external_idp_login_status_response(current));
+            }
+
+            current.idp_callback_consumed = true;
+            current.message = Some("已收到授权码，正在交换 token".to_string());
+            current.updated_at = Utc::now();
+            current.clone()
+        };
+
+        let result: Result<AddCredentialResponse, AdminServiceError> = async {
+            let config = self.token_manager.config();
+            let proxy = self.login_proxy_for_external_idp_login(&exchange_session.request)?;
+            let client = build_client(proxy.as_ref(), 60, config.tls_backend)
+                .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+            let token = self
+                .exchange_external_idp_authorization_code(&client, &exchange_session, &code)
+                .await?;
+            let add_req = self.build_external_idp_add_credential_request(&exchange_session, token);
+            self.add_credential(add_req).await
+        }
+        .await;
+
+        let mut sessions = self.external_idp_login_sessions.lock();
+        let session = sessions.get_mut(session_id).ok_or_else(|| {
+            AdminServiceError::InvalidCredential("ExternalIdP 登录会话不存在或已过期".to_string())
+        })?;
+        match result {
+            Ok(add_response) => {
+                session.status = ExternalIdpLoginStatus::Completed;
+                session.phase = ExternalIdpLoginPhase::Completed;
+                session.message = Some(add_response.message.clone());
+                session.credential_result = Some(add_response);
+                session.updated_at = Utc::now();
+            }
+            Err(err) => {
+                session.status = ExternalIdpLoginStatus::Failed;
+                session.message = Some(err.to_string());
+                session.updated_at = Utc::now();
+            }
         }
         Ok(external_idp_login_status_response(session))
     }
@@ -1773,7 +1972,10 @@ impl AdminService {
         let (issuer_url, _, _) = Self::external_idp_session_inputs(session)?;
         let discovery = self.fetch_oidc_discovery(client, &issuer_url).await?;
 
-        if session.flow != ExternalIdpLoginFlow::Pkce {
+        if !matches!(
+            session.flow,
+            ExternalIdpLoginFlow::Pkce | ExternalIdpLoginFlow::KiroPkce
+        ) {
             if discovery.device_authorization_endpoint.is_some() {
                 if let Some(message) =
                     external_idp_device_code_secret_requirement_message(&discovery)
@@ -1809,11 +2011,19 @@ impl AdminService {
         let token_endpoint = discovery.token_endpoint.clone().ok_or_else(|| {
             AdminServiceError::InvalidCredential("OIDC discovery 未返回 token_endpoint".to_string())
         })?;
-        let callback_url = session.callback_url.as_deref().ok_or_else(|| {
-            AdminServiceError::InvalidCredential(
-                "ExternalIdP PKCE 登录需要 callbackBaseUrl".to_string(),
-            )
-        })?;
+        let idp_redirect_uri = if session.flow == ExternalIdpLoginFlow::KiroPkce {
+            KIRO_IDE_EXTERNAL_IDP_REDIRECT_URI.to_string()
+        } else {
+            session
+                .callback_url
+                .as_deref()
+                .ok_or_else(|| {
+                    AdminServiceError::InvalidCredential(
+                        "ExternalIdP PKCE 登录需要 callbackBaseUrl".to_string(),
+                    )
+                })?
+                .to_string()
+        };
 
         let state = random_oauth_state()?;
         let code_verifier = random_pkce_code_verifier()?;
@@ -1821,7 +2031,7 @@ impl AdminService {
         let auth_url = build_external_idp_authorization_url(
             &authorization_endpoint,
             &client_id,
-            callback_url,
+            &idp_redirect_uri,
             &scopes,
             &state,
             &code_challenge,
@@ -1829,9 +2039,12 @@ impl AdminService {
             session.audience.as_deref(),
         )?;
 
-        session.flow = ExternalIdpLoginFlow::Pkce;
+        if session.flow != ExternalIdpLoginFlow::KiroPkce {
+            session.flow = ExternalIdpLoginFlow::Pkce;
+        }
         session.phase = ExternalIdpLoginPhase::IdpAuthorization;
         session.auth_url = Some(auth_url);
+        session.idp_redirect_uri = Some(idp_redirect_uri);
         session.idp_state = Some(state);
         session.idp_code_verifier = Some(code_verifier);
         session.issuer_url = Some(issuer_url);
@@ -1840,7 +2053,11 @@ impl AdminService {
         session.token_endpoint = Some(token_endpoint);
         session.device_authorization_endpoint = discovery.device_authorization_endpoint;
         session.interval_seconds = EXTERNAL_IDP_LOGIN_POLL_INTERVAL_SECS;
-        session.message = Some("等待用户在组织 IdP 页面完成登录".to_string());
+        session.message = Some(if session.flow == ExternalIdpLoginFlow::KiroPkce {
+            "等待用户完成组织 IdP 登录，并粘贴 kiro:// 回调 URL 或授权码".to_string()
+        } else {
+            "等待用户在组织 IdP 页面完成登录".to_string()
+        });
         session.updated_at = Utc::now();
         Ok(())
     }
@@ -2260,8 +2477,9 @@ impl AdminService {
                 )
             })?;
         let redirect_uri = session
-            .callback_url
+            .idp_redirect_uri
             .as_deref()
+            .or(session.callback_url.as_deref())
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| {
@@ -3889,6 +4107,10 @@ mod tests {
         let device_req: StartExternalIdpLoginRequest =
             serde_json::from_str(r#"{"flow":"device-code"}"#).unwrap();
         assert_eq!(device_req.flow, ExternalIdpLoginFlow::DeviceCode);
+
+        let kiro_pkce_req: StartExternalIdpLoginRequest =
+            serde_json::from_str(r#"{"flow":"kiro-pkce"}"#).unwrap();
+        assert_eq!(kiro_pkce_req.flow, ExternalIdpLoginFlow::KiroPkce);
     }
 
     #[test]
@@ -3923,6 +4145,70 @@ mod tests {
             Some("user@example.com")
         );
         assert_eq!(pairs.get("audience").map(String::as_str), Some("aud-1"));
+    }
+
+    #[test]
+    fn external_idp_authorization_url_accepts_kiro_ide_redirect_uri() {
+        let url = build_external_idp_authorization_url(
+            "https://login.example.com/oauth2/v2.0/authorize",
+            "client-1",
+            KIRO_IDE_EXTERNAL_IDP_REDIRECT_URI,
+            "openid offline_access",
+            "state-1",
+            "challenge-1",
+            None,
+            None,
+        )
+        .unwrap();
+        let parsed = url::Url::parse(&url).unwrap();
+        let pairs: HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+
+        assert_eq!(
+            pairs.get("redirect_uri").map(String::as_str),
+            Some(KIRO_IDE_EXTERNAL_IDP_REDIRECT_URI)
+        );
+        assert_eq!(
+            pairs.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
+    }
+
+    #[test]
+    fn external_idp_submit_callback_params_accept_url_query_or_code() {
+        let params = external_idp_submit_callback_params(&SubmitExternalIdpCallbackRequest {
+            callback_url: Some("kiro://kiro.oauth/callback?code=code-1&state=state-1".to_string()),
+            code: None,
+            state: None,
+        })
+        .unwrap();
+        assert_eq!(params.get("code").map(String::as_str), Some("code-1"));
+        assert_eq!(params.get("state").map(String::as_str), Some("state-1"));
+
+        let params = external_idp_submit_callback_params(&SubmitExternalIdpCallbackRequest {
+            callback_url: Some("?code=code-2&state=state-2".to_string()),
+            code: None,
+            state: None,
+        })
+        .unwrap();
+        assert_eq!(params.get("code").map(String::as_str), Some("code-2"));
+        assert_eq!(params.get("state").map(String::as_str), Some("state-2"));
+
+        let params = external_idp_submit_callback_params(&SubmitExternalIdpCallbackRequest {
+            callback_url: None,
+            code: Some(" code-3 ".to_string()),
+            state: None,
+        })
+        .unwrap();
+        assert_eq!(params.get("code").map(String::as_str), Some("code-3"));
+
+        assert!(
+            external_idp_submit_callback_params(&SubmitExternalIdpCallbackRequest {
+                callback_url: None,
+                code: None,
+                state: None,
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -4124,6 +4410,7 @@ mod tests {
             provider: "ExternalIdp".to_string(),
             auth_url: Some("https://microsoft.com/devicelogin".to_string()),
             callback_url: None,
+            idp_redirect_uri: None,
             expires_at: now + Duration::minutes(10),
             request: serde_json::from_str("{}").unwrap(),
             portal_state: None,
