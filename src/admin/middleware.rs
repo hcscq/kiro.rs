@@ -294,7 +294,7 @@ fn admin_request_path(request: &Request<Body>) -> &str {
 }
 
 fn is_public_admin_callback_route(method: &Method, path: &str) -> bool {
-    if *method != Method::GET {
+    if !matches!(*method, Method::GET | Method::POST) {
         return false;
     }
     let path = path
@@ -456,15 +456,23 @@ mod tests {
             &Method::GET,
             "/api/admin/auth/external-idp/callback",
         ));
+        assert!(is_public_admin_callback_route(
+            &Method::POST,
+            "/api/admin/auth/external-idp/callback",
+        ));
         assert!(requires_leader_routing(
             &Method::GET,
+            "/api/admin/auth/external-idp/callback",
+        ));
+        assert!(requires_leader_routing(
+            &Method::POST,
             "/api/admin/auth/external-idp/callback",
         ));
         assert!(!is_retryable_admin_write_route(
             &Method::GET,
             "/api/admin/auth/external-idp/callback",
         ));
-        assert!(!is_public_admin_callback_route(
+        assert!(!is_retryable_admin_write_route(
             &Method::POST,
             "/api/admin/auth/external-idp/callback",
         ));

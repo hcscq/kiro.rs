@@ -406,6 +406,22 @@ pub async fn submit_external_idp_callback(
     }
 }
 
+/// POST /api/admin/auth/external-idp/callback
+/// 按 OAuth state 自动定位会话并提交 External IdP 自定义 scheme 回调
+pub async fn submit_external_idp_callback_by_state(
+    State(state): State<AdminState>,
+    Json(payload): Json<SubmitExternalIdpCallbackRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .submit_external_idp_callback_by_state(payload)
+        .await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// GET /api/admin/auth/external-idp/callback
 /// 接收 Kiro portal / External IdP 浏览器回调
 pub async fn handle_external_idp_callback(

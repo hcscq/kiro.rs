@@ -77,6 +77,38 @@ function isExternalIdpSession(session: LoginSession): session is ExternalIdpSess
   return 'phase' in session
 }
 
+function buildWindowsExternalIdpCallbackHelperScript(origin: string): string {
+  const endpoint = `${origin.replace(/\/+$/, '')}/api/admin/auth/external-idp/callback`
+  return `$Endpoint = ${JSON.stringify(endpoint)}
+$InstallDir = Join-Path $env:LOCALAPPDATA "kiro-rs-callback"
+New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+$ScriptPath = Join-Path $InstallDir "kiro-callback.ps1"
+$ScriptBody = @'
+param([string]$CallbackUrl)
+$ErrorActionPreference = "Stop"
+if ([string]::IsNullOrWhiteSpace($CallbackUrl)) { exit 1 }
+$Endpoint = "__ENDPOINT__"
+$LogPath = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "callback.log"
+try {
+  $Body = @{ callbackUrl = $CallbackUrl } | ConvertTo-Json -Compress
+  Invoke-RestMethod -Method Post -Uri $Endpoint -ContentType "application/json" -Body $Body | Out-Null
+  Add-Content -Path $LogPath -Value ("{0} submitted callback" -f (Get-Date).ToString("s"))
+} catch {
+  Add-Content -Path $LogPath -Value ("{0} {1}" -f (Get-Date).ToString("s"), $_.Exception.Message)
+  throw
+}
+'@
+$ScriptBody = $ScriptBody.Replace("__ENDPOINT__", $Endpoint)
+Set-Content -Path $ScriptPath -Value $ScriptBody -Encoding UTF8
+New-Item -Path "HKCU:\\Software\\Classes\\kiro" -Force | Out-Null
+Set-Item -Path "HKCU:\\Software\\Classes\\kiro" -Value "URL:Kiro OAuth Callback"
+New-ItemProperty -Path "HKCU:\\Software\\Classes\\kiro" -Name "URL Protocol" -Value "" -PropertyType String -Force | Out-Null
+New-Item -Path "HKCU:\\Software\\Classes\\kiro\\shell\\open\\command" -Force | Out-Null
+$Command = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $ScriptPath + '" "%1"'
+Set-Item -Path "HKCU:\\Software\\Classes\\kiro\\shell\\open\\command" -Value $Command
+Write-Host "Registered kiro:// callback helper"`
+}
+
 function sessionSecondaryText(session: LoginSession): string {
   if (isIdcSession(session)) {
     return session.region
@@ -433,6 +465,17 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
     try {
       await navigator.clipboard.writeText(userCode)
       toast.success('验证码已复制')
+    } catch {
+      toast.error('复制失败')
+    }
+  }
+
+  const handleCopyExternalCallbackHelper = async () => {
+    try {
+      await navigator.clipboard.writeText(
+        buildWindowsExternalIdpCallbackHelperScript(window.location.origin)
+      )
+      toast.success('Windows 捕获器安装命令已复制')
     } catch {
       toast.error('复制失败')
     }
@@ -906,14 +949,24 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
                     className="flex w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
                   />
                 </div>
-                <Button type="submit" className="w-full" disabled={submittingCallback}>
-                  {submittingCallback ? (
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  ) : (
-                    <Send className="h-4 w-4" />
-                  )}
-                  提交回调
-                </Button>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={handleCopyExternalCallbackHelper}
+                  >
+                    <Copy className="h-4 w-4" />
+                    Windows 捕获器
+                  </Button>
+                  <Button type="submit" disabled={submittingCallback}>
+                    {submittingCallback ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Send className="h-4 w-4" />
+                    )}
+                    提交回调
+                  </Button>
+                </div>
               </form>
             ) : null}
 

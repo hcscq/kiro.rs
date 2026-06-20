@@ -18,6 +18,7 @@ use super::{
         set_credential_proxy, set_credential_rate_limit_config, set_credential_source,
         set_load_balancing_mode, set_model_capabilities_config, start_external_idp_login,
         start_idc_device_login, submit_external_idp_callback,
+        submit_external_idp_callback_by_state,
     },
     middleware::{AdminState, admin_auth_middleware, admin_write_routing_middleware},
 };
@@ -51,6 +52,7 @@ use super::{
 /// - `POST /auth/external-idp/start` - 启动 External IdP 浏览器 PKCE 登录
 /// - `POST /auth/external-idp/:session_id/callback` - 手动提交 External IdP 自定义 scheme 回调
 /// - `GET /auth/external-idp/callback` - External IdP 浏览器回调
+/// - `POST /auth/external-idp/callback` - 按 state 提交自定义 scheme 回调
 ///
 /// # 认证
 /// 需要 Admin API Key 认证，支持：
@@ -87,7 +89,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         )
         .route(
             "/auth/external-idp/callback",
-            get(handle_external_idp_callback),
+            get(handle_external_idp_callback).post(submit_external_idp_callback_by_state),
         )
         .route("/credentials/{id}", delete(delete_credential))
         .route("/credentials/{id}/disabled", post(set_credential_disabled))

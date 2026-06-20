@@ -1567,6 +1567,32 @@ impl AdminService {
         Ok(external_idp_login_status_response(session))
     }
 
+    /// 通过 OAuth state 自动定位 External IdP 登录会话并提交自定义 scheme 回调。
+    pub async fn submit_external_idp_callback_by_state(
+        &self,
+        payload: SubmitExternalIdpCallbackRequest,
+    ) -> Result<ExternalIdpLoginStatusResponse, AdminServiceError> {
+        self.ensure_runtime_write_leader()?;
+        self.prune_external_idp_login_sessions();
+
+        let params = external_idp_submit_callback_params(&payload)?;
+        let state = params
+            .get("state")
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                AdminServiceError::InvalidCredential(
+                    "公共 External IdP 回调提交需要完整回调 URL 或 state".to_string(),
+                )
+            })?
+            .to_string();
+
+        let session = self.clone_external_idp_session_by_state(&state)?;
+        self.submit_external_idp_callback(&session.session_id, payload)
+            .await
+    }
+
     /// 处理 Kiro portal 或 External IdP 的浏览器回调
     pub async fn handle_external_idp_callback(
         &self,
