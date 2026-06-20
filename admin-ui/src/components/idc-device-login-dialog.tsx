@@ -541,6 +541,17 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
     }
   }
 
+  const handleCopyAuthUrl = async () => {
+    const url = session ? sessionAuthUrl(session) : undefined
+    if (!url) return
+    try {
+      await navigator.clipboard.writeText(url)
+      toast.success('链接已复制，可在无痕窗口打开')
+    } catch {
+      toast.error('复制失败')
+    }
+  }
+
   const handleDownloadExternalCallbackHelper = () => {
     if (!session || sessionMode !== 'external_idp' || !isExternalIdpSession(session)) {
       toast.error('请先开始 External IdP 登录')
@@ -988,20 +999,26 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
             </div>
 
             {authUrl ? (
-              <Button asChild className="w-full">
-                <a
-                  href={authUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                >
-                  <ExternalLink className="h-4 w-4" />
-                  {sessionMode === 'external_idp' &&
-                  isExternalIdpSession(session) &&
-                  (session.flow === 'pkce' || session.flow === 'kiro-pkce')
-                    ? '打开登录页面'
-                    : '打开验证页面'}
-                </a>
-              </Button>
+              <div className="grid gap-2 sm:grid-cols-2">
+                <Button asChild>
+                  <a
+                    href={authUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    <ExternalLink className="h-4 w-4" />
+                    {sessionMode === 'external_idp' &&
+                    isExternalIdpSession(session) &&
+                    (session.flow === 'pkce' || session.flow === 'kiro-pkce')
+                      ? '打开登录页面'
+                      : '打开验证页面'}
+                  </a>
+                </Button>
+                <Button type="button" variant="outline" onClick={handleCopyAuthUrl}>
+                  <Copy className="h-4 w-4" />
+                  {sessionMode === 'external_idp' ? '复制登录链接' : '复制验证链接'}
+                </Button>
+              </div>
             ) : null}
 
             {needsManualExternalCallback && externalSession ? (
