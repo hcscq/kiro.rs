@@ -523,12 +523,12 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
     }
 
     const delayMs = Math.max(session.intervalSeconds || 5, 2) * 1000
-    const timeout = window.setTimeout(() => {
+    const interval = window.setInterval(() => {
       void pollStatus()
     }, delayMs)
 
-    return () => window.clearTimeout(timeout)
-  }, [open, sessionMode, session?.sessionId, session?.status, session?.intervalSeconds, session?.message])
+    return () => window.clearInterval(interval)
+  }, [open, sessionMode, session?.sessionId, session?.status, session?.intervalSeconds])
 
   const handleCopyCode = async () => {
     const userCode = session ? sessionUserCode(session) : undefined
