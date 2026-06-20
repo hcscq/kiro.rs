@@ -139,6 +139,67 @@ fn normalize_optional_metadata(value: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+fn normalized_duplicate_identity(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_lowercase)
+}
+
+fn normalized_duplicate_url(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim_end_matches('/').to_lowercase())
+}
+
+fn external_idp_duplicate_reason(
+    existing: &KiroCredentials,
+    candidate: &KiroCredentials,
+) -> Option<&'static str> {
+    if !existing.is_external_idp_auth() || !candidate.is_external_idp_auth() {
+        return None;
+    }
+
+    let existing_profile = normalized_duplicate_identity(existing.profile_arn.as_deref());
+    let candidate_profile = normalized_duplicate_identity(candidate.profile_arn.as_deref());
+    if existing_profile.is_some() && existing_profile == candidate_profile {
+        return Some("profileArn 重复");
+    }
+
+    let same_issuer = match (
+        normalized_duplicate_url(existing.issuer_url.as_deref()),
+        normalized_duplicate_url(candidate.issuer_url.as_deref()),
+    ) {
+        (Some(existing), Some(candidate)) => existing == candidate,
+        _ => false,
+    };
+    let same_client = match (
+        normalized_duplicate_identity(existing.client_id.as_deref()),
+        normalized_duplicate_identity(candidate.client_id.as_deref()),
+    ) {
+        (Some(existing), Some(candidate)) => existing == candidate,
+        _ => false,
+    };
+    if !same_issuer || !same_client {
+        return None;
+    }
+
+    let existing_user_id = normalized_duplicate_identity(existing.user_id.as_deref());
+    let candidate_user_id = normalized_duplicate_identity(candidate.user_id.as_deref());
+    if existing_user_id.is_some() && existing_user_id == candidate_user_id {
+        return Some("issuerUrl/clientId/userId 重复");
+    }
+
+    let existing_email = normalized_duplicate_identity(existing.email.as_deref());
+    let candidate_email = normalized_duplicate_identity(candidate.email.as_deref());
+    if existing_email.is_some() && existing_email == candidate_email {
+        return Some("issuerUrl/clientId/email 重复");
+    }
+
+    None
+}
+
 /// 验证 refreshToken 的基本有效性
 pub(crate) fn validate_refresh_token(credentials: &KiroCredentials) -> anyhow::Result<()> {
     let refresh_token = credentials
@@ -9397,6 +9458,23 @@ impl MultiTokenManager {
         if duplicate_exists {
             anyhow::bail!("凭据已存在（refreshToken 重复）");
         }
+        if let Some((existing_id, reason)) = persisted.iter().find_map(|credential| {
+            external_idp_duplicate_reason(credential, &validated_cred)
+                .map(|reason| (credential.id, reason))
+        }) {
+            match existing_id {
+                Some(existing_id) => {
+                    anyhow::bail!(
+                        "凭据已存在（ExternalIdP 账号重复：{}，已有凭据 #{}）",
+                        reason,
+                        existing_id
+                    );
+                }
+                None => {
+                    anyhow::bail!("凭据已存在（ExternalIdP 账号重复：{}）", reason);
+                }
+            }
+        }
 
         let new_id = persisted
             .iter()
@@ -10796,6 +10874,61 @@ mod tests {
         let result = manager.add_credential(duplicate).await;
         assert!(result.is_err());
         assert!(result.err().unwrap().to_string().contains("凭据已存在"));
+    }
+
+    #[test]
+    fn external_idp_duplicate_reason_matches_stable_identity() {
+        let mut existing = KiroCredentials::default();
+        existing.auth_method = Some("external_idp".to_string());
+        existing.provider = Some("ExternalIdp".to_string());
+        existing.issuer_url = Some("https://login.example.com/tenant/v2.0/".to_string());
+        existing.client_id = Some("CLIENT-1".to_string());
+        existing.email = Some("User@Example.com".to_string());
+        existing.user_id = Some("USER-1".to_string());
+        existing.profile_arn = Some("arn:aws:codewhisperer:us-east-1:123:profile/p1".to_string());
+
+        let mut by_profile = KiroCredentials::default();
+        by_profile.auth_method = Some("external-idp".to_string());
+        by_profile.profile_arn = Some("ARN:AWS:CODEWHISPERER:US-EAST-1:123:PROFILE/P1".to_string());
+        assert_eq!(
+            external_idp_duplicate_reason(&existing, &by_profile),
+            Some("profileArn 重复")
+        );
+
+        let mut by_email = KiroCredentials::default();
+        by_email.auth_method = Some("external_idp".to_string());
+        by_email.issuer_url = Some("https://login.example.com/tenant/v2.0".to_string());
+        by_email.client_id = Some("client-1".to_string());
+        by_email.email = Some("user@example.com".to_string());
+        assert_eq!(
+            external_idp_duplicate_reason(&existing, &by_email),
+            Some("issuerUrl/clientId/email 重复")
+        );
+
+        let mut by_user_id = KiroCredentials::default();
+        by_user_id.auth_method = Some("external_idp".to_string());
+        by_user_id.issuer_url = Some("https://login.example.com/tenant/v2.0".to_string());
+        by_user_id.client_id = Some("client-1".to_string());
+        by_user_id.user_id = Some("user-1".to_string());
+        assert_eq!(
+            external_idp_duplicate_reason(&existing, &by_user_id),
+            Some("issuerUrl/clientId/userId 重复")
+        );
+    }
+
+    #[test]
+    fn external_idp_duplicate_reason_ignores_non_external_accounts() {
+        let mut existing = KiroCredentials::default();
+        existing.auth_method = Some("social".to_string());
+        existing.email = Some("user@example.com".to_string());
+        existing.profile_arn = Some("arn:aws:codewhisperer:us-east-1:123:profile/p1".to_string());
+
+        let mut candidate = KiroCredentials::default();
+        candidate.auth_method = Some("external_idp".to_string());
+        candidate.email = Some("user@example.com".to_string());
+        candidate.profile_arn = Some("arn:aws:codewhisperer:us-east-1:123:profile/p1".to_string());
+
+        assert_eq!(external_idp_duplicate_reason(&existing, &candidate), None);
     }
 
     // MultiTokenManager 测试

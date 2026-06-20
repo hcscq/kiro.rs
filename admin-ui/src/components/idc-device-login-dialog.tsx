@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
-import { CheckCircle2, Copy, ExternalLink, Loader2, LogIn, Search, Send, XCircle } from 'lucide-react'
+import { CheckCircle2, Copy, Download, ExternalLink, Loader2, LogIn, Search, Send, XCircle } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import {
@@ -106,7 +106,63 @@ New-ItemProperty -Path "HKCU:\\Software\\Classes\\kiro" -Name "URL Protocol" -Va
 New-Item -Path "HKCU:\\Software\\Classes\\kiro\\shell\\open\\command" -Force | Out-Null
 $Command = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $ScriptPath + '" "%1"'
 Set-Item -Path "HKCU:\\Software\\Classes\\kiro\\shell\\open\\command" -Value $Command
-Write-Host "Registered kiro:// callback helper"`
+Write-Host "Registered kiro:// callback helper"
+`
+}
+
+function base64EncodeUtf8(value: string): string {
+  const bytes = new TextEncoder().encode(value)
+  let binary = ''
+  bytes.forEach((byte) => {
+    binary += String.fromCharCode(byte)
+  })
+  return window.btoa(binary)
+}
+
+function chunkString(value: string, size: number): string[] {
+  const chunks: string[] = []
+  for (let index = 0; index < value.length; index += size) {
+    chunks.push(value.slice(index, index + size))
+  }
+  return chunks
+}
+
+function buildWindowsExternalIdpCallbackHelperInstaller(origin: string): string {
+  const installerScript = buildWindowsExternalIdpCallbackHelperScript(origin)
+  const chunks = chunkString(base64EncodeUtf8(installerScript), 76)
+    .map((chunk) => `echo ${chunk}`)
+    .join('\r\n')
+
+  return `@echo off
+setlocal
+set "INSTALL_DIR=%LOCALAPPDATA%\\kiro-rs-callback"
+if not exist "%INSTALL_DIR%" mkdir "%INSTALL_DIR%"
+set "INSTALLER=%INSTALL_DIR%\\install-kiro-rs-callback.ps1"
+set "B64=%INSTALL_DIR%\\install-kiro-rs-callback.ps1.b64"
+> "%B64%" (
+${chunks}
+)
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $b64=(Get-Content -Raw $env:B64).Replace([string][char]13,'').Replace([string][char]10,''); [System.IO.File]::WriteAllBytes($env:INSTALLER, [Convert]::FromBase64String($b64)); & $env:INSTALLER"
+if errorlevel 1 (
+  echo Failed to install kiro:// callback helper.
+  pause
+  exit /b 1
+)
+echo Installed kiro:// callback helper.
+pause
+`
+}
+
+function downloadTextFile(filename: string, content: string): void {
+  const blob = new Blob([content], { type: 'text/plain;charset=utf-8' })
+  const url = window.URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = filename
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  window.URL.revokeObjectURL(url)
 }
 
 function sessionSecondaryText(session: LoginSession): string {
@@ -470,14 +526,15 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
     }
   }
 
-  const handleCopyExternalCallbackHelper = async () => {
+  const handleDownloadExternalCallbackHelper = () => {
     try {
-      await navigator.clipboard.writeText(
-        buildWindowsExternalIdpCallbackHelperScript(window.location.origin)
+      downloadTextFile(
+        'install-kiro-rs-callback-helper.cmd',
+        buildWindowsExternalIdpCallbackHelperInstaller(window.location.origin)
       )
-      toast.success('Windows 捕获器安装命令已复制')
+      toast.success('Windows 捕获器安装器已下载')
     } catch {
-      toast.error('复制失败')
+      toast.error('下载失败')
     }
   }
 
@@ -953,10 +1010,10 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
                   <Button
                     type="button"
                     variant="outline"
-                    onClick={handleCopyExternalCallbackHelper}
+                    onClick={handleDownloadExternalCallbackHelper}
                   >
-                    <Copy className="h-4 w-4" />
-                    Windows 捕获器
+                    <Download className="h-4 w-4" />
+                    下载捕获器
                   </Button>
                   <Button type="submit" disabled={submittingCallback}>
                     {submittingCallback ? (
