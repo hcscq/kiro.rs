@@ -161,12 +161,6 @@ fn external_idp_duplicate_reason(
         return None;
     }
 
-    let existing_profile = normalized_duplicate_identity(existing.profile_arn.as_deref());
-    let candidate_profile = normalized_duplicate_identity(candidate.profile_arn.as_deref());
-    if existing_profile.is_some() && existing_profile == candidate_profile {
-        return Some("profileArn 重复");
-    }
-
     let same_issuer = match (
         normalized_duplicate_url(existing.issuer_url.as_deref()),
         normalized_duplicate_url(candidate.issuer_url.as_deref()),
@@ -10887,12 +10881,27 @@ mod tests {
         existing.user_id = Some("USER-1".to_string());
         existing.profile_arn = Some("arn:aws:codewhisperer:us-east-1:123:profile/p1".to_string());
 
-        let mut by_profile = KiroCredentials::default();
-        by_profile.auth_method = Some("external-idp".to_string());
-        by_profile.profile_arn = Some("ARN:AWS:CODEWHISPERER:US-EAST-1:123:PROFILE/P1".to_string());
+        let mut same_profile_different_user = KiroCredentials::default();
+        same_profile_different_user.auth_method = Some("external-idp".to_string());
+        same_profile_different_user.issuer_url =
+            Some("https://login.example.com/tenant/v2.0".to_string());
+        same_profile_different_user.client_id = Some("client-1".to_string());
+        same_profile_different_user.email = Some("other@example.com".to_string());
+        same_profile_different_user.user_id = Some("user-2".to_string());
+        same_profile_different_user.profile_arn =
+            Some("ARN:AWS:CODEWHISPERER:US-EAST-1:123:PROFILE/P1".to_string());
         assert_eq!(
-            external_idp_duplicate_reason(&existing, &by_profile),
-            Some("profileArn 重复")
+            external_idp_duplicate_reason(&existing, &same_profile_different_user),
+            None
+        );
+
+        let mut profile_only = KiroCredentials::default();
+        profile_only.auth_method = Some("external-idp".to_string());
+        profile_only.profile_arn =
+            Some("ARN:AWS:CODEWHISPERER:US-EAST-1:123:PROFILE/P1".to_string());
+        assert_eq!(
+            external_idp_duplicate_reason(&existing, &profile_only),
+            None
         );
 
         let mut by_email = KiroCredentials::default();
