@@ -704,6 +704,10 @@ pub enum ConversionError {
     UnsupportedModel(String),
     EmptyMessages,
     DocumentValidation(String),
+    KiroHistoryLimitExceeded {
+        history_len: usize,
+        max_safe_history_len: usize,
+    },
 }
 
 impl std::fmt::Display for ConversionError {
@@ -712,6 +716,13 @@ impl std::fmt::Display for ConversionError {
             ConversionError::UnsupportedModel(model) => write!(f, "模型不支持: {}", model),
             ConversionError::EmptyMessages => write!(f, "消息列表为空"),
             ConversionError::DocumentValidation(message) => write!(f, "文档校验失败: {}", message),
+            ConversionError::KiroHistoryLimitExceeded {
+                history_len,
+                max_safe_history_len,
+            } => write!(
+                f,
+                "conversation history has {history_len} Kiro history entries, exceeding safe upstream limit {max_safe_history_len}"
+            ),
         }
     }
 }
@@ -938,6 +949,18 @@ fn convert_request_with_options(
     merge_consecutive_history_assistant_messages(&mut history);
     repair_history_tool_result_pairing_for_kiro(&mut history, &validated_tool_results);
     remove_empty_history_user_messages(&mut history);
+
+    if history.len() > KIRO_MAX_SAFE_HISTORY_ENTRIES {
+        tracing::warn!(
+            history_len = history.len(),
+            max_safe_history_len = KIRO_MAX_SAFE_HISTORY_ENTRIES,
+            "Kiro history entry count exceeds upstream-safe limit; rejecting before upstream malformed 400"
+        );
+        return Err(ConversionError::KiroHistoryLimitExceeded {
+            history_len: history.len(),
+            max_safe_history_len: KIRO_MAX_SAFE_HISTORY_ENTRIES,
+        });
+    }
 
     // 10. 收集历史中使用的工具名称，为缺失的工具生成占位符定义
     // Kiro API 要求：历史消息中引用的工具必须在 tools 列表中有定义
@@ -2907,6 +2930,10 @@ const KIRO_MAX_IMAGES_PER_USER_TURN: usize = 10;
 /// 400 Improperly formed request。等比例缩放保留图片语义，同时兼容上游。
 const KIRO_MAX_IMAGE_DIMENSION_PX: u32 = 1200;
 
+/// Kiro 上游在 history 达到 10000 条时会稳定返回 REQUEST_BODY_INVALID。
+/// 9998 条已通过实测，保守使用该上限并让客户端压缩/裁剪历史。
+const KIRO_MAX_SAFE_HISTORY_ENTRIES: usize = 9_998;
+
 fn merge_user_message_parts(
     messages: &[&super::types::Message],
 ) -> Result<MergedUserMessageParts, ConversionError> {
@@ -4158,6 +4185,52 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+        }
+    }
+
+    fn alternating_history_request(pairs: usize) -> MessagesRequest {
+        let mut messages = Vec::with_capacity(pairs.saturating_mul(2).saturating_add(1));
+        for _ in 0..pairs {
+            messages.push(super::super::types::Message {
+                role: "user".to_string(),
+                content: serde_json::json!("u"),
+            });
+            messages.push(super::super::types::Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!("a"),
+            });
+        }
+        messages.push(super::super::types::Message {
+            role: "user".to_string(),
+            content: serde_json::json!("current"),
+        });
+        request_from_messages(messages)
+    }
+
+    #[test]
+    fn test_convert_request_allows_max_safe_kiro_history_entries() {
+        let req = alternating_history_request(KIRO_MAX_SAFE_HISTORY_ENTRIES / 2);
+        let state = convert_request(&req)
+            .expect("max safe Kiro history should convert")
+            .conversation_state;
+
+        assert_eq!(state.history.len(), KIRO_MAX_SAFE_HISTORY_ENTRIES);
+    }
+
+    #[test]
+    fn test_convert_request_rejects_kiro_history_entries_before_upstream_limit() {
+        let req = alternating_history_request(KIRO_MAX_SAFE_HISTORY_ENTRIES / 2 + 1);
+        let err = convert_request(&req).expect_err("oversized Kiro history should be rejected");
+
+        match err {
+            ConversionError::KiroHistoryLimitExceeded {
+                history_len,
+                max_safe_history_len,
+            } => {
+                assert_eq!(history_len, KIRO_MAX_SAFE_HISTORY_ENTRIES + 2);
+                assert_eq!(max_safe_history_len, KIRO_MAX_SAFE_HISTORY_ENTRIES);
+            }
+            other => panic!("expected KiroHistoryLimitExceeded, got {other:?}"),
         }
     }
 

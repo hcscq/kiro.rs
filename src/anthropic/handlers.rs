@@ -243,27 +243,37 @@ fn conversion_runtime_error_response(
 ) -> Response {
     match err {
         ConversionRuntimeError::Conversion(e) => {
-            let (error_type, message) = match &e {
-                ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
-                }
+            let (error_type, error_code, message) = match &e {
+                ConversionError::UnsupportedModel(model) => (
+                    "invalid_request_error",
+                    None,
+                    format!("模型不支持: {}", model),
+                ),
                 ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "消息列表为空".to_string())
+                    ("invalid_request_error", None, "消息列表为空".to_string())
                 }
                 ConversionError::DocumentValidation(message) => {
-                    ("invalid_request_error", message.clone())
+                    ("invalid_request_error", None, message.clone())
                 }
+                ConversionError::KiroHistoryLimitExceeded { .. } => (
+                    "invalid_request_error",
+                    Some("context_length_exceeded"),
+                    format!(
+                        "prompt is too long: {}. Reduce or compact conversation history.",
+                        e
+                    ),
+                ),
             };
             if let Some(request_id) = request_id {
                 tracing::warn!(request_id = %request_id, route, error = %e, "请求转换失败");
             } else {
                 tracing::warn!(route, error = %e, "请求转换失败");
             }
-            (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(error_type, message)),
-            )
-                .into_response()
+            let error_response = match error_code {
+                Some(code) => ErrorResponse::with_code(error_type, code, message),
+                None => ErrorResponse::new(error_type, message),
+            };
+            (StatusCode::BAD_REQUEST, Json(error_response)).into_response()
         }
         ConversionRuntimeError::QueueFull { stats, workload } => {
             if let Some(request_id) = request_id {
@@ -2979,12 +2989,14 @@ fn create_buffered_sse_stream(
 mod tests {
     use super::{
         ANTHROPIC_RUNTIME_LEADER_REQUIRED_HEADER, NonStreamMessageResponse,
-        coerce_structured_response, decode_non_stream_message, finalize_stream_events,
-        is_adaptive_opus_model, map_provider_error, non_2020_12_schema_uri,
+        coerce_structured_response, conversion_runtime_error_response, decode_non_stream_message,
+        finalize_stream_events, is_adaptive_opus_model, map_provider_error, non_2020_12_schema_uri,
         override_thinking_from_model_name, prepare_stream_events_for_emit,
         request_thinking_enabled, should_synthesize_hidden_thinking_signature_for_request,
         validate_thinking_signature_payload,
     };
+    use crate::anthropic::conversion_runtime::ConversionRuntimeError;
+    use crate::anthropic::converter::ConversionError;
     use crate::anthropic::stream::{SseEvent, StreamContext};
     use crate::anthropic::structured_outputs::JsonSchemaOutput;
     use crate::anthropic::thinking_compat::sign_thinking_block;
@@ -3400,6 +3412,32 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("prompt is too long")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_conversion_history_limit_maps_to_context_length_exceeded() {
+        let response = conversion_runtime_error_response(
+            ConversionRuntimeError::Conversion(ConversionError::KiroHistoryLimitExceeded {
+                history_len: 10_000,
+                max_safe_history_len: 9_998,
+            }),
+            Some("test-history-limit"),
+            "messages",
+        );
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["type"], "error");
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+        assert_eq!(json["error"]["code"], "context_length_exceeded");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("exceeding safe upstream limit 9998")
         );
     }
 
