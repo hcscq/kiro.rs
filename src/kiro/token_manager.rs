@@ -999,7 +999,7 @@ pub(crate) async fn get_usage_limits(
 ) -> anyhow::Result<UsageLimitsResponse> {
     tracing::debug!("正在获取使用额度信息...");
 
-    let region = credentials.effective_api_region(config);
+    let region = credentials.effective_usage_limits_api_region(config);
     let management_endpoint =
         effective_management_endpoint_base_for_credentials(credentials, config, region);
     let host = Config::endpoint_host(&management_endpoint);
@@ -1015,8 +1015,9 @@ pub(crate) async fn get_usage_limits(
         management_endpoint
     );
 
-    // BuilderID 账号在 Kiro/KAM 中会使用固定 profileArn；Enterprise 仅使用导入或发现到的 profileArn。
-    if let Some(profile_arn) = credentials.effective_profile_arn_for_kiro_requests() {
+    // getUsageLimits 只使用显式保存或自动发现到的 profileArn。不要注入
+    // BuilderId 固定默认 profileArn；该默认值可能把付费账号查成 FREE 额度。
+    if let Some(profile_arn) = credentials.explicit_profile_arn_for_kiro_requests() {
         url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
     }
 

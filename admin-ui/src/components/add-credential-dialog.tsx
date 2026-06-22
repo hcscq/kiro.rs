@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { Globe2, Link2, Network, Server, Shuffle } from 'lucide-react'
 import {
@@ -48,6 +48,7 @@ function proxyPoolEntryLabel(proxy: ProxyPoolEntry): string {
 }
 
 export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
+  const refreshTokenInputRef = useRef<HTMLInputElement>(null)
   const [refreshToken, setRefreshToken] = useState('')
   const [email, setEmail] = useState('')
   const [authMethod, setAuthMethod] = useState<AuthMethod>('social')
@@ -104,9 +105,14 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const proxyPoolEnabled = loadBalancingData?.proxyPool?.enabled ?? false
   const proxyRequireProxy = loadBalancingData?.proxyPool?.requireProxy ?? false
 
-  const resetForm = () => {
+  const resetCredentialDraft = () => {
     setRefreshToken('')
     setEmail('')
+    setMachineId('')
+  }
+
+  const resetForm = () => {
+    resetCredentialDraft()
     setAuthMethod('social')
     setAuthRegion('')
     setApiRegion('')
@@ -119,7 +125,6 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setRateLimitCooldownMode('global')
     setRateLimitBucketCapacity('')
     setRateLimitRefillPerSecond('')
-    setMachineId('')
     setAccountType('')
     setSourceSupplierName('')
     setSourceSupplierId('')
@@ -133,9 +138,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setProxyPassword('')
   }
 
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault()
-
+  const submitCredential = (closeAfterSuccess: boolean) => {
     // 验证必填字段
     if (!refreshToken.trim()) {
       toast.error('请输入 Refresh Token')
@@ -237,14 +240,23 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       {
         onSuccess: (data) => {
           toast.success(data.message)
-          onOpenChange(false)
-          resetForm()
+          resetCredentialDraft()
+          if (closeAfterSuccess) {
+            onOpenChange(false)
+          } else {
+            window.setTimeout(() => refreshTokenInputRef.current?.focus(), 0)
+          }
         },
         onError: (error: unknown) => {
           toast.error(`添加失败: ${extractErrorMessage(error)}`)
         },
       }
     )
+  }
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault()
+    submitCredential(false)
   }
 
   return (
@@ -262,6 +274,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 Refresh Token <span className="text-red-500">*</span>
               </label>
               <Input
+                ref={refreshTokenInputRef}
                 id="refreshToken"
                 type="password"
                 placeholder="请输入 Refresh Token"
@@ -707,18 +720,36 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
             </div>
           </div>
 
-          <DialogFooter>
+          <DialogFooter className="gap-2 sm:justify-between sm:space-x-0">
             <Button
               type="button"
               variant="outline"
-              onClick={() => onOpenChange(false)}
+              onClick={resetForm}
               disabled={isPending}
             >
-              取消
+              清空全部
             </Button>
-            <Button type="submit" disabled={isPending}>
-              {isPending ? '添加中...' : '添加'}
-            </Button>
+            <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => onOpenChange(false)}
+                disabled={isPending}
+              >
+                取消
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => submitCredential(true)}
+                disabled={isPending}
+              >
+                {isPending ? '添加中...' : '添加后关闭'}
+              </Button>
+              <Button type="submit" disabled={isPending}>
+                {isPending ? '添加中...' : '添加并继续'}
+              </Button>
+            </div>
           </DialogFooter>
         </form>
       </DialogContent>

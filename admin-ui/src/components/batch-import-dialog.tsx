@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { CheckCircle2, XCircle, AlertCircle, Loader2, Globe2, Link2, Network, Server, Shuffle, Tags } from 'lucide-react'
 import {
@@ -130,6 +130,7 @@ function normalizeScopes(scopes?: string | string[]): string | undefined {
 }
 
 export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps) {
+  const jsonInputRef = useRef<HTMLTextAreaElement>(null)
   const [jsonInput, setJsonInput] = useState('')
   const [importing, setImporting] = useState(false)
   const [progress, setProgress] = useState({ current: 0, total: 0 })
@@ -161,12 +162,6 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     [existingCredentials?.credentials]
   )
 
-  useEffect(() => {
-    if (open && !importing && !jsonInput.trim() && results.length === 0) {
-      setDefaultSourceBatch(formatDefaultSourceBatch())
-    }
-  }, [importing, jsonInput, open, results.length])
-
   const rollbackCredential = async (id: number): Promise<{ success: boolean; error?: string }> => {
     try {
       await setCredentialDisabled(id, true)
@@ -188,11 +183,20 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     }
   }
 
-  const resetForm = () => {
+  const resetImportDraft = () => {
     setJsonInput('')
     setProgress({ current: 0, total: 0 })
     setCurrentProcessing('')
     setResults([])
+  }
+
+  const resetForNextImport = () => {
+    resetImportDraft()
+    window.setTimeout(() => jsonInputRef.current?.focus(), 0)
+  }
+
+  const resetForm = () => {
+    resetImportDraft()
     setDefaultPriority('0')
     setDefaultMaxConcurrency('')
     setDefaultRateLimitCooldownMode('global')
@@ -626,10 +630,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     <Dialog
       open={open}
       onOpenChange={(newOpen) => {
-        // 关闭时清空表单（但不在导入过程中清空）
-        if (!newOpen && !importing) {
-          resetForm()
-        }
+        if (!newOpen && importing) return
         onOpenChange(newOpen)
       }}
     >
@@ -839,6 +840,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               )}
             </div>
             <textarea
+              ref={jsonInputRef}
               placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\nEnterprise: [{"email":"user@example.com","provider":"Enterprise","refreshToken":"...","clientId":"...","clientSecret":"...","region":"us-east-1","startUrl":"https://example.awsapps.com/start","sourceSupplierName":"供应商A","sourceBatch":"20260618211"}]\nExternalIdp: [{"authMethod":"external_idp","provider":"ExternalIdp","refreshToken":"...","clientId":"...","issuerUrl":"https://login.microsoftonline.com/.../v2.0","tokenEndpoint":"...","scopes":"..."}]\n支持 region 字段自动映射为 authRegion 和 apiRegion'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
@@ -924,27 +926,42 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           )}
         </div>
 
-        <DialogFooter>
+        <DialogFooter className="gap-2 sm:justify-between sm:space-x-0">
           <Button
             type="button"
             variant="outline"
-            onClick={() => {
-              onOpenChange(false)
-              resetForm()
-            }}
+            onClick={resetForm}
             disabled={importing}
           >
-            {importing ? '验活中...' : results.length > 0 ? '关闭' : '取消'}
+            清空全部
           </Button>
-          {results.length === 0 && (
+          <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
             <Button
               type="button"
-              onClick={handleBatchImport}
-              disabled={importing || !jsonInput.trim()}
+              variant="outline"
+              onClick={() => onOpenChange(false)}
+              disabled={importing}
             >
-              开始导入并验活
+              {importing ? '验活中...' : results.length > 0 ? '关闭' : '取消'}
             </Button>
-          )}
+            {results.length > 0 ? (
+              <Button
+                type="button"
+                onClick={resetForNextImport}
+                disabled={importing}
+              >
+                继续导入
+              </Button>
+            ) : (
+              <Button
+                type="button"
+                onClick={handleBatchImport}
+                disabled={importing || !jsonInput.trim()}
+              >
+                开始导入并验活
+              </Button>
+            )}
+          </div>
         </DialogFooter>
       </DialogContent>
     </Dialog>

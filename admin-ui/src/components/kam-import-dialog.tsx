@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { CheckCircle2, XCircle, AlertCircle, Loader2, Globe2, Link2, Network, Server, Shuffle, Tags } from 'lucide-react'
 import {
@@ -436,6 +436,7 @@ function parseKamJson(raw: string): KamAccount[] {
 }
 
 export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
+  const jsonInputRef = useRef<HTMLTextAreaElement>(null)
   const [jsonInput, setJsonInput] = useState('')
   const [importing, setImporting] = useState(false)
   const [skipErrorAccounts, setSkipErrorAccounts] = useState(true)
@@ -468,12 +469,6 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     [existingCredentials?.credentials]
   )
 
-  useEffect(() => {
-    if (open && !importing && !jsonInput.trim() && results.length === 0) {
-      setDefaultSourceBatch(formatDefaultSourceBatch())
-    }
-  }, [importing, jsonInput, open, results.length])
-
   const rollbackCredential = async (id: number): Promise<{ success: boolean; error?: string }> => {
     try {
       await setCredentialDisabled(id, true)
@@ -488,11 +483,20 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     }
   }
 
-  const resetForm = () => {
+  const resetImportDraft = () => {
     setJsonInput('')
     setProgress({ current: 0, total: 0 })
     setCurrentProcessing('')
     setResults([])
+  }
+
+  const resetForNextImport = () => {
+    resetImportDraft()
+    window.setTimeout(() => jsonInputRef.current?.focus(), 0)
+  }
+
+  const resetForm = () => {
+    resetImportDraft()
     setDefaultPriority('0')
     setDefaultMaxConcurrency('')
     setDefaultRateLimitCooldownMode('global')
@@ -936,7 +940,6 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
       open={open}
       onOpenChange={(newOpen) => {
         if (!newOpen && importing) return
-        if (!newOpen) resetForm()
         onOpenChange(newOpen)
       }}
     >
@@ -1144,6 +1147,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
               )}
             </div>
             <textarea
+              ref={jsonInputRef}
               placeholder={'粘贴 Kiro Account Manager 导出的 JSON\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "userId": "...",\n    "provider": "Enterprise",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "eu-central-1",\n    "authRegion": "us-east-1",\n    "startUrl": "https://example.awsapps.com/start",\n    "accountType": "power",\n    "sourceSupplierName": "供应商A",\n    "sourceBatch": "20260618211",\n    "maxConcurrency": 20,\n    "rateLimitCooldownEnabled": true\n  }\n]\n\n（可选的 authMethod 字段会被忽略，系统会根据 clientId/clientSecret 自动判断；未提供 authRegion 时，Enterprise 默认使用 us-east-1 进行 OIDC 刷新）\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "provider": "Enterprise",\n      "sourceSupplierName": "供应商A",\n      "sourceBatch": "20260618211",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "eu-central-1",\n        "authRegion": "us-east-1",\n        "startUrl": "https://example.awsapps.com/start"\n      }\n    }\n  ]\n}'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
@@ -1242,24 +1246,42 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           )}
         </div>
 
-        <DialogFooter>
+        <DialogFooter className="gap-2 sm:justify-between sm:space-x-0">
           <Button
             type="button"
             variant="outline"
-            onClick={() => { onOpenChange(false); resetForm() }}
+            onClick={resetForm}
             disabled={importing}
           >
-            {importing ? '导入中...' : results.length > 0 ? '关闭' : '取消'}
+            清空全部
           </Button>
-          {results.length === 0 && (
+          <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
             <Button
               type="button"
-              onClick={handleImport}
-              disabled={importing || !jsonInput.trim() || previewAccounts.length === 0 || !!parseError}
+              variant="outline"
+              onClick={() => onOpenChange(false)}
+              disabled={importing}
             >
-              开始导入并验活
+              {importing ? '导入中...' : results.length > 0 ? '关闭' : '取消'}
             </Button>
-          )}
+            {results.length > 0 ? (
+              <Button
+                type="button"
+                onClick={resetForNextImport}
+                disabled={importing}
+              >
+                继续导入
+              </Button>
+            ) : (
+              <Button
+                type="button"
+                onClick={handleImport}
+                disabled={importing || !jsonInput.trim() || previewAccounts.length === 0 || !!parseError}
+              >
+                开始导入并验活
+              </Button>
+            )}
+          </div>
         </DialogFooter>
       </DialogContent>
     </Dialog>

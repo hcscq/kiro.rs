@@ -2980,7 +2980,15 @@ impl AdminService {
         AddCredentialRequest {
             refresh_token: token.refresh_token,
             auth_method: "idc".to_string(),
-            provider: Some(session.provider.clone()),
+            // BuilderId device-code tokens should behave like the existing KAM/IDE
+            // idc imports, which do not persist provider=BuilderId. Persisting it
+            // makes quota lookups inject Kiro's fixed BuilderId profileArn and can
+            // report a paid account as KIRO FREE.
+            provider: if session.provider.eq_ignore_ascii_case("Enterprise") {
+                Some(session.provider.clone())
+            } else {
+                None
+            },
             profile_arn: req.profile_arn.clone(),
             client_id: Some(session.client_id.clone()),
             client_secret: Some(session.client_secret.clone()),
@@ -4172,6 +4180,96 @@ mod tests {
             )
             .unwrap(),
             "https://d-1234567890.awsapps.com/start"
+        );
+    }
+
+    fn idc_device_login_session_for_test(provider: &str) -> IdcDeviceLoginSession {
+        let now = Utc::now();
+        let start_url = if provider.eq_ignore_ascii_case("Enterprise") {
+            "https://example.awsapps.com/start"
+        } else {
+            BUILDER_ID_START_URL
+        };
+
+        IdcDeviceLoginSession {
+            session_id: "session-1".to_string(),
+            status: IdcDeviceLoginStatus::Pending,
+            provider: provider.to_string(),
+            start_url: start_url.to_string(),
+            region: "us-east-1".to_string(),
+            client_id: "client-1".to_string(),
+            client_secret: "secret-1".to_string(),
+            device_code: "device-code".to_string(),
+            user_code: "user-code".to_string(),
+            verification_uri: "https://device.example.com".to_string(),
+            verification_uri_complete: None,
+            interval_seconds: 5,
+            next_poll_at: now,
+            expires_at: now + Duration::minutes(10),
+            request: StartIdcDeviceLoginRequest {
+                provider: provider.to_string(),
+                start_url: Some(start_url.to_string()),
+                region: None,
+                auth_region: None,
+                api_region: None,
+                profile_arn: None,
+                priority: 0,
+                max_concurrency: None,
+                machine_id: None,
+                account_type: None,
+                source_supplier_id: None,
+                source_supplier_name: None,
+                source_batch: None,
+                proxy_url: None,
+                proxy_username: None,
+                proxy_password: None,
+                proxy_id: None,
+            },
+            message: None,
+            credential_result: None,
+            polling: false,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn builder_id_device_login_add_request_does_not_persist_builder_provider() {
+        let manager =
+            Arc::new(MultiTokenManager::new(Config::default(), vec![], None, None, false).unwrap());
+        let service = AdminService::new(manager);
+        let session = idc_device_login_session_for_test("BuilderId");
+
+        let req = service.build_idc_device_add_credential_request(
+            &session,
+            AwsCreateTokenResponse {
+                refresh_token: "refresh-token".to_string(),
+            },
+        );
+
+        assert_eq!(req.auth_method, "idc");
+        assert_eq!(req.provider, None);
+        assert_eq!(req.start_url, None);
+    }
+
+    #[test]
+    fn enterprise_device_login_add_request_persists_provider_and_start_url() {
+        let manager =
+            Arc::new(MultiTokenManager::new(Config::default(), vec![], None, None, false).unwrap());
+        let service = AdminService::new(manager);
+        let session = idc_device_login_session_for_test("Enterprise");
+
+        let req = service.build_idc_device_add_credential_request(
+            &session,
+            AwsCreateTokenResponse {
+                refresh_token: "refresh-token".to_string(),
+            },
+        );
+
+        assert_eq!(req.auth_method, "idc");
+        assert_eq!(req.provider.as_deref(), Some("Enterprise"));
+        assert_eq!(
+            req.start_url.as_deref(),
+            Some("https://example.awsapps.com/start")
         );
     }
 

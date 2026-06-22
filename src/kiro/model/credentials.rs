@@ -647,6 +647,30 @@ impl KiroCredentials {
         config.effective_api_region()
     }
 
+    /// 获取使用额度查询使用的 API Region。
+    ///
+    /// getUsageLimits 只跟随显式保存或自动发现到的 profileArn。BuilderId
+    /// 的固定默认 profileArn 只用于运行时请求，不能用于额度查询，否则通过
+    /// GitHub/Builder ID 授权的付费账号可能被查成默认 FREE 档。
+    pub fn effective_usage_limits_api_region<'a>(&'a self, config: &'a Config) -> &'a str {
+        if let Some(region) = self
+            .explicit_profile_arn_for_kiro_requests()
+            .and_then(parse_region_from_profile_arn)
+        {
+            return region;
+        }
+
+        if let Some(region) = non_empty_trimmed(self.api_region.as_deref()) {
+            return region;
+        }
+
+        if let Some(region) = non_empty_trimmed(self.region.as_deref()) {
+            return region;
+        }
+
+        config.effective_api_region()
+    }
+
     /// 获取有效的代理配置
     /// 优先级：凭据代理 > 全局代理 > 无代理
     /// 特殊值 "direct" 表示显式不使用代理（即使全局配置了代理）
@@ -740,11 +764,8 @@ impl KiroCredentials {
     }
 
     pub fn effective_profile_arn_for_kiro_requests(&self) -> Option<&str> {
-        if let Some(profile_arn) = self.profile_arn.as_deref() {
-            let trimmed = profile_arn.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed);
-            }
+        if let Some(profile_arn) = self.explicit_profile_arn_for_kiro_requests() {
+            return Some(profile_arn);
         }
 
         // Enterprise profiles are account-specific. Only use an ARN that was
@@ -768,6 +789,14 @@ impl KiroCredentials {
         }
 
         None
+    }
+
+    /// 显式保存或自动发现到的 profileArn，不包含 BuilderId 默认值。
+    pub fn explicit_profile_arn_for_kiro_requests(&self) -> Option<&str> {
+        self.profile_arn
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
     }
 
     pub fn normalize_identity_metadata(&mut self) {
@@ -1510,6 +1539,58 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(social.effective_profile_arn_for_kiro_requests(), None);
+    }
+
+    #[test]
+    fn test_usage_limits_profile_arn_does_not_use_builder_id_default() {
+        let mut config = Config::default();
+        config.region = "eu-central-1".to_string();
+        config.api_region = None;
+
+        let builder = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            provider: Some("BuilderId".to_string()),
+            client_id: Some("client".to_string()),
+            client_secret: Some("secret".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            builder.effective_profile_arn_for_kiro_requests(),
+            Some(KIRO_BUILDER_ID_PROFILE_ARN)
+        );
+        assert_eq!(builder.explicit_profile_arn_for_kiro_requests(), None);
+        assert_eq!(
+            builder.effective_usage_limits_api_region(&config),
+            "eu-central-1"
+        );
+    }
+
+    #[test]
+    fn test_usage_limits_profile_arn_uses_explicit_profile() {
+        let mut config = Config::default();
+        config.region = "eu-central-1".to_string();
+        config.api_region = None;
+
+        let builder = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            provider: Some("BuilderId".to_string()),
+            client_id: Some("client".to_string()),
+            client_secret: Some("secret".to_string()),
+            profile_arn: Some(
+                " arn:aws:codewhisperer:ap-southeast-2:123:profile/test ".to_string(),
+            ),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            builder.explicit_profile_arn_for_kiro_requests(),
+            Some("arn:aws:codewhisperer:ap-southeast-2:123:profile/test")
+        );
+        assert_eq!(
+            builder.effective_usage_limits_api_region(&config),
+            "ap-southeast-2"
+        );
     }
 
     #[test]
