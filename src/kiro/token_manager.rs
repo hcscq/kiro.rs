@@ -194,6 +194,98 @@ fn external_idp_duplicate_reason(
     None
 }
 
+fn normalized_auth_account_type(credentials: &KiroCredentials) -> Option<String> {
+    let account_type =
+        normalized_duplicate_identity(credentials.detected_auth_account_type().as_deref())?;
+    if account_type == "builder-id" {
+        return Some("idc".to_string());
+    }
+    Some(account_type)
+}
+
+fn non_external_duplicate_scope_matches(
+    existing: &KiroCredentials,
+    candidate: &KiroCredentials,
+) -> bool {
+    if existing.is_external_idp_auth() || candidate.is_external_idp_auth() {
+        return false;
+    }
+
+    let existing_account_type = normalized_auth_account_type(existing);
+    let candidate_account_type = normalized_auth_account_type(candidate);
+    if existing_account_type.is_none() || existing_account_type != candidate_account_type {
+        return false;
+    }
+
+    if let (Some(existing_provider), Some(candidate_provider)) = (
+        normalized_duplicate_identity(existing.provider.as_deref()),
+        normalized_duplicate_identity(candidate.provider.as_deref()),
+    ) {
+        if existing_provider != candidate_provider {
+            return false;
+        }
+    }
+
+    if existing_account_type.as_deref() == Some("enterprise") {
+        let existing_start_url = normalized_duplicate_url(existing.start_url.as_deref());
+        let candidate_start_url = normalized_duplicate_url(candidate.start_url.as_deref());
+        if existing_start_url.is_some()
+            && candidate_start_url.is_some()
+            && existing_start_url != candidate_start_url
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn credential_duplicate_reason(
+    existing: &KiroCredentials,
+    candidate: &KiroCredentials,
+) -> Option<&'static str> {
+    if let Some(reason) = external_idp_duplicate_reason(existing, candidate) {
+        return Some(reason);
+    }
+
+    if !non_external_duplicate_scope_matches(existing, candidate) {
+        return None;
+    }
+
+    let existing_user_id = normalized_duplicate_identity(existing.user_id.as_deref());
+    let candidate_user_id = normalized_duplicate_identity(candidate.user_id.as_deref());
+    if existing_user_id.is_some() && existing_user_id == candidate_user_id {
+        return Some("authAccountType/userId 重复");
+    }
+
+    let existing_email = normalized_duplicate_identity(existing.email.as_deref());
+    let candidate_email = normalized_duplicate_identity(candidate.email.as_deref());
+    if existing_email.is_some() && existing_email == candidate_email {
+        return Some("authAccountType/email 重复");
+    }
+
+    None
+}
+
+fn apply_usage_limits_metadata_to_credentials(
+    credentials: &mut KiroCredentials,
+    usage_limits: &UsageLimitsResponse,
+) {
+    if let Some(subscription_title) = normalize_optional_metadata(usage_limits.subscription_title())
+    {
+        credentials.subscription_title = Some(subscription_title);
+    }
+    if let Some(subscription_type) = normalize_optional_metadata(usage_limits.subscription_type()) {
+        credentials.subscription_type = Some(subscription_type);
+    }
+    if let Some(email) = normalize_optional_metadata(usage_limits.email()) {
+        credentials.email = Some(email);
+    }
+    if let Some(user_id) = normalize_optional_metadata(usage_limits.user_id()) {
+        credentials.user_id = Some(user_id);
+    }
+}
+
 /// 验证 refreshToken 的基本有效性
 pub(crate) fn validate_refresh_token(credentials: &KiroCredentials) -> anyhow::Result<()> {
     let refresh_token = credentials
@@ -9310,11 +9402,12 @@ impl MultiTokenManager {
     ///
     /// # 流程
     /// 1. 验证凭据基本字段（refresh_token 不为空）
-    /// 2. 基于 refreshToken 的 SHA-256 哈希检测重复
+    /// 2. 基于 refreshToken 哈希和稳定账号身份检测重复
     /// 3. 尝试刷新 Token 验证凭据有效性
-    /// 4. 分配新 ID（当前最大 ID + 1）
-    /// 5. 添加到 entries 列表
-    /// 6. 持久化到配置文件
+    /// 4. 尝试读取 usage 元数据，补齐 email/userId/subscription
+    /// 5. 分配新 ID（当前最大 ID + 1）
+    /// 6. 添加到 entries 列表
+    /// 7. 持久化到配置文件
     ///
     /// # 返回
     /// - `Ok(u64)` - 新凭据 ID
@@ -9342,6 +9435,22 @@ impl MultiTokenManager {
         });
         if duplicate_exists {
             anyhow::bail!("凭据已存在（refreshToken 重复）");
+        }
+        if let Some((existing_id, reason)) = persisted_snapshot.iter().find_map(|credential| {
+            credential_duplicate_reason(credential, &new_cred).map(|reason| (credential.id, reason))
+        }) {
+            match existing_id {
+                Some(existing_id) => {
+                    anyhow::bail!(
+                        "凭据已存在（账号重复：{}，已有凭据 #{}）",
+                        reason,
+                        existing_id
+                    );
+                }
+                None => {
+                    anyhow::bail!("凭据已存在（账号重复：{}）", reason);
+                }
+            }
         }
         self.assign_proxy_for_new_credential(&mut new_cred, &persisted_snapshot)?;
 
@@ -9398,10 +9507,18 @@ impl MultiTokenManager {
         validated_cred.auth_region = new_cred.auth_region;
         validated_cred.api_region = new_cred.api_region;
         validated_cred.machine_id = new_cred.machine_id;
-        validated_cred.email = new_cred.email;
-        validated_cred.user_id = new_cred.user_id;
-        validated_cred.subscription_title = new_cred.subscription_title;
-        validated_cred.subscription_type = new_cred.subscription_type;
+        if new_cred.email.is_some() {
+            validated_cred.email = new_cred.email;
+        }
+        if new_cred.user_id.is_some() {
+            validated_cred.user_id = new_cred.user_id;
+        }
+        if new_cred.subscription_title.is_some() {
+            validated_cred.subscription_title = new_cred.subscription_title;
+        }
+        if new_cred.subscription_type.is_some() {
+            validated_cred.subscription_type = new_cred.subscription_type;
+        }
         validated_cred.account_type = new_cred.account_type;
         validated_cred.source_supplier_id = new_cred.source_supplier_id;
         validated_cred.source_supplier_name = new_cred.source_supplier_name;
@@ -9424,6 +9541,28 @@ impl MultiTokenManager {
         validated_cred.proxy_id = new_cred.proxy_id;
         Self::clear_disabled_metadata(&mut validated_cred);
         validated_cred.normalize_model_capabilities();
+
+        if let Some(access_token) = validated_cred.access_token.clone() {
+            match get_usage_limits(
+                &validated_cred,
+                &self.config,
+                &access_token,
+                effective_proxy.as_ref(),
+            )
+            .await
+            {
+                Ok(usage_limits) => {
+                    apply_usage_limits_metadata_to_credentials(&mut validated_cred, &usage_limits);
+                    validated_cred.normalize_model_capabilities();
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "添加凭据前获取订阅和身份信息失败（将继续添加并仅按已有元数据去重）: {}",
+                        err
+                    );
+                }
+            }
+        }
 
         if import_is_enterprise {
             let token = validated_cred
@@ -9454,19 +9593,19 @@ impl MultiTokenManager {
             anyhow::bail!("凭据已存在（refreshToken 重复）");
         }
         if let Some((existing_id, reason)) = persisted.iter().find_map(|credential| {
-            external_idp_duplicate_reason(credential, &validated_cred)
+            credential_duplicate_reason(credential, &validated_cred)
                 .map(|reason| (credential.id, reason))
         }) {
             match existing_id {
                 Some(existing_id) => {
                     anyhow::bail!(
-                        "凭据已存在（ExternalIdP 账号重复：{}，已有凭据 #{}）",
+                        "凭据已存在（账号重复：{}，已有凭据 #{}）",
                         reason,
                         existing_id
                     );
                 }
                 None => {
-                    anyhow::bail!("凭据已存在（ExternalIdP 账号重复：{}）", reason);
+                    anyhow::bail!("凭据已存在（账号重复：{}）", reason);
                 }
             }
         }
@@ -10939,6 +11078,123 @@ mod tests {
         candidate.profile_arn = Some("arn:aws:codewhisperer:us-east-1:123:profile/p1".to_string());
 
         assert_eq!(external_idp_duplicate_reason(&existing, &candidate), None);
+    }
+
+    #[test]
+    fn credential_duplicate_reason_matches_idc_user_id_with_rotated_refresh_token() {
+        let mut existing = KiroCredentials::default();
+        existing.auth_method = Some("idc".to_string());
+        existing.refresh_token = Some("old-refresh".to_string());
+        existing.email = Some("ProMaxUser@Example.com".to_string());
+        existing.user_id = Some("user-123".to_string());
+        existing.subscription_title = Some("KIRO MAX".to_string());
+
+        let mut candidate = KiroCredentials::default();
+        candidate.auth_method = Some("idc".to_string());
+        candidate.refresh_token = Some("new-refresh".to_string());
+        candidate.email = Some("other@example.com".to_string());
+        candidate.user_id = Some("USER-123".to_string());
+        candidate.subscription_title = Some("KIRO MAX".to_string());
+
+        assert_eq!(
+            credential_duplicate_reason(&existing, &candidate),
+            Some("authAccountType/userId 重复")
+        );
+    }
+
+    #[test]
+    fn credential_duplicate_reason_matches_legacy_builder_id_provider() {
+        let mut existing = KiroCredentials::default();
+        existing.auth_method = Some("idc".to_string());
+        existing.provider = Some("BuilderId".to_string());
+        existing.user_id = Some("user-123".to_string());
+
+        let mut candidate = KiroCredentials::default();
+        candidate.auth_method = Some("idc".to_string());
+        candidate.user_id = Some("user-123".to_string());
+
+        assert_eq!(
+            credential_duplicate_reason(&existing, &candidate),
+            Some("authAccountType/userId 重复")
+        );
+    }
+
+    #[test]
+    fn credential_duplicate_reason_matches_same_scope_email_when_user_id_missing() {
+        let mut existing = KiroCredentials::default();
+        existing.auth_method = Some("idc".to_string());
+        existing.email = Some("ProMaxUser@Example.com".to_string());
+        existing.subscription_title = Some("KIRO MAX".to_string());
+
+        let mut candidate = KiroCredentials::default();
+        candidate.auth_method = Some("idc".to_string());
+        candidate.email = Some("promaxuser@example.com".to_string());
+        candidate.subscription_title = Some("KIRO MAX".to_string());
+
+        assert_eq!(
+            credential_duplicate_reason(&existing, &candidate),
+            Some("authAccountType/email 重复")
+        );
+    }
+
+    #[test]
+    fn credential_duplicate_reason_allows_same_enterprise_org_different_accounts() {
+        let mut existing = KiroCredentials::default();
+        existing.auth_method = Some("idc".to_string());
+        existing.provider = Some("Enterprise".to_string());
+        existing.start_url = Some("https://example.awsapps.com/start".to_string());
+        existing.email = Some("alice@example.com".to_string());
+        existing.user_id = Some("alice-user-id".to_string());
+
+        let mut candidate = KiroCredentials::default();
+        candidate.auth_method = Some("idc".to_string());
+        candidate.provider = Some("Enterprise".to_string());
+        candidate.start_url = Some("https://example.awsapps.com/start/".to_string());
+        candidate.email = Some("bob@example.com".to_string());
+        candidate.user_id = Some("bob-user-id".to_string());
+
+        assert_eq!(credential_duplicate_reason(&existing, &candidate), None);
+    }
+
+    #[test]
+    fn credential_duplicate_reason_does_not_match_email_across_auth_scopes() {
+        let mut existing = KiroCredentials::default();
+        existing.auth_method = Some("social".to_string());
+        existing.provider = Some("Google".to_string());
+        existing.email = Some("user@example.com".to_string());
+
+        let mut candidate = KiroCredentials::default();
+        candidate.auth_method = Some("idc".to_string());
+        candidate.email = Some("user@example.com".to_string());
+
+        assert_eq!(credential_duplicate_reason(&existing, &candidate), None);
+    }
+
+    #[test]
+    fn apply_usage_limits_metadata_to_credentials_populates_identity_for_duplicate_check() {
+        let usage_limits: UsageLimitsResponse = serde_json::from_value(serde_json::json!({
+            "subscriptionInfo": {
+                "subscriptionTitle": "KIRO MAX",
+                "type": "Q_DEVELOPER_STANDALONE_MAX"
+            },
+            "userInfo": {
+                "email": "promax@example.com",
+                "userId": "user-123"
+            }
+        }))
+        .unwrap();
+
+        let mut credentials = KiroCredentials::default();
+        credentials.auth_method = Some("idc".to_string());
+        apply_usage_limits_metadata_to_credentials(&mut credentials, &usage_limits);
+
+        assert_eq!(credentials.email.as_deref(), Some("promax@example.com"));
+        assert_eq!(credentials.user_id.as_deref(), Some("user-123"));
+        assert_eq!(credentials.subscription_title.as_deref(), Some("KIRO MAX"));
+        assert_eq!(
+            credentials.subscription_type.as_deref(),
+            Some("Q_DEVELOPER_STANDALONE_MAX")
+        );
     }
 
     // MultiTokenManager 测试
