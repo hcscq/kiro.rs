@@ -22,6 +22,7 @@ import {
   startIdcDeviceLogin,
   submitExternalIdpCallback,
 } from '@/api/credentials'
+import { storage } from '@/lib/storage'
 import { cn, extractErrorMessage } from '@/lib/utils'
 import type {
   ExternalIdpLoginStartResponse,
@@ -43,6 +44,32 @@ type LoginMode = 'idc' | 'external_idp'
 type LoginProvider = 'BuilderId' | 'Enterprise'
 type ExternalIdpSession = ExternalIdpLoginStartResponse | ExternalIdpLoginStatusResponse
 type LoginSession = IdcDeviceLoginStartResponse | IdcDeviceLoginStatusResponse | ExternalIdpSession
+
+const DEFAULT_IDC_AUTH_REGIONS = [
+  'us-east-1',
+  'us-east-2',
+  'us-west-2',
+  'eu-central-1',
+  'eu-west-1',
+  'ap-northeast-1',
+  'ap-southeast-1',
+]
+const BUILDER_ID_START_URL = 'https://view.awsapps.com/start'
+
+function uniqueValues(values: string[]): string[] {
+  const seen = new Set<string>()
+  const result: string[] = []
+
+  values.forEach((value) => {
+    const normalized = value.trim()
+    const key = normalized.toLowerCase()
+    if (!normalized || seen.has(key)) return
+    seen.add(key)
+    result.push(normalized)
+  })
+
+  return result
+}
 
 function isPending(session: LoginSession | null): boolean {
   return session?.status === 'pending'
@@ -244,6 +271,12 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
   const [priority, setPriority] = useState('0')
   const [sourceSupplierName, setSourceSupplierName] = useState('')
   const [sourceBatch, setSourceBatch] = useState('')
+  const [recentAuthRegions, setRecentAuthRegions] = useState<string[]>(() =>
+    storage.getRecentIdcAuthRegions()
+  )
+  const [recentStartUrls, setRecentStartUrls] = useState<string[]>(() =>
+    storage.getRecentIdcStartUrls()
+  )
   const [externalWorkEmail, setExternalWorkEmail] = useState('')
   const [externalDomainName, setExternalDomainName] = useState('')
   const [externalIssuerUrl, setExternalIssuerUrl] = useState('')
@@ -286,6 +319,38 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
     setPolling(false)
     pollInFlightRef.current = false
     completedSessionRef.current = null
+  }
+
+  const refreshRecentIdcLoginOptions = () => {
+    setRecentAuthRegions(storage.getRecentIdcAuthRegions())
+    setRecentStartUrls(storage.getRecentIdcStartUrls())
+  }
+
+  const handleStartUrlChange = (value: string) => {
+    setStartUrl(value)
+    const authRegion = storage.getRecentIdcAuthRegionForStartUrl(value)
+    if (authRegion) {
+      setRegion(authRegion)
+    }
+  }
+
+  const recordCompletedIdcLogin = (
+    response: IdcDeviceLoginStartResponse | IdcDeviceLoginStatusResponse
+  ) => {
+    if (response.status !== 'completed') return
+
+    storage.addRecentIdcAuthRegion(response.region)
+    if (
+      response.provider.toLowerCase() === 'enterprise' &&
+      response.startUrl.trim() &&
+      response.startUrl.trim().replace(/\/+$/, '') !== BUILDER_ID_START_URL
+    ) {
+      storage.addRecentIdcLoginPair({
+        startUrl: response.startUrl,
+        authRegion: response.region,
+      })
+    }
+    refreshRecentIdcLoginOptions()
   }
 
   const handleDialogOpenChange = async (nextOpen: boolean) => {
@@ -460,6 +525,9 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
 
       if (response.status === 'completed' && completedSessionRef.current !== response.sessionId) {
         completedSessionRef.current = response.sessionId
+        if (isIdcSession(response)) {
+          recordCompletedIdcLogin(response)
+        }
         toast.success(response.message || '登录完成')
         queryClient.invalidateQueries({ queryKey: ['credentials'] })
         queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
@@ -516,6 +584,12 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
       setSubmittingCallback(false)
     }
   }
+
+  useEffect(() => {
+    if (open) {
+      refreshRecentIdcLoginOptions()
+    }
+  }, [open])
 
   useEffect(() => {
     if (!open || !session || session.status !== 'pending') {
@@ -586,6 +660,7 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
     externalSession?.status === 'pending' &&
     externalSession.flow === 'kiro-pkce' &&
     externalSession.phase === 'idp-authorization'
+  const authRegionOptions = uniqueValues([...recentAuthRegions, ...DEFAULT_IDC_AUTH_REGIONS])
 
   return (
     <Dialog open={open} onOpenChange={handleDialogOpenChange}>
@@ -646,11 +721,17 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
                     </label>
                     <Input
                       id="idc-start-url"
+                      list="idc-start-url-options"
                       value={startUrl}
-                      onChange={(event) => setStartUrl(event.target.value)}
+                      onChange={(event) => handleStartUrlChange(event.target.value)}
                       placeholder="https://d-xxxxxxxxxx.awsapps.com/start"
                       disabled={starting}
                     />
+                    <datalist id="idc-start-url-options">
+                      {recentStartUrls.map((item) => (
+                        <option key={item} value={item} />
+                      ))}
+                    </datalist>
                   </div>
                 )}
 
@@ -661,11 +742,17 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
                     </label>
                     <Input
                       id="idc-region"
+                      list="idc-auth-region-options"
                       value={region}
                       onChange={(event) => setRegion(event.target.value)}
                       placeholder="us-east-1"
                       disabled={starting}
                     />
+                    <datalist id="idc-auth-region-options">
+                      {authRegionOptions.map((item) => (
+                        <option key={item} value={item} />
+                      ))}
+                    </datalist>
                   </div>
                   <div className="space-y-1.5">
                     <label htmlFor="idc-api-region" className="text-sm font-medium">
