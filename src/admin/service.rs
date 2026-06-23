@@ -3001,8 +3001,15 @@ impl AdminService {
             rate_limit_cooldown_enabled: None,
             rate_limit_bucket_capacity: None,
             rate_limit_refill_per_second: None,
-            region: Some(req.region.clone().unwrap_or_else(|| session.region.clone())),
-            auth_region: req.auth_region.clone(),
+            // The device-login region is the AWS SSO OIDC/Auth region. Persist it
+            // as authRegion so it does not become the API region fallback for
+            // Enterprise ListAvailableModels/runtime calls.
+            region: None,
+            auth_region: req
+                .auth_region
+                .clone()
+                .or_else(|| req.region.clone())
+                .or_else(|| Some(session.region.clone())),
             api_region: req.api_region.clone(),
             machine_id: req.machine_id.clone(),
             start_url: if session.provider.eq_ignore_ascii_case("Enterprise") {
@@ -4271,6 +4278,27 @@ mod tests {
             req.start_url.as_deref(),
             Some("https://example.awsapps.com/start")
         );
+    }
+
+    #[test]
+    fn enterprise_device_login_add_request_keeps_auth_region_out_of_api_region_fallback() {
+        let manager =
+            Arc::new(MultiTokenManager::new(Config::default(), vec![], None, None, false).unwrap());
+        let service = AdminService::new(manager);
+        let mut session = idc_device_login_session_for_test("Enterprise");
+        session.region = "us-east-2".to_string();
+        session.request.region = Some("us-east-2".to_string());
+
+        let req = service.build_idc_device_add_credential_request(
+            &session,
+            AwsCreateTokenResponse {
+                refresh_token: "refresh-token".to_string(),
+            },
+        );
+
+        assert_eq!(req.region, None);
+        assert_eq!(req.auth_region.as_deref(), Some("us-east-2"));
+        assert_eq!(req.api_region, None);
     }
 
     #[test]

@@ -324,7 +324,7 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
     const payload: StartIdcDeviceLoginRequest = {
       provider,
       startUrl: trimmedStartUrl || undefined,
-      region: region.trim() || undefined,
+      authRegion: region.trim() || undefined,
       apiRegion: apiRegion.trim() || undefined,
       priority: parsedPriority,
       sourceSupplierName: sourceSupplierName.trim() || undefined,
