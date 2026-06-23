@@ -1,5 +1,21 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react'
-import { CheckCircle2, Copy, Download, ExternalLink, Loader2, LogIn, Search, Send, XCircle } from 'lucide-react'
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
+import {
+  CheckCircle2,
+  Copy,
+  Download,
+  ExternalLink,
+  Globe2,
+  Link2,
+  Loader2,
+  LogIn,
+  Network,
+  Search,
+  Send,
+  Server,
+  Shuffle,
+  Tags,
+  XCircle,
+} from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import {
@@ -22,15 +38,26 @@ import {
   startIdcDeviceLogin,
   submitExternalIdpCallback,
 } from '@/api/credentials'
+import { useCredentials, useLoadBalancingMode } from '@/hooks/use-credentials'
 import { storage } from '@/lib/storage'
 import { cn, extractErrorMessage } from '@/lib/utils'
+import {
+  collectSourceSupplierSuggestions,
+  formatDefaultSourceBatch,
+} from '@/lib/source-metadata'
+import {
+  persistCredentialDefaultsDraft,
+  readCredentialDefaultsDraft,
+} from '@/lib/credential-defaults'
 import type {
+  CredentialProxyMode,
   ExternalIdpLoginStartResponse,
   ExternalIdpLoginStatusResponse,
   ExternalIdpProbeResponse,
   ExternalIdpProbeStatus,
   IdcDeviceLoginStartResponse,
   IdcDeviceLoginStatusResponse,
+  ProxyPoolEntry,
   StartExternalIdpLoginRequest,
   StartIdcDeviceLoginRequest,
 } from '@/types/api'
@@ -261,16 +288,35 @@ function boolStatusText(value: boolean): string {
   return value ? '支持' : '待验证'
 }
 
+function proxyPoolEntryLabel(proxy: ProxyPoolEntry): string {
+  const egress = proxy.expectedEgressIp ? ` (${proxy.expectedEgressIp})` : ''
+  const assigned = typeof proxy.assignedCredentials === 'number'
+    ? ` · 已挂载 ${proxy.assignedCredentials} 凭据`
+    : ''
+  return `${proxy.id}${egress}${assigned}`
+}
+
 export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialogProps) {
   const queryClient = useQueryClient()
+  const initialDefaults = useMemo(() => readCredentialDefaultsDraft(), [])
   const [mode, setMode] = useState<LoginMode>('idc')
   const [provider, setProvider] = useState<LoginProvider>('BuilderId')
   const [startUrl, setStartUrl] = useState('')
-  const [region, setRegion] = useState('')
-  const [apiRegion, setApiRegion] = useState('')
-  const [priority, setPriority] = useState('0')
-  const [sourceSupplierName, setSourceSupplierName] = useState('')
-  const [sourceBatch, setSourceBatch] = useState('')
+  const [region, setRegion] = useState(initialDefaults.authRegion)
+  const [apiRegion, setApiRegion] = useState(initialDefaults.apiRegion)
+  const [profileArn, setProfileArn] = useState(initialDefaults.profileArn)
+  const [priority, setPriority] = useState(initialDefaults.priority)
+  const [maxConcurrency, setMaxConcurrency] = useState(initialDefaults.maxConcurrency)
+  const [machineId, setMachineId] = useState(initialDefaults.machineId)
+  const [accountType, setAccountType] = useState(initialDefaults.accountType)
+  const [sourceSupplierName, setSourceSupplierName] = useState(initialDefaults.sourceSupplierName)
+  const [sourceSupplierId, setSourceSupplierId] = useState(initialDefaults.sourceSupplierId)
+  const [sourceBatch, setSourceBatch] = useState(initialDefaults.sourceBatch)
+  const [proxyMode, setProxyMode] = useState<CredentialProxyMode>(initialDefaults.proxyMode)
+  const [proxyId, setProxyId] = useState(initialDefaults.proxyId)
+  const [proxyUrl, setProxyUrl] = useState(initialDefaults.proxyUrl)
+  const [proxyUsername, setProxyUsername] = useState(initialDefaults.proxyUsername)
+  const [proxyPassword, setProxyPassword] = useState('')
   const [recentAuthRegions, setRecentAuthRegions] = useState<string[]>(() =>
     storage.getRecentIdcAuthRegions()
   )
@@ -293,16 +339,37 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
   const [polling, setPolling] = useState(false)
   const pollInFlightRef = useRef(false)
   const completedSessionRef = useRef<string | null>(null)
+  const { data: existingCredentials } = useCredentials()
+  const { data: loadBalancingData } = useLoadBalancingMode()
+  const sourceSupplierSuggestions = useMemo(
+    () => collectSourceSupplierSuggestions(existingCredentials?.credentials),
+    [existingCredentials?.credentials]
+  )
+  const proxyPoolOptions =
+    loadBalancingData?.proxyPool?.proxies.filter((proxy) => proxy.enabled) ?? []
+  const proxyPoolEnabled = loadBalancingData?.proxyPool?.enabled ?? false
+  const proxyRequireProxy = loadBalancingData?.proxyPool?.requireProxy ?? false
 
   const reset = () => {
+    const defaults = readCredentialDefaultsDraft()
     setMode('idc')
     setProvider('BuilderId')
     setStartUrl('')
-    setRegion('')
-    setApiRegion('')
-    setPriority('0')
-    setSourceSupplierName('')
-    setSourceBatch('')
+    setRegion(defaults.authRegion)
+    setApiRegion(defaults.apiRegion)
+    setProfileArn(defaults.profileArn)
+    setPriority(defaults.priority)
+    setMaxConcurrency(defaults.maxConcurrency)
+    setMachineId(defaults.machineId)
+    setAccountType(defaults.accountType)
+    setSourceSupplierName(defaults.sourceSupplierName)
+    setSourceSupplierId(defaults.sourceSupplierId)
+    setSourceBatch(defaults.sourceBatch)
+    setProxyMode(defaults.proxyMode)
+    setProxyId(defaults.proxyId)
+    setProxyUrl(defaults.proxyUrl)
+    setProxyUsername(defaults.proxyUsername)
+    setProxyPassword('')
     setExternalWorkEmail('')
     setExternalDomainName('')
     setExternalIssuerUrl('')
@@ -331,6 +398,97 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
     const authRegion = storage.getRecentIdcAuthRegionForStartUrl(value)
     if (authRegion) {
       setRegion(authRegion)
+    }
+  }
+
+  const buildProxyPayload = (label = '登录'):
+    | Pick<StartIdcDeviceLoginRequest, 'proxyId' | 'proxyUrl' | 'proxyUsername' | 'proxyPassword'>
+    | null => {
+    if (proxyMode === 'pool' && !proxyId.trim()) {
+      toast.error(`${label}需要选择代理池节点`)
+      return null
+    }
+    if (proxyMode === 'custom') {
+      const url = proxyUrl.trim()
+      if (!url) {
+        toast.error(`${label}需要填写代理 URL`)
+        return null
+      }
+      if (url.toLowerCase() === 'direct') {
+        toast.error('direct 请使用直连模式')
+        return null
+      }
+    }
+    if (proxyMode === 'direct' && proxyRequireProxy) {
+      toast.error('当前代理池要求新凭据必须绑定代理')
+      return null
+    }
+
+    return {
+      proxyId: proxyMode === 'pool' ? proxyId.trim() || undefined : undefined,
+      proxyUrl:
+        proxyMode === 'custom'
+          ? proxyUrl.trim() || undefined
+          : proxyMode === 'direct'
+            ? 'direct'
+            : undefined,
+      proxyUsername: proxyMode === 'custom' ? proxyUsername.trim() || undefined : undefined,
+      proxyPassword: proxyMode === 'custom' ? proxyPassword.trim() || undefined : undefined,
+    }
+  }
+
+  const buildCredentialOptionsPayload = (label = '登录'):
+    | Partial<StartIdcDeviceLoginRequest & StartExternalIdpLoginRequest>
+    | null => {
+    const parsedPriority = priority.trim() ? Number.parseInt(priority, 10) : 0
+    if (!Number.isInteger(parsedPriority) || parsedPriority < 0) {
+      toast.error('优先级必须是大于等于 0 的整数')
+      return null
+    }
+
+    const parsedMaxConcurrency = maxConcurrency.trim()
+      ? Number.parseInt(maxConcurrency, 10)
+      : undefined
+    if (
+      parsedMaxConcurrency !== undefined &&
+      (!Number.isInteger(parsedMaxConcurrency) || parsedMaxConcurrency <= 0)
+    ) {
+      toast.error('并发上限必须是大于 0 的整数，留空表示不限制')
+      return null
+    }
+
+    const proxyPayload = buildProxyPayload(label)
+    if (!proxyPayload) return null
+
+    persistCredentialDefaultsDraft({
+      priority: String(parsedPriority),
+      maxConcurrency: maxConcurrency.trim(),
+      sourceSupplierName: sourceSupplierName.trim(),
+      sourceSupplierId: sourceSupplierId.trim(),
+      sourceBatch: sourceBatch.trim(),
+      accountType: accountType.trim(),
+      authRegion: region.trim(),
+      apiRegion: apiRegion.trim(),
+      profileArn: profileArn.trim(),
+      machineId: machineId.trim(),
+      proxyMode,
+      proxyId: proxyId.trim(),
+      proxyUrl: proxyUrl.trim(),
+      proxyUsername: proxyUsername.trim(),
+    })
+
+    return {
+      authRegion: region.trim() || undefined,
+      apiRegion: apiRegion.trim() || undefined,
+      profileArn: profileArn.trim() || undefined,
+      priority: parsedPriority,
+      maxConcurrency: parsedMaxConcurrency,
+      machineId: machineId.trim() || undefined,
+      accountType: accountType.trim() || undefined,
+      sourceSupplierId: sourceSupplierId.trim() || undefined,
+      sourceSupplierName: sourceSupplierName.trim() || undefined,
+      sourceBatch: sourceBatch.trim() || undefined,
+      ...proxyPayload,
     }
   }
 
@@ -380,20 +538,13 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
       return
     }
 
-    const parsedPriority = priority.trim() ? Number.parseInt(priority, 10) : 0
-    if (!Number.isInteger(parsedPriority) || parsedPriority < 0) {
-      toast.error('优先级必须是大于等于 0 的整数')
-      return
-    }
+    const credentialOptions = buildCredentialOptionsPayload('IdC 登录')
+    if (!credentialOptions) return
 
     const payload: StartIdcDeviceLoginRequest = {
       provider,
       startUrl: trimmedStartUrl || undefined,
-      authRegion: region.trim() || undefined,
-      apiRegion: apiRegion.trim() || undefined,
-      priority: parsedPriority,
-      sourceSupplierName: sourceSupplierName.trim() || undefined,
-      sourceBatch: sourceBatch.trim() || undefined,
+      ...credentialOptions,
     }
 
     setStarting(true)
@@ -423,6 +574,8 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
     setExternalProbing(true)
     setExternalProbe(null)
     try {
+      const proxyPayload = buildProxyPayload('External IdP 探测')
+      if (!proxyPayload) return
       const response = await probeExternalIdp({
         workEmail: workEmail || undefined,
         domainName: domainName || undefined,
@@ -431,6 +584,7 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
         scopes: externalScopes.trim() || undefined,
         audience: externalAudience.trim() || undefined,
         probeOidc: true,
+        ...proxyPayload,
       })
       setExternalProbe(response)
       if (response.issuerUrl && !issuerUrl) {
@@ -469,11 +623,8 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
       return
     }
 
-    const parsedPriority = priority.trim() ? Number.parseInt(priority, 10) : 0
-    if (!Number.isInteger(parsedPriority) || parsedPriority < 0) {
-      toast.error('优先级必须是大于等于 0 的整数')
-      return
-    }
+    const credentialOptions = buildCredentialOptionsPayload('External IdP 登录')
+    if (!credentialOptions) return
 
     const payload: StartExternalIdpLoginRequest = {
       workEmail: workEmail || undefined,
@@ -485,10 +636,7 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
       loginHint: workEmail || undefined,
       flow: 'kiro-pkce',
       callbackBaseUrl: window.location.origin,
-      apiRegion: apiRegion.trim() || undefined,
-      priority: parsedPriority,
-      sourceSupplierName: sourceSupplierName.trim() || undefined,
-      sourceBatch: sourceBatch.trim() || undefined,
+      ...credentialOptions,
     }
 
     setStarting(true)
@@ -662,9 +810,277 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
     externalSession.phase === 'idp-authorization'
   const authRegionOptions = uniqueValues([...recentAuthRegions, ...DEFAULT_IDC_AUTH_REGIONS])
 
+  const resetSessionForNextLogin = () => {
+    const nextMode = sessionMode
+    setSession(null)
+    setSessionMode(nextMode)
+    setExternalCallbackInput('')
+    setSubmittingCallback(false)
+    setPolling(false)
+    pollInFlightRef.current = false
+    completedSessionRef.current = null
+    setMode(nextMode)
+
+    if (nextMode === 'external_idp') {
+      setExternalWorkEmail('')
+      setExternalProbe(null)
+    }
+  }
+
+  const renderCredentialOptions = (disabled: boolean, idPrefix: string) => (
+    <div className="space-y-3 rounded-md border p-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-2 text-sm font-medium">
+          <Tags className="h-4 w-4 text-muted-foreground" />
+          凭据参数
+        </div>
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          className="h-8"
+          onClick={() => setSourceBatch(formatDefaultSourceBatch())}
+          disabled={disabled}
+        >
+          当前小时批次
+        </Button>
+      </div>
+
+      <div className="grid gap-3 sm:grid-cols-3">
+        <div className="space-y-1.5">
+          <label htmlFor={`${idPrefix}-priority`} className="text-xs font-medium text-muted-foreground">
+            优先级
+          </label>
+          <Input
+            id={`${idPrefix}-priority`}
+            type="number"
+            min="0"
+            value={priority}
+            onChange={(event) => setPriority(event.target.value)}
+            disabled={disabled}
+          />
+        </div>
+        <div className="space-y-1.5">
+          <label htmlFor={`${idPrefix}-source-supplier`} className="text-xs font-medium text-muted-foreground">
+            供应商
+          </label>
+          <Input
+            id={`${idPrefix}-source-supplier`}
+            list={`${idPrefix}-source-supplier-options`}
+            value={sourceSupplierName}
+            onChange={(event) => setSourceSupplierName(event.target.value)}
+            placeholder="可输入或选择"
+            disabled={disabled}
+          />
+          <datalist id={`${idPrefix}-source-supplier-options`}>
+            {sourceSupplierSuggestions.map((supplier) => (
+              <option key={supplier} value={supplier} />
+            ))}
+          </datalist>
+        </div>
+        <div className="space-y-1.5">
+          <label htmlFor={`${idPrefix}-source-batch`} className="text-xs font-medium text-muted-foreground">
+            批次
+          </label>
+          <Input
+            id={`${idPrefix}-source-batch`}
+            value={sourceBatch}
+            onChange={(event) => setSourceBatch(event.target.value)}
+            placeholder={formatDefaultSourceBatch()}
+            disabled={disabled}
+          />
+        </div>
+      </div>
+
+      <details className="rounded-md bg-muted/20 px-3 py-2">
+        <summary className="cursor-pointer text-sm font-medium text-muted-foreground">
+          更多凭据参数
+        </summary>
+        <div className="mt-3 space-y-3">
+          <div className="grid gap-3 sm:grid-cols-3">
+            <div className="space-y-1.5">
+              <label htmlFor={`${idPrefix}-source-supplier-id`} className="text-xs font-medium text-muted-foreground">
+                供应商 ID
+              </label>
+              <Input
+                id={`${idPrefix}-source-supplier-id`}
+                value={sourceSupplierId}
+                onChange={(event) => setSourceSupplierId(event.target.value)}
+                placeholder="可选"
+                disabled={disabled}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <label htmlFor={`${idPrefix}-max-concurrency`} className="text-xs font-medium text-muted-foreground">
+                并发上限
+              </label>
+              <Input
+                id={`${idPrefix}-max-concurrency`}
+                type="number"
+                min="1"
+                value={maxConcurrency}
+                onChange={(event) => setMaxConcurrency(event.target.value)}
+                placeholder="不限"
+                disabled={disabled}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <label htmlFor={`${idPrefix}-account-type`} className="text-xs font-medium text-muted-foreground">
+                账号类型
+              </label>
+              <Input
+                id={`${idPrefix}-account-type`}
+                value={accountType}
+                onChange={(event) => setAccountType(event.target.value)}
+                placeholder="可选"
+                disabled={disabled}
+              />
+            </div>
+          </div>
+
+          <div className="grid gap-3 sm:grid-cols-2">
+            <div className="space-y-1.5">
+              <label htmlFor={`${idPrefix}-auth-region`} className="text-xs font-medium text-muted-foreground">
+                Auth Region
+              </label>
+              <Input
+                id={`${idPrefix}-auth-region`}
+                list="idc-auth-region-options"
+                value={region}
+                onChange={(event) => setRegion(event.target.value)}
+                placeholder="us-east-1"
+                disabled={disabled}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <label htmlFor={`${idPrefix}-api-region`} className="text-xs font-medium text-muted-foreground">
+                API Region
+              </label>
+              <Input
+                id={`${idPrefix}-api-region`}
+                value={apiRegion}
+                onChange={(event) => setApiRegion(event.target.value)}
+                placeholder="留空跟随全局"
+                disabled={disabled}
+              />
+            </div>
+          </div>
+
+          <div className="grid gap-3 sm:grid-cols-2">
+            <div className="space-y-1.5">
+              <label htmlFor={`${idPrefix}-profile-arn`} className="text-xs font-medium text-muted-foreground">
+                Profile ARN
+              </label>
+              <Input
+                id={`${idPrefix}-profile-arn`}
+                value={profileArn}
+                onChange={(event) => setProfileArn(event.target.value)}
+                placeholder="可选，留空自动发现"
+                disabled={disabled}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <label htmlFor={`${idPrefix}-machine-id`} className="text-xs font-medium text-muted-foreground">
+                Machine ID
+              </label>
+              <Input
+                id={`${idPrefix}-machine-id`}
+                value={machineId}
+                onChange={(event) => setMachineId(event.target.value)}
+                placeholder="可选"
+                disabled={disabled}
+              />
+            </div>
+          </div>
+
+          <div className="space-y-2 rounded-md border bg-background p-3">
+            <div className="flex items-center gap-2 text-sm font-medium">
+              <Network className="h-4 w-4 text-muted-foreground" />
+              代理策略
+            </div>
+            <div className="grid gap-2 sm:grid-cols-4">
+              {([
+                ['auto', Shuffle, '自动'],
+                ['pool', Server, '节点'],
+                ['custom', Link2, '自定义'],
+                ['direct', Globe2, '直连'],
+              ] as const).map(([item, Icon, label]) => (
+                <button
+                  key={item}
+                  type="button"
+                  onClick={() => setProxyMode(item)}
+                  disabled={
+                    disabled ||
+                    (item === 'pool' && (!proxyPoolEnabled || proxyPoolOptions.length === 0)) ||
+                    (item === 'direct' && proxyRequireProxy)
+                  }
+                  className={cn(
+                    'flex h-9 items-center justify-center gap-2 rounded-md border px-2 text-sm transition-colors',
+                    proxyMode === item
+                      ? 'border-primary bg-primary/10 text-primary'
+                      : 'border-input bg-background hover:bg-muted/60',
+                    ((item === 'pool' && (!proxyPoolEnabled || proxyPoolOptions.length === 0)) ||
+                      (item === 'direct' && proxyRequireProxy)) &&
+                      'cursor-not-allowed opacity-50'
+                  )}
+                >
+                  <Icon className="h-4 w-4" />
+                  {label}
+                </button>
+              ))}
+            </div>
+            {proxyMode === 'pool' && (
+              <select
+                value={proxyId}
+                onChange={(event) => setProxyId(event.target.value)}
+                disabled={disabled || proxyPoolOptions.length === 0}
+                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <option value="">选择代理池节点</option>
+                {proxyPoolOptions.map((proxy) => (
+                  <option key={proxy.id} value={proxy.id}>
+                    {proxyPoolEntryLabel(proxy)}
+                  </option>
+                ))}
+              </select>
+            )}
+            {proxyMode === 'custom' && (
+              <div className="space-y-2">
+                <Input
+                  value={proxyUrl}
+                  onChange={(event) => setProxyUrl(event.target.value)}
+                  placeholder="http://proxy:3128 或 socks5://proxy:1080"
+                  disabled={disabled}
+                />
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <Input
+                    value={proxyUsername}
+                    onChange={(event) => setProxyUsername(event.target.value)}
+                    placeholder="代理用户名"
+                    disabled={disabled}
+                  />
+                  <Input
+                    type="password"
+                    value={proxyPassword}
+                    onChange={(event) => setProxyPassword(event.target.value)}
+                    placeholder="代理密码"
+                    disabled={disabled}
+                  />
+                </div>
+              </div>
+            )}
+            {proxyRequireProxy && (
+              <div className="text-xs text-amber-600">当前代理池启用了强制代理，不能选择直连。</div>
+            )}
+          </div>
+        </div>
+      </details>
+    </div>
+  )
+
   return (
     <Dialog open={open} onOpenChange={handleDialogOpenChange}>
-      <DialogContent className="sm:max-w-xl">
+      <DialogContent className="sm:max-w-2xl max-h-[85vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>在线登录</DialogTitle>
         </DialogHeader>
@@ -692,6 +1108,11 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
                 </button>
               ))}
             </div>
+            <datalist id="idc-auth-region-options">
+              {authRegionOptions.map((item) => (
+                <option key={item} value={item} />
+              ))}
+            </datalist>
 
             {mode === 'idc' ? (
               <form onSubmit={handleStart} className="space-y-4">
@@ -735,78 +1156,7 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
                   </div>
                 )}
 
-                <div className="grid gap-3 sm:grid-cols-2">
-                  <div className="space-y-1.5">
-                    <label htmlFor="idc-region" className="text-sm font-medium">
-                      Auth Region
-                    </label>
-                    <Input
-                      id="idc-region"
-                      list="idc-auth-region-options"
-                      value={region}
-                      onChange={(event) => setRegion(event.target.value)}
-                      placeholder="us-east-1"
-                      disabled={starting}
-                    />
-                    <datalist id="idc-auth-region-options">
-                      {authRegionOptions.map((item) => (
-                        <option key={item} value={item} />
-                      ))}
-                    </datalist>
-                  </div>
-                  <div className="space-y-1.5">
-                    <label htmlFor="idc-api-region" className="text-sm font-medium">
-                      API Region
-                    </label>
-                    <Input
-                      id="idc-api-region"
-                      value={apiRegion}
-                      onChange={(event) => setApiRegion(event.target.value)}
-                      placeholder="留空跟随全局"
-                      disabled={starting}
-                    />
-                  </div>
-                </div>
-
-                <div className="grid gap-3 sm:grid-cols-3">
-                  <div className="space-y-1.5">
-                    <label htmlFor="idc-priority" className="text-sm font-medium">
-                      优先级
-                    </label>
-                    <Input
-                      id="idc-priority"
-                      value={priority}
-                      onChange={(event) => setPriority(event.target.value)}
-                      inputMode="numeric"
-                      disabled={starting}
-                    />
-                  </div>
-                  <div className="space-y-1.5 sm:col-span-2">
-                    <label htmlFor="idc-source-name" className="text-sm font-medium">
-                      供应商
-                    </label>
-                    <Input
-                      id="idc-source-name"
-                      value={sourceSupplierName}
-                      onChange={(event) => setSourceSupplierName(event.target.value)}
-                      placeholder="可选"
-                      disabled={starting}
-                    />
-                  </div>
-                </div>
-
-                <div className="space-y-1.5">
-                  <label htmlFor="idc-source-batch" className="text-sm font-medium">
-                    批次
-                  </label>
-                  <Input
-                    id="idc-source-batch"
-                    value={sourceBatch}
-                    onChange={(event) => setSourceBatch(event.target.value)}
-                    placeholder="可选"
-                    disabled={starting}
-                  />
-                </div>
+                {renderCredentialOptions(starting, 'idc')}
 
                 <DialogFooter>
                   <Button
@@ -856,58 +1206,70 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
                   </div>
                 </div>
 
-                <div className="space-y-1.5">
-                  <label htmlFor="external-issuer" className="text-sm font-medium">
-                    Issuer URL
-                  </label>
-                  <Input
-                    id="external-issuer"
-                    value={externalIssuerUrl}
-                    onChange={(event) => setExternalIssuerUrl(event.target.value)}
-                    placeholder="https://login.example.com/oauth2/default"
-                    disabled={externalProbing}
-                  />
-                </div>
+                <details
+                  className="rounded-md border p-3"
+                  open={Boolean(externalIssuerUrl || externalClientId || externalScopes || externalAudience)}
+                >
+                  <summary className="cursor-pointer text-sm font-medium text-muted-foreground">
+                    高级 IdP 参数
+                  </summary>
+                  <div className="mt-3 space-y-3">
+                    <div className="space-y-1.5">
+                      <label htmlFor="external-issuer" className="text-sm font-medium">
+                        Issuer URL
+                      </label>
+                      <Input
+                        id="external-issuer"
+                        value={externalIssuerUrl}
+                        onChange={(event) => setExternalIssuerUrl(event.target.value)}
+                        placeholder="https://login.example.com/oauth2/default"
+                        disabled={externalProbing}
+                      />
+                    </div>
 
-                <div className="grid gap-3 sm:grid-cols-2">
-                  <div className="space-y-1.5">
-                    <label htmlFor="external-client-id" className="text-sm font-medium">
-                      Client ID
-                    </label>
-                    <Input
-                      id="external-client-id"
-                      value={externalClientId}
-                      onChange={(event) => setExternalClientId(event.target.value)}
-                      placeholder="可选"
-                      disabled={externalProbing}
-                    />
-                  </div>
-                  <div className="space-y-1.5">
-                    <label htmlFor="external-audience" className="text-sm font-medium">
-                      Audience
-                    </label>
-                    <Input
-                      id="external-audience"
-                      value={externalAudience}
-                      onChange={(event) => setExternalAudience(event.target.value)}
-                      placeholder="可选"
-                      disabled={externalProbing}
-                    />
-                  </div>
-                </div>
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <div className="space-y-1.5">
+                        <label htmlFor="external-client-id" className="text-sm font-medium">
+                          Client ID
+                        </label>
+                        <Input
+                          id="external-client-id"
+                          value={externalClientId}
+                          onChange={(event) => setExternalClientId(event.target.value)}
+                          placeholder="可选"
+                          disabled={externalProbing}
+                        />
+                      </div>
+                      <div className="space-y-1.5">
+                        <label htmlFor="external-audience" className="text-sm font-medium">
+                          Audience
+                        </label>
+                        <Input
+                          id="external-audience"
+                          value={externalAudience}
+                          onChange={(event) => setExternalAudience(event.target.value)}
+                          placeholder="可选"
+                          disabled={externalProbing}
+                        />
+                      </div>
+                    </div>
 
-                <div className="space-y-1.5">
-                  <label htmlFor="external-scopes" className="text-sm font-medium">
-                    Scopes
-                  </label>
-                  <Input
-                    id="external-scopes"
-                    value={externalScopes}
-                    onChange={(event) => setExternalScopes(event.target.value)}
-                    placeholder="openid profile email offline_access"
-                    disabled={externalProbing}
-                  />
-                </div>
+                    <div className="space-y-1.5">
+                      <label htmlFor="external-scopes" className="text-sm font-medium">
+                        Scopes
+                      </label>
+                      <Input
+                        id="external-scopes"
+                        value={externalScopes}
+                        onChange={(event) => setExternalScopes(event.target.value)}
+                        placeholder="openid profile email offline_access"
+                        disabled={externalProbing}
+                      />
+                    </div>
+                  </div>
+                </details>
+
+                {renderCredentialOptions(externalProbing || starting, 'external')}
 
                 {externalProbe && (
                   <div className="space-y-3 rounded-md border p-4">
@@ -1172,9 +1534,14 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
                   </Button>
                 </>
               ) : (
-                <Button type="button" onClick={() => void handleDialogOpenChange(false)}>
-                  关闭
-                </Button>
+                <>
+                  <Button type="button" variant="outline" onClick={resetSessionForNextLogin}>
+                    继续登录
+                  </Button>
+                  <Button type="button" onClick={() => void handleDialogOpenChange(false)}>
+                    关闭
+                  </Button>
+                </>
               )}
             </DialogFooter>
           </div>

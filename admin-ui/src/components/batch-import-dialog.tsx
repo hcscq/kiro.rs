@@ -20,6 +20,11 @@ import {
   formatDefaultSourceBatch,
   normalizedSourceString,
 } from '@/lib/source-metadata'
+import {
+  persistCredentialDefaultsDraft,
+  readCredentialDefaultsDraft,
+  resetCredentialDefaultsDraft,
+} from '@/lib/credential-defaults'
 
 interface BatchImportDialogProps {
   open: boolean
@@ -131,23 +136,25 @@ function normalizeScopes(scopes?: string | string[]): string | undefined {
 
 export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps) {
   const jsonInputRef = useRef<HTMLTextAreaElement>(null)
+  const defaultDraft = useMemo(() => readCredentialDefaultsDraft(), [])
   const [jsonInput, setJsonInput] = useState('')
   const [importing, setImporting] = useState(false)
   const [progress, setProgress] = useState({ current: 0, total: 0 })
   const [currentProcessing, setCurrentProcessing] = useState<string>('')
   const [results, setResults] = useState<VerificationResult[]>([])
-  const [defaultPriority, setDefaultPriority] = useState('0')
-  const [defaultMaxConcurrency, setDefaultMaxConcurrency] = useState('')
+  const [defaultPriority, setDefaultPriority] = useState(defaultDraft.priority)
+  const [defaultMaxConcurrency, setDefaultMaxConcurrency] = useState(defaultDraft.maxConcurrency)
   const [defaultRateLimitCooldownMode, setDefaultRateLimitCooldownMode] =
-    useState<RateLimitCooldownMode>('global')
-  const [defaultSourceSupplierName, setDefaultSourceSupplierName] = useState('')
-  const [defaultSourceBatch, setDefaultSourceBatch] = useState(() => formatDefaultSourceBatch())
-  const [defaultProxyMode, setDefaultProxyMode] = useState<CredentialProxyMode>('auto')
-  const [defaultProxyId, setDefaultProxyId] = useState('')
-  const [defaultProxyUrl, setDefaultProxyUrl] = useState('')
-  const [defaultProxyUsername, setDefaultProxyUsername] = useState('')
+    useState<RateLimitCooldownMode>(defaultDraft.rateLimitCooldownMode)
+  const [defaultSourceSupplierName, setDefaultSourceSupplierName] = useState(defaultDraft.sourceSupplierName)
+  const [defaultSourceSupplierId, setDefaultSourceSupplierId] = useState(defaultDraft.sourceSupplierId)
+  const [defaultSourceBatch, setDefaultSourceBatch] = useState(defaultDraft.sourceBatch)
+  const [defaultProxyMode, setDefaultProxyMode] = useState<CredentialProxyMode>(defaultDraft.proxyMode)
+  const [defaultProxyId, setDefaultProxyId] = useState(defaultDraft.proxyId)
+  const [defaultProxyUrl, setDefaultProxyUrl] = useState(defaultDraft.proxyUrl)
+  const [defaultProxyUsername, setDefaultProxyUsername] = useState(defaultDraft.proxyUsername)
   const [defaultProxyPassword, setDefaultProxyPassword] = useState('')
-  const [autoEnableOverage, setAutoEnableOverage] = useState(false)
+  const [autoEnableOverage, setAutoEnableOverage] = useState(defaultDraft.autoEnableOverage)
 
   const { data: existingCredentials } = useCredentials()
   const { data: loadBalancingData } = useLoadBalancingMode()
@@ -196,18 +203,20 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
   }
 
   const resetForm = () => {
+    const resetDraft = resetCredentialDefaultsDraft()
     resetImportDraft()
-    setDefaultPriority('0')
-    setDefaultMaxConcurrency('')
-    setDefaultRateLimitCooldownMode('global')
-    setDefaultSourceSupplierName('')
-    setDefaultSourceBatch(formatDefaultSourceBatch())
-    setDefaultProxyMode('auto')
-    setDefaultProxyId('')
-    setDefaultProxyUrl('')
-    setDefaultProxyUsername('')
+    setDefaultPriority(resetDraft.priority)
+    setDefaultMaxConcurrency(resetDraft.maxConcurrency)
+    setDefaultRateLimitCooldownMode(resetDraft.rateLimitCooldownMode)
+    setDefaultSourceSupplierName(resetDraft.sourceSupplierName)
+    setDefaultSourceSupplierId(resetDraft.sourceSupplierId)
+    setDefaultSourceBatch(resetDraft.sourceBatch)
+    setDefaultProxyMode(resetDraft.proxyMode)
+    setDefaultProxyId(resetDraft.proxyId)
+    setDefaultProxyUrl(resetDraft.proxyUrl)
+    setDefaultProxyUsername(resetDraft.proxyUsername)
     setDefaultProxyPassword('')
-    setAutoEnableOverage(false)
+    setAutoEnableOverage(resetDraft.autoEnableOverage)
   }
 
   const handleBatchImport = async () => {
@@ -259,9 +268,23 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       return
     }
     const defaultSourceSupplierNameValue = defaultSourceSupplierName.trim()
+    const defaultSourceSupplierIdValue = defaultSourceSupplierId.trim()
     const defaultSourceBatchValue = defaultSourceBatch.trim()
 
     try {
+      persistCredentialDefaultsDraft({
+        priority: String(parsedDefaultPriority),
+        maxConcurrency: defaultMaxConcurrency.trim(),
+        rateLimitCooldownMode: defaultRateLimitCooldownMode,
+        sourceSupplierName: defaultSourceSupplierNameValue,
+        sourceSupplierId: defaultSourceSupplierIdValue,
+        sourceBatch: defaultSourceBatchValue,
+        proxyMode: defaultProxyMode,
+        proxyId: defaultProxyId.trim(),
+        proxyUrl: defaultProxyUrl.trim(),
+        proxyUsername: defaultProxyUsername.trim(),
+        autoEnableOverage,
+      })
       setImporting(true)
       setProgress({ current: 0, total: credentials.length })
 
@@ -461,7 +484,10 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             machineId: cred.machineId?.trim() || undefined,
             accountType: cred.accountType?.trim() || undefined,
             sourceSupplierId:
-              cred.sourceSupplierId?.trim() || cred.source_supplier_id?.trim() || undefined,
+              normalizedSourceString(cred.sourceSupplierId) ||
+              normalizedSourceString(cred.source_supplier_id) ||
+              defaultSourceSupplierIdValue ||
+              undefined,
             sourceSupplierName:
               normalizedSourceString(cred.sourceSupplierName) ||
               normalizedSourceString(cred.source_supplier_name) ||
@@ -707,7 +733,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
                 </div>
                 <span className="text-xs text-muted-foreground">JSON 单条来源字段优先</span>
               </div>
-              <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_160px_auto] md:items-end">
+              <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_180px_160px_auto] md:items-end">
                 <div className="space-y-1.5">
                   <label htmlFor="batchDefaultSourceSupplier" className="text-xs font-medium text-muted-foreground">
                     默认供应商
@@ -725,6 +751,18 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
                       <option key={supplier} value={supplier} />
                     ))}
                   </datalist>
+                </div>
+                <div className="space-y-1.5">
+                  <label htmlFor="batchDefaultSourceSupplierId" className="text-xs font-medium text-muted-foreground">
+                    默认供应商 ID
+                  </label>
+                  <Input
+                    id="batchDefaultSourceSupplierId"
+                    placeholder="可选"
+                    value={defaultSourceSupplierId}
+                    onChange={(e) => setDefaultSourceSupplierId(e.target.value)}
+                    disabled={importing}
+                  />
                 </div>
                 <div className="space-y-1.5">
                   <label htmlFor="batchDefaultSourceBatch" className="text-xs font-medium text-muted-foreground">

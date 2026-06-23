@@ -24,6 +24,15 @@ import {
 } from '@/hooks/use-credentials'
 import type { CredentialProxyMode, ProxyPoolEntry } from '@/types/api'
 import { cn, extractErrorMessage } from '@/lib/utils'
+import {
+  collectSourceSupplierSuggestions,
+  formatDefaultSourceBatch,
+} from '@/lib/source-metadata'
+import {
+  persistCredentialDefaultsDraft,
+  readCredentialDefaultsDraft,
+  resetCredentialDefaultsDraft,
+} from '@/lib/credential-defaults'
 
 interface AddCredentialDialogProps {
   open: boolean
@@ -48,33 +57,34 @@ function proxyPoolEntryLabel(proxy: ProxyPoolEntry): string {
 }
 
 export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
+  const initialDefaults = useMemo(() => readCredentialDefaultsDraft(), [])
   const refreshTokenInputRef = useRef<HTMLInputElement>(null)
   const [refreshToken, setRefreshToken] = useState('')
   const [email, setEmail] = useState('')
   const [authMethod, setAuthMethod] = useState<AuthMethod>('social')
-  const [authRegion, setAuthRegion] = useState('')
-  const [apiRegion, setApiRegion] = useState('')
-  const [profileArn, setProfileArn] = useState('')
+  const [authRegion, setAuthRegion] = useState(initialDefaults.authRegion)
+  const [apiRegion, setApiRegion] = useState(initialDefaults.apiRegion)
+  const [profileArn, setProfileArn] = useState(initialDefaults.profileArn)
   const [clientId, setClientId] = useState('')
   const [clientSecret, setClientSecret] = useState('')
   const [startUrl, setStartUrl] = useState('')
-  const [priority, setPriority] = useState('0')
-  const [maxConcurrency, setMaxConcurrency] = useState('')
+  const [priority, setPriority] = useState(initialDefaults.priority)
+  const [maxConcurrency, setMaxConcurrency] = useState(initialDefaults.maxConcurrency)
   const [rateLimitCooldownMode, setRateLimitCooldownMode] =
-    useState<RateLimitCooldownMode>('global')
+    useState<RateLimitCooldownMode>(initialDefaults.rateLimitCooldownMode)
   const [rateLimitBucketCapacity, setRateLimitBucketCapacity] = useState('')
   const [rateLimitRefillPerSecond, setRateLimitRefillPerSecond] = useState('')
-  const [machineId, setMachineId] = useState('')
-  const [accountType, setAccountType] = useState('')
-  const [sourceSupplierName, setSourceSupplierName] = useState('')
-  const [sourceSupplierId, setSourceSupplierId] = useState('')
-  const [sourceBatch, setSourceBatch] = useState('')
+  const [machineId, setMachineId] = useState(initialDefaults.machineId)
+  const [accountType, setAccountType] = useState(initialDefaults.accountType)
+  const [sourceSupplierName, setSourceSupplierName] = useState(initialDefaults.sourceSupplierName)
+  const [sourceSupplierId, setSourceSupplierId] = useState(initialDefaults.sourceSupplierId)
+  const [sourceBatch, setSourceBatch] = useState(initialDefaults.sourceBatch)
   const [allowedModels, setAllowedModels] = useState<string[]>([])
   const [blockedModels, setBlockedModels] = useState<string[]>([])
-  const [proxyMode, setProxyMode] = useState<CredentialProxyMode>('auto')
-  const [proxyId, setProxyId] = useState('')
-  const [proxyUrl, setProxyUrl] = useState('')
-  const [proxyUsername, setProxyUsername] = useState('')
+  const [proxyMode, setProxyMode] = useState<CredentialProxyMode>(initialDefaults.proxyMode)
+  const [proxyId, setProxyId] = useState(initialDefaults.proxyId)
+  const [proxyUrl, setProxyUrl] = useState(initialDefaults.proxyUrl)
+  const [proxyUsername, setProxyUsername] = useState(initialDefaults.proxyUsername)
   const [proxyPassword, setProxyPassword] = useState('')
 
   const { mutate, isPending } = useAddCredential()
@@ -104,37 +114,42 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     loadBalancingData?.proxyPool?.proxies.filter((proxy) => proxy.enabled) ?? []
   const proxyPoolEnabled = loadBalancingData?.proxyPool?.enabled ?? false
   const proxyRequireProxy = loadBalancingData?.proxyPool?.requireProxy ?? false
+  const sourceSupplierSuggestions = useMemo(
+    () => collectSourceSupplierSuggestions(credentialsData?.credentials),
+    [credentialsData?.credentials]
+  )
 
   const resetCredentialDraft = () => {
     setRefreshToken('')
     setEmail('')
-    setMachineId('')
   }
 
   const resetForm = () => {
+    const resetDraft = resetCredentialDefaultsDraft()
     resetCredentialDraft()
     setAuthMethod('social')
-    setAuthRegion('')
-    setApiRegion('')
-    setProfileArn('')
+    setAuthRegion(resetDraft.authRegion)
+    setApiRegion(resetDraft.apiRegion)
+    setProfileArn(resetDraft.profileArn)
     setClientId('')
     setClientSecret('')
     setStartUrl('')
-    setPriority('0')
-    setMaxConcurrency('')
-    setRateLimitCooldownMode('global')
+    setPriority(resetDraft.priority)
+    setMaxConcurrency(resetDraft.maxConcurrency)
+    setRateLimitCooldownMode(resetDraft.rateLimitCooldownMode)
     setRateLimitBucketCapacity('')
     setRateLimitRefillPerSecond('')
-    setAccountType('')
-    setSourceSupplierName('')
-    setSourceSupplierId('')
-    setSourceBatch('')
+    setMachineId(resetDraft.machineId)
+    setAccountType(resetDraft.accountType)
+    setSourceSupplierName(resetDraft.sourceSupplierName)
+    setSourceSupplierId(resetDraft.sourceSupplierId)
+    setSourceBatch(resetDraft.sourceBatch)
     setAllowedModels([])
     setBlockedModels([])
-    setProxyMode('auto')
-    setProxyId('')
-    setProxyUrl('')
-    setProxyUsername('')
+    setProxyMode(resetDraft.proxyMode)
+    setProxyId(resetDraft.proxyId)
+    setProxyUrl(resetDraft.proxyUrl)
+    setProxyUsername(resetDraft.proxyUsername)
     setProxyPassword('')
   }
 
@@ -148,6 +163,12 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     // IdC/Builder-ID/IAM 需要额外字段
     if (authMethod === 'idc' && (!clientId.trim() || !clientSecret.trim())) {
       toast.error('IdC/Builder-ID/IAM 认证需要填写 Client ID 和 Client Secret')
+      return
+    }
+
+    const parsedPriority = Number.parseInt(priority.trim() || '0', 10)
+    if (!Number.isInteger(parsedPriority) || parsedPriority < 0) {
+      toast.error('优先级必须是大于等于 0 的整数')
       return
     }
 
@@ -213,7 +234,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         clientId: clientId.trim() || undefined,
         clientSecret: clientSecret.trim() || undefined,
         startUrl: startUrl.trim() || undefined,
-        priority: parseInt(priority) || 0,
+        priority: parsedPriority,
         maxConcurrency: parsedMaxConcurrency,
         rateLimitCooldownEnabled: rateLimitCooldownValueFromMode(rateLimitCooldownMode),
         rateLimitBucketCapacity: parsedRateLimitBucketCapacity,
@@ -239,6 +260,23 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       },
       {
         onSuccess: (data) => {
+          persistCredentialDefaultsDraft({
+            priority: String(parsedPriority),
+            maxConcurrency: maxConcurrency.trim(),
+            rateLimitCooldownMode,
+            sourceSupplierName: sourceSupplierName.trim(),
+            sourceSupplierId: sourceSupplierId.trim(),
+            sourceBatch: sourceBatch.trim(),
+            accountType: accountType.trim(),
+            authRegion: authRegion.trim(),
+            apiRegion: apiRegion.trim(),
+            profileArn: profileArn.trim(),
+            machineId: machineId.trim(),
+            proxyMode,
+            proxyId: proxyId.trim(),
+            proxyUrl: proxyUrl.trim(),
+            proxyUsername: proxyUsername.trim(),
+          })
           toast.success(data.message)
           resetCredentialDraft()
           if (closeAfterSuccess) {
@@ -509,15 +547,33 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
             />
 
             <div className="space-y-2 rounded-lg border p-3 bg-muted/5">
-              <label className="text-sm font-medium">来源标记</label>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <label className="text-sm font-medium">来源标记</label>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  className="h-8"
+                  onClick={() => setSourceBatch(formatDefaultSourceBatch())}
+                  disabled={isPending}
+                >
+                  当前小时批次
+                </Button>
+              </div>
               <div className="grid gap-2 sm:grid-cols-3">
                 <Input
                   id="sourceSupplierName"
+                  list="sourceSupplierNameOptions"
                   placeholder="供应商名称"
                   value={sourceSupplierName}
                   onChange={(e) => setSourceSupplierName(e.target.value)}
                   disabled={isPending}
                 />
+                <datalist id="sourceSupplierNameOptions">
+                  {sourceSupplierSuggestions.map((supplier) => (
+                    <option key={supplier} value={supplier} />
+                  ))}
+                </datalist>
                 <Input
                   id="sourceSupplierId"
                   placeholder="供应商 ID"
@@ -527,7 +583,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 />
                 <Input
                   id="sourceBatch"
-                  placeholder="批次"
+                  placeholder={formatDefaultSourceBatch()}
                   value={sourceBatch}
                   onChange={(e) => setSourceBatch(e.target.value)}
                   disabled={isPending}

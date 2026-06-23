@@ -32,6 +32,7 @@ import {
 import { getCredentialBalance, forceRefreshToken, setCredentialOverageStatus, setCredentialSource } from '@/api/credentials'
 import { getCredentialLabel, getCredentialLabelWithId } from '@/lib/credential-label'
 import { cn, extractErrorMessage } from '@/lib/utils'
+import { formatDefaultSourceBatch } from '@/lib/source-metadata'
 import type { BalanceResponse, CredentialStatusItem } from '@/types/api'
 
 const ALL_LEVELS = '__all_levels__'
@@ -737,7 +738,7 @@ export function Dashboard() {
   const handleOpenBatchSourceDialog = () => {
     setBatchSourceSupplierName('')
     setBatchSourceSupplierId('')
-    setBatchSourceBatch('')
+    setBatchSourceBatch(formatDefaultSourceBatch())
     setBatchSourceProgress({ current: 0, total: 0 })
     setSourceDialogOpen(true)
   }
@@ -1378,11 +1379,22 @@ export function Dashboard() {
                 </label>
                 <Input
                   id="batch-source-supplier-name"
+                  list="batch-source-supplier-name-options"
                   value={batchSourceSupplierName}
                   onChange={(event) => setBatchSourceSupplierName(event.target.value)}
                   placeholder="供应商名称"
                   disabled={batchSourceUpdating}
                 />
+                <datalist id="batch-source-supplier-name-options">
+                  {sourceSupplierOptions
+                    .filter((option) =>
+                      option.value !== ALL_SOURCE_SUPPLIERS &&
+                      option.value !== UNKNOWN_SOURCE_SUPPLIER
+                    )
+                    .map((option) => (
+                      <option key={option.value} value={option.value} />
+                    ))}
+                </datalist>
               </div>
               <div className="space-y-1.5">
                 <label htmlFor="batch-source-supplier-id" className="text-sm font-medium">
@@ -1404,7 +1416,7 @@ export function Dashboard() {
                   id="batch-source-batch"
                   value={batchSourceBatch}
                   onChange={(event) => setBatchSourceBatch(event.target.value)}
-                  placeholder="如 202606181"
+                  placeholder={formatDefaultSourceBatch()}
                   disabled={batchSourceUpdating}
                 />
               </div>
