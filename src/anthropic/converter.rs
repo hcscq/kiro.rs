@@ -616,6 +616,7 @@ const MAX_DOCUMENT_EXTRACT_BYTES: usize = 64 * 1024 * 1024;
 // 4_500_001 bytes with DOCUMENT_SIZE_EXCEEDED and accepts 4_500_000 bytes.
 const KIRO_MAX_DOCUMENT_BYTES: usize = 4_500_000;
 const KIRO_MAX_DOCUMENTS_PER_CONVERSATION: usize = 5;
+const PDF_SIGNATURE_SCAN_BYTES: usize = 1024;
 const MAX_INLINE_DOCUMENT_TEXT_CHARS: usize = 40_000;
 const MAX_RENDERED_DOCUMENT_TEXT_CHARS: usize = 7_200;
 const MAX_RENDERED_DOCUMENT_IMAGES: usize = 4;
@@ -1341,7 +1342,7 @@ fn base64_decoded_len(data: &str) -> Option<usize> {
 }
 
 fn pdf_declares_zero_pages(bytes: &[u8]) -> bool {
-    if !bytes.starts_with(b"%PDF-") {
+    if !looks_like_pdf(bytes) {
         return false;
     }
 
@@ -1362,6 +1363,12 @@ fn pdf_declares_zero_pages(bytes: &[u8]) -> bool {
     }
 
     saw_page_tree && !saw_positive_count
+}
+
+fn looks_like_pdf(bytes: &[u8]) -> bool {
+    bytes[..bytes.len().min(PDF_SIGNATURE_SCAN_BYTES)]
+        .windows(b"%PDF-".len())
+        .any(|window| window == b"%PDF-")
 }
 
 fn validate_kiro_document(document: &KiroDocument) -> Result<(), ConversionError> {
@@ -1386,11 +1393,19 @@ fn validate_kiro_document(document: &KiroDocument) -> Result<(), ConversionError
             document.name
         ))
     })?;
-    if document.format == "pdf" && pdf_declares_zero_pages(&decoded) {
-        return Err(ConversionError::DocumentValidation(format!(
-            "PDF document '{}' has no pages. Remove or replace the attachment.",
-            document.name
-        )));
+    if document.format == "pdf" {
+        if !looks_like_pdf(&decoded) {
+            return Err(ConversionError::DocumentValidation(format!(
+                "Document '{}' is declared as PDF but does not look like a PDF file.",
+                document.name
+            )));
+        }
+        if pdf_declares_zero_pages(&decoded) {
+            return Err(ConversionError::DocumentValidation(format!(
+                "PDF document '{}' has no pages. Remove or replace the attachment.",
+                document.name
+            )));
+        }
     }
 
     Ok(())
@@ -4122,6 +4137,7 @@ mod tests {
     const VALID_RGB_1X1_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADUlEQVR42mP8z8BQDwAFgwJ/PrcruAAAAABJRU5ErkJggg==";
     const VALID_RGBA_1X1_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
     const CORRUPT_RGBA_1X1_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    const VALID_PDF_DOCUMENT: &str = "JVBERi0xLjAKMSAwIG9iajw8L1R5cGUvQ2F0YWxvZy9QYWdlcyAyIDAgUj4+ZW5kb2JqCjIgMCBvYmo8PC9UeXBlL1BhZ2VzL0tpZHNbMyAwIFJdL0NvdW50IDE+PmVuZG9iagozIDAgb2JqPDwvVHlwZS9QYWdlL01lZGlhQm94WzAgMCAzMDAgNTBdL1BhcmVudCAyIDAgUi9Db250ZW50cyA0IDAgUi9SZXNvdXJjZXM8PC9Gb250PDwvRjEgNSAwIFI+Pj4+Pj5lbmRvYmoKNCAwIG9iajw8L0xlbmd0aCAzOD4+CnN0cmVhbQpCVCAvRjEgMTQgVGYgMTAgMjAgVGQgKDZHNlM3TVNTKSBUaiBFVAplbmRzdHJlYW0KZW5kb2JqCjUgMCBvYmo8PC9UeXBlL0ZvbnQvU3VidHlwZS9UeXBlMS9CYXNlRm9udC9IZWx2ZXRpY2E+PmVuZG9iagp4cmVmCjAgNgowMDAwMDAwMDAwIDY1NTM1IGYgCjAwMDAwMDAwMDkgMDAwMDAgbiAKMDAwMDAwMDA1MiAwMDAwMCBuIAowMDAwMDAwMTAxIDAwMDAwIG4gCjAwMDAwMDAyMTAgMDAwMDAgbiAKMDAwMDAwMDI5NSAwMDAwMCBuIAp0cmFpbGVyPDwvU2l6ZSA2L1Jvb3QgMSAwIFI+PgpzdGFydHhyZWYKMzU2CiUlRU9G";
 
     fn png_image_block() -> serde_json::Value {
         serde_json::json!({
@@ -4448,7 +4464,7 @@ mod tests {
             "source": {
                 "type": "base64",
                 "media_type": "application/pdf",
-                "data": "JVBERi0xLjAKMSAwIG9iajw8L1R5cGUvQ2F0YWxvZy9QYWdlcyAyIDAgUj4+ZW5kb2JqCjIgMCBvYmo8PC9UeXBlL1BhZ2VzL0tpZHNbMyAwIFJdL0NvdW50IDE+PmVuZG9iagozIDAgb2JqPDwvVHlwZS9QYWdlL01lZGlhQm94WzAgMCAzMDAgNTBdL1BhcmVudCAyIDAgUi9Db250ZW50cyA0IDAgUi9SZXNvdXJjZXM8PC9Gb250PDwvRjEgNSAwIFI+Pj4+Pj5lbmRvYmoKNCAwIG9iajw8L0xlbmd0aCAzOD4+CnN0cmVhbQpCVCAvRjEgMTQgVGYgMTAgMjAgVGQgKDZHNlM3TVNTKSBUaiBFVAplbmRzdHJlYW0KZW5kb2JqCjUgMCBvYmo8PC9UeXBlL0ZvbnQvU3VidHlwZS9UeXBlMS9CYXNlRm9udC9IZWx2ZXRpY2E+PmVuZG9iagp4cmVmCjAgNgowMDAwMDAwMDAwIDY1NTM1IGYgCjAwMDAwMDAwMDkgMDAwMDAgbiAKMDAwMDAwMDA1MiAwMDAwMCBuIAowMDAwMDAwMTAxIDAwMDAwIG4gCjAwMDAwMDAyMTAgMDAwMDAgbiAKMDAwMDAwMDI5NSAwMDAwMCBuIAp0cmFpbGVyPDwvU2l6ZSA2L1Jvb3QgMSAwIFI+PgpzdGFydHhyZWYKMzU2CiUlRU9G"
+                "data": VALID_PDF_DOCUMENT
             }
         })
     }
@@ -4845,7 +4861,7 @@ mod tests {
                 "document_url": {
                     "name": "Spec Sheet.pdf",
                     "mimeType": "application/pdf",
-                    "data": "cGRm"
+                    "data": VALID_PDF_DOCUMENT
                 }
             }),
             serde_json::json!({
@@ -4866,7 +4882,7 @@ mod tests {
         assert_eq!(documents.len(), 2);
         assert_eq!(documents[0].name, "Spec Sheet");
         assert_eq!(documents[0].format, "pdf");
-        assert_eq!(documents[0].source.bytes, "cGRm");
+        assert_eq!(documents[0].source.bytes, VALID_PDF_DOCUMENT);
         assert_eq!(documents[1].name, "notes");
         assert_eq!(documents[1].format, "md");
     }
@@ -4898,6 +4914,20 @@ mod tests {
 
         assert!(matches!(err, ConversionError::DocumentValidation(_)));
         assert!(err.to_string().contains("Invalid base64"));
+    }
+
+    #[test]
+    fn test_process_message_content_rejects_pdf_with_non_pdf_bytes() {
+        let content = serde_json::Value::Array(vec![named_document_block(
+            "bad.pdf",
+            "application/pdf",
+            &BASE64_STANDARD.encode(b"not a pdf"),
+        )]);
+
+        let err = process_message_content(&content).expect_err("non-pdf payload should fail");
+
+        assert!(matches!(err, ConversionError::DocumentValidation(_)));
+        assert!(err.to_string().contains("does not look like a PDF"));
     }
 
     #[test]
@@ -8678,7 +8708,8 @@ mod tests {
     fn test_convert_request_drops_duplicate_document_names_across_conversation() {
         use super::super::types::Message as AnthropicMessage;
 
-        let duplicate_doc = || named_document_block("Plan.pdf", "application/pdf", "cGRm");
+        let duplicate_doc =
+            || named_document_block("Plan.pdf", "application/pdf", VALID_PDF_DOCUMENT);
         let req = request_from_messages(vec![
             AnthropicMessage {
                 role: "user".to_string(),
@@ -8722,7 +8753,13 @@ mod tests {
         use super::super::types::Message as AnthropicMessage;
 
         let docs = (0..6)
-            .map(|idx| named_document_block(&format!("Doc {idx}.pdf"), "application/pdf", "cGRm"))
+            .map(|idx| {
+                named_document_block(
+                    &format!("Doc {idx}.pdf"),
+                    "application/pdf",
+                    VALID_PDF_DOCUMENT,
+                )
+            })
             .collect();
         let req = request_from_messages(vec![AnthropicMessage {
             role: "user".to_string(),
@@ -8746,7 +8783,7 @@ mod tests {
                 content: serde_json::Value::Array(vec![named_document_block(
                     &format!("History {idx}.pdf"),
                     "application/pdf",
-                    "cGRm",
+                    VALID_PDF_DOCUMENT,
                 )]),
             });
             messages.push(AnthropicMessage {
@@ -8757,7 +8794,7 @@ mod tests {
         messages.push(AnthropicMessage {
             role: "user".to_string(),
             content: serde_json::Value::Array(vec![
-                named_document_block("History 4.pdf", "application/pdf", "cGRm"),
+                named_document_block("History 4.pdf", "application/pdf", VALID_PDF_DOCUMENT),
                 serde_json::json!({"type":"text","text":"Use the latest duplicate."}),
             ]),
         });
