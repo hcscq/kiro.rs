@@ -15,9 +15,9 @@ use serde::{Deserialize, Serialize};
 use crate::admin::types::BalanceResponse;
 use crate::kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use crate::model::config::{
-    Config, KiroRequestBodyGuardConfig, NonStreamBodyReadTimeoutConfig, ProxyPoolConfig,
-    RequestWeightingConfig, StateBackendKind, StreamPreSseFailoverConfig,
-    ThinkingSignatureValidationMode,
+    Config, CredentialGroupConfig, KiroRequestBodyGuardConfig, NonStreamBodyReadTimeoutConfig,
+    ProxyPoolConfig, RequestWeightingConfig, StateBackendKind, StreamPreSseFailoverConfig,
+    ThinkingSignatureValidationMode, normalize_credential_group_catalog,
 };
 use crate::model::model_policy::{
     AccountTypeDispatchPolicy, ModelSupportPolicy, normalize_account_type_dispatch_policies,
@@ -903,6 +903,8 @@ pub struct PersistedDispatchConfig {
     pub account_type_policies: BTreeMap<String, ModelSupportPolicy>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub account_type_dispatch_policies: BTreeMap<String, AccountTypeDispatchPolicy>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credential_groups: Vec<CredentialGroupConfig>,
 }
 
 fn default_persisted_rate_limit_cooldown_enabled() -> bool {
@@ -1013,6 +1015,7 @@ impl PersistedDispatchConfig {
             proxy_pool: config.proxy_pool.clone(),
             account_type_policies,
             account_type_dispatch_policies,
+            credential_groups: config.credential_groups.clone(),
         }
     }
 
@@ -1057,6 +1060,9 @@ impl PersistedDispatchConfig {
         config.proxy_pool = self.proxy_pool.clone();
         config.account_type_policies = self.account_type_policies.clone();
         config.account_type_dispatch_policies = self.account_type_dispatch_policies.clone();
+        if !self.credential_groups.is_empty() {
+            config.credential_groups = normalize_credential_group_catalog(&self.credential_groups);
+        }
     }
 }
 
@@ -3933,6 +3939,7 @@ mod tests {
             proxy_pool: ProxyPoolConfig::default(),
             account_type_policies: BTreeMap::new(),
             account_type_dispatch_policies: BTreeMap::new(),
+            credential_groups: vec![CredentialGroupConfig::default_group()],
         };
 
         store.persist_dispatch_config(&dispatch).unwrap();

@@ -185,6 +185,32 @@ export interface SetCredentialGroupsRequest {
   credentialGroups: string[]
 }
 
+export interface CredentialGroupConfigItem {
+  name: string
+  displayName?: string | null
+  description?: string | null
+  enabled: boolean
+}
+
+export interface CredentialGroupUsageItem {
+  name: string
+  credentialCount: number
+  apiKeyCount: number
+  known: boolean
+  enabled: boolean
+}
+
+export interface CredentialGroupsConfigResponse {
+  groups: CredentialGroupConfigItem[]
+  usage: CredentialGroupUsageItem[]
+  legacyFullAccessKey: boolean
+  unknownCredentialGroups: string[]
+}
+
+export interface SetCredentialGroupsConfigRequest {
+  groups: CredentialGroupConfigItem[]
+}
+
 export type CredentialProxyMode = 'auto' | 'pool' | 'custom' | 'direct' | 'global'
 
 export interface SetCredentialProxyRequest {

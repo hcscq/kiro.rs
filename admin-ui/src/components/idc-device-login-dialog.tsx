@@ -49,6 +49,7 @@ import {
   persistCredentialDefaultsDraft,
   readCredentialDefaultsDraft,
 } from '@/lib/credential-defaults'
+import { CredentialGroupPicker } from '@/components/credential-group-picker'
 import { normalizeCredentialGroups } from '@/lib/credential-groups'
 import type {
   CredentialProxyMode,
@@ -946,16 +947,13 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
               <label htmlFor={`${idPrefix}-credential-groups`} className="text-xs font-medium text-muted-foreground">
                 凭据分组
               </label>
-              <Input
+              <CredentialGroupPicker
                 id={`${idPrefix}-credential-groups`}
                 value={credentialGroups}
-                onChange={(event) => setCredentialGroups(event.target.value)}
-                placeholder="default, low-cost, stable"
+                onChange={setCredentialGroups}
                 disabled={disabled}
+                compact
               />
-              <p className="text-[10px] text-muted-foreground">
-                多个分组可用逗号、空格或换行分隔；留空时按 default 兼容处理。
-              </p>
             </div>
           </div>
 

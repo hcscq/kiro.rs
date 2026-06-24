@@ -32,6 +32,8 @@ import type {
   StandardAccountTypePreset,
   UpdateLoadBalancingConfigRequest,
   UpdateModelCapabilitiesConfigRequest,
+  CredentialGroupsConfigResponse,
+  SetCredentialGroupsConfigRequest,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -397,6 +399,21 @@ export async function setLoadBalancingMode(
   payload: UpdateLoadBalancingConfigRequest
 ): Promise<LoadBalancingConfigResponse> {
   const { data } = await api.put<LoadBalancingConfigResponse>('/config/load-balancing', payload)
+  return data
+}
+
+export async function getCredentialGroupsConfig(): Promise<CredentialGroupsConfigResponse> {
+  const { data } = await api.get<CredentialGroupsConfigResponse>('/config/credential-groups')
+  return data
+}
+
+export async function setCredentialGroupsConfig(
+  payload: SetCredentialGroupsConfigRequest
+): Promise<CredentialGroupsConfigResponse> {
+  const { data } = await api.put<CredentialGroupsConfigResponse>(
+    '/config/credential-groups',
+    payload
+  )
   return data
 }
 

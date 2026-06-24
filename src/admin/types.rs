@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use crate::kiro::model::available_profiles::AvailableProfile;
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::{
-    KiroRequestBodyGuardConfig, NonStreamBodyReadTimeoutConfig, ProxyPoolConfig,
-    ProxyPoolFailoverConfig, RequestWeightingConfig, StreamPreSseFailoverConfig,
+    CredentialGroupConfig, KiroRequestBodyGuardConfig, NonStreamBodyReadTimeoutConfig,
+    ProxyPoolConfig, ProxyPoolFailoverConfig, RequestWeightingConfig, StreamPreSseFailoverConfig,
     ThinkingSignatureValidationMode,
 };
 use crate::model::model_policy::{
@@ -384,6 +384,73 @@ pub struct SetCredentialGroupsRequest {
     /// 完整替换凭据分组；空数组表示清空，运行时按 default 参与旧凭据兼容匹配
     #[serde(default)]
     pub credential_groups: Vec<String>,
+}
+
+/// 凭据分组目录项
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialGroupConfigItem {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl From<CredentialGroupConfig> for CredentialGroupConfigItem {
+    fn from(value: CredentialGroupConfig) -> Self {
+        Self {
+            name: value.name,
+            display_name: value.display_name,
+            description: value.description,
+            enabled: value.enabled,
+        }
+    }
+}
+
+impl From<CredentialGroupConfigItem> for CredentialGroupConfig {
+    fn from(value: CredentialGroupConfigItem) -> Self {
+        Self {
+            name: value.name,
+            display_name: value.display_name,
+            description: value.description,
+            enabled: value.enabled,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// 凭据分组使用情况
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialGroupUsageItem {
+    pub name: String,
+    pub credential_count: usize,
+    pub api_key_count: usize,
+    pub known: bool,
+    pub enabled: bool,
+}
+
+/// 凭据分组目录响应
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialGroupsConfigResponse {
+    pub groups: Vec<CredentialGroupConfigItem>,
+    pub usage: Vec<CredentialGroupUsageItem>,
+    pub legacy_full_access_key: bool,
+    pub unknown_credential_groups: Vec<String>,
+}
+
+/// 设置凭据分组目录请求
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCredentialGroupsConfigRequest {
+    pub groups: Vec<CredentialGroupConfigItem>,
 }
 
 /// 设置凭据超额使用开关请求

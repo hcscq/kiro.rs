@@ -15,6 +15,7 @@ import {
   useLoadBalancingMode,
   useSetLoadBalancingMode,
 } from '@/hooks/use-credentials'
+import { CredentialGroupsSettings } from '@/components/credential-groups-settings'
 import { extractErrorMessage } from '@/lib/utils'
 import { Save, AlertCircle, Info, Plus, Trash2 } from 'lucide-react'
 import type {
@@ -999,6 +1000,8 @@ export function SettingsPage() {
         <h2 className="text-2xl font-semibold tracking-tight">调度与并发配置</h2>
         <p className="text-muted-foreground">管理此节点的全局令牌桶限制以及服务并发上限设置</p>
       </div>
+
+      <CredentialGroupsSettings />
 
       <Card className="border-muted shadow-sm">
         <CardHeader>

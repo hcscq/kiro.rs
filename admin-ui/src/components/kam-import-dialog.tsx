@@ -8,10 +8,17 @@ import {
   DialogTitle,
   DialogFooter,
 } from '@/components/ui/dialog'
+import { CredentialGroupPicker } from '@/components/credential-group-picker'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
-import { useCredentials, useAddCredential, useDeleteCredential, useLoadBalancingMode } from '@/hooks/use-credentials'
+import {
+  useAddCredential,
+  useCredentialGroupsConfig,
+  useCredentials,
+  useDeleteCredential,
+  useLoadBalancingMode,
+} from '@/hooks/use-credentials'
 import { getCredentialBalance, setCredentialDisabled, setCredentialOverageStatus } from '@/api/credentials'
 import type { CredentialProxyMode, ProxyPoolEntry } from '@/types/api'
 import { cn, extractErrorMessage, sha256Hex } from '@/lib/utils'
@@ -482,12 +489,32 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
 
   const { data: existingCredentials } = useCredentials()
   const { data: loadBalancingData } = useLoadBalancingMode()
+  const { data: credentialGroupsConfig } = useCredentialGroupsConfig()
   const { mutateAsync: addCredential } = useAddCredential()
   const { mutateAsync: deleteCredential } = useDeleteCredential()
   const proxyPoolOptions =
     loadBalancingData?.proxyPool?.proxies.filter((proxy) => proxy.enabled) ?? []
   const proxyPoolEnabled = loadBalancingData?.proxyPool?.enabled ?? false
   const proxyRequireProxy = loadBalancingData?.proxyPool?.requireProxy ?? false
+  const enabledCredentialGroupNames = useMemo(
+    () =>
+      new Set(
+        (credentialGroupsConfig?.groups ?? [])
+          .filter((group) => group.enabled)
+          .map((group) => group.name)
+      ),
+    [credentialGroupsConfig?.groups]
+  )
+  const uncoveredCredentialGroupNames = useMemo(() => {
+    if (!credentialGroupsConfig || credentialGroupsConfig.legacyFullAccessKey) {
+      return new Set<string>()
+    }
+    return new Set(
+      credentialGroupsConfig.usage
+        .filter((item) => item.known && item.apiKeyCount === 0)
+        .map((item) => item.name)
+    )
+  }, [credentialGroupsConfig])
   const sourceSupplierSuggestions = useMemo(
     () => collectSourceSupplierSuggestions(existingCredentials?.credentials),
     [existingCredentials?.credentials]
@@ -591,6 +618,27 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     const defaultSourceSupplierNameValue = defaultSourceSupplierName.trim()
     const defaultSourceBatchValue = defaultSourceBatch.trim()
     const defaultCredentialGroupValues = normalizeCredentialGroups(defaultCredentialGroups)
+    const batchCredentialGroups = new Set<string>()
+    for (const account of validAccounts) {
+      getKamCredentialGroups(account, defaultCredentialGroupValues).forEach((group) =>
+        batchCredentialGroups.add(group)
+      )
+    }
+    if (credentialGroupsConfig) {
+      const unknownGroups = Array.from(batchCredentialGroups).filter(
+        (group) => !enabledCredentialGroupNames.has(group)
+      )
+      if (unknownGroups.length > 0) {
+        toast.error(`存在未登记或未启用的凭据分组: ${unknownGroups.join(', ')}`)
+        return
+      }
+      const uncoveredGroups = Array.from(batchCredentialGroups).filter((group) =>
+        uncoveredCredentialGroupNames.has(group)
+      )
+      if (uncoveredGroups.length > 0) {
+        toast.warning(`以下分组当前没有 scoped API Key 覆盖: ${uncoveredGroups.join(', ')}`)
+      }
+    }
 
     try {
 
@@ -1045,16 +1093,12 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
                 </div>
                 <span className="text-xs text-muted-foreground">KAM 单账号 credentialGroups 优先</span>
               </div>
-              <Input
+              <CredentialGroupPicker
                 id="kamDefaultCredentialGroups"
-                placeholder="default, low-cost, stable"
                 value={defaultCredentialGroups}
-                onChange={(e) => setDefaultCredentialGroups(e.target.value)}
+                onChange={setDefaultCredentialGroups}
                 disabled={importing}
               />
-              <p className="text-xs text-muted-foreground">
-                多个分组可用逗号、空格或换行分隔；留空时后端按 default 兼容处理。
-              </p>
             </div>
             <div className="space-y-3 rounded-md border p-3">
               <div className="flex items-center justify-between gap-3">

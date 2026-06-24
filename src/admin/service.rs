@@ -1,6 +1,6 @@
 //! Admin API 业务逻辑服务
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::common::auth::{
+    DEFAULT_CREDENTIAL_GROUP, effective_credential_groups, normalize_credential_groups,
+};
 use crate::common::logging::summarize_upstream_error;
 use crate::http_client::{ProxyConfig, build_client, build_client_no_redirect};
 use crate::kiro::model::credentials::KiroCredentials;
@@ -18,12 +21,14 @@ use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::account_type_preset::{
     built_in_account_type_presets, infer_standard_account_type_id_from_subscription,
 };
+use crate::model::config::{Config, CredentialGroupConfig};
 use crate::model::model_catalog::built_in_model_catalog;
 use crate::state::{CachedBalanceRecord, RuntimeCoordinationStatus, StateChangeKind};
 
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CachedBalanceResponse,
+    CredentialGroupConfigItem, CredentialGroupUsageItem, CredentialGroupsConfigResponse,
     CredentialProfilesResponse, CredentialStatusItem, CredentialsStatusResponse,
     ExternalIdpLoginFlow, ExternalIdpLoginPhase, ExternalIdpLoginStartResponse,
     ExternalIdpLoginStatus, ExternalIdpLoginStatusResponse, ExternalIdpOidcDiscoverySummary,
@@ -31,10 +36,11 @@ use super::types::{
     IdcDeviceLoginStartResponse, IdcDeviceLoginStatus, IdcDeviceLoginStatusResponse,
     LoadBalancingModeResponse, ModelCapabilitiesConfigResponse, ModelCatalogItemResponse,
     ModelCatalogResponse, ProxyPoolConfigResponse, ProxyPoolEntryResponse,
-    SetCredentialGroupsRequest, SetCredentialModelPolicyRequest, SetCredentialProfileRequest,
-    SetCredentialProxyRequest, SetCredentialSourceRequest, SetLoadBalancingModeRequest,
-    SetModelCapabilitiesConfigRequest, StandardAccountTypePresetResponse,
-    StartExternalIdpLoginRequest, StartIdcDeviceLoginRequest, SubmitExternalIdpCallbackRequest,
+    SetCredentialGroupsConfigRequest, SetCredentialGroupsRequest, SetCredentialModelPolicyRequest,
+    SetCredentialProfileRequest, SetCredentialProxyRequest, SetCredentialSourceRequest,
+    SetLoadBalancingModeRequest, SetModelCapabilitiesConfigRequest,
+    StandardAccountTypePresetResponse, StartExternalIdpLoginRequest, StartIdcDeviceLoginRequest,
+    SubmitExternalIdpCallbackRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -894,6 +900,93 @@ impl AdminService {
         }
     }
 
+    fn normalize_and_validate_credential_groups(
+        &self,
+        groups: &[String],
+    ) -> Result<Vec<String>, AdminServiceError> {
+        let normalized = normalize_credential_groups(groups);
+        if normalized.is_empty() {
+            return Ok(normalized);
+        }
+
+        let enabled_groups = self
+            .token_manager
+            .credential_group_catalog_snapshot()
+            .into_iter()
+            .filter(|group| group.enabled)
+            .map(|group| group.name)
+            .collect::<BTreeSet<_>>();
+        let unknown = normalized
+            .iter()
+            .filter(|group| !enabled_groups.contains(*group))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unknown.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "credentialGroups 包含未登记或未启用的凭据分组: {}",
+                unknown.join(", ")
+            )));
+        }
+
+        Ok(normalized)
+    }
+
+    fn scoped_api_key_group_counts(&self) -> BTreeMap<String, usize> {
+        let mut counts = BTreeMap::new();
+        for api_key in &self.token_manager.config().api_keys {
+            for group in normalize_credential_groups(&api_key.allowed_credential_groups) {
+                *counts.entry(group).or_insert(0) += 1;
+            }
+        }
+        counts
+    }
+
+    fn credential_group_counts(&self) -> BTreeMap<String, usize> {
+        let mut counts = BTreeMap::new();
+        for entry in self.token_manager.snapshot().entries {
+            for group in effective_credential_groups(&entry.credential_groups) {
+                *counts.entry(group).or_insert(0) += 1;
+            }
+        }
+        counts
+    }
+
+    fn validate_catalog_keeps_existing_references(
+        &self,
+        groups: &[CredentialGroupConfig],
+    ) -> Result<(), AdminServiceError> {
+        let known = groups
+            .iter()
+            .map(|group| group.name.clone())
+            .collect::<BTreeSet<_>>();
+
+        let missing_api_key_groups = self
+            .scoped_api_key_group_counts()
+            .into_keys()
+            .filter(|group| !known.contains(group))
+            .collect::<Vec<_>>();
+        if !missing_api_key_groups.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "不能删除 API Key 仍在引用的凭据分组: {}",
+                missing_api_key_groups.join(", ")
+            )));
+        }
+
+        let missing_credential_groups = self
+            .credential_group_counts()
+            .into_keys()
+            .filter(|group| !known.contains(group))
+            .collect::<Vec<_>>();
+        if !missing_credential_groups.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "不能删除现有凭据仍在引用的分组，请先批量修复凭据分组: {}",
+                missing_credential_groups.join(", ")
+            )));
+        }
+
+        Ok(())
+    }
+
     /// 获取所有凭据状态
     pub fn get_all_credentials(&self) -> Result<CredentialsStatusResponse, AdminServiceError> {
         self.sync_runtime_state_for_read()?;
@@ -1216,6 +1309,9 @@ impl AdminService {
         req.source_supplier_id = normalize_optional_string(req.source_supplier_id.as_deref());
         req.source_supplier_name = normalize_optional_string(req.source_supplier_name.as_deref());
         req.source_batch = normalize_optional_string(req.source_batch.as_deref());
+        if let Some(groups) = req.credential_groups.as_ref() {
+            req.credential_groups = Some(self.normalize_and_validate_credential_groups(groups)?);
+        }
         req.proxy_url = normalize_optional_string(req.proxy_url.as_deref());
         req.proxy_username = normalize_optional_string(req.proxy_username.as_deref());
         req.proxy_password = normalize_optional_string(req.proxy_password.as_deref());
@@ -1766,6 +1862,9 @@ impl AdminService {
         req.source_supplier_id = normalize_optional_string(req.source_supplier_id.as_deref());
         req.source_supplier_name = normalize_optional_string(req.source_supplier_name.as_deref());
         req.source_batch = normalize_optional_string(req.source_batch.as_deref());
+        if let Some(groups) = req.credential_groups.as_ref() {
+            req.credential_groups = Some(self.normalize_and_validate_credential_groups(groups)?);
+        }
         req.proxy_url = normalize_optional_string(req.proxy_url.as_deref());
         req.proxy_username = normalize_optional_string(req.proxy_username.as_deref());
         req.proxy_password = normalize_optional_string(req.proxy_password.as_deref());
@@ -3184,9 +3283,11 @@ impl AdminService {
         req: SetCredentialGroupsRequest,
     ) -> Result<(), AdminServiceError> {
         self.ensure_runtime_write_leader()?;
+        let credential_groups =
+            self.normalize_and_validate_credential_groups(&req.credential_groups)?;
 
         self.token_manager
-            .set_credential_groups(id, req.credential_groups)
+            .set_credential_groups(id, credential_groups)
             .map_err(|e| self.classify_error(e, id))
     }
 
@@ -3356,6 +3457,12 @@ impl AdminService {
         req: AddCredentialRequest,
     ) -> Result<AddCredentialResponse, AdminServiceError> {
         self.ensure_runtime_write_leader()?;
+        let normalized_credential_groups = req
+            .credential_groups
+            .as_ref()
+            .map(|groups| self.normalize_and_validate_credential_groups(groups))
+            .transpose()?
+            .unwrap_or_default();
 
         // 构建凭据对象
         let email = req.email.clone();
@@ -3487,10 +3594,7 @@ impl AdminService {
             source_supplier_id: req.source_supplier_id,
             source_supplier_name: req.source_supplier_name,
             source_batch: req.source_batch,
-            credential_groups: req
-                .credential_groups
-                .map(|groups| crate::common::auth::normalize_credential_groups(&groups))
-                .unwrap_or_default(),
+            credential_groups: normalized_credential_groups,
             allowed_models: req.allowed_models.unwrap_or_default(),
             blocked_models: req.blocked_models.unwrap_or_default(),
             runtime_model_restrictions: Vec::new(),
@@ -3716,6 +3820,56 @@ impl AdminService {
         })
     }
 
+    pub fn get_credential_groups_config(
+        &self,
+    ) -> Result<CredentialGroupsConfigResponse, AdminServiceError> {
+        self.sync_runtime_state_for_read()?;
+        let groups = self.token_manager.credential_group_catalog_snapshot();
+        let known = groups
+            .iter()
+            .map(|group| (group.name.clone(), group.enabled))
+            .collect::<BTreeMap<_, _>>();
+        let credential_counts = self.credential_group_counts();
+        let api_key_counts = self.scoped_api_key_group_counts();
+        let mut usage_names = BTreeSet::new();
+        usage_names.extend(known.keys().cloned());
+        usage_names.extend(credential_counts.keys().cloned());
+        usage_names.extend(api_key_counts.keys().cloned());
+        usage_names.insert(DEFAULT_CREDENTIAL_GROUP.to_string());
+
+        let usage = usage_names
+            .into_iter()
+            .map(|name| CredentialGroupUsageItem {
+                credential_count: credential_counts.get(&name).copied().unwrap_or(0),
+                api_key_count: api_key_counts.get(&name).copied().unwrap_or(0),
+                enabled: known.get(&name).copied().unwrap_or(false),
+                known: known.contains_key(&name),
+                name,
+            })
+            .collect::<Vec<_>>();
+        let unknown_credential_groups = usage
+            .iter()
+            .filter(|item| !item.known && item.credential_count > 0)
+            .map(|item| item.name.clone())
+            .collect::<Vec<_>>();
+        let legacy_full_access_key = self
+            .token_manager
+            .config()
+            .api_key
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+
+        Ok(CredentialGroupsConfigResponse {
+            groups: groups
+                .into_iter()
+                .map(CredentialGroupConfigItem::from)
+                .collect(),
+            usage,
+            legacy_full_access_key,
+            unknown_credential_groups,
+        })
+    }
+
     pub fn get_model_catalog(&self) -> ModelCatalogResponse {
         ModelCatalogResponse {
             models: built_in_model_catalog()
@@ -3727,6 +3881,47 @@ impl AdminService {
                 })
                 .collect(),
         }
+    }
+
+    pub fn set_credential_groups_config(
+        &self,
+        req: SetCredentialGroupsConfigRequest,
+    ) -> Result<CredentialGroupsConfigResponse, AdminServiceError> {
+        self.ensure_runtime_write_leader()?;
+
+        let groups = Config::normalize_and_validate_credential_group_catalog(
+            req.groups
+                .into_iter()
+                .map(CredentialGroupConfig::from)
+                .collect(),
+        )
+        .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?;
+        self.validate_catalog_keeps_existing_references(&groups)?;
+
+        let previous_groups = self.token_manager.credential_group_catalog_snapshot();
+        self.token_manager
+            .set_credential_group_catalog_config(groups.clone())
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+
+        if let Some(config_path) = self.token_manager.config().config_path() {
+            let mut config = Config::load(config_path).map_err(|err| {
+                let _ = self
+                    .token_manager
+                    .set_credential_group_catalog_config(previous_groups.clone());
+                AdminServiceError::InternalError(err.to_string())
+            })?;
+            config.credential_groups = groups.clone();
+            if let Err(err) = config.save() {
+                let _ = self
+                    .token_manager
+                    .set_credential_group_catalog_config(previous_groups);
+                return Err(AdminServiceError::InternalError(err.to_string()));
+            }
+        } else {
+            tracing::warn!("配置文件路径未知，凭据分组目录仅通过运行时状态持久化");
+        }
+
+        self.get_credential_groups_config()
     }
 
     /// 设置负载均衡模式

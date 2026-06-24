@@ -1,10 +1,13 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::common::auth::{ApiKeyAuthEntry, CredentialGroupScope, normalize_credential_groups};
+use crate::common::auth::{
+    ApiKeyAuthEntry, CredentialGroupScope, DEFAULT_CREDENTIAL_GROUP, normalize_credential_group,
+    normalize_credential_groups,
+};
 
 use super::model_policy::{
     AccountTypeDispatchPolicy, ModelSupportPolicy, normalize_account_type_dispatch_policies,
@@ -623,6 +626,68 @@ impl ProxyPoolConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct CredentialGroupConfig {
+    pub name: String,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl CredentialGroupConfig {
+    pub fn default_group() -> Self {
+        Self {
+            name: DEFAULT_CREDENTIAL_GROUP.to_string(),
+            display_name: Some("Default".to_string()),
+            description: Some("未显式标记分组的旧凭据会按 default 分组参与匹配".to_string()),
+            enabled: true,
+        }
+    }
+
+    fn normalize(&mut self) -> bool {
+        let Some(name) = normalize_credential_group(&self.name) else {
+            return false;
+        };
+        self.name = name;
+        self.display_name = normalize_optional_text(self.display_name.as_deref());
+        self.description = normalize_optional_text(self.description.as_deref());
+        true
+    }
+}
+
+pub fn normalize_credential_group_catalog(
+    groups: &[CredentialGroupConfig],
+) -> Vec<CredentialGroupConfig> {
+    let mut by_name = BTreeMap::new();
+    for group in groups {
+        let mut group = group.clone();
+        if group.normalize() {
+            by_name.entry(group.name.clone()).or_insert(group);
+        }
+    }
+
+    by_name
+        .entry(DEFAULT_CREDENTIAL_GROUP.to_string())
+        .or_insert_with(CredentialGroupConfig::default_group)
+        .enabled = true;
+
+    by_name.into_values().collect()
+}
+
+fn normalize_optional_text(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct ApiKeyConfig {
     /// API key 标识，仅用于日志与调度亲和隔离，不会暴露明文 key
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -686,6 +751,10 @@ pub struct Config {
     /// 多 API key 配置。每个 key 可绑定一个或多个凭据分组。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub api_keys: Vec<ApiKeyConfig>,
+
+    /// 凭据分组目录。只做分组治理，不承载计价或稳定性属性。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credential_groups: Vec<CredentialGroupConfig>,
 
     #[serde(default = "default_system_version")]
     pub system_version: String,
@@ -1173,6 +1242,10 @@ fn default_conversion_max_request_weight() -> usize {
     8
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -1188,6 +1261,7 @@ impl Default for Config {
             machine_id: None,
             api_key: None,
             api_keys: Vec::new(),
+            credential_groups: vec![CredentialGroupConfig::default_group()],
             system_version: default_system_version(),
             node_version: default_node_version(),
             tls_backend: default_tls_backend(),
@@ -1394,6 +1468,7 @@ impl Config {
     fn normalize(&mut self) {
         normalize_account_type_policies(&mut self.account_type_policies);
         normalize_account_type_dispatch_policies(&mut self.account_type_dispatch_policies);
+        let had_explicit_credential_groups = !self.credential_groups.is_empty();
         for api_key in &mut self.api_keys {
             api_key.id = api_key
                 .id
@@ -1405,11 +1480,35 @@ impl Config {
             api_key.allowed_credential_groups =
                 normalize_credential_groups(&api_key.allowed_credential_groups);
         }
+        let mut credential_groups = normalize_credential_group_catalog(&self.credential_groups);
+        if !had_explicit_credential_groups {
+            let mut known = credential_groups
+                .iter()
+                .map(|group| group.name.clone())
+                .collect::<BTreeSet<_>>();
+            for group in self
+                .api_keys
+                .iter()
+                .flat_map(|api_key| api_key.allowed_credential_groups.iter())
+            {
+                if known.insert(group.clone()) {
+                    credential_groups.push(CredentialGroupConfig {
+                        name: group.clone(),
+                        display_name: Some(group.clone()),
+                        description: None,
+                        enabled: true,
+                    });
+                }
+            }
+            credential_groups.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+        self.credential_groups = credential_groups;
     }
 
     fn validate_api_keys(&self) -> anyhow::Result<()> {
         let mut ids = std::collections::BTreeSet::new();
         let mut keys = std::collections::BTreeSet::new();
+        let credential_group_names = self.credential_group_name_set();
 
         if let Some(api_key) = self.api_key.as_deref() {
             if api_key.trim().is_empty() {
@@ -1442,9 +1541,40 @@ impl Config {
             if normalize_credential_groups(&api_key.allowed_credential_groups).is_empty() {
                 anyhow::bail!("{key_name}.allowedCredentialGroups 至少需要一个有效分组");
             }
+
+            for group in normalize_credential_groups(&api_key.allowed_credential_groups) {
+                if !credential_group_names.contains(&group) {
+                    anyhow::bail!(
+                        "{key_name}.allowedCredentialGroups 包含未登记的凭据分组: {group}"
+                    );
+                }
+            }
         }
 
         Ok(())
+    }
+
+    pub fn credential_group_name_set(&self) -> BTreeSet<String> {
+        normalize_credential_group_catalog(&self.credential_groups)
+            .into_iter()
+            .map(|group| group.name)
+            .collect()
+    }
+
+    pub fn normalize_and_validate_credential_group_catalog(
+        groups: Vec<CredentialGroupConfig>,
+    ) -> anyhow::Result<Vec<CredentialGroupConfig>> {
+        let normalized = normalize_credential_group_catalog(&groups);
+        if normalized.is_empty() {
+            anyhow::bail!("credentialGroups 至少需要包含 default 分组");
+        }
+        if !normalized
+            .iter()
+            .any(|group| group.name == DEFAULT_CREDENTIAL_GROUP && group.enabled)
+        {
+            anyhow::bail!("credentialGroups 必须包含启用的 default 分组");
+        }
+        Ok(normalized)
     }
 
     pub fn api_key_auth_entries(&self) -> anyhow::Result<Vec<ApiKeyAuthEntry>> {
@@ -1576,6 +1706,14 @@ mod tests {
         RequestWeightingConfig, ServerWebToolsMode, ThinkingSignatureValidationMode,
     };
     use crate::common::auth::CredentialGroupScope;
+    use std::fs;
+
+    fn temp_config_path(test_name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("kiro-config-{test_name}-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        dir.join("config.json")
+    }
 
     #[test]
     fn validate_rejects_invalid_redis_runtime_coordination_timing() {
@@ -1624,6 +1762,56 @@ mod tests {
         let err = config.validate().unwrap_err().to_string();
 
         assert!(err.contains("allowedCredentialGroups"));
+    }
+
+    #[test]
+    fn load_seeds_credential_group_catalog_from_api_keys_when_missing() {
+        let path = temp_config_path("seed-credential-groups");
+        fs::write(
+            &path,
+            r#"{
+              "apiKeys": [
+                {
+                  "id": "stable",
+                  "key": "scoped-key",
+                  "allowedCredentialGroups": ["Stable", "low-cost"]
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&path).unwrap();
+        let groups = config
+            .credential_groups
+            .iter()
+            .map(|group| group.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(groups, vec!["default", "low-cost", "stable"]);
+    }
+
+    #[test]
+    fn load_rejects_api_key_group_missing_from_explicit_catalog() {
+        let path = temp_config_path("missing-explicit-credential-group");
+        fs::write(
+            &path,
+            r#"{
+              "credentialGroups": [{ "name": "default" }],
+              "apiKeys": [
+                {
+                  "id": "stable",
+                  "key": "scoped-key",
+                  "allowedCredentialGroups": ["stable"]
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let err = Config::load(&path).unwrap_err().to_string();
+
+        assert!(err.contains("未登记的凭据分组"));
     }
 
     #[test]

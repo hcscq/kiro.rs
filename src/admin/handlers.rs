@@ -12,12 +12,13 @@ use super::{
     middleware::AdminState,
     service::ExternalIdpCallbackAction,
     types::{
-        AddCredentialRequest, ExternalIdpProbeRequest, SetCredentialGroupsRequest,
-        SetCredentialModelPolicyRequest, SetCredentialProfileRequest, SetCredentialProxyRequest,
-        SetCredentialRateLimitConfigRequest, SetCredentialSourceRequest, SetDisabledRequest,
-        SetLoadBalancingModeRequest, SetMaxConcurrencyRequest, SetModelCapabilitiesConfigRequest,
-        SetOverageStatusRequest, SetPriorityRequest, StartExternalIdpLoginRequest,
-        StartIdcDeviceLoginRequest, SubmitExternalIdpCallbackRequest, SuccessResponse,
+        AddCredentialRequest, ExternalIdpProbeRequest, SetCredentialGroupsConfigRequest,
+        SetCredentialGroupsRequest, SetCredentialModelPolicyRequest, SetCredentialProfileRequest,
+        SetCredentialProxyRequest, SetCredentialRateLimitConfigRequest, SetCredentialSourceRequest,
+        SetDisabledRequest, SetLoadBalancingModeRequest, SetMaxConcurrencyRequest,
+        SetModelCapabilitiesConfigRequest, SetOverageStatusRequest, SetPriorityRequest,
+        StartExternalIdpLoginRequest, StartIdcDeviceLoginRequest, SubmitExternalIdpCallbackRequest,
+        SuccessResponse,
     },
 };
 
@@ -490,6 +491,15 @@ pub async fn get_load_balancing_mode(State(state): State<AdminState>) -> impl In
     }
 }
 
+/// GET /api/admin/config/credential-groups
+/// 获取凭据分组目录
+pub async fn get_credential_groups_config(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.get_credential_groups_config() {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// GET /api/admin/config/model-capabilities
 /// 获取账号类型模型策略配置
 pub async fn get_model_capabilities_config(State(state): State<AdminState>) -> impl IntoResponse {
@@ -512,6 +522,18 @@ pub async fn set_load_balancing_mode(
     Json(payload): Json<SetLoadBalancingModeRequest>,
 ) -> impl IntoResponse {
     match state.service.set_load_balancing_mode(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// PUT /api/admin/config/credential-groups
+/// 设置凭据分组目录
+pub async fn set_credential_groups_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetCredentialGroupsConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_credential_groups_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

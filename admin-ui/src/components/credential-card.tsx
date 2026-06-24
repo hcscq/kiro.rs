@@ -78,6 +78,7 @@ import {
   useForceRefreshToken,
   useLoadBalancingMode,
 } from '@/hooks/use-credentials'
+import { CredentialGroupPicker } from '@/components/credential-group-picker'
 import { getCredentialLabel, getCredentialLabelWithId } from '@/lib/credential-label'
 import { formatCredentialGroupsInput, normalizeCredentialGroups } from '@/lib/credential-groups'
 import { cn } from '@/lib/utils'
@@ -1487,17 +1488,13 @@ export function CredentialCard({
             {/* 凭据分组配置区 */}
             <div className="space-y-2 rounded-lg border p-3 bg-muted/5">
               <div className="text-sm font-medium text-foreground">凭据分组</div>
-              <Input
+              <CredentialGroupPicker
                 id={`credential-groups-${credential.id}`}
                 value={credentialGroupsValue}
-                onChange={(e) => setCredentialGroupsValue(e.target.value)}
-                className="h-9 text-sm"
-                placeholder="default, low-cost, stable"
+                onChange={setCredentialGroupsValue}
                 disabled={isSaving}
+                compact
               />
-              <p className="text-[10px] text-muted-foreground">
-                多个分组可用逗号、空格或换行分隔；留空表示按 default 兼容分组参与匹配。
-              </p>
             </div>
 
             {/* Profile 选择配置区 */}

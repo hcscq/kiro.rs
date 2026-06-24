@@ -1427,6 +1427,7 @@ mod tests {
             proxy_pool: ProxyPoolConfig::default(),
             account_type_policies: std::collections::BTreeMap::new(),
             account_type_dispatch_policies: std::collections::BTreeMap::new(),
+            credential_groups: Vec::new(),
         };
 
         let rollback = build_file_rollback_config(&config, &dispatch);

@@ -19,8 +19,10 @@ import {
   addCredential,
   deleteCredential,
   getLoadBalancingMode,
+  getCredentialGroupsConfig,
   getModelCatalog,
   setLoadBalancingMode,
+  setCredentialGroupsConfig,
   getModelCapabilitiesConfig,
   setModelCapabilitiesConfig,
 } from '@/api/credentials'
@@ -32,6 +34,7 @@ import type {
   SetCredentialGroupsRequest,
   SetCredentialProxyRequest,
   SetCredentialProfileRequest,
+  SetCredentialGroupsConfigRequest,
   UpdateLoadBalancingConfigRequest,
   UpdateModelCapabilitiesConfigRequest,
 } from '@/types/api'
@@ -310,6 +313,25 @@ export function useSetLoadBalancingMode() {
     mutationFn: (payload: UpdateLoadBalancingConfigRequest) => setLoadBalancingMode(payload),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
+    },
+  })
+}
+
+export function useCredentialGroupsConfig() {
+  return useQuery({
+    queryKey: ['credentialGroupsConfig'],
+    queryFn: getCredentialGroupsConfig,
+  })
+}
+
+export function useSetCredentialGroupsConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (payload: SetCredentialGroupsConfigRequest) =>
+      setCredentialGroupsConfig(payload),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentialGroupsConfig'] })
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
   })
 }

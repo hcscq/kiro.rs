@@ -34,8 +34,8 @@ use crate::kiro::model::token_refresh::{
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::{
-    Config, KiroRequestBodyGuardConfig, NonStreamBodyReadTimeoutConfig, ProxyPoolConfig,
-    ProxyPoolEntry, RequestWeightingConfig, StreamPreSseFailoverConfig,
+    Config, CredentialGroupConfig, KiroRequestBodyGuardConfig, NonStreamBodyReadTimeoutConfig,
+    ProxyPoolConfig, ProxyPoolEntry, RequestWeightingConfig, StreamPreSseFailoverConfig,
     ThinkingSignatureValidationMode,
 };
 use crate::model::model_policy::{
@@ -2114,6 +2114,8 @@ pub struct MultiTokenManager {
     is_multiple_format: bool,
     /// 调度配置（负载均衡模式、排队参数）
     dispatch_config: Mutex<DispatchConfig>,
+    /// 凭据分组目录只用于管理写入治理，不参与热路径调度匹配。
+    credential_group_catalog: Mutex<Vec<CredentialGroupConfig>>,
     /// 可用性变更通知（并发释放、凭据启用、配置变更等）
     availability_notify: Arc<Notify>,
     /// 当前正在等待可用槽位的请求数
@@ -2325,6 +2327,7 @@ impl MultiTokenManager {
         let state_store = StateStore::from_config(&config, credentials_path.clone())?;
         let initial_state_change_revisions = state_store.state_change_revisions()?;
         let dispatch_config = DispatchConfig::from_config(&config);
+        let credential_group_catalog = config.credential_groups.clone();
         let now = Instant::now();
 
         // 计算当前最大 ID，为没有 ID 的凭据分配新 ID
@@ -2410,6 +2413,7 @@ impl MultiTokenManager {
             current_id: Mutex::new(initial_id),
             is_multiple_format,
             dispatch_config: Mutex::new(dispatch_config),
+            credential_group_catalog: Mutex::new(credential_group_catalog),
             availability_notify: Arc::new(Notify::new()),
             waiting_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             session_affinity_cache: Mutex::new(HashMap::new()),
@@ -2449,6 +2453,34 @@ impl MultiTokenManager {
     /// 获取配置的引用
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    pub fn credential_group_catalog_snapshot(&self) -> Vec<CredentialGroupConfig> {
+        self.credential_group_catalog.lock().clone()
+    }
+
+    pub fn set_credential_group_catalog_snapshot(&self, groups: Vec<CredentialGroupConfig>) {
+        *self.credential_group_catalog.lock() = groups;
+    }
+
+    pub fn set_credential_group_catalog_config(
+        &self,
+        groups: Vec<CredentialGroupConfig>,
+    ) -> anyhow::Result<()> {
+        let previous = self.credential_group_catalog_snapshot();
+        if previous == groups {
+            return Ok(());
+        }
+
+        let _state_write_guard = self.state_write_lock.lock();
+        *self.credential_group_catalog.lock() = groups;
+
+        if let Err(err) = self.persist_dispatch_config(&self.dispatch_config()) {
+            *self.credential_group_catalog.lock() = previous;
+            return Err(err);
+        }
+
+        Ok(())
     }
 
     /// 获取凭据总数
@@ -6610,12 +6642,25 @@ impl MultiTokenManager {
         persisted.apply_to_config(&mut config);
         let next = DispatchConfig::from_config(&config);
         let previous = self.dispatch_config();
+        let next_catalog = if persisted.credential_groups.is_empty() {
+            None
+        } else {
+            Some(config.credential_groups.clone())
+        };
+        let catalog_changed = next_catalog
+            .as_ref()
+            .is_some_and(|groups| *groups != self.credential_group_catalog_snapshot());
 
-        if previous == next {
+        if previous == next && !catalog_changed {
             return false;
         }
 
-        *self.dispatch_config.lock() = next.clone();
+        if previous != next {
+            *self.dispatch_config.lock() = next.clone();
+        }
+        if let Some(groups) = next_catalog {
+            self.set_credential_group_catalog_snapshot(groups);
+        }
 
         if previous.rate_limit_cooldown_enabled != next.rate_limit_cooldown_enabled {
             self.clear_disabled_rate_limit_penalties(&next);
@@ -10076,6 +10121,7 @@ impl MultiTokenManager {
                 proxy_pool: dispatch.proxy_pool.clone(),
                 account_type_policies: dispatch.account_type_policies.clone(),
                 account_type_dispatch_policies: dispatch.account_type_dispatch_policies.clone(),
+                credential_groups: self.credential_group_catalog_snapshot(),
             })?;
         self.try_bump_state_change_revision(StateChangeKind::DispatchConfig);
         Ok(())
@@ -13300,6 +13346,12 @@ mod tests {
             proxy_pool: ProxyPoolConfig::default(),
             account_type_policies: BTreeMap::new(),
             account_type_dispatch_policies: BTreeMap::new(),
+            credential_groups: vec![crate::model::config::CredentialGroupConfig {
+                name: "stable".to_string(),
+                display_name: Some("Stable".to_string()),
+                description: None,
+                enabled: true,
+            }],
         };
 
         assert!(manager.apply_dispatch_config_from_state(&persisted));
@@ -13337,6 +13389,12 @@ mod tests {
         assert_eq!(snapshot.rate_limit_refill_recovery_step_per_success, 0.15);
         assert_eq!(snapshot.rate_limit_refill_backoff_factor, 0.6);
         assert_eq!(snapshot.request_weighting.max_weight, 4.0);
+        assert!(
+            manager
+                .credential_group_catalog_snapshot()
+                .iter()
+                .any(|group| group.name == "stable")
+        );
         assert_eq!(snapshot.request_weighting.tools_bonus, 1.0);
         assert!(!snapshot.stream_dispatch_lease_release_enabled);
         assert!(snapshot.stream_pre_sse_failover.enabled);

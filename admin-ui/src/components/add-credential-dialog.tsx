@@ -6,6 +6,7 @@ import {
   ModelSelector,
   collectAccountTypeSuggestions,
 } from '@/components/model-policy-controls'
+import { CredentialGroupPicker } from '@/components/credential-group-picker'
 import {
   Dialog,
   DialogContent,
@@ -604,16 +605,12 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               <label htmlFor="credentialGroups" className="text-sm font-medium">
                 凭据分组
               </label>
-              <Input
+              <CredentialGroupPicker
                 id="credentialGroups"
-                placeholder="default, low-cost, stable"
                 value={credentialGroups}
-                onChange={(e) => setCredentialGroups(e.target.value)}
+                onChange={setCredentialGroups}
                 disabled={isPending}
               />
-              <p className="text-xs text-muted-foreground">
-                多个分组可用逗号、空格或换行分隔。留空时后端按 default 兼容处理。
-              </p>
             </div>
 
             <ModelSelector
