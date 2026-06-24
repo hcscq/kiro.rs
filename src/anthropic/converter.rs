@@ -35,6 +35,8 @@ use super::{
     types::{ContentBlock, MessagesRequest},
 };
 
+const KIRO_SCHEMA_MAX_SIGNED_INTEGER_BOUND: u64 = i64::MAX as u64;
+
 /// 规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题
 ///
 /// Claude Code / MCP 工具定义偶尔会出现 `required: null`、`properties: null` 等，
@@ -408,6 +410,7 @@ fn normalize_schema_object_for_kiro(obj: &mut serde_json::Map<String, serde_json
 
 fn normalize_schema_object_shape_for_kiro(obj: &mut serde_json::Map<String, serde_json::Value>) {
     normalize_schema_type_names_for_kiro(obj);
+    normalize_schema_integer_bounds_for_kiro(obj);
 
     if obj.contains_key("properties")
         && !obj.get("properties").is_some_and(|value| value.is_object())
@@ -447,6 +450,26 @@ fn normalize_schema_object_shape_for_kiro(obj: &mut serde_json::Map<String, serd
     }
 
     normalize_draft_07_tuple_items_for_kiro(obj);
+}
+
+fn normalize_schema_integer_bounds_for_kiro(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    for key in [
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+    ] {
+        let Some(value) = obj.get_mut(key) else {
+            continue;
+        };
+        let Some(raw) = value.as_u64() else {
+            continue;
+        };
+        if raw > KIRO_SCHEMA_MAX_SIGNED_INTEGER_BOUND {
+            *value = serde_json::Value::Number(serde_json::Number::from(i64::MAX));
+        }
+    }
 }
 
 fn normalize_schema_type_names_for_kiro(obj: &mut serde_json::Map<String, serde_json::Value>) {
@@ -5866,6 +5889,92 @@ mod tests {
                 .pointer("/properties/options/properties/mode/type")
                 .and_then(|value| value.as_str()),
             Some("string")
+        );
+        assert!(
+            jsonschema::validator_for(schema).is_ok(),
+            "normalized schema should remain locally valid: {schema}"
+        );
+    }
+
+    #[test]
+    fn test_convert_tools_clamps_schema_integer_bounds_to_i64_max() {
+        let too_large_integer = 9_223_372_036_854_776_000_u64;
+        let tools = Some(vec![super::super::types::Tool {
+            tool_type: None,
+            name: "LargeIntegerBounds".to_string(),
+            description: "Tool with upstream-incompatible integer schema bounds".to_string(),
+            input_schema: HashMap::from([
+                ("type".to_string(), serde_json::json!("object")),
+                (
+                    "properties".to_string(),
+                    serde_json::json!({
+                        "page_limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": too_large_integer
+                        },
+                        "positive_minimum": {
+                            "type": "integer",
+                            "minimum": too_large_integer
+                        },
+                        "exclusive_bounds": {
+                            "type": "integer",
+                            "exclusiveMinimum": too_large_integer,
+                            "exclusiveMaximum": too_large_integer
+                        },
+                        "multiple": {
+                            "type": "integer",
+                            "multipleOf": too_large_integer
+                        },
+                        "float_bound": {
+                            "type": "integer",
+                            "maximum": 1e20
+                        },
+                        "nested": {
+                            "allOf": [
+                                {
+                                    "type": "integer",
+                                    "maximum": too_large_integer
+                                }
+                            ]
+                        }
+                    }),
+                ),
+                ("required".to_string(), serde_json::json!([])),
+            ]),
+            max_uses: None,
+            ..super::super::types::Tool::default()
+        }]);
+
+        let converted = convert_tools(&tools, &mut HashMap::new());
+
+        let schema = &converted[0].tool_specification.input_schema.json;
+        for pointer in [
+            "/properties/page_limit/maximum",
+            "/properties/positive_minimum/minimum",
+            "/properties/exclusive_bounds/exclusiveMinimum",
+            "/properties/exclusive_bounds/exclusiveMaximum",
+            "/properties/multiple/multipleOf",
+            "/properties/nested/allOf/0/maximum",
+        ] {
+            assert_eq!(
+                schema.pointer(pointer).and_then(|value| value.as_i64()),
+                Some(i64::MAX),
+                "{pointer} should be clamped to the upstream-accepted signed integer maximum: {schema}"
+            );
+        }
+        assert_eq!(
+            schema
+                .pointer("/properties/page_limit/minimum")
+                .and_then(|value| value.as_i64()),
+            Some(1)
+        );
+        assert_eq!(
+            schema
+                .pointer("/properties/float_bound/maximum")
+                .and_then(|value| value.as_f64()),
+            Some(1e20),
+            "upstream-accepted floating-point bounds should be preserved: {schema}"
         );
         assert!(
             jsonschema::validator_for(schema).is_ok(),
