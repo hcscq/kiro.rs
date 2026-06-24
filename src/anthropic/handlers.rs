@@ -8,14 +8,16 @@ use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::parser::error::ParseError;
 use crate::kiro::parser::frame::Frame;
-use crate::kiro::token_manager::{RuntimeRefreshLeaderRequiredError, RuntimeRefreshLeaseBusyError};
+use crate::kiro::token_manager::{
+    CredentialScopeForbiddenError, RuntimeRefreshLeaderRequiredError, RuntimeRefreshLeaseBusyError,
+};
 use crate::model::config::ThinkingSignatureValidationMode;
 use crate::model::model_catalog::built_in_model_catalog;
 use crate::token;
 use anyhow::Error;
 use axum::{
     body::Body,
-    extract::State,
+    extract::{Extension, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
@@ -45,6 +47,7 @@ use super::types::{
     OutputConfig, Thinking,
 };
 use super::webfetch;
+use crate::common::auth::ApiKeyAuthContext;
 use crate::kiro::provider::{PublicProviderError, RequestOptions};
 
 const LARGE_ANTHROPIC_REQUEST_WARN_THRESHOLD_BYTES: usize = 16 * 1024 * 1024;
@@ -440,6 +443,21 @@ pub(crate) fn map_provider_error(err: Error) -> Response {
             Json(ErrorResponse::new(
                 "service_unavailable",
                 "Shared credential refresh is already in progress on another runtime instance. Retry later.",
+            )),
+        )
+            .into_response();
+    }
+
+    if err
+        .downcast_ref::<CredentialScopeForbiddenError>()
+        .is_some()
+    {
+        tracing::warn!(error = %err_summary, "API key 凭据分组范围内没有可用凭据");
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::new(
+                "permission_error",
+                "No available credentials are assigned to this API key's credential groups.",
             )),
         )
             .into_response();
@@ -956,12 +974,18 @@ impl Drop for PreUpstreamTrace {
 /// GET /v1/models
 ///
 /// 返回可用的模型列表
-pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn get_models(
+    State(state): State<AppState>,
+    api_key_context: Option<Extension<ApiKeyAuthContext>>,
+) -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
 
     let mut models = built_in_models();
     if let Some(provider) = &state.kiro_provider {
-        models.retain(|model| provider.supports_model(&model.id));
+        let scope = api_key_context
+            .as_ref()
+            .map(|Extension(context)| &context.credential_group_scope);
+        models.retain(|model| provider.supports_model_for_scope(&model.id, scope));
     }
 
     Json(ModelsResponse {
@@ -975,6 +999,7 @@ pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
 /// 创建消息（对话）
 pub async fn post_messages(
     State(state): State<AppState>,
+    api_key_context: Option<Extension<ApiKeyAuthContext>>,
     headers: HeaderMap,
     payload: AnthropicJson<MessagesRequest>,
 ) -> Response {
@@ -1024,6 +1049,7 @@ pub async fn post_messages(
         }
     };
 
+    let api_key_context = api_key_context.map(|Extension(context)| context);
     let probe = parse_upstream_probe(&headers);
     if probe.is_enabled() {
         tracing::info!(request_id = %request_id, ?probe, "启用上游裸探针选项");
@@ -1154,6 +1180,7 @@ pub async fn post_messages(
             probe.clone(),
             &request_id,
             structured_output,
+            api_key_context.clone(),
         )
         .await;
     }
@@ -1167,6 +1194,7 @@ pub async fn post_messages(
                 probe.clone(),
                 request_id.clone(),
                 output,
+                api_key_context.clone(),
             )
             .await;
         }
@@ -1178,6 +1206,7 @@ pub async fn post_messages(
             probe.clone(),
             request_id,
             output,
+            api_key_context.clone(),
         )
         .await;
     }
@@ -1368,6 +1397,10 @@ pub async fn post_messages(
                 request_id: Some(request_id.clone()),
                 model_id: Some(model_id.clone()),
                 session_affinity_key: session_affinity_key.clone(),
+                credential_group_scope: api_key_context
+                    .as_ref()
+                    .map(|context| context.credential_group_scope.clone()),
+                api_key_id: api_key_context.as_ref().map(|context| context.id.clone()),
                 request_weight,
                 wait_for_stream_content_start: true,
                 stream_thinking_enabled: thinking_enabled,
@@ -1388,6 +1421,10 @@ pub async fn post_messages(
                 request_id: Some(request_id),
                 model_id: Some(model_id),
                 session_affinity_key,
+                credential_group_scope: api_key_context
+                    .as_ref()
+                    .map(|context| context.credential_group_scope.clone()),
+                api_key_id: api_key_context.as_ref().map(|context| context.id.clone()),
                 request_weight,
                 wait_for_stream_content_start: false,
                 stream_thinking_enabled: false,
@@ -1693,6 +1730,7 @@ pub(crate) async fn execute_non_stream_round(
     conversion_runtime: Arc<ConversionRuntime>,
     probe: UpstreamProbe,
     request_id: Option<String>,
+    api_key_context: Option<ApiKeyAuthContext>,
 ) -> Result<NonStreamMessageResponse, Response> {
     let conversion_result = convert_request_on_runtime(
         conversion_runtime,
@@ -1750,6 +1788,10 @@ pub(crate) async fn execute_non_stream_round(
             request_id,
             model_id: Some(conversion_result.model_id),
             session_affinity_key: conversion_result.session_id,
+            credential_group_scope: api_key_context
+                .as_ref()
+                .map(|context| context.credential_group_scope.clone()),
+            api_key_id: api_key_context.as_ref().map(|context| context.id.clone()),
             request_weight,
             wait_for_stream_content_start: false,
             stream_thinking_enabled: false,
@@ -1806,6 +1848,7 @@ async fn handle_structured_non_stream_request(
     probe: UpstreamProbe,
     request_id: String,
     output: JsonSchemaOutput,
+    api_key_context: Option<ApiKeyAuthContext>,
 ) -> Response {
     match execute_structured_non_stream(
         provider,
@@ -1814,6 +1857,7 @@ async fn handle_structured_non_stream_request(
         probe,
         request_id,
         output,
+        api_key_context,
     )
     .await
     {
@@ -1829,6 +1873,7 @@ async fn handle_structured_stream_request(
     probe: UpstreamProbe,
     request_id: String,
     output: JsonSchemaOutput,
+    api_key_context: Option<ApiKeyAuthContext>,
 ) -> Response {
     match execute_structured_non_stream(
         provider,
@@ -1837,6 +1882,7 @@ async fn handle_structured_stream_request(
         probe,
         request_id,
         output,
+        api_key_context,
     )
     .await
     {
@@ -1866,6 +1912,7 @@ async fn execute_structured_non_stream(
     probe: UpstreamProbe,
     request_id: String,
     output: JsonSchemaOutput,
+    api_key_context: Option<ApiKeyAuthContext>,
 ) -> Result<NonStreamMessageResponse, Response> {
     let mut attempt_payload = payload.clone();
     let structured_started_at = Instant::now();
@@ -1888,6 +1935,7 @@ async fn execute_structured_non_stream(
             conversion_runtime.clone(),
             probe.clone(),
             Some(request_id.clone()),
+            api_key_context.clone(),
         )
         .await?;
         let previous_text = structured_outputs::collect_text_content(&result.content);
@@ -2432,6 +2480,7 @@ pub async fn count_tokens(payload: AnthropicJson<CountTokensRequest>) -> impl In
 /// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
 pub async fn post_messages_cc(
     State(state): State<AppState>,
+    api_key_context: Option<Extension<ApiKeyAuthContext>>,
     headers: HeaderMap,
     payload: AnthropicJson<MessagesRequest>,
 ) -> Response {
@@ -2482,6 +2531,7 @@ pub async fn post_messages_cc(
         }
     };
 
+    let api_key_context = api_key_context.map(|Extension(context)| context);
     let probe = parse_upstream_probe(&headers);
     if probe.is_enabled() {
         tracing::info!(request_id = %request_id, ?probe, "启用上游裸探针选项");
@@ -2591,6 +2641,7 @@ pub async fn post_messages_cc(
             probe.clone(),
             &request_id,
             structured_output,
+            api_key_context.clone(),
         )
         .await;
     }
@@ -2604,6 +2655,7 @@ pub async fn post_messages_cc(
                 probe.clone(),
                 request_id.clone(),
                 output,
+                api_key_context.clone(),
             )
             .await;
         }
@@ -2615,6 +2667,7 @@ pub async fn post_messages_cc(
             probe.clone(),
             request_id,
             output,
+            api_key_context.clone(),
         )
         .await;
     }
@@ -2805,6 +2858,10 @@ pub async fn post_messages_cc(
                 request_id: Some(request_id.clone()),
                 model_id: Some(model_id.clone()),
                 session_affinity_key: session_affinity_key.clone(),
+                credential_group_scope: api_key_context
+                    .as_ref()
+                    .map(|context| context.credential_group_scope.clone()),
+                api_key_id: api_key_context.as_ref().map(|context| context.id.clone()),
                 request_weight,
                 wait_for_stream_content_start: true,
                 stream_thinking_enabled: thinking_enabled,
@@ -2825,6 +2882,10 @@ pub async fn post_messages_cc(
                 request_id: Some(request_id),
                 model_id: Some(model_id),
                 session_affinity_key,
+                credential_group_scope: api_key_context
+                    .as_ref()
+                    .map(|context| context.credential_group_scope.clone()),
+                api_key_id: api_key_context.as_ref().map(|context| context.id.clone()),
                 request_weight,
                 wait_for_stream_content_start: false,
                 stream_thinking_enabled: false,

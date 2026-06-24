@@ -1057,9 +1057,17 @@ async fn main() {
         );
     }
 
-    // 获取 API Key
-    let api_key = config.api_key.clone().unwrap_or_else(|| {
-        tracing::error!("配置文件中未设置 apiKey");
+    // 获取 API Key 注册表
+    let api_key_entries = config.api_key_auth_entries().unwrap_or_else(|err| {
+        tracing::error!("{}", err);
+        std::process::exit(1);
+    });
+    let api_key_log_sample = api_key_entries
+        .first()
+        .map(|entry| entry.key.clone())
+        .unwrap_or_default();
+    let thinking_signature_key_material = config.primary_api_key_material().unwrap_or_else(|| {
+        tracing::error!("配置文件中未设置 apiKey 或 apiKeys");
         std::process::exit(1);
     });
 
@@ -1175,8 +1183,9 @@ async fn main() {
         thinking_signature_validation_mode = config.thinking_signature_validation_mode.as_str(),
         "Anthropic thinking signature validation mode configured"
     );
-    let anthropic_app = anthropic::create_router_with_provider(
-        &api_key,
+    let anthropic_app = anthropic::create_router_with_provider_and_api_keys(
+        api_key_entries.clone(),
+        &thinking_signature_key_material,
         Some(kiro_provider),
         conversion_runtime.clone(),
     );
@@ -1266,7 +1275,13 @@ async fn main() {
         tracing::warn!("port=65535 且未配置 healthPort，未启动独立健康检查端点");
         None
     };
-    tracing::info!("API Key: {}***", &api_key[..(api_key.len() / 2)]);
+    if !api_key_log_sample.is_empty() {
+        tracing::info!(
+            "API Keys: {} configured (first: {}***)",
+            api_key_entries.len(),
+            &api_key_log_sample[..(api_key_log_sample.len() / 2)]
+        );
+    }
     tracing::info!("可用 API:");
     tracing::info!("  GET  /v1/models");
     tracing::info!("  POST /v1/messages");

@@ -12,6 +12,7 @@ export interface CredentialDefaultsDraft {
   sourceSupplierName: string
   sourceSupplierId: string
   sourceBatch: string
+  credentialGroups: string
   accountType: string
   authRegion: string
   apiRegion: string
@@ -44,6 +45,7 @@ export function createCredentialDefaultsDraft(): CredentialDefaultsDraft {
     sourceSupplierName: '',
     sourceSupplierId: '',
     sourceBatch: formatDefaultSourceBatch(),
+    credentialGroups: '',
     accountType: '',
     authRegion: '',
     apiRegion: '',
@@ -73,6 +75,7 @@ export function readCredentialDefaultsDraft(): CredentialDefaultsDraft {
       sourceSupplierName: stringValue(parsed.sourceSupplierName),
       sourceSupplierId: stringValue(parsed.sourceSupplierId),
       sourceBatch: stringValue(parsed.sourceBatch) || defaults.sourceBatch,
+      credentialGroups: stringValue(parsed.credentialGroups),
       accountType: stringValue(parsed.accountType),
       authRegion: stringValue(parsed.authRegion),
       apiRegion: stringValue(parsed.apiRegion),

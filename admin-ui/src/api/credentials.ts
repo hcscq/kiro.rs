@@ -9,6 +9,7 @@ import type {
   SetCredentialRateLimitConfigRequest,
   SetCredentialModelPolicyRequest,
   SetCredentialSourceRequest,
+  SetCredentialGroupsRequest,
   SetCredentialProxyRequest,
   SetCredentialProfileRequest,
   CredentialProfilesResponse,
@@ -202,6 +203,15 @@ export async function setCredentialSource(
   payload: SetCredentialSourceRequest
 ): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>(`/credentials/${id}/source`, payload)
+  return data
+}
+
+// 设置凭据分组标记
+export async function setCredentialGroups(
+  id: number,
+  payload: SetCredentialGroupsRequest
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/groups`, payload)
   return data
 }
 

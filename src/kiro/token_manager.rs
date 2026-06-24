@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::admin::types::BalanceResponse;
+use crate::common::auth::CredentialGroupScope;
 use crate::common::logging::summarize_upstream_error;
 use crate::http_client::{ProxyConfig, build_client, build_client_no_redirect};
 use crate::kiro::machine_id;
@@ -375,6 +376,17 @@ impl fmt::Display for RuntimeRefreshLeaseBusyError {
 }
 
 impl std::error::Error for RuntimeRefreshLeaseBusyError {}
+
+#[derive(Debug, Clone)]
+pub struct CredentialScopeForbiddenError;
+
+impl fmt::Display for CredentialScopeForbiddenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "当前 API key 的凭据分组范围内没有可用凭据")
+    }
+}
+
+impl StdError for CredentialScopeForbiddenError {}
 
 /// 刷新 Token
 pub(crate) async fn refresh_token(
@@ -1643,6 +1655,9 @@ pub struct CredentialEntrySnapshot {
     /// 账号来源批次
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_batch: Option<String>,
+    /// 凭据分组标记
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub credential_groups: Vec<String>,
     /// 当前命中的账号类型（显式账号类型或由订阅信息推断）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_account_type: Option<String>,
@@ -2243,6 +2258,7 @@ impl Drop for CallLeaseState {
 enum ReservationFailure {
     NoCredentials,
     AllDisabled,
+    NoCredentialScopeMatch,
     NoModelSupport,
     AllTemporarilyUnavailable { next_ready_at: Option<Instant> },
 }
@@ -3394,6 +3410,15 @@ impl MultiTokenManager {
         )
     }
 
+    fn credential_allowed_by_scope(
+        credentials: &KiroCredentials,
+        credential_group_scope: Option<&CredentialGroupScope>,
+    ) -> bool {
+        credential_group_scope.map_or(true, |scope| {
+            scope.allows_credential_groups(&credentials.credential_groups)
+        })
+    }
+
     fn is_model_supported(
         dispatch: &DispatchConfig,
         credentials: &KiroCredentials,
@@ -3997,6 +4022,7 @@ impl MultiTokenManager {
         model: Option<&str>,
         request_weight: f64,
         excluded_credential_ids: &HashSet<u64>,
+        credential_group_scope: Option<&CredentialGroupScope>,
     ) -> HashSet<u64> {
         let dispatch = self.dispatch_config();
         let model_requirement = Self::model_requirement(model);
@@ -4027,6 +4053,7 @@ impl MultiTokenManager {
             let has_fresh_dispatchable_alternate = entries.iter().any(|entry| {
                 !entry.disabled
                     && !excluded_credential_ids.contains(&entry.id)
+                    && Self::credential_allowed_by_scope(&entry.credentials, credential_group_scope)
                     && Self::is_model_supported(
                         &dispatch,
                         &entry.credentials,
@@ -4054,6 +4081,10 @@ impl MultiTokenManager {
             for entry in entries.iter() {
                 if entry.disabled
                     || excluded_credential_ids.contains(&entry.id)
+                    || !Self::credential_allowed_by_scope(
+                        &entry.credentials,
+                        credential_group_scope,
+                    )
                     || !Self::is_model_supported(
                         &dispatch,
                         &entry.credentials,
@@ -4487,6 +4518,7 @@ impl MultiTokenManager {
         model: Option<&str>,
         model_requirement: ModelRequirement,
         excluded_credential_ids: &HashSet<u64>,
+        credential_group_scope: Option<&CredentialGroupScope>,
         now: Instant,
         now_utc: &DateTime<Utc>,
         fallback_next_ready_at: Option<Instant>,
@@ -4497,6 +4529,7 @@ impl MultiTokenManager {
         }
 
         let mut has_enabled = false;
+        let mut has_scope_match = false;
         let mut has_supported = false;
         let mut next_ready_at = fallback_next_ready_at;
         let mut credentials = Vec::new();
@@ -4507,6 +4540,11 @@ impl MultiTokenManager {
                 continue;
             }
             has_enabled = true;
+
+            if !Self::credential_allowed_by_scope(&entry.credentials, credential_group_scope) {
+                continue;
+            }
+            has_scope_match = true;
 
             if excluded_credential_ids.contains(&entry.id) {
                 continue;
@@ -4559,6 +4597,9 @@ impl MultiTokenManager {
 
         if !has_enabled {
             return Err(ReservationFailure::AllDisabled);
+        }
+        if !has_scope_match {
+            return Err(ReservationFailure::NoCredentialScopeMatch);
         }
         if !has_supported {
             return Err(ReservationFailure::NoModelSupport);
@@ -4745,6 +4786,7 @@ impl MultiTokenManager {
         request_weight: f64,
         excluded_credential_ids: &HashSet<u64>,
         session_affinity_cache_key: Option<&str>,
+        credential_group_scope: Option<&CredentialGroupScope>,
     ) -> Result<(u64, KiroCredentials, CallLease), ReservationFailure> {
         let dispatch = self.dispatch_config();
         let mode = dispatch.mode.clone();
@@ -4763,6 +4805,7 @@ impl MultiTokenManager {
         let current_id_value = *current_id;
         let is_balanced = mode == "balanced";
         let mut has_enabled = false;
+        let mut has_scope_match = false;
         let mut has_supported = false;
         let mut selected_index: Option<usize> = None;
         let mut priority_key: Option<(u8, u32, u8, usize, u8, u8, u64)> = None;
@@ -4776,6 +4819,10 @@ impl MultiTokenManager {
                 continue;
             }
             has_enabled = true;
+            if !Self::credential_allowed_by_scope(&entry.credentials, credential_group_scope) {
+                continue;
+            }
+            has_scope_match = true;
             if excluded_credential_ids.contains(&entry.id) {
                 continue;
             }
@@ -4860,6 +4907,9 @@ impl MultiTokenManager {
 
         if !has_enabled {
             return Err(ReservationFailure::AllDisabled);
+        }
+        if !has_scope_match {
+            return Err(ReservationFailure::NoCredentialScopeMatch);
         }
         if !has_supported {
             return Err(ReservationFailure::NoModelSupport);
@@ -4985,6 +5035,7 @@ impl MultiTokenManager {
         request_weight: f64,
         excluded_credential_ids: &HashSet<u64>,
         session_affinity_cache_key: Option<&str>,
+        credential_group_scope: Option<&CredentialGroupScope>,
     ) -> Result<(u64, KiroCredentials, CallLease), ReservationFailure> {
         let dispatch = self.dispatch_config();
         let model_requirement = Self::model_requirement(model);
@@ -5004,6 +5055,7 @@ impl MultiTokenManager {
                 model,
                 model_requirement,
                 excluded_credential_ids,
+                credential_group_scope,
                 now,
                 &now_utc,
                 fallback_next_ready_at,
@@ -5045,6 +5097,7 @@ impl MultiTokenManager {
 
                 let current_id_value = *self.current_id.lock();
                 let mut has_enabled = false;
+                let mut has_scope_match = false;
                 let mut has_supported = false;
                 let mut selected_id: Option<u64> = None;
                 let mut selected_credentials: Option<KiroCredentials> = None;
@@ -5059,6 +5112,13 @@ impl MultiTokenManager {
                         continue;
                     }
                     has_enabled = true;
+                    if !Self::credential_allowed_by_scope(
+                        &entry.credentials,
+                        credential_group_scope,
+                    ) {
+                        continue;
+                    }
+                    has_scope_match = true;
                     if excluded_credential_ids.contains(&entry.id) {
                         continue;
                     }
@@ -5195,6 +5255,9 @@ impl MultiTokenManager {
 
                 if !has_enabled {
                     return Err(ReservationFailure::AllDisabled);
+                }
+                if !has_scope_match {
+                    return Err(ReservationFailure::NoCredentialScopeMatch);
                 }
                 if !has_supported {
                     return Err(ReservationFailure::NoModelSupport);
@@ -5350,11 +5413,30 @@ impl MultiTokenManager {
         excluded_credential_ids: &HashSet<u64>,
         session_affinity_key: Option<&str>,
     ) -> anyhow::Result<CallContext> {
+        self.acquire_context_with_weight_excluding_and_affinity_for_scope(
+            model,
+            request_weight,
+            excluded_credential_ids,
+            session_affinity_key,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn acquire_context_with_weight_excluding_and_affinity_for_scope(
+        &self,
+        model: Option<&str>,
+        request_weight: f64,
+        excluded_credential_ids: &HashSet<u64>,
+        session_affinity_key: Option<&str>,
+        credential_group_scope: Option<&CredentialGroupScope>,
+    ) -> anyhow::Result<CallContext> {
         self.acquire_context_with_weight_excluding_and_affinity_inner(
             model,
             request_weight,
             excluded_credential_ids,
             session_affinity_key,
+            credential_group_scope,
             None,
         )
         .await
@@ -5366,12 +5448,14 @@ impl MultiTokenManager {
         request_weight: f64,
         excluded_credential_ids: &HashSet<u64>,
         session_affinity_key: Option<&str>,
+        credential_group_scope: Option<&CredentialGroupScope>,
     ) -> anyhow::Result<CallContext> {
         self.acquire_context_with_weight_excluding_and_affinity_inner(
             model,
             request_weight,
             excluded_credential_ids,
             session_affinity_key,
+            credential_group_scope,
             Some(self),
         )
         .await
@@ -5383,6 +5467,7 @@ impl MultiTokenManager {
         request_weight: f64,
         excluded_credential_ids: &HashSet<u64>,
         session_affinity_key: Option<&str>,
+        credential_group_scope: Option<&CredentialGroupScope>,
         background_owner: Option<&Arc<Self>>,
     ) -> anyhow::Result<CallContext> {
         let request_weight = if request_weight.is_finite() && request_weight > 0.0 {
@@ -5414,6 +5499,7 @@ impl MultiTokenManager {
                         model,
                         request_weight,
                         excluded_credential_ids,
+                        credential_group_scope,
                     )
                 })
                 .unwrap_or_default();
@@ -5446,6 +5532,7 @@ impl MultiTokenManager {
                     request_weight,
                     reservation_excluded_credential_ids,
                     session_affinity_cache_key.as_deref(),
+                    credential_group_scope,
                 )
             } else {
                 self.reserve_next_credential(
@@ -5453,6 +5540,7 @@ impl MultiTokenManager {
                     request_weight,
                     reservation_excluded_credential_ids,
                     session_affinity_cache_key.as_deref(),
+                    credential_group_scope,
                 )
             } {
                 Ok(selection) => {
@@ -5466,6 +5554,9 @@ impl MultiTokenManager {
                         continue;
                     }
                     anyhow::bail!("所有凭据均已禁用（0/{})", total);
+                }
+                Err(ReservationFailure::NoCredentialScopeMatch) => {
+                    return Err(anyhow::Error::new(CredentialScopeForbiddenError));
                 }
                 Err(ReservationFailure::NoModelSupport) => {
                     anyhow::bail!("当前没有可用凭据支持该模型");
@@ -5542,6 +5633,14 @@ impl MultiTokenManager {
     }
 
     pub(crate) fn enabled_supported_credential_count(&self, model: Option<&str>) -> usize {
+        self.enabled_supported_credential_count_for_scope(model, None)
+    }
+
+    pub(crate) fn enabled_supported_credential_count_for_scope(
+        &self,
+        model: Option<&str>,
+        credential_group_scope: Option<&CredentialGroupScope>,
+    ) -> usize {
         let dispatch = self.dispatch_config();
         let model_requirement = Self::model_requirement(model);
         let mut entries = self.entries.lock();
@@ -5552,6 +5651,7 @@ impl MultiTokenManager {
             .iter()
             .filter(|entry| {
                 !entry.disabled
+                    && Self::credential_allowed_by_scope(&entry.credentials, credential_group_scope)
                     && Self::is_model_supported(
                         &dispatch,
                         &entry.credentials,
@@ -5567,6 +5667,15 @@ impl MultiTokenManager {
         model: Option<&str>,
         priority: u32,
     ) -> Vec<u64> {
+        self.enabled_supported_credential_ids_at_priority_for_scope(model, priority, None)
+    }
+
+    pub(crate) fn enabled_supported_credential_ids_at_priority_for_scope(
+        &self,
+        model: Option<&str>,
+        priority: u32,
+        credential_group_scope: Option<&CredentialGroupScope>,
+    ) -> Vec<u64> {
         let dispatch = self.dispatch_config();
         let model_requirement = Self::model_requirement(model);
         let mut entries = self.entries.lock();
@@ -5578,6 +5687,7 @@ impl MultiTokenManager {
             .filter(|entry| {
                 !entry.disabled
                     && entry.credentials.priority == priority
+                    && Self::credential_allowed_by_scope(&entry.credentials, credential_group_scope)
                     && Self::is_model_supported(
                         &dispatch,
                         &entry.credentials,
@@ -5594,6 +5704,7 @@ impl MultiTokenManager {
         model: Option<&str>,
         priority: u32,
         excluded_credential_ids: &HashSet<u64>,
+        credential_group_scope: Option<&CredentialGroupScope>,
     ) -> bool {
         let dispatch = self.dispatch_config();
         let model_requirement = Self::model_requirement(model);
@@ -5605,6 +5716,7 @@ impl MultiTokenManager {
             !entry.disabled
                 && entry.credentials.priority > priority
                 && !excluded_credential_ids.contains(&entry.id)
+                && Self::credential_allowed_by_scope(&entry.credentials, credential_group_scope)
                 && Self::is_model_supported(&dispatch, &entry.credentials, model, model_requirement)
         })
     }
@@ -8386,6 +8498,7 @@ impl MultiTokenManager {
                         source_supplier_id: e.credentials.source_supplier_id.clone(),
                         source_supplier_name: e.credentials.source_supplier_name.clone(),
                         source_batch: e.credentials.source_batch.clone(),
+                        credential_groups: e.credentials.credential_groups.clone(),
                         resolved_account_type: e.credentials.resolved_account_type(),
                         account_type_source: e
                             .credentials
@@ -8750,6 +8863,34 @@ impl MultiTokenManager {
             credential.source_batch = value;
         }
         credential.normalize_source_metadata();
+        let updated_credential = credential.clone();
+        self.persist_credentials_snapshot(&persisted)?;
+
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials = updated_credential;
+        }
+
+        self.availability_notify.notify_waiters();
+        Ok(())
+    }
+
+    /// 设置凭据分组标记（Admin API）
+    pub fn set_credential_groups(
+        &self,
+        id: u64,
+        credential_groups: Vec<String>,
+    ) -> anyhow::Result<()> {
+        let normalized_groups =
+            crate::common::auth::normalize_credential_groups(&credential_groups);
+        let _state_write_guard = self.state_write_lock.lock();
+        let mut persisted = self.persisted_credentials_snapshot();
+        let credential = Self::persisted_credential_mut(&mut persisted, id)?;
+        credential.credential_groups = normalized_groups.clone();
         let updated_credential = credential.clone();
         self.persist_credentials_snapshot(&persisted)?;
 
@@ -9838,11 +9979,20 @@ impl MultiTokenManager {
     }
 
     pub fn supports_model(&self, model: &str) -> bool {
+        self.supports_model_for_scope(model, None)
+    }
+
+    pub fn supports_model_for_scope(
+        &self,
+        model: &str,
+        credential_group_scope: Option<&CredentialGroupScope>,
+    ) -> bool {
         let dispatch = self.dispatch_config();
         let requirement = Self::model_requirement(Some(model));
         let entries = self.entries.lock();
         entries.iter().any(|entry| {
             !entry.disabled
+                && Self::credential_allowed_by_scope(&entry.credentials, credential_group_scope)
                 && Self::is_model_supported(&dispatch, &entry.credentials, Some(model), requirement)
         })
     }
@@ -10579,6 +10729,48 @@ mod tests {
     }
 
     #[test]
+    fn set_credential_groups_normalizes_and_persists() {
+        let credentials_path = temp_credentials_path("set-credential-groups");
+        let mut credential = available_credential(0);
+        credential.id = Some(1);
+        write_credentials_file(&credentials_path, &[credential.clone()]);
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![credential],
+            None,
+            Some(credentials_path.clone()),
+            true,
+        )
+        .unwrap();
+
+        manager
+            .set_credential_groups(
+                1,
+                vec![
+                    " Stable ".to_string(),
+                    "low-cost".to_string(),
+                    "stable".to_string(),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            manager.current_credentials(1).unwrap().credential_groups,
+            vec!["low-cost".to_string(), "stable".to_string()]
+        );
+        let persisted = CredentialsConfig::load(&credentials_path)
+            .unwrap()
+            .into_sorted_credentials();
+        assert_eq!(
+            persisted[0].credential_groups,
+            vec!["low-cost".to_string(), "stable".to_string()]
+        );
+
+        std::fs::remove_file(credentials_path).unwrap();
+    }
+
+    #[test]
     fn set_credential_proxy_custom_clears_pool_binding() {
         let credentials_path = temp_credentials_path("set-proxy-custom");
         let mut config = Config::default();
@@ -10826,6 +11018,7 @@ mod tests {
                 None,
                 ModelRequirement::Any,
                 &HashSet::new(),
+                None,
                 Instant::now(),
                 &Utc::now(),
                 None,
@@ -10862,14 +11055,101 @@ mod tests {
         assert_eq!(fallback_ids.len(), 1);
 
         let excluded = HashSet::new();
-        assert!(manager.has_enabled_supported_credential_below_priority(None, 0, &excluded));
+        assert!(manager.has_enabled_supported_credential_below_priority(None, 0, &excluded, None));
 
         let excluded_fallback: HashSet<u64> = fallback_ids.into_iter().collect();
         assert!(!manager.has_enabled_supported_credential_below_priority(
             None,
             0,
-            &excluded_fallback
+            &excluded_fallback,
+            None
         ));
+    }
+
+    #[tokio::test]
+    async fn credential_group_scope_limits_acquired_credentials() {
+        let mut stable = available_credential(10);
+        stable.credential_groups = vec!["stable".to_string()];
+        let mut cheap = available_credential(0);
+        cheap.credential_groups = vec!["low-cost".to_string()];
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![stable, cheap], None, None, false)
+                .unwrap();
+        let scope = CredentialGroupScope::Groups(vec!["stable".to_string()]);
+
+        let ctx = manager
+            .acquire_context_with_weight_excluding_and_affinity_for_scope(
+                None,
+                1.0,
+                &HashSet::new(),
+                None,
+                Some(&scope),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(ctx.id, 1);
+        assert_eq!(ctx.credentials.credential_groups, vec!["stable"]);
+        assert_eq!(
+            manager.enabled_supported_credential_count_for_scope(None, Some(&scope)),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_group_scope_reports_forbidden_without_match() {
+        let mut stable = available_credential(0);
+        stable.credential_groups = vec!["stable".to_string()];
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![stable], None, None, false).unwrap();
+        let scope = CredentialGroupScope::Groups(vec!["low-cost".to_string()]);
+
+        let err = match manager
+            .acquire_context_with_weight_excluding_and_affinity_for_scope(
+                None,
+                1.0,
+                &HashSet::new(),
+                None,
+                Some(&scope),
+            )
+            .await
+        {
+            Ok(_) => panic!("expected credential scope mismatch to be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.downcast_ref::<CredentialScopeForbiddenError>()
+                .is_some()
+        );
+        assert_eq!(
+            manager.enabled_supported_credential_count_for_scope(None, Some(&scope)),
+            0
+        );
+        assert!(!manager.supports_model_for_scope("claude-sonnet-4.5", Some(&scope)));
+    }
+
+    #[tokio::test]
+    async fn empty_credential_groups_match_default_scope() {
+        let credential = available_credential(0);
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
+        let default_scope = CredentialGroupScope::Groups(vec!["default".to_string()]);
+
+        let ctx = manager
+            .acquire_context_with_weight_excluding_and_affinity_for_scope(
+                None,
+                1.0,
+                &HashSet::new(),
+                None,
+                Some(&default_scope),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(ctx.id, 1);
+        assert!(ctx.credentials.credential_groups.is_empty());
+        assert!(manager.supports_model_for_scope("claude-sonnet-4.5", Some(&default_scope)));
     }
 
     #[test]
@@ -10910,6 +11190,7 @@ mod tests {
             None,
             ModelRequirement::Any,
             &HashSet::new(),
+            None,
             Instant::now(),
             &Utc::now(),
             None,
@@ -13633,7 +13914,7 @@ mod tests {
 
         let excluded = HashSet::new();
         let ctx = manager
-            .acquire_context_with_background_refresh(None, 1.0, &excluded, None)
+            .acquire_context_with_background_refresh(None, 1.0, &excluded, None, None)
             .await
             .unwrap();
 
@@ -13664,7 +13945,7 @@ mod tests {
         let excluded = HashSet::new();
 
         let request_exclusions =
-            manager.background_refresh_exclusions_for_request(None, 1.0, &excluded);
+            manager.background_refresh_exclusions_for_request(None, 1.0, &excluded, None);
 
         assert!(request_exclusions.is_empty());
         let entries = manager.entries.lock();
@@ -13705,7 +13986,7 @@ mod tests {
         let excluded = HashSet::new();
 
         let request_exclusions =
-            manager.background_refresh_exclusions_for_request(None, 1.0, &excluded);
+            manager.background_refresh_exclusions_for_request(None, 1.0, &excluded, None);
 
         assert_eq!(request_exclusions.len(), 2);
         assert!(request_exclusions.contains(&1));

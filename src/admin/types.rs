@@ -144,6 +144,8 @@ pub struct CredentialStatusItem {
     /// 账号来源批次
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_batch: Option<String>,
+    /// 凭据分组标记
+    pub credential_groups: Vec<String>,
     /// 当前命中的账号类型（显式账号类型或标准档位推断）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_account_type: Option<String>,
@@ -375,6 +377,15 @@ pub struct SetCredentialSourceRequest {
     pub source_batch: Option<Option<String>>,
 }
 
+/// 修改凭据分组请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCredentialGroupsRequest {
+    /// 完整替换凭据分组；空数组表示清空，运行时按 default 参与旧凭据兼容匹配
+    #[serde(default)]
+    pub credential_groups: Vec<String>,
+}
+
 /// 设置凭据超额使用开关请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -490,6 +501,9 @@ pub struct AddCredentialRequest {
     /// 账号来源批次（可选）
     pub source_batch: Option<String>,
 
+    /// 凭据分组标记（可选）
+    pub credential_groups: Option<Vec<String>>,
+
     /// 账号级额外允许模型
     pub allowed_models: Option<Vec<String>>,
 
@@ -597,6 +611,10 @@ pub struct StartIdcDeviceLoginRequest {
     /// 账号来源批次（可选）
     #[serde(default)]
     pub source_batch: Option<String>,
+
+    /// 凭据分组标记（可选）
+    #[serde(default)]
+    pub credential_groups: Option<Vec<String>>,
 
     /// 凭据级代理 URL（可选，特殊值 "direct" 表示不使用代理）
     #[serde(default)]
@@ -877,6 +895,10 @@ pub struct StartExternalIdpLoginRequest {
     /// 账号来源批次（可选）
     #[serde(default)]
     pub source_batch: Option<String>,
+
+    /// 凭据分组标记（可选）
+    #[serde(default)]
+    pub credential_groups: Option<Vec<String>>,
 
     /// 凭据级代理 URL（可选，特殊值 "direct" 表示不使用代理）
     #[serde(default)]

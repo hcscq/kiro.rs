@@ -18,7 +18,7 @@ use axum::{
 use futures::TryStreamExt;
 use reqwest::Client;
 
-use crate::common::auth;
+use crate::common::auth::{self, ApiKeyAuthContext, ApiKeyAuthEntry};
 use crate::kiro::provider::KiroProvider;
 
 use super::{
@@ -103,8 +103,8 @@ impl BufferedAnthropicRequest {
 /// 应用共享状态
 #[derive(Clone)]
 pub struct AppState {
-    /// API 密钥
-    pub api_key: String,
+    /// API key 注册表
+    pub api_keys: Arc<Vec<ApiKeyAuthEntry>>,
     /// Kiro Provider（可选，用于实际 API 调用）
     /// 内部使用 MultiTokenManager，已支持线程安全的多凭据管理
     pub kiro_provider: Option<Arc<KiroProvider>>,
@@ -117,9 +117,21 @@ impl AppState {
     /// 创建新的应用状态
     pub fn new(api_key: impl Into<String>) -> Self {
         let api_key = api_key.into();
-        init_thinking_signature_key(&api_key);
+        let api_keys = vec![ApiKeyAuthEntry {
+            id: "legacy".to_string(),
+            key: api_key.clone(),
+            credential_group_scope: auth::CredentialGroupScope::all(),
+        }];
+        Self::new_with_api_keys(api_keys, api_key)
+    }
+
+    pub fn new_with_api_keys(
+        api_keys: Vec<ApiKeyAuthEntry>,
+        thinking_signature_key_material: impl AsRef<str>,
+    ) -> Self {
+        init_thinking_signature_key(thinking_signature_key_material.as_ref());
         Self {
-            api_key,
+            api_keys: Arc::new(api_keys),
             kiro_provider: None,
             conversion_runtime: Arc::new(ConversionRuntime::default()),
             client: Client::builder()
@@ -371,11 +383,29 @@ impl AppState {
 /// API Key 认证中间件
 pub async fn auth_middleware(
     State(state): State<AppState>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response {
     match auth::extract_api_key(&request) {
-        Some(key) if auth::constant_time_eq(&key, &state.api_key) => next.run(request).await,
+        Some(key) => {
+            let mut matched_entry = None;
+            for entry in state.api_keys.iter() {
+                if auth::constant_time_eq(&key, &entry.key) {
+                    matched_entry = Some(entry);
+                }
+            }
+
+            if let Some(entry) = matched_entry {
+                request.extensions_mut().insert(ApiKeyAuthContext {
+                    id: entry.id.clone(),
+                    credential_group_scope: entry.credential_group_scope.clone(),
+                });
+                next.run(request).await
+            } else {
+                let error = ErrorResponse::authentication_error();
+                (StatusCode::UNAUTHORIZED, Json(error)).into_response()
+            }
+        }
         _ => {
             let error = ErrorResponse::authentication_error();
             (StatusCode::UNAUTHORIZED, Json(error)).into_response()

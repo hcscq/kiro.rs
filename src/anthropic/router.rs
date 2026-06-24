@@ -9,6 +9,7 @@ use axum::{
     routing::{get, post},
 };
 
+use crate::common::auth::ApiKeyAuthEntry;
 use crate::kiro::provider::KiroProvider;
 
 use super::{
@@ -35,6 +36,7 @@ use super::{
 /// - `kiro_provider`: 可选的 KiroProvider，用于调用上游 API
 
 /// 创建带有 KiroProvider 的 Anthropic API 路由
+#[allow(dead_code)]
 pub fn create_router_with_provider(
     api_key: impl Into<String>,
     kiro_provider: Option<KiroProvider>,
@@ -61,6 +63,51 @@ pub fn create_router_with_provider(
 
     // 需要认证的 /cc/v1 路由（Claude Code 兼容端点）
     // 与 /v1 的区别：流式响应会等待 contextUsageEvent 后再发送 message_start
+    let cc_v1_routes = Router::new()
+        .route("/messages", post(post_messages_cc))
+        .route("/messages/count_tokens", post(count_tokens))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            message_routing_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
+
+    Router::new()
+        .nest("/v1", v1_routes)
+        .nest("/cc/v1", cc_v1_routes)
+        .layer(cors_layer())
+        .layer(DefaultBodyLimit::max(MAX_ANTHROPIC_BODY_SIZE_BYTES))
+        .with_state(state)
+}
+
+pub fn create_router_with_provider_and_api_keys(
+    api_keys: Vec<ApiKeyAuthEntry>,
+    thinking_signature_key_material: impl AsRef<str>,
+    kiro_provider: Option<KiroProvider>,
+    conversion_runtime: Arc<ConversionRuntime>,
+) -> Router {
+    let mut state = AppState::new_with_api_keys(api_keys, thinking_signature_key_material)
+        .with_conversion_runtime(conversion_runtime);
+    if let Some(provider) = kiro_provider {
+        state = state.with_kiro_provider(provider);
+    }
+
+    let v1_routes = Router::new()
+        .route("/models", get(get_models))
+        .route("/messages", post(post_messages))
+        .route("/messages/count_tokens", post(count_tokens))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            message_routing_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
+
     let cc_v1_routes = Router::new()
         .route("/messages", post(post_messages_cc))
         .route("/messages/count_tokens", post(count_tokens))

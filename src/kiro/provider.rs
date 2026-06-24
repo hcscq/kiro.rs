@@ -22,6 +22,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
+use crate::common::auth::CredentialGroupScope;
 use crate::common::logging::{summarize_text_for_log, summarize_upstream_error};
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
@@ -110,6 +111,8 @@ pub struct RequestOptions {
     pub request_id: Option<String>,
     pub model_id: Option<String>,
     pub session_affinity_key: Option<String>,
+    pub credential_group_scope: Option<CredentialGroupScope>,
+    pub api_key_id: Option<String>,
     pub request_weight: f64,
     pub wait_for_stream_content_start: bool,
     pub stream_thinking_enabled: bool,
@@ -122,6 +125,8 @@ impl Default for RequestOptions {
             request_id: None,
             model_id: None,
             session_affinity_key: None,
+            credential_group_scope: None,
+            api_key_id: None,
             request_weight: 1.0,
             wait_for_stream_content_start: false,
             stream_thinking_enabled: false,
@@ -1633,6 +1638,15 @@ impl KiroProvider {
         self.token_manager.supports_model(model)
     }
 
+    pub fn supports_model_for_scope(
+        &self,
+        model: &str,
+        credential_group_scope: Option<&CredentialGroupScope>,
+    ) -> bool {
+        self.token_manager
+            .supports_model_for_scope(model, credential_group_scope)
+    }
+
     pub fn leader_message_forward_target(&self) -> anyhow::Result<Option<String>> {
         self.token_manager
             .leader_http_base_url_for_single_shared_credential_mode()
@@ -1644,6 +1658,25 @@ impl KiroProvider {
 
     fn should_report_proxy_transport_failure(error: &reqwest::Error) -> bool {
         error.is_connect() || error.is_timeout()
+    }
+
+    fn scoped_session_affinity_key(
+        session_affinity_key: Option<&str>,
+        api_key_id: Option<&str>,
+        credential_group_scope: Option<&CredentialGroupScope>,
+    ) -> Option<String> {
+        let raw_key = session_affinity_key?;
+        if api_key_id.is_none() && credential_group_scope.is_none() {
+            return Some(raw_key.to_string());
+        }
+
+        let api_key_id = api_key_id.unwrap_or("unknown");
+        let scope = credential_group_scope
+            .map(CredentialGroupScope::cache_key_component)
+            .unwrap_or_else(|| "unspecified".to_string());
+        Some(format!(
+            "api-key:{api_key_id}\0scope:{scope}\0session:{raw_key}"
+        ))
     }
 
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
@@ -2679,11 +2712,24 @@ impl KiroProvider {
     /// # Returns
     /// 返回原始的 HTTP Response
     pub async fn call_mcp(&self, request_body: &str) -> anyhow::Result<ManagedResponse> {
-        self.call_mcp_with_retry(request_body).await
+        self.call_mcp_with_options(request_body, RequestOptions::default())
+            .await
+    }
+
+    pub async fn call_mcp_with_options(
+        &self,
+        request_body: &str,
+        options: RequestOptions,
+    ) -> anyhow::Result<ManagedResponse> {
+        self.call_mcp_with_retry(request_body, options).await
     }
 
     /// 内部方法：带重试逻辑的 MCP API 调用
-    async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<ManagedResponse> {
+    async fn call_mcp_with_retry(
+        &self,
+        request_body: &str,
+        options: RequestOptions,
+    ) -> anyhow::Result<ManagedResponse> {
         let total_credentials = self.token_manager.total_count();
         let mut max_retries = Self::base_retry_cap(total_credentials);
         let mut last_error: Option<anyhow::Error> = None;
@@ -2692,11 +2738,18 @@ impl KiroProvider {
         let mut request_scoped_rate_limited_credentials: HashSet<u64> = HashSet::new();
         let mut request_scoped_transient_error_credentials: HashSet<u64> = HashSet::new();
         let mut priority_rate_limit_hits: HashMap<u32, usize> = HashMap::new();
+        let credential_group_scope = options.credential_group_scope.as_ref();
+        let scoped_session_affinity_key = Self::scoped_session_affinity_key(
+            options.session_affinity_key.as_deref(),
+            options.api_key_id.as_deref(),
+            credential_group_scope,
+        );
 
         let mut attempt_count = 0;
         while attempt_count < max_retries {
-            let supported_candidate_count =
-                self.token_manager.enabled_supported_credential_count(None);
+            let supported_candidate_count = self
+                .token_manager
+                .enabled_supported_credential_count_for_scope(None, credential_group_scope);
             let retryable_exclusion_count = Self::request_scoped_retryable_exclusion_count(
                 &request_scoped_rate_limited_credentials,
                 &request_scoped_transient_error_credentials,
@@ -2731,7 +2784,8 @@ impl KiroProvider {
                     None,
                     1.0,
                     &request_scoped_excluded_credentials,
-                    None,
+                    scoped_session_affinity_key.as_deref(),
+                    credential_group_scope,
                 )
                 .await
             {
@@ -3001,9 +3055,11 @@ impl KiroProvider {
                         &empty_slow_first_content,
                         &empty_body,
                         &request_scoped_transient_error_credentials,
+                        credential_group_scope,
                     );
-                    let supported_candidate_count =
-                        self.token_manager.enabled_supported_credential_count(None);
+                    let supported_candidate_count = self
+                        .token_manager
+                        .enabled_supported_credential_count_for_scope(None, credential_group_scope);
                     max_retries = max_retries.max(Self::rate_limit_retry_cap(
                         total_credentials,
                         supported_candidate_count,
@@ -3086,6 +3142,12 @@ impl KiroProvider {
             .clone()
             .unwrap_or_else(|| format!("kirors-{}", Uuid::new_v4().simple()));
         let request_weight = options.normalized_request_weight();
+        let credential_group_scope = options.credential_group_scope.as_ref();
+        let scoped_session_affinity_key = Self::scoped_session_affinity_key(
+            options.session_affinity_key.as_deref(),
+            options.api_key_id.as_deref(),
+            credential_group_scope,
+        );
         let overall_started_at = Instant::now();
         let mut original_request_body: Option<Bytes> = None;
         let stream_pre_sse_failover_config =
@@ -3123,7 +3185,10 @@ impl KiroProvider {
         while attempt_count < max_retries {
             let supported_candidate_count = self
                 .token_manager
-                .enabled_supported_credential_count(model.as_deref());
+                .enabled_supported_credential_count_for_scope(
+                    model.as_deref(),
+                    credential_group_scope,
+                );
             let retryable_candidate_count = Self::request_retryable_candidate_count(
                 supported_candidate_count,
                 &request_scoped_model_unsupported_credentials,
@@ -3159,7 +3224,8 @@ impl KiroProvider {
                     model.as_deref(),
                     request_weight,
                     &request_scoped_excluded_credentials,
-                    options.session_affinity_key.as_deref(),
+                    scoped_session_affinity_key.as_deref(),
+                    credential_group_scope,
                 )
             };
             let acquire_result = if is_stream {
@@ -4625,7 +4691,10 @@ impl KiroProvider {
                     request_scoped_rate_limited_credentials.insert(ctx_id);
                     let supported_candidate_count = self
                         .token_manager
-                        .enabled_supported_credential_count(model.as_deref());
+                        .enabled_supported_credential_count_for_scope(
+                            model.as_deref(),
+                            credential_group_scope,
+                        );
                     max_retries = max_retries.max(Self::rate_limit_retry_cap(
                         total_credentials,
                         supported_candidate_count,
@@ -4649,6 +4718,7 @@ impl KiroProvider {
                         &request_scoped_slow_first_content_credentials,
                         &request_scoped_empty_body_credentials,
                         &request_scoped_transient_error_credentials,
+                        credential_group_scope,
                     );
                 } else {
                     request_scoped_transient_error_credentials.insert(ctx_id);
@@ -4910,6 +4980,7 @@ impl KiroProvider {
         request_scoped_slow_first_content_credentials: &HashSet<u64>,
         request_scoped_empty_body_credentials: &HashSet<u64>,
         request_scoped_transient_error_credentials: &HashSet<u64>,
+        credential_group_scope: Option<&CredentialGroupScope>,
     ) {
         let hits = priority_rate_limit_hits
             .entry(credential_priority)
@@ -4931,12 +5002,16 @@ impl KiroProvider {
             model,
             credential_priority,
             &excluded,
+            credential_group_scope,
         ) {
             return;
         }
 
-        let skipped_ids =
-            token_manager.enabled_supported_credential_ids_at_priority(model, credential_priority);
+        let skipped_ids = token_manager.enabled_supported_credential_ids_at_priority_for_scope(
+            model,
+            credential_priority,
+            credential_group_scope,
+        );
         let skipped_count = skipped_ids.len();
         request_scoped_rate_limited_credentials.extend(skipped_ids);
         tracing::warn!(

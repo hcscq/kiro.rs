@@ -40,4 +40,4 @@ mod webfetch;
 mod websearch;
 
 pub(crate) use conversion_runtime::ConversionRuntime;
-pub use router::create_router_with_provider;
+pub use router::create_router_with_provider_and_api_keys;

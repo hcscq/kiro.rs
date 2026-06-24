@@ -12,8 +12,8 @@ use super::{
     middleware::AdminState,
     service::ExternalIdpCallbackAction,
     types::{
-        AddCredentialRequest, ExternalIdpProbeRequest, SetCredentialModelPolicyRequest,
-        SetCredentialProfileRequest, SetCredentialProxyRequest,
+        AddCredentialRequest, ExternalIdpProbeRequest, SetCredentialGroupsRequest,
+        SetCredentialModelPolicyRequest, SetCredentialProfileRequest, SetCredentialProxyRequest,
         SetCredentialRateLimitConfigRequest, SetCredentialSourceRequest, SetDisabledRequest,
         SetLoadBalancingModeRequest, SetMaxConcurrencyRequest, SetModelCapabilitiesConfigRequest,
         SetOverageStatusRequest, SetPriorityRequest, StartExternalIdpLoginRequest,
@@ -166,6 +166,19 @@ pub async fn set_credential_source(
 ) -> impl IntoResponse {
     match state.service.set_source(id, payload) {
         Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 来源标记已更新", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/groups
+/// 设置凭据分组标记
+pub async fn set_credential_groups(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetCredentialGroupsRequest>,
+) -> impl IntoResponse {
+    match state.service.set_groups(id, payload) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 分组标记已更新", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

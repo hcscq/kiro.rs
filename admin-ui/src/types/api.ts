@@ -25,6 +25,7 @@ export interface CredentialStatusItem {
   subscriptionType?: string | null
   authAccountType?: 'social' | 'builder-id' | 'enterprise' | 'idc' | string | null
   accountType?: string | null
+  credentialGroups: string[]
   sourceSupplierId?: string | null
   sourceSupplierName?: string | null
   sourceBatch?: string | null
@@ -180,6 +181,10 @@ export interface SetCredentialSourceRequest {
   sourceBatch?: string | null
 }
 
+export interface SetCredentialGroupsRequest {
+  credentialGroups: string[]
+}
+
 export type CredentialProxyMode = 'auto' | 'pool' | 'custom' | 'direct' | 'global'
 
 export interface SetCredentialProxyRequest {
@@ -231,6 +236,7 @@ export interface AddCredentialRequest {
   email?: string
   userId?: string
   accountType?: string
+  credentialGroups?: string[]
   sourceSupplierId?: string
   sourceSupplierName?: string
   sourceBatch?: string
@@ -275,6 +281,7 @@ export interface StartIdcDeviceLoginRequest {
   maxConcurrency?: number
   machineId?: string
   accountType?: string
+  credentialGroups?: string[]
   sourceSupplierId?: string
   sourceSupplierName?: string
   sourceBatch?: string
@@ -402,6 +409,7 @@ export interface StartExternalIdpLoginRequest {
   apiRegion?: string
   machineId?: string
   accountType?: string
+  credentialGroups?: string[]
   sourceSupplierId?: string
   sourceSupplierName?: string
   sourceBatch?: string

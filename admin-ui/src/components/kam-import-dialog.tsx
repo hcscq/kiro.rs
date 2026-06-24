@@ -19,6 +19,7 @@ import {
   collectSourceSupplierSuggestions,
   formatDefaultSourceBatch,
 } from '@/lib/source-metadata'
+import { normalizeCredentialGroups } from '@/lib/credential-groups'
 
 interface KamImportDialogProps {
   open: boolean
@@ -43,6 +44,8 @@ interface KamAccount {
   source_supplier_id?: string
   source_supplier_name?: string
   source_batch?: string
+  credentialGroups?: string[] | string
+  credential_groups?: string[] | string
   availableModelIds?: string[]
   availableModels?: unknown[]
   models?: unknown[]
@@ -82,6 +85,8 @@ interface KamAccount {
     source_supplier_id?: string
     source_supplier_name?: string
     source_batch?: string
+    credentialGroups?: string[] | string
+    credential_groups?: string[] | string
     maxConcurrency?: number
     rateLimitCooldownEnabled?: boolean
     rateLimitBucketCapacity?: number
@@ -156,6 +161,16 @@ function getKamSourceString(
     getAliasedString(account.credentials, key, snakeKey) ??
     getAliasedString(account, key, snakeKey)
   )
+}
+
+function getKamCredentialGroups(account: KamAccount, fallback: string[]): string[] {
+  const groups = normalizeCredentialGroups(
+    account.credentials.credentialGroups ??
+      account.credentials.credential_groups ??
+      account.credentialGroups ??
+      account.credential_groups
+  )
+  return groups.length ? groups : fallback
 }
 
 function getKamDispatchNumber(
@@ -301,6 +316,12 @@ function normalizeKamAccount(item: unknown): unknown {
     const sourceSupplierId = getAliasedString(obj, 'sourceSupplierId', 'source_supplier_id')
     const sourceSupplierName = getAliasedString(obj, 'sourceSupplierName', 'source_supplier_name')
     const sourceBatch = getAliasedString(obj, 'sourceBatch', 'source_batch')
+    const credentialGroups =
+      Array.isArray(obj.credentialGroups) || typeof obj.credentialGroups === 'string'
+        ? (obj.credentialGroups as string[] | string)
+        : Array.isArray(obj.credential_groups) || typeof obj.credential_groups === 'string'
+          ? (obj.credential_groups as string[] | string)
+          : undefined
     const availableModelIds = Array.isArray(obj.availableModelIds)
       ? obj.availableModelIds.filter((value): value is string => typeof value === 'string')
       : undefined
@@ -345,6 +366,7 @@ function normalizeKamAccount(item: unknown): unknown {
       sourceSupplierId,
       sourceSupplierName,
       sourceBatch,
+      credentialGroups,
       availableModelIds,
       availableModels,
       models,
@@ -372,6 +394,7 @@ function normalizeKamAccount(item: unknown): unknown {
         sourceSupplierId,
         sourceSupplierName,
         sourceBatch,
+        credentialGroups,
         priority,
         rateLimitCooldownEnabled,
         proxyId,
@@ -449,6 +472,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     useState<RateLimitCooldownMode>('global')
   const [defaultSourceSupplierName, setDefaultSourceSupplierName] = useState('')
   const [defaultSourceBatch, setDefaultSourceBatch] = useState(() => formatDefaultSourceBatch())
+  const [defaultCredentialGroups, setDefaultCredentialGroups] = useState('')
   const [defaultProxyMode, setDefaultProxyMode] = useState<CredentialProxyMode>('auto')
   const [defaultProxyId, setDefaultProxyId] = useState('')
   const [defaultProxyUrl, setDefaultProxyUrl] = useState('')
@@ -502,6 +526,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     setDefaultRateLimitCooldownMode('global')
     setDefaultSourceSupplierName('')
     setDefaultSourceBatch(formatDefaultSourceBatch())
+    setDefaultCredentialGroups('')
     setDefaultProxyMode('auto')
     setDefaultProxyId('')
     setDefaultProxyUrl('')
@@ -565,6 +590,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     }
     const defaultSourceSupplierNameValue = defaultSourceSupplierName.trim()
     const defaultSourceBatchValue = defaultSourceBatch.trim()
+    const defaultCredentialGroupValues = normalizeCredentialGroups(defaultCredentialGroups)
 
     try {
 
@@ -708,6 +734,10 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           const sourceBatch =
             getKamSourceString(account, 'sourceBatch', 'source_batch') ??
             (defaultSourceBatchValue || undefined)
+          const credentialGroupValues = getKamCredentialGroups(
+            account,
+            defaultCredentialGroupValues
+          )
 
           if (authMethod === 'idc' && (!clientId || !clientSecret)) {
             throw new Error('idc 模式需要同时提供 clientId 和 clientSecret')
@@ -785,6 +815,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             sourceSupplierId,
             sourceSupplierName,
             sourceBatch,
+            credentialGroups: credentialGroupValues.length ? credentialGroupValues : undefined,
             availableModelIds: availableModelIds.length > 0 ? availableModelIds : undefined,
             maxConcurrency,
             rateLimitCooldownEnabled,
@@ -1010,6 +1041,25 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
               <div className="flex items-center justify-between gap-3">
                 <div className="flex items-center gap-2 text-sm font-medium">
                   <Tags className="h-4 w-4 text-muted-foreground" />
+                  默认凭据分组
+                </div>
+                <span className="text-xs text-muted-foreground">KAM 单账号 credentialGroups 优先</span>
+              </div>
+              <Input
+                id="kamDefaultCredentialGroups"
+                placeholder="default, low-cost, stable"
+                value={defaultCredentialGroups}
+                onChange={(e) => setDefaultCredentialGroups(e.target.value)}
+                disabled={importing}
+              />
+              <p className="text-xs text-muted-foreground">
+                多个分组可用逗号、空格或换行分隔；留空时后端按 default 兼容处理。
+              </p>
+            </div>
+            <div className="space-y-3 rounded-md border p-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2 text-sm font-medium">
+                  <Tags className="h-4 w-4 text-muted-foreground" />
                   默认来源标记
                 </div>
                 <span className="text-xs text-muted-foreground">KAM 单账号来源字段优先</span>
@@ -1148,7 +1198,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             </div>
             <textarea
               ref={jsonInputRef}
-              placeholder={'粘贴 Kiro Account Manager 导出的 JSON\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "userId": "...",\n    "provider": "Enterprise",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "eu-central-1",\n    "authRegion": "us-east-1",\n    "startUrl": "https://example.awsapps.com/start",\n    "accountType": "power",\n    "sourceSupplierName": "供应商A",\n    "sourceBatch": "20260618211",\n    "maxConcurrency": 20,\n    "rateLimitCooldownEnabled": true\n  }\n]\n\n（可选的 authMethod 字段会被忽略，系统会根据 clientId/clientSecret 自动判断；未提供 authRegion 时，Enterprise 默认使用 us-east-1 进行 OIDC 刷新）\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "provider": "Enterprise",\n      "sourceSupplierName": "供应商A",\n      "sourceBatch": "20260618211",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "eu-central-1",\n        "authRegion": "us-east-1",\n        "startUrl": "https://example.awsapps.com/start"\n      }\n    }\n  ]\n}'}
+              placeholder={'粘贴 Kiro Account Manager 导出的 JSON\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "userId": "...",\n    "provider": "Enterprise",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "eu-central-1",\n    "authRegion": "us-east-1",\n    "startUrl": "https://example.awsapps.com/start",\n    "accountType": "power",\n    "sourceSupplierName": "供应商A",\n    "sourceBatch": "20260618211",\n    "credentialGroups": ["stable"],\n    "maxConcurrency": 20,\n    "rateLimitCooldownEnabled": true\n  }\n]\n\n（可选的 authMethod 字段会被忽略，系统会根据 clientId/clientSecret 自动判断；未提供 authRegion 时，Enterprise 默认使用 us-east-1 进行 OIDC 刷新）\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "provider": "Enterprise",\n      "sourceSupplierName": "供应商A",\n      "sourceBatch": "20260618211",\n      "credentialGroups": ["stable"],\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "eu-central-1",\n        "authRegion": "us-east-1",\n        "startUrl": "https://example.awsapps.com/start"\n      }\n    }\n  ]\n}'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}

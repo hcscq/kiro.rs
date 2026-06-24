@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::common::auth::{ApiKeyAuthEntry, CredentialGroupScope, normalize_credential_groups};
+
 use super::model_policy::{
     AccountTypeDispatchPolicy, ModelSupportPolicy, normalize_account_type_dispatch_policies,
     normalize_account_type_policies,
@@ -619,6 +621,21 @@ impl ProxyPoolConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiKeyConfig {
+    /// API key 标识，仅用于日志与调度亲和隔离，不会暴露明文 key
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+
+    /// 客户端认证使用的 API key
+    pub key: String,
+
+    /// 该 API key 可使用的凭据分组
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_credential_groups: Vec<String>,
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -665,6 +682,10 @@ pub struct Config {
 
     #[serde(default)]
     pub api_key: Option<String>,
+
+    /// 多 API key 配置。每个 key 可绑定一个或多个凭据分组。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub api_keys: Vec<ApiKeyConfig>,
 
     #[serde(default = "default_system_version")]
     pub system_version: String,
@@ -1166,6 +1187,7 @@ impl Default for Config {
             kiro_version: default_kiro_version(),
             machine_id: None,
             api_key: None,
+            api_keys: Vec::new(),
             system_version: default_system_version(),
             node_version: default_node_version(),
             tls_backend: default_tls_backend(),
@@ -1341,6 +1363,7 @@ impl Config {
             anyhow::bail!("healthPort 不能与 port 相同");
         }
 
+        self.validate_api_keys()?;
         if self.suspicious_activity_auto_disable_enabled
             && self.suspicious_activity_auto_disable_threshold == 0
         {
@@ -1371,6 +1394,114 @@ impl Config {
     fn normalize(&mut self) {
         normalize_account_type_policies(&mut self.account_type_policies);
         normalize_account_type_dispatch_policies(&mut self.account_type_dispatch_policies);
+        for api_key in &mut self.api_keys {
+            api_key.id = api_key
+                .id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            api_key.key = api_key.key.trim().to_string();
+            api_key.allowed_credential_groups =
+                normalize_credential_groups(&api_key.allowed_credential_groups);
+        }
+    }
+
+    fn validate_api_keys(&self) -> anyhow::Result<()> {
+        let mut ids = std::collections::BTreeSet::new();
+        let mut keys = std::collections::BTreeSet::new();
+
+        if let Some(api_key) = self.api_key.as_deref() {
+            if api_key.trim().is_empty() {
+                anyhow::bail!("apiKey 不能为空字符串");
+            }
+            keys.insert(api_key.trim().to_string());
+        }
+
+        for (index, api_key) in self.api_keys.iter().enumerate() {
+            let key_name = format!("apiKeys[{index}]");
+            if api_key.key.trim().is_empty() {
+                anyhow::bail!("{key_name}.key 不能为空字符串");
+            }
+
+            let id = api_key
+                .id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("api-key-{}", index + 1));
+            if !ids.insert(id.clone()) {
+                anyhow::bail!("apiKeys 中存在重复 id: {id}");
+            }
+
+            if !keys.insert(api_key.key.trim().to_string()) {
+                anyhow::bail!("apiKeys 中存在重复 key");
+            }
+
+            if normalize_credential_groups(&api_key.allowed_credential_groups).is_empty() {
+                anyhow::bail!("{key_name}.allowedCredentialGroups 至少需要一个有效分组");
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn api_key_auth_entries(&self) -> anyhow::Result<Vec<ApiKeyAuthEntry>> {
+        let mut entries = Vec::new();
+
+        if let Some(key) = self
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            entries.push(ApiKeyAuthEntry {
+                id: "legacy".to_string(),
+                key: key.to_string(),
+                credential_group_scope: CredentialGroupScope::all(),
+            });
+        }
+
+        for (index, api_key) in self.api_keys.iter().enumerate() {
+            let key = api_key.key.trim();
+            let groups = normalize_credential_groups(&api_key.allowed_credential_groups);
+            if key.is_empty() || groups.is_empty() {
+                continue;
+            }
+            entries.push(ApiKeyAuthEntry {
+                id: api_key
+                    .id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("api-key-{}", index + 1)),
+                key: key.to_string(),
+                credential_group_scope: CredentialGroupScope::Groups(groups),
+            });
+        }
+
+        if entries.is_empty() {
+            anyhow::bail!("配置文件中未设置 apiKey 或 apiKeys");
+        }
+
+        Ok(entries)
+    }
+
+    pub fn primary_api_key_material(&self) -> Option<String> {
+        self.api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                self.api_keys
+                    .iter()
+                    .map(|entry| entry.key.trim())
+                    .find(|value| !value.is_empty())
+                    .map(str::to_string)
+            })
     }
 
     pub fn resolved_instance_id(&self) -> String {
@@ -1441,9 +1572,10 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, ConversionRuntimeConfig, KiroRequestBodyGuardConfig, RequestWeightingConfig,
-        ServerWebToolsMode, ThinkingSignatureValidationMode,
+        ApiKeyConfig, Config, ConversionRuntimeConfig, KiroRequestBodyGuardConfig,
+        RequestWeightingConfig, ServerWebToolsMode, ThinkingSignatureValidationMode,
     };
+    use crate::common::auth::CredentialGroupScope;
 
     #[test]
     fn validate_rejects_invalid_redis_runtime_coordination_timing() {
@@ -1454,6 +1586,44 @@ mod tests {
         let err = config.validate().unwrap_err().to_string();
 
         assert!(err.contains("stateRedisHeartbeatIntervalSecs"));
+    }
+
+    #[test]
+    fn api_key_auth_entries_keep_legacy_key_full_scope() {
+        let mut config = Config::default();
+        config.api_key = Some(" legacy-key ".to_string());
+        config.api_keys = vec![ApiKeyConfig {
+            id: Some("cheap".to_string()),
+            key: " scoped-key ".to_string(),
+            allowed_credential_groups: vec!["LOW-COST".to_string(), "stable".to_string()],
+        }];
+
+        let entries = config.api_key_auth_entries().unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, "legacy");
+        assert_eq!(entries[0].key, "legacy-key");
+        assert_eq!(entries[0].credential_group_scope, CredentialGroupScope::All);
+        assert_eq!(entries[1].id, "cheap");
+        assert_eq!(entries[1].key, "scoped-key");
+        assert_eq!(
+            entries[1].credential_group_scope,
+            CredentialGroupScope::Groups(vec!["low-cost".to_string(), "stable".to_string()])
+        );
+    }
+
+    #[test]
+    fn validate_rejects_api_key_without_valid_groups() {
+        let mut config = Config::default();
+        config.api_keys = vec![ApiKeyConfig {
+            id: Some("empty".to_string()),
+            key: "scoped-key".to_string(),
+            allowed_credential_groups: vec!["  ".to_string()],
+        }];
+
+        let err = config.validate().unwrap_err().to_string();
+
+        assert!(err.contains("allowedCredentialGroups"));
     }
 
     #[test]

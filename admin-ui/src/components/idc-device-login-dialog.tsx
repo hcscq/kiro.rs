@@ -49,6 +49,7 @@ import {
   persistCredentialDefaultsDraft,
   readCredentialDefaultsDraft,
 } from '@/lib/credential-defaults'
+import { normalizeCredentialGroups } from '@/lib/credential-groups'
 import type {
   CredentialProxyMode,
   ExternalIdpLoginStartResponse,
@@ -312,6 +313,7 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
   const [sourceSupplierName, setSourceSupplierName] = useState(initialDefaults.sourceSupplierName)
   const [sourceSupplierId, setSourceSupplierId] = useState(initialDefaults.sourceSupplierId)
   const [sourceBatch, setSourceBatch] = useState(initialDefaults.sourceBatch)
+  const [credentialGroups, setCredentialGroups] = useState(initialDefaults.credentialGroups)
   const [proxyMode, setProxyMode] = useState<CredentialProxyMode>(initialDefaults.proxyMode)
   const [proxyId, setProxyId] = useState(initialDefaults.proxyId)
   const [proxyUrl, setProxyUrl] = useState(initialDefaults.proxyUrl)
@@ -365,6 +367,7 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
     setSourceSupplierName(defaults.sourceSupplierName)
     setSourceSupplierId(defaults.sourceSupplierId)
     setSourceBatch(defaults.sourceBatch)
+    setCredentialGroups(defaults.credentialGroups)
     setProxyMode(defaults.proxyMode)
     setProxyId(defaults.proxyId)
     setProxyUrl(defaults.proxyUrl)
@@ -459,6 +462,7 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
 
     const proxyPayload = buildProxyPayload(label)
     if (!proxyPayload) return null
+    const normalizedCredentialGroups = normalizeCredentialGroups(credentialGroups)
 
     persistCredentialDefaultsDraft({
       priority: String(parsedPriority),
@@ -466,6 +470,7 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
       sourceSupplierName: sourceSupplierName.trim(),
       sourceSupplierId: sourceSupplierId.trim(),
       sourceBatch: sourceBatch.trim(),
+      credentialGroups: credentialGroups.trim(),
       accountType: accountType.trim(),
       authRegion: region.trim(),
       apiRegion: apiRegion.trim(),
@@ -485,6 +490,7 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
       maxConcurrency: parsedMaxConcurrency,
       machineId: machineId.trim() || undefined,
       accountType: accountType.trim() || undefined,
+      credentialGroups: normalizedCredentialGroups.length ? normalizedCredentialGroups : undefined,
       sourceSupplierId: sourceSupplierId.trim() || undefined,
       sourceSupplierName: sourceSupplierName.trim() || undefined,
       sourceBatch: sourceBatch.trim() || undefined,
@@ -935,6 +941,21 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
                 placeholder="可选"
                 disabled={disabled}
               />
+            </div>
+            <div className="space-y-1.5 sm:col-span-3">
+              <label htmlFor={`${idPrefix}-credential-groups`} className="text-xs font-medium text-muted-foreground">
+                凭据分组
+              </label>
+              <Input
+                id={`${idPrefix}-credential-groups`}
+                value={credentialGroups}
+                onChange={(event) => setCredentialGroups(event.target.value)}
+                placeholder="default, low-cost, stable"
+                disabled={disabled}
+              />
+              <p className="text-[10px] text-muted-foreground">
+                多个分组可用逗号、空格或换行分隔；留空时按 default 兼容处理。
+              </p>
             </div>
           </div>
 

@@ -28,6 +28,7 @@ use serde_json::{Value, json};
 use url::Url;
 use uuid::Uuid;
 
+use crate::common::auth::ApiKeyAuthContext;
 use crate::common::logging::summarize_text_for_log;
 use crate::model::config::ServerWebToolsMode;
 use crate::token;
@@ -157,6 +158,7 @@ pub async fn handle_server_web_tool_request(
     probe: UpstreamProbe,
     request_id: &str,
     structured_output: Option<JsonSchemaOutput>,
+    api_key_context: Option<ApiKeyAuthContext>,
 ) -> Response {
     let mode = provider.server_web_tools_mode();
     if mode == ServerWebToolsMode::Disabled {
@@ -183,6 +185,7 @@ pub async fn handle_server_web_tool_request(
         probe.clone(),
         request_id,
         mode,
+        api_key_context.clone(),
     )
     .await
     {
@@ -199,6 +202,7 @@ pub async fn handle_server_web_tool_request(
             probe,
             request_id,
             output,
+            api_key_context,
         )
         .await;
     }
@@ -223,6 +227,7 @@ async fn execute_server_web_tool_loop(
     probe: UpstreamProbe,
     request_id: &str,
     mode: ServerWebToolsMode,
+    api_key_context: Option<ApiKeyAuthContext>,
 ) -> Result<ServerWebToolRun, Response> {
     let config = validate_server_web_tools(payload, mode)?;
     let mut internal_payload = build_internal_server_web_tool_payload(payload);
@@ -241,6 +246,7 @@ async fn execute_server_web_tool_loop(
             conversion_runtime.clone(),
             probe.clone(),
             Some(round_request_id),
+            api_key_context.clone(),
         )
         .await?;
 
@@ -289,6 +295,7 @@ async fn execute_server_web_tool_loop(
                     block,
                     config.web_search.as_ref(),
                     web_search_requests as usize,
+                    api_key_context.clone(),
                 )
                 .await;
                 web_fetch_requests += execution.web_fetch_requests;
@@ -372,6 +379,7 @@ async fn execute_server_web_tool_loop(
         conversion_runtime,
         probe,
         Some(synthesis_request_id.clone()),
+        api_key_context,
     )
     .await
     {
@@ -973,6 +981,7 @@ async fn execute_web_search_tool(
     tool_use: &serde_json::Value,
     config: Option<&WebSearchConfig>,
     completed_uses: usize,
+    api_key_context: Option<ApiKeyAuthContext>,
 ) -> ServerToolExecution {
     let internal_tool_use_id = tool_use
         .get("id")
@@ -993,7 +1002,7 @@ async fn execute_web_search_tool(
     let outcome = if max_uses_exceeded {
         websearch::WebSearchOutcome::Unavailable("web_search max_uses exceeded".to_string())
     } else if performed_request {
-        let outcome = websearch::perform_web_search(provider, query).await;
+        let outcome = websearch::perform_web_search(provider, query, api_key_context).await;
         match config {
             Some(config) => filter_web_search_outcome(outcome, config),
             None => outcome,
@@ -1414,6 +1423,7 @@ async fn finalize_structured_server_web_tool_response(
     probe: UpstreamProbe,
     request_id: &str,
     output: JsonSchemaOutput,
+    api_key_context: Option<ApiKeyAuthContext>,
 ) -> Response {
     let structured_started_at = Instant::now();
     let stats = structured_outputs::schema_stats(&output.schema);
@@ -1484,6 +1494,7 @@ async fn finalize_structured_server_web_tool_response(
                     conversion_runtime.clone(),
                     probe.clone(),
                     Some(repair_request_id),
+                    api_key_context.clone(),
                 )
                 .await
                 {

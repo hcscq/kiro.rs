@@ -375,6 +375,7 @@ fn retryable_credential_admin_action(path: &str) -> bool {
                 | "rate-limit-config"
                 | "model-policy"
                 | "source"
+                | "groups"
                 | "proxy"
                 | "profile"
                 | "overage"

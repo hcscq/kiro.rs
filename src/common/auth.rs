@@ -6,6 +6,80 @@ use axum::{
 };
 use subtle::ConstantTimeEq;
 
+pub const DEFAULT_CREDENTIAL_GROUP: &str = "default";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialGroupScope {
+    All,
+    Groups(Vec<String>),
+}
+
+impl CredentialGroupScope {
+    pub fn all() -> Self {
+        Self::All
+    }
+
+    pub fn allows_credential_groups(&self, credential_groups: &[String]) -> bool {
+        match self {
+            Self::All => true,
+            Self::Groups(allowed_groups) => {
+                if allowed_groups.is_empty() {
+                    return false;
+                }
+
+                let credential_groups = effective_credential_groups(credential_groups);
+                credential_groups
+                    .iter()
+                    .any(|group| allowed_groups.binary_search(group).is_ok())
+            }
+        }
+    }
+
+    pub fn cache_key_component(&self) -> String {
+        match self {
+            Self::All => "all".to_string(),
+            Self::Groups(groups) => format!("groups:{}", groups.join(",")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiKeyAuthContext {
+    pub id: String,
+    pub credential_group_scope: CredentialGroupScope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiKeyAuthEntry {
+    pub id: String,
+    pub key: String,
+    pub credential_group_scope: CredentialGroupScope,
+}
+
+pub fn normalize_credential_group(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+pub fn normalize_credential_groups(groups: &[String]) -> Vec<String> {
+    let mut groups = groups
+        .iter()
+        .filter_map(|group| normalize_credential_group(group))
+        .collect::<Vec<_>>();
+    groups.sort();
+    groups.dedup();
+    groups
+}
+
+pub fn effective_credential_groups(groups: &[String]) -> Vec<String> {
+    let groups = normalize_credential_groups(groups);
+    if groups.is_empty() {
+        vec![DEFAULT_CREDENTIAL_GROUP.to_string()]
+    } else {
+        groups
+    }
+}
+
 /// 从请求中提取 API Key
 ///
 /// 支持两种认证方式：

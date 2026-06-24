@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
+use crate::common::auth::ApiKeyAuthContext;
 use crate::common::logging::summarize_text_for_log;
+use crate::kiro::provider::RequestOptions;
 
 #[cfg(test)]
 use super::stream::SseEvent;
@@ -639,6 +641,7 @@ pub(crate) fn generate_search_summary(query: &str, outcome: &WebSearchOutcome) -
 async fn call_mcp_api(
     provider: &crate::kiro::provider::KiroProvider,
     request: &McpRequest,
+    api_key_context: Option<ApiKeyAuthContext>,
 ) -> anyhow::Result<McpResponse> {
     let request_body = serde_json::to_string(request)?;
 
@@ -649,7 +652,19 @@ async fn call_mcp_api(
         "MCP request prepared"
     );
 
-    let response = provider.call_mcp(&request_body).await?;
+    let response = provider
+        .call_mcp_with_options(
+            &request_body,
+            RequestOptions {
+                request_id: Some(request.id.clone()),
+                credential_group_scope: api_key_context
+                    .as_ref()
+                    .map(|context| context.credential_group_scope.clone()),
+                api_key_id: api_key_context.as_ref().map(|context| context.id.clone()),
+                ..RequestOptions::default()
+            },
+        )
+        .await?;
 
     let body = response.text().await?;
     tracing::debug!(
@@ -675,10 +690,11 @@ async fn call_mcp_api(
 pub(crate) async fn perform_web_search(
     provider: &crate::kiro::provider::KiroProvider,
     query: &str,
+    api_key_context: Option<ApiKeyAuthContext>,
 ) -> WebSearchOutcome {
     let (_, mcp_request) = create_mcp_request(query);
 
-    match call_mcp_api(provider, &mcp_request).await {
+    match call_mcp_api(provider, &mcp_request, api_key_context).await {
         Ok(response) => match parse_search_results_checked(&response) {
             Ok(results) => {
                 if let Some(error) = results.error.as_deref().filter(|e| !e.trim().is_empty()) {

@@ -18,6 +18,7 @@ import {
   Server,
   ShieldCheck,
   Shuffle,
+  Tags,
   Trash2,
   UserRound,
   Wallet,
@@ -65,6 +66,7 @@ import {
   useClearCredentialSuspiciousActivity,
   useSetCredentialModelPolicy,
   useSetCredentialSource,
+  useSetCredentialGroups,
   useSetCredentialProxy,
   useCredentialProfiles,
   useSetCredentialProfile,
@@ -77,6 +79,7 @@ import {
   useLoadBalancingMode,
 } from '@/hooks/use-credentials'
 import { getCredentialLabel, getCredentialLabelWithId } from '@/lib/credential-label'
+import { formatCredentialGroupsInput, normalizeCredentialGroups } from '@/lib/credential-groups'
 import { cn } from '@/lib/utils'
 
 interface CredentialCardProps {
@@ -405,6 +408,9 @@ export function CredentialCard({
     credential.sourceSupplierId ?? ''
   )
   const [sourceBatchValue, setSourceBatchValue] = useState(credential.sourceBatch ?? '')
+  const [credentialGroupsValue, setCredentialGroupsValue] = useState(
+    formatCredentialGroupsInput(credential.credentialGroups ?? [])
+  )
   const [allowedModelsValue, setAllowedModelsValue] = useState(credential.allowedModels ?? [])
   const [blockedModelsValue, setBlockedModelsValue] = useState(credential.blockedModels ?? [])
   const [clearRuntimeModelRestrictions, setClearRuntimeModelRestrictions] = useState(false)
@@ -423,6 +429,7 @@ export function CredentialCard({
   const clearSuspiciousActivity = useClearCredentialSuspiciousActivity()
   const setModelPolicy = useSetCredentialModelPolicy()
   const setSource = useSetCredentialSource()
+  const setGroups = useSetCredentialGroups()
   const setProxy = useSetCredentialProxy()
   const profileQuery = useCredentialProfiles(credential.id, showModelPolicyDialog)
   const setProfile = useSetCredentialProfile()
@@ -536,6 +543,7 @@ export function CredentialCard({
     setSourceSupplierNameValue(credential.sourceSupplierName ?? '')
     setSourceSupplierIdValue(credential.sourceSupplierId ?? '')
     setSourceBatchValue(credential.sourceBatch ?? '')
+    setCredentialGroupsValue(formatCredentialGroupsInput(credential.credentialGroups ?? []))
     setAllowedModelsValue(credential.allowedModels ?? [])
     setBlockedModelsValue(credential.blockedModels ?? [])
     setClearRuntimeModelRestrictions(false)
@@ -590,6 +598,7 @@ export function CredentialCard({
     setProfile.isPending ||
     setModelPolicy.isPending ||
     setSource.isPending ||
+    setGroups.isPending ||
     setProxy.isPending
 
   const handleProxySave = async () => {
@@ -775,6 +784,18 @@ export function CredentialCard({
         changed = true
       }
 
+      const currentCredentialGroups = normalizeCredentialGroups(credential.credentialGroups ?? [])
+      const targetCredentialGroups = normalizeCredentialGroups(credentialGroupsValue)
+      const groupsChanged =
+        JSON.stringify(currentCredentialGroups) !== JSON.stringify(targetCredentialGroups)
+      if (groupsChanged) {
+        await setGroups.mutateAsync({
+          id: credential.id,
+          payload: { credentialGroups: targetCredentialGroups },
+        })
+        changed = true
+      }
+
       if (changed) {
         toast.success('配置已保存')
       } else {
@@ -889,6 +910,11 @@ export function CredentialCard({
     .join(' / ')
   const sourceBatchLabel = credential.sourceBatch?.trim() || null
   const hasSourceMetadata = Boolean(sourceSupplierLabel || sourceBatchLabel)
+  const effectiveCredentialGroups = normalizeCredentialGroups(credential.credentialGroups ?? [])
+  const credentialGroupLabels = effectiveCredentialGroups.length
+    ? effectiveCredentialGroups
+    : ['default']
+  const credentialGroupTitle = `凭据分组：${credentialGroupLabels.join(', ')}`
 
   return (
     <>
@@ -1138,6 +1164,15 @@ export function CredentialCard({
                 批次: {sourceBatchLabel}
               </Badge>
             )}
+            <Badge
+              variant="secondary"
+              className="max-w-full truncate px-1.5 py-0 text-[10px]"
+              title={credentialGroupTitle}
+            >
+              <Tags className="mr-1 h-3 w-3 shrink-0" />
+              分组: {credentialGroupLabels.slice(0, 3).join(', ')}
+              {credentialGroupLabels.length > 3 ? ` +${credentialGroupLabels.length - 3}` : ''}
+            </Badge>
             {!hasSourceMetadata && (
               <Badge variant="outline" className="px-1.5 py-0 text-[10px] text-muted-foreground">
                 来源未标记
@@ -1447,6 +1482,22 @@ export function CredentialCard({
                 </div>
               </div>
               <p className="text-[10px] text-muted-foreground">留空并保存会清除对应来源字段。</p>
+            </div>
+
+            {/* 凭据分组配置区 */}
+            <div className="space-y-2 rounded-lg border p-3 bg-muted/5">
+              <div className="text-sm font-medium text-foreground">凭据分组</div>
+              <Input
+                id={`credential-groups-${credential.id}`}
+                value={credentialGroupsValue}
+                onChange={(e) => setCredentialGroupsValue(e.target.value)}
+                className="h-9 text-sm"
+                placeholder="default, low-cost, stable"
+                disabled={isSaving}
+              />
+              <p className="text-[10px] text-muted-foreground">
+                多个分组可用逗号、空格或换行分隔；留空表示按 default 兼容分组参与匹配。
+              </p>
             </div>
 
             {/* Profile 选择配置区 */}

@@ -25,6 +25,7 @@ import {
   readCredentialDefaultsDraft,
   resetCredentialDefaultsDraft,
 } from '@/lib/credential-defaults'
+import { normalizeCredentialGroups } from '@/lib/credential-groups'
 
 interface BatchImportDialogProps {
   open: boolean
@@ -57,6 +58,8 @@ interface CredentialInput {
   source_supplier_id?: string
   source_supplier_name?: string
   source_batch?: string
+  credentialGroups?: string[] | string
+  credential_groups?: string[] | string
   availableModelIds?: string[]
   maxConcurrency?: number
   rateLimitCooldownEnabled?: boolean
@@ -149,6 +152,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
   const [defaultSourceSupplierName, setDefaultSourceSupplierName] = useState(defaultDraft.sourceSupplierName)
   const [defaultSourceSupplierId, setDefaultSourceSupplierId] = useState(defaultDraft.sourceSupplierId)
   const [defaultSourceBatch, setDefaultSourceBatch] = useState(defaultDraft.sourceBatch)
+  const [defaultCredentialGroups, setDefaultCredentialGroups] = useState(defaultDraft.credentialGroups)
   const [defaultProxyMode, setDefaultProxyMode] = useState<CredentialProxyMode>(defaultDraft.proxyMode)
   const [defaultProxyId, setDefaultProxyId] = useState(defaultDraft.proxyId)
   const [defaultProxyUrl, setDefaultProxyUrl] = useState(defaultDraft.proxyUrl)
@@ -211,6 +215,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     setDefaultSourceSupplierName(resetDraft.sourceSupplierName)
     setDefaultSourceSupplierId(resetDraft.sourceSupplierId)
     setDefaultSourceBatch(resetDraft.sourceBatch)
+    setDefaultCredentialGroups(resetDraft.credentialGroups)
     setDefaultProxyMode(resetDraft.proxyMode)
     setDefaultProxyId(resetDraft.proxyId)
     setDefaultProxyUrl(resetDraft.proxyUrl)
@@ -270,6 +275,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     const defaultSourceSupplierNameValue = defaultSourceSupplierName.trim()
     const defaultSourceSupplierIdValue = defaultSourceSupplierId.trim()
     const defaultSourceBatchValue = defaultSourceBatch.trim()
+    const defaultCredentialGroupValues = normalizeCredentialGroups(defaultCredentialGroups)
 
     try {
       persistCredentialDefaultsDraft({
@@ -279,6 +285,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
         sourceSupplierName: defaultSourceSupplierNameValue,
         sourceSupplierId: defaultSourceSupplierIdValue,
         sourceBatch: defaultSourceBatchValue,
+        credentialGroups: defaultCredentialGroups.trim(),
         proxyMode: defaultProxyMode,
         proxyId: defaultProxyId.trim(),
         proxyUrl: defaultProxyUrl.trim(),
@@ -379,6 +386,9 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           const apiRegion = cred.apiRegion?.trim() || region || undefined
           const startUrl = cred.startUrl?.trim() || undefined
           const profileArn = cred.profileArn?.trim() || undefined
+          const credentialGroupValues = normalizeCredentialGroups(
+            cred.credentialGroups ?? cred.credential_groups ?? defaultCredentialGroupValues
+          )
 
           if (authMethod === 'idc' && (!clientId || !clientSecret)) {
             throw new Error('idc 模式需要同时提供 clientId 和 clientSecret')
@@ -501,6 +511,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             availableModelIds: Array.isArray(cred.availableModelIds)
               ? cred.availableModelIds.filter(modelId => typeof modelId === 'string' && modelId.trim())
               : undefined,
+            credentialGroups: credentialGroupValues.length ? credentialGroupValues : undefined,
             maxConcurrency:
               typeof cred.maxConcurrency === 'number'
                 ? cred.maxConcurrency
@@ -729,6 +740,25 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               <div className="flex items-center justify-between gap-3">
                 <div className="flex items-center gap-2 text-sm font-medium">
                   <Tags className="h-4 w-4 text-muted-foreground" />
+                  默认凭据分组
+                </div>
+                <span className="text-xs text-muted-foreground">JSON 单条 credentialGroups 优先</span>
+              </div>
+              <Input
+                id="batchDefaultCredentialGroups"
+                placeholder="default, low-cost, stable"
+                value={defaultCredentialGroups}
+                onChange={(e) => setDefaultCredentialGroups(e.target.value)}
+                disabled={importing}
+              />
+              <p className="text-xs text-muted-foreground">
+                多个分组可用逗号、空格或换行分隔；留空时后端按 default 兼容处理。
+              </p>
+            </div>
+            <div className="space-y-3 rounded-md border p-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2 text-sm font-medium">
+                  <Tags className="h-4 w-4 text-muted-foreground" />
                   默认来源标记
                 </div>
                 <span className="text-xs text-muted-foreground">JSON 单条来源字段优先</span>
@@ -886,7 +916,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               className="flex min-h-[200px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
             />
             <p className="text-xs text-muted-foreground">
-              支持附带 `email`、`userId`、`provider`、`authMethod`、`startUrl`、`issuerUrl`、`tokenEndpoint`、`scopes`、`accountType`、`sourceSupplierName`、`sourceSupplierId`、`sourceBatch`、`availableModelIds`、`maxConcurrency`、`rateLimitCooldownEnabled`、`rateLimitBucketCapacity`、`rateLimitRefillPerSecond`。
+              支持附带 `email`、`userId`、`provider`、`authMethod`、`startUrl`、`issuerUrl`、`tokenEndpoint`、`scopes`、`accountType`、`credentialGroups`、`sourceSupplierName`、`sourceSupplierId`、`sourceBatch`、`availableModelIds`、`maxConcurrency`、`rateLimitCooldownEnabled`、`rateLimitBucketCapacity`、`rateLimitRefillPerSecond`。
               导入时会自动验活，失败的凭据会被排除。
             </p>
           </div>

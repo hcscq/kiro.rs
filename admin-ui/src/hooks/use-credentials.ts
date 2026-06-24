@@ -6,6 +6,7 @@ import {
   setCredentialRateLimitConfig,
   setCredentialModelPolicy,
   setCredentialSource,
+  setCredentialGroups,
   setCredentialProxy,
   getCredentialProfiles,
   setCredentialProfile,
@@ -28,6 +29,7 @@ import type {
   CredentialsStatusResponse,
   SetCredentialModelPolicyRequest,
   SetCredentialSourceRequest,
+  SetCredentialGroupsRequest,
   SetCredentialProxyRequest,
   SetCredentialProfileRequest,
   UpdateLoadBalancingConfigRequest,
@@ -164,6 +166,30 @@ export function useSetCredentialSource() {
     mutationFn: ({ id, payload }: { id: number; payload: SetCredentialSourceRequest }) =>
       setCredentialSource(id, payload),
     onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 设置凭据分组标记
+export function useSetCredentialGroups() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, payload }: { id: number; payload: SetCredentialGroupsRequest }) =>
+      setCredentialGroups(id, payload),
+    onSuccess: (_response, { id, payload }) => {
+      queryClient.setQueryData<CredentialsStatusResponse>(['credentials'], (current) => {
+        if (!current) return current
+
+        return {
+          ...current,
+          credentials: current.credentials.map((credential) =>
+            credential.id === id
+              ? { ...credential, credentialGroups: payload.credentialGroups }
+              : credential
+          ),
+        }
+      })
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
   })

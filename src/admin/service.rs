@@ -31,10 +31,10 @@ use super::types::{
     IdcDeviceLoginStartResponse, IdcDeviceLoginStatus, IdcDeviceLoginStatusResponse,
     LoadBalancingModeResponse, ModelCapabilitiesConfigResponse, ModelCatalogItemResponse,
     ModelCatalogResponse, ProxyPoolConfigResponse, ProxyPoolEntryResponse,
-    SetCredentialModelPolicyRequest, SetCredentialProfileRequest, SetCredentialProxyRequest,
-    SetCredentialSourceRequest, SetLoadBalancingModeRequest, SetModelCapabilitiesConfigRequest,
-    StandardAccountTypePresetResponse, StartExternalIdpLoginRequest, StartIdcDeviceLoginRequest,
-    SubmitExternalIdpCallbackRequest,
+    SetCredentialGroupsRequest, SetCredentialModelPolicyRequest, SetCredentialProfileRequest,
+    SetCredentialProxyRequest, SetCredentialSourceRequest, SetLoadBalancingModeRequest,
+    SetModelCapabilitiesConfigRequest, StandardAccountTypePresetResponse,
+    StartExternalIdpLoginRequest, StartIdcDeviceLoginRequest, SubmitExternalIdpCallbackRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -946,6 +946,7 @@ impl AdminService {
                     source_supplier_id: entry.source_supplier_id,
                     source_supplier_name: entry.source_supplier_name,
                     source_batch: entry.source_batch,
+                    credential_groups: entry.credential_groups,
                     resolved_account_type: entry.resolved_account_type,
                     account_type_source: entry.account_type_source,
                     standard_account_type,
@@ -3023,6 +3024,7 @@ impl AdminService {
             source_supplier_id: req.source_supplier_id.clone(),
             source_supplier_name: req.source_supplier_name.clone(),
             source_batch: req.source_batch.clone(),
+            credential_groups: req.credential_groups.clone(),
             allowed_models: None,
             blocked_models: None,
             available_model_ids: None,
@@ -3069,6 +3071,7 @@ impl AdminService {
             source_supplier_id: req.source_supplier_id.clone(),
             source_supplier_name: req.source_supplier_name.clone(),
             source_batch: req.source_batch.clone(),
+            credential_groups: req.credential_groups.clone(),
             allowed_models: None,
             blocked_models: None,
             available_model_ids: None,
@@ -3172,6 +3175,18 @@ impl AdminService {
                 req.source_supplier_name,
                 req.source_batch,
             )
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    pub fn set_groups(
+        &self,
+        id: u64,
+        req: SetCredentialGroupsRequest,
+    ) -> Result<(), AdminServiceError> {
+        self.ensure_runtime_write_leader()?;
+
+        self.token_manager
+            .set_credential_groups(id, req.credential_groups)
             .map_err(|e| self.classify_error(e, id))
     }
 
@@ -3472,6 +3487,10 @@ impl AdminService {
             source_supplier_id: req.source_supplier_id,
             source_supplier_name: req.source_supplier_name,
             source_batch: req.source_batch,
+            credential_groups: req
+                .credential_groups
+                .map(|groups| crate::common::auth::normalize_credential_groups(&groups))
+                .unwrap_or_default(),
             allowed_models: req.allowed_models.unwrap_or_default(),
             blocked_models: req.blocked_models.unwrap_or_default(),
             runtime_model_restrictions: Vec::new(),
@@ -4224,6 +4243,7 @@ mod tests {
                 max_concurrency: None,
                 machine_id: None,
                 account_type: None,
+                credential_groups: None,
                 source_supplier_id: None,
                 source_supplier_name: None,
                 source_batch: None,
@@ -4682,6 +4702,7 @@ mod tests {
                 max_concurrency: None,
                 machine_id: None,
                 account_type: None,
+                credential_groups: None,
                 source_supplier_id: None,
                 source_supplier_name: None,
                 source_batch: None,

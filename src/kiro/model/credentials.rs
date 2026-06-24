@@ -9,6 +9,7 @@ use std::borrow::Cow;
 use std::fs;
 use std::path::Path;
 
+use crate::common::auth::normalize_credential_groups;
 use crate::http_client::ProxyConfig;
 use crate::model::account_type_preset::{
     infer_standard_account_type_id, infer_standard_account_type_id_from_subscription,
@@ -207,6 +208,10 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub source_batch: Option<String>,
+
+    /// 凭据分组标记，用于限制不同 API key 可调度的凭据范围
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credential_groups: Vec<String>,
 
     /// 账号级额外允许的模型列表
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -813,12 +818,17 @@ impl KiroCredentials {
         self.auth_region = normalize_optional_string(self.auth_region.as_deref());
         self.api_region = normalize_optional_string(self.api_region.as_deref());
         self.normalize_source_metadata();
+        self.normalize_credential_groups();
     }
 
     pub fn normalize_source_metadata(&mut self) {
         self.source_supplier_id = normalize_optional_string(self.source_supplier_id.as_deref());
         self.source_supplier_name = normalize_optional_string(self.source_supplier_name.as_deref());
         self.source_batch = normalize_optional_string(self.source_batch.as_deref());
+    }
+
+    pub fn normalize_credential_groups(&mut self) {
+        self.credential_groups = normalize_credential_groups(&self.credential_groups);
     }
 
     pub fn canonicalize_auth_method(&mut self) {
@@ -1336,6 +1346,7 @@ mod tests {
             source_supplier_id: None,
             source_supplier_name: None,
             source_batch: None,
+            credential_groups: vec![],
             allowed_models: vec![],
             blocked_models: vec![],
             runtime_model_restrictions: vec![],
@@ -1826,6 +1837,7 @@ mod tests {
             source_supplier_id: None,
             source_supplier_name: None,
             source_batch: None,
+            credential_groups: vec![],
             allowed_models: vec![],
             blocked_models: vec![],
             runtime_model_restrictions: vec![],
@@ -1888,6 +1900,7 @@ mod tests {
             source_supplier_id: None,
             source_supplier_name: None,
             source_batch: None,
+            credential_groups: vec![],
             allowed_models: vec![],
             blocked_models: vec![],
             runtime_model_restrictions: vec![],
@@ -2032,6 +2045,7 @@ mod tests {
             source_supplier_id: None,
             source_supplier_name: None,
             source_batch: None,
+            credential_groups: vec![],
             allowed_models: vec![],
             blocked_models: vec![],
             runtime_model_restrictions: vec![],

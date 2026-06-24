@@ -33,6 +33,7 @@ import {
   readCredentialDefaultsDraft,
   resetCredentialDefaultsDraft,
 } from '@/lib/credential-defaults'
+import { normalizeCredentialGroups } from '@/lib/credential-groups'
 
 interface AddCredentialDialogProps {
   open: boolean
@@ -79,6 +80,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [sourceSupplierName, setSourceSupplierName] = useState(initialDefaults.sourceSupplierName)
   const [sourceSupplierId, setSourceSupplierId] = useState(initialDefaults.sourceSupplierId)
   const [sourceBatch, setSourceBatch] = useState(initialDefaults.sourceBatch)
+  const [credentialGroups, setCredentialGroups] = useState(initialDefaults.credentialGroups)
   const [allowedModels, setAllowedModels] = useState<string[]>([])
   const [blockedModels, setBlockedModels] = useState<string[]>([])
   const [proxyMode, setProxyMode] = useState<CredentialProxyMode>(initialDefaults.proxyMode)
@@ -144,6 +146,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setSourceSupplierName(resetDraft.sourceSupplierName)
     setSourceSupplierId(resetDraft.sourceSupplierId)
     setSourceBatch(resetDraft.sourceBatch)
+    setCredentialGroups(resetDraft.credentialGroups)
     setAllowedModels([])
     setBlockedModels([])
     setProxyMode(resetDraft.proxyMode)
@@ -222,6 +225,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       toast.error('当前代理池要求新凭据必须绑定代理')
       return
     }
+    const normalizedCredentialGroups = normalizeCredentialGroups(credentialGroups)
 
     mutate(
       {
@@ -244,6 +248,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         sourceSupplierName: sourceSupplierName.trim() || undefined,
         sourceSupplierId: sourceSupplierId.trim() || undefined,
         sourceBatch: sourceBatch.trim() || undefined,
+        credentialGroups: normalizedCredentialGroups.length ? normalizedCredentialGroups : undefined,
         allowedModels: allowedModels.length ? allowedModels : undefined,
         blockedModels: blockedModels.length ? blockedModels : undefined,
         proxyId: proxyMode === 'pool' ? proxyId.trim() || undefined : undefined,
@@ -267,6 +272,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
             sourceSupplierName: sourceSupplierName.trim(),
             sourceSupplierId: sourceSupplierId.trim(),
             sourceBatch: sourceBatch.trim(),
+            credentialGroups: credentialGroups.trim(),
             accountType: accountType.trim(),
             authRegion: authRegion.trim(),
             apiRegion: apiRegion.trim(),
@@ -591,6 +597,22 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               </div>
               <p className="text-xs text-muted-foreground">
                 可选，用于按账号来源供应商和导入批次筛选。
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <label htmlFor="credentialGroups" className="text-sm font-medium">
+                凭据分组
+              </label>
+              <Input
+                id="credentialGroups"
+                placeholder="default, low-cost, stable"
+                value={credentialGroups}
+                onChange={(e) => setCredentialGroups(e.target.value)}
+                disabled={isPending}
+              />
+              <p className="text-xs text-muted-foreground">
+                多个分组可用逗号、空格或换行分隔。留空时后端按 default 兼容处理。
               </p>
             </div>
 

@@ -200,6 +200,7 @@ GitHub Actions 镜像构建：
 | `host` | string | `127.0.0.1` | 服务监听地址 |
 | `port` | number | `8080` | 服务监听端口 |
 | `apiKey` | string | - | 自定义 API Key（用于客户端认证，必配） |
+| `apiKeys` | array | `[]` | 多 API Key 配置；每项通过 `allowedCredentialGroups` 限定可使用的凭据分组。与 `apiKey` 同时配置时，legacy `apiKey` 保持全量凭据访问 |
 | `region` | string | `us-east-1` | AWS 区域 |
 | `authRegion` | string | - | Auth Region（用于 Token 刷新），未配置时回退到 region |
 | `apiRegion` | string | - | API Region（用于 API 请求），未配置时回退到 region |
@@ -254,6 +255,28 @@ GitHub Actions 镜像构建：
 | `responseThinkingSignatureCompatEnabled` | boolean | `false` | 响应侧 thinking signature 兼容补齐；启用后，thinking 流式请求若上游先返回普通内容，会在首个非 thinking 内容块前补齐隐藏 thinking block 和动态 AWS-shaped `signature_delta` |
 | `serverWebToolsMode` | string | `max_compat` | Anthropic server-side web tools 兼容模式：`max_compat` 最大化复原 Claude 官方 `web_search`/`web_fetch` 能力；`native_only` 只使用 Kiro 原生 MCP 能力（当前仅 `web_search`）；`disabled` 直接拒绝 server web tools，可作为上线快速回滚开关 |
 
+`apiKeys` 仅用于限制不同 API key 可调度的凭据范围，不做计价或费率计算。示例：
+
+```json
+{
+   "apiKey": "sk-legacy-full-access",
+   "apiKeys": [
+      {
+         "id": "low-cost-client",
+         "key": "sk-low-cost",
+         "allowedCredentialGroups": ["low-cost", "default"]
+      },
+      {
+         "id": "stable-client",
+         "key": "sk-stable",
+         "allowedCredentialGroups": ["stable"]
+      }
+   ]
+}
+```
+
+凭据未配置 `credentialGroups` 时按兼容分组 `default` 参与匹配；如果只使用旧的 `apiKey`，调度行为与历史版本一致。
+
 完整配置示例：
 
 ```json
@@ -261,6 +284,18 @@ GitHub Actions 镜像构建：
    "host": "127.0.0.1",
    "port": 8990,
    "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
+   "apiKeys": [
+      {
+         "id": "low-cost-client",
+         "key": "sk-low-cost-client",
+         "allowedCredentialGroups": ["low-cost", "default"]
+      },
+      {
+         "id": "stable-client",
+         "key": "sk-stable-client",
+         "allowedCredentialGroups": ["stable"]
+      }
+   ],
    "region": "us-east-1",
    "tlsBackend": "rustls",
    "kiroVersion": "0.9.2",
@@ -456,6 +491,7 @@ kiro-rs \
 | `email`        | string | 用户邮箱（可选，从 API 获取）                           |
 | `userId`       | string | 用户 ID（可选；Enterprise 账号可能没有 email）             |
 | `accountType`  | string | 账号类型（可选，用于账号类型模型/调度策略）                    |
+| `credentialGroups` | array | 凭据分组标记（可选）；用于 `apiKeys[].allowedCredentialGroups` 限制该 API key 可调度的凭据范围 |
 | `allowedModels` | array | 账号级额外允许模型列表（可选）                           |
 | `blockedModels` | array | 账号级额外禁用模型列表（可选）                           |
 | `availableModelIds` | array | 从 Kiro/KAM 可用模型列表导入的模型缓存（可选）         |
@@ -469,6 +505,7 @@ kiro-rs \
 - 为兼容旧配置，`builder-id` / `iam` 仍可被识别，但会按 `idc` 处理
 - `provider: "Enterprise"` 会强制按 IdC 刷新，并在请求 Kiro 上游时使用导入或自动发现到的账号专属 `profileArn`
 - BuilderId 账号未显式配置 `profileArn` 时会使用 Kiro 默认 BuilderId profile；Enterprise 不会补默认 BuilderId profile
+- `credentialGroups` 为空或缺失时按 `default` 兼容分组参与 API key 范围匹配；该字段只影响本服务内的凭据可用范围，不影响上游账号能力或计价
 
 #### 单凭据格式（旧格式，向后兼容）
 
@@ -496,6 +533,7 @@ kiro-rs \
       "expiresAt": "2025-12-31T02:32:45.144Z",
       "authMethod": "social",
       "priority": 0,
+      "credentialGroups": ["default", "low-cost"],
       "maxConcurrency": 2,
       "rateLimitBucketCapacity": 3,
       "rateLimitRefillPerSecond": 0.8
@@ -508,6 +546,7 @@ kiro-rs \
       "clientSecret": "xxxxxxxxx",
       "region": "us-east-2",
       "priority": 1,
+      "credentialGroups": ["stable"],
       "maxConcurrency": 1,
       "proxyUrl": "socks5://proxy.example.com:1080",
       "proxyUsername": "user",
@@ -522,6 +561,7 @@ kiro-rs \
       "region": "us-east-1",
       "startUrl": "https://example.awsapps.com/start",
       "userId": "enterprise-user-id",
+      "credentialGroups": ["stable"],
       "availableModelIds": ["claude-sonnet-4.5"]
    },
    {
@@ -536,6 +576,7 @@ kiro-rs \
 
 多凭据特性：
 - 按 `priority` 字段排序，数字越小优先级越高（默认为 0）
+- `credentialGroups` 可为同一个凭据设置一个或多个分组；请求使用 `apiKeys[]` 中的 scoped key 时，只会在该 key 允许的分组内选择凭据，legacy `apiKey` 不受限
 - `balanced` 模式会优先选择当前并发较低的账号；如果并发相同，再参考历史成功次数和 `priority`
 - `defaultMaxConcurrency` 可为所有未单独配置 `maxConcurrency` 的账号设置统一并发上限，适合快速收敛单号过载
 - `accountTypeDispatchPolicies` 可把同类账号的实测承载能力固化成统一调度策略；当前 `power` 预设建议 `maxConcurrency=32` 且关闭本地 bucket 覆盖
@@ -629,7 +670,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 | 端点 | 方法 | 描述 |
 |------|------|------|
-| `/v1/models` | GET | 获取当前启用账号并集下可用的模型列表 |
+| `/v1/models` | GET | 获取当前 API key 可见凭据范围内的可用模型并集 |
 | `/v1/messages` | POST | 创建消息（对话） |
 | `/v1/messages/count_tokens` | POST | 估算 Token 数量 |
 
@@ -705,7 +746,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 - 当账号未显式填写 `accountType` 时，会回退到 `subscriptionTitle` 推断出的标准类型（如 `KIRO POWER -> power`），方便直接对标准档位整池生效
 - 模型能力最终生效顺序：账号类型策略 + 账号级允许/禁用 + 运行时探测到的临时限制
 - 调度能力最终生效顺序：凭据级 `maxConcurrency` / bucket 覆盖 > 账号类型调度策略 > 全局默认调度配置
-- `/v1/models` 会按当前启用账号的能力并集动态过滤，不再固定返回全量静态列表
+- `/v1/models` 会按当前 API key 可见凭据范围内的能力并集动态过滤，不再固定返回全量静态列表
 
 ## Admin（可选）
 
@@ -719,6 +760,7 @@ RUST_LOG=debug ./target/release/kiro-rs
   - `POST /api/admin/credentials/:id/priority` - 设置凭据优先级
   - `POST /api/admin/credentials/:id/max-concurrency` - 设置凭据并发上限
   - `POST /api/admin/credentials/:id/reset` - 重置失败计数
+  - `POST /api/admin/credentials/:id/groups` - 设置凭据分组标记
   - `POST /api/admin/credentials/:id/model-policy` - 设置凭据级模型策略
   - `GET /api/admin/credentials/:id/balance` - 获取凭据余额
   - `GET /api/admin/config/load-balancing` - 获取当前负载均衡、默认并发、限流和 thinking 签名校验配置

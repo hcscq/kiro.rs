@@ -3,6 +3,23 @@
   "port": 8990,
   "healthPort": 8991,
   "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
+  "apiKeys": [
+    {
+      "id": "low-cost-client",
+      "key": "sk-low-cost-client",
+      "allowedCredentialGroups": [
+        "low-cost",
+        "default"
+      ]
+    },
+    {
+      "id": "stable-client",
+      "key": "sk-stable-client",
+      "allowedCredentialGroups": [
+        "stable"
+      ]
+    }
+  ],
   "tlsBackend": "rustls",
   "region": "us-east-1",
   "adminApiKey": "sk-admin-your-secret-key",
