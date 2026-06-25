@@ -501,8 +501,11 @@ fn normalize_json_schema_type_name(type_name: &str) -> Option<&'static str> {
         "object" => Some("object"),
         "string" => Some("string"),
         "number" => Some("number"),
+        "float" | "double" => Some("number"),
         "integer" => Some("integer"),
+        "int" | "long" => Some("integer"),
         "boolean" => Some("boolean"),
+        "bool" => Some("boolean"),
         "array" => Some("array"),
         "null" => Some("null"),
         _ => None,
@@ -2763,6 +2766,11 @@ fn convert_tools(
     let mut seen_tool_names = HashSet::new();
 
     for t in tools {
+        if t.name.trim().is_empty() {
+            tracing::warn!("跳过空白工具名称定义，避免上游 REQUEST_BODY_INVALID");
+            continue;
+        }
+
         let tool_name = map_tool_name(&t.name, tool_name_map);
         if !seen_tool_names.insert(tool_name_lookup_key(&tool_name)) {
             continue;
@@ -5726,6 +5734,60 @@ mod tests {
     }
 
     #[test]
+    fn test_convert_tools_filters_blank_tool_names() {
+        let schema = HashMap::from([
+            ("type".to_string(), serde_json::json!("object")),
+            ("properties".to_string(), serde_json::json!({})),
+        ]);
+        let tools = Some(vec![super::super::types::Tool {
+            tool_type: None,
+            name: "".to_string(),
+            description: "empty tool name".to_string(),
+            input_schema: schema,
+            max_uses: None,
+            ..super::super::types::Tool::default()
+        }]);
+
+        let converted = convert_tools(&tools, &mut HashMap::new());
+
+        assert!(
+            converted.is_empty(),
+            "blank current tool definitions must not be sent upstream"
+        );
+    }
+
+    #[test]
+    fn test_convert_tools_filters_whitespace_tool_names_and_keeps_valid_tools() {
+        let schema = HashMap::from([
+            ("type".to_string(), serde_json::json!("object")),
+            ("properties".to_string(), serde_json::json!({})),
+        ]);
+        let tools = Some(vec![
+            super::super::types::Tool {
+                tool_type: None,
+                name: "   ".to_string(),
+                description: "whitespace tool name".to_string(),
+                input_schema: schema.clone(),
+                max_uses: None,
+                ..super::super::types::Tool::default()
+            },
+            super::super::types::Tool {
+                tool_type: None,
+                name: "mcp__read__file".to_string(),
+                description: "read declaration".to_string(),
+                input_schema: schema,
+                max_uses: None,
+                ..super::super::types::Tool::default()
+            },
+        ]);
+
+        let converted = convert_tools(&tools, &mut HashMap::new());
+
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].tool_specification.name, "mcp__read__file");
+    }
+
+    #[test]
     fn test_convert_tools_deduplicates_duplicate_names() {
         let schema = HashMap::from([
             ("type".to_string(), serde_json::json!("object")),
@@ -5919,6 +5981,97 @@ mod tests {
                 .pointer("/properties/options/properties/mode/type")
                 .and_then(|value| value.as_str()),
             Some("string")
+        );
+        assert!(
+            jsonschema::validator_for(schema).is_ok(),
+            "normalized schema should remain locally valid: {schema}"
+        );
+    }
+
+    #[test]
+    fn test_convert_tools_normalizes_schema_type_aliases_recursively() {
+        let tools = Some(vec![super::super::types::Tool {
+            tool_type: None,
+            name: "AliasTypes".to_string(),
+            description: "Tool with upstream-rejected schema type aliases".to_string(),
+            input_schema: HashMap::from([
+                ("type".to_string(), serde_json::json!("object")),
+                (
+                    "properties".to_string(),
+                    serde_json::json!({
+                        "nid": {"type": "long"},
+                        "count": {"type": "int"},
+                        "enabled": {"type": "bool"},
+                        "ratio": {"type": "float"},
+                        "score": {"type": "double"},
+                        "items": {
+                            "type": "array",
+                            "items": {"type": ["long", "null"]}
+                        },
+                        "nested": {
+                            "allOf": [
+                                {"type": "int"},
+                                {"type": "number"}
+                            ]
+                        }
+                    }),
+                ),
+                ("required".to_string(), serde_json::json!([])),
+            ]),
+            max_uses: None,
+            ..super::super::types::Tool::default()
+        }]);
+
+        let converted = convert_tools(&tools, &mut HashMap::new());
+        let schema = &converted[0].tool_specification.input_schema.json;
+
+        assert_eq!(
+            schema
+                .pointer("/properties/nid/type")
+                .and_then(|value| value.as_str()),
+            Some("integer")
+        );
+        assert_eq!(
+            schema
+                .pointer("/properties/count/type")
+                .and_then(|value| value.as_str()),
+            Some("integer")
+        );
+        assert_eq!(
+            schema
+                .pointer("/properties/enabled/type")
+                .and_then(|value| value.as_str()),
+            Some("boolean")
+        );
+        assert_eq!(
+            schema
+                .pointer("/properties/ratio/type")
+                .and_then(|value| value.as_str()),
+            Some("number")
+        );
+        assert_eq!(
+            schema
+                .pointer("/properties/score/type")
+                .and_then(|value| value.as_str()),
+            Some("number")
+        );
+        assert_eq!(
+            schema
+                .pointer("/properties/items/items/type/0")
+                .and_then(|value| value.as_str()),
+            Some("integer")
+        );
+        assert_eq!(
+            schema
+                .pointer("/properties/items/items/type/1")
+                .and_then(|value| value.as_str()),
+            Some("null")
+        );
+        assert_eq!(
+            schema
+                .pointer("/properties/nested/allOf/0/type")
+                .and_then(|value| value.as_str()),
+            Some("integer")
         );
         assert!(
             jsonschema::validator_for(schema).is_ok(),
