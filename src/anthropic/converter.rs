@@ -2767,7 +2767,7 @@ fn convert_tools(
 
     for t in tools {
         if t.name.trim().is_empty() {
-            tracing::warn!("跳过空白工具名称定义，避免上游 REQUEST_BODY_INVALID");
+            tracing::info!("跳过空白工具名称定义，已从当前工具列表移除");
             continue;
         }
 
