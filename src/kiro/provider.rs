@@ -2892,6 +2892,7 @@ impl KiroProvider {
             }
 
             // 失败响应
+            let upstream_retry_after = response_header_for_log(response.headers(), "retry-after");
             let body = response.text().await.unwrap_or_default();
             let error_summary = Self::summarize_error_body(status, &body);
 
@@ -3034,6 +3035,9 @@ impl KiroProvider {
 
             // 瞬态错误
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
+                let supported_candidate_count = self
+                    .token_manager
+                    .enabled_supported_credential_count_for_scope(None, credential_group_scope);
                 if status.as_u16() == 429 {
                     if Self::is_suspicious_activity_limited(&body, &error_summary) {
                         self.token_manager
@@ -3057,9 +3061,6 @@ impl KiroProvider {
                         &request_scoped_transient_error_credentials,
                         credential_group_scope,
                     );
-                    let supported_candidate_count = self
-                        .token_manager
-                        .enabled_supported_credential_count_for_scope(None, credential_group_scope);
                     max_retries = max_retries.max(Self::rate_limit_retry_cap(
                         total_credentials,
                         supported_candidate_count,
@@ -3068,16 +3069,44 @@ impl KiroProvider {
                 } else {
                     request_scoped_transient_error_credentials.insert(ctx_id);
                 }
+                let empty_model_unsupported = HashSet::new();
+                let empty_slow_first_content = HashSet::new();
+                let empty_body = HashSet::new();
+                let will_retry = attempt + 1 < max_retries;
+                let retryable_candidate_count_after_status =
+                    Self::request_scoped_available_candidate_count(
+                        supported_candidate_count,
+                        &empty_model_unsupported,
+                        &request_scoped_rate_limited_credentials,
+                        &empty_slow_first_content,
+                        &empty_body,
+                        &request_scoped_transient_error_credentials,
+                    );
+                let skip_retry_delay = Self::should_skip_retry_delay_for_status_failover(
+                    status.as_u16(),
+                    will_retry,
+                    retryable_candidate_count_after_status,
+                );
                 tracing::warn!(
                     credential_id = ctx_id,
                     attempt = attempt + 1,
                     max_retries,
                     status_code = status.as_u16(),
                     error_summary = %error_summary,
+                    upstream_retry_after = upstream_retry_after.as_deref().unwrap_or(""),
+                    upstream_retry_after_present = upstream_retry_after.is_some(),
+                    will_retry,
+                    retryable_candidate_count_after_status,
+                    retry_delay_skipped = skip_retry_delay,
+                    retry_delay_skip_reason = if skip_retry_delay {
+                        "rate_limit_alternate_credential_available"
+                    } else {
+                        "none"
+                    },
                     "MCP 请求失败（上游瞬态错误）"
                 );
                 last_error = Some(anyhow::anyhow!("MCP 请求失败: {}", error_summary));
-                if attempt + 1 < max_retries {
+                if will_retry && !skip_retry_delay {
                     sleep(Self::retry_delay(attempt)).await;
                 }
                 continue;
@@ -4268,6 +4297,7 @@ impl KiroProvider {
             }
 
             // 失败响应：读取 body 用于日志/错误信息
+            let upstream_retry_after = response_header_for_log(response.headers(), "retry-after");
             let body = Self::read_failure_body_before_sse(
                 response,
                 is_stream,
@@ -4723,6 +4753,21 @@ impl KiroProvider {
                 } else {
                     request_scoped_transient_error_credentials.insert(ctx_id);
                 }
+                let will_retry = attempt + 1 < max_retries;
+                let retryable_candidate_count_after_status =
+                    Self::request_scoped_available_candidate_count(
+                        supported_candidate_count,
+                        &request_scoped_model_unsupported_credentials,
+                        &request_scoped_rate_limited_credentials,
+                        &request_scoped_slow_first_content_credentials,
+                        &request_scoped_empty_body_credentials,
+                        &request_scoped_transient_error_credentials,
+                    );
+                let skip_retry_delay = Self::should_skip_retry_delay_for_status_failover(
+                    status.as_u16(),
+                    will_retry,
+                    retryable_candidate_count_after_status,
+                );
                 tracing::warn!(
                     request_id = %request_id,
                     api_type,
@@ -4735,9 +4780,19 @@ impl KiroProvider {
                     request_body_bytes,
                     status_code = status.as_u16(),
                     error_summary = %error_summary,
+                    upstream_retry_after = upstream_retry_after.as_deref().unwrap_or(""),
+                    upstream_retry_after_present = upstream_retry_after.is_some(),
                     insufficient_capacity,
                     capacity_unavailable_count,
                     effective_retry_cap = max_retries,
+                    will_retry,
+                    retryable_candidate_count_after_status,
+                    retry_delay_skipped = skip_retry_delay,
+                    retry_delay_skip_reason = if skip_retry_delay {
+                        "rate_limit_alternate_credential_available"
+                    } else {
+                        "none"
+                    },
                     total_elapsed_ms = overall_started_at.elapsed().as_millis(),
                     "API 请求失败（上游瞬态错误）"
                 );
@@ -4749,7 +4804,7 @@ impl KiroProvider {
                 } else {
                     anyhow::anyhow!("{} API 请求失败: {}", api_type, error_summary)
                 });
-                if attempt + 1 < max_retries {
+                if will_retry && !skip_retry_delay {
                     sleep(Self::retry_delay(attempt)).await;
                 }
                 continue;
@@ -4954,6 +5009,24 @@ impl KiroProvider {
         excluded
     }
 
+    fn request_scoped_available_candidate_count(
+        supported_candidate_count: usize,
+        model_unsupported_credentials: &HashSet<u64>,
+        rate_limited_credentials: &HashSet<u64>,
+        slow_first_content_credentials: &HashSet<u64>,
+        empty_body_credentials: &HashSet<u64>,
+        transient_error_credentials: &HashSet<u64>,
+    ) -> usize {
+        let excluded = Self::combined_request_exclusions(
+            model_unsupported_credentials,
+            rate_limited_credentials,
+            slow_first_content_credentials,
+            empty_body_credentials,
+            transient_error_credentials,
+        );
+        supported_candidate_count.saturating_sub(excluded.len())
+    }
+
     fn request_scoped_retryable_exclusion_count(
         rate_limited_credentials: &HashSet<u64>,
         transient_error_credentials: &HashSet<u64>,
@@ -4968,6 +5041,14 @@ impl KiroProvider {
         let mut excluded = rate_limited_credentials.clone();
         excluded.extend(transient_error_credentials.iter().copied());
         excluded.len()
+    }
+
+    fn should_skip_retry_delay_for_status_failover(
+        status_code: u16,
+        will_retry: bool,
+        retryable_candidate_count_after_status: usize,
+    ) -> bool {
+        status_code == 429 && will_retry && retryable_candidate_count_after_status > 0
     }
 
     fn maybe_spill_rate_limited_priority(
@@ -6365,6 +6446,38 @@ mod tests {
     }
 
     #[test]
+    fn test_available_candidate_count_deduplicates_all_request_exclusions() {
+        let mut model_unsupported = HashSet::new();
+        model_unsupported.insert(1);
+
+        let mut rate_limited = HashSet::new();
+        rate_limited.insert(2);
+        rate_limited.insert(3);
+
+        let mut slow_first_content = HashSet::new();
+        slow_first_content.insert(3);
+
+        let mut empty_body = HashSet::new();
+        empty_body.insert(4);
+
+        let mut transient_errors = HashSet::new();
+        transient_errors.insert(4);
+        transient_errors.insert(5);
+
+        assert_eq!(
+            KiroProvider::request_scoped_available_candidate_count(
+                8,
+                &model_unsupported,
+                &rate_limited,
+                &slow_first_content,
+                &empty_body,
+                &transient_errors,
+            ),
+            3
+        );
+    }
+
+    #[test]
     fn test_retryable_exclusion_count_deduplicates_transient_and_rate_limited() {
         let mut rate_limited = HashSet::new();
         rate_limited.insert(1);
@@ -6381,6 +6494,25 @@ mod tests {
             ),
             3
         );
+    }
+
+    #[test]
+    fn test_429_with_alternate_candidate_skips_retry_delay() {
+        assert!(KiroProvider::should_skip_retry_delay_for_status_failover(
+            429, true, 1
+        ));
+        assert!(!KiroProvider::should_skip_retry_delay_for_status_failover(
+            429, true, 0
+        ));
+        assert!(!KiroProvider::should_skip_retry_delay_for_status_failover(
+            429, false, 1
+        ));
+        assert!(!KiroProvider::should_skip_retry_delay_for_status_failover(
+            500, true, 3
+        ));
+        assert!(!KiroProvider::should_skip_retry_delay_for_status_failover(
+            408, true, 3
+        ));
     }
 
     #[test]
