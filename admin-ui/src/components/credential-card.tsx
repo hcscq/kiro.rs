@@ -936,7 +936,7 @@ export function CredentialCard({
   const inputTokens = credential.inputTokens ?? 0
   const outputTokens = credential.outputTokens ?? 0
   const tokenUsageCount = credential.tokenUsageCount ?? 0
-  const tokenUsageTitle = `完整响应 ${formatInteger(tokenUsageCount)} 次 / 输入 ${formatInteger(inputTokens)} / 输出 ${formatInteger(outputTokens)} / 合计 ${formatInteger(totalTokens)} tokens`
+  const tokenUsageTitle = `完整响应 ${formatInteger(tokenUsageCount)} 次 / 计费输入 ${formatInteger(inputTokens)} / 输出 ${formatInteger(outputTokens)} / 合计 ${formatInteger(totalTokens)} tokens`
 
   return (
     <>

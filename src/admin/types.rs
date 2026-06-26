@@ -177,7 +177,7 @@ pub struct CredentialStatusItem {
     pub success_count: u64,
     /// 完整响应 token 用量记录次数
     pub token_usage_count: u64,
-    /// 完整响应累计输入 tokens
+    /// 完整响应累计计费输入 tokens
     pub input_tokens: u64,
     /// 完整响应累计输出 tokens
     pub output_tokens: u64,

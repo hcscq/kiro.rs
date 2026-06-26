@@ -544,14 +544,12 @@ impl StreamContext {
     }
 
     pub fn final_usage(&self) -> (i32, i32, &'static str) {
+        // Credential aggregates are used for cost accounting, so keep them on the
+        // billing pre-count instead of Kiro context window occupancy.
         (
-            self.context_input_tokens.unwrap_or(self.input_tokens),
+            self.input_tokens,
             self.output_tokens,
-            if self.context_input_tokens.is_some() {
-                "context_usage"
-            } else {
-                "billing_input_tokens"
-            },
+            "billing_input_tokens",
         )
     }
 
@@ -1633,6 +1631,10 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data["message"]["usage"]["input_tokens"], 500_000);
+
+        let (input_tokens, _, token_source) = ctx.final_usage();
+        assert_eq!(input_tokens, 123);
+        assert_eq!(token_source, "billing_input_tokens");
     }
 
     #[test]

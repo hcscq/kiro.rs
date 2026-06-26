@@ -67,7 +67,8 @@ pub(crate) struct NonStreamMessageResponse {
     pub stop_reason: String,
     pub input_tokens: i32,
     pub output_tokens: i32,
-    pub input_token_source: &'static str,
+    pub stats_input_tokens: i32,
+    pub stats_input_token_source: &'static str,
 }
 
 fn request_id_from_headers(headers: &HeaderMap) -> String {
@@ -2197,9 +2198,9 @@ async fn execute_non_stream_request_body(
     );
     if let Some(recorder) = usage_recorder {
         recorder.record_complete(
-            result.input_tokens,
+            result.stats_input_tokens,
             result.output_tokens,
-            result.input_token_source,
+            result.stats_input_token_source,
         );
     }
 
@@ -2353,12 +2354,6 @@ fn decode_non_stream_message(
     } else {
         input_tokens
     };
-    let input_token_source = if prefer_context_input_tokens && context_input_tokens.is_some() {
-        "context_usage"
-    } else {
-        "billing_input_tokens"
-    };
-
     // 构建 Anthropic 响应
     let response_body = json!({
         "id": response_id,
@@ -2380,7 +2375,8 @@ fn decode_non_stream_message(
         stop_reason,
         input_tokens: final_input_tokens,
         output_tokens,
-        input_token_source,
+        stats_input_tokens: input_tokens,
+        stats_input_token_source: "billing_input_tokens",
     }
 }
 
@@ -3326,6 +3322,8 @@ mod tests {
 
         assert_eq!(response.input_tokens, 123);
         assert_eq!(response.body["usage"]["input_tokens"], 123);
+        assert_eq!(response.stats_input_tokens, 123);
+        assert_eq!(response.stats_input_token_source, "billing_input_tokens");
     }
 
     #[test]
@@ -3339,6 +3337,8 @@ mod tests {
             response.body["usage"]["input_tokens"],
             response.input_tokens
         );
+        assert_eq!(response.stats_input_tokens, 123);
+        assert_eq!(response.stats_input_token_source, "billing_input_tokens");
     }
 
     #[test]
@@ -3625,7 +3625,8 @@ mod tests {
             stop_reason: "end_turn".to_string(),
             input_tokens: 10,
             output_tokens: 20,
-            input_token_source: "billing_input_tokens",
+            stats_input_tokens: 10,
+            stats_input_token_source: "billing_input_tokens",
         };
 
         let coerced = coerce_structured_response(response, &output).unwrap();
