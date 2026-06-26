@@ -737,14 +737,25 @@ impl CredentialMetadataPatch {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatsEntryRecord {
+    #[serde(default)]
     pub success_count: u64,
+    #[serde(default)]
     pub last_used_at: Option<String>,
+    #[serde(default)]
+    pub token_usage_count: u64,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StatsMergeRecord {
     pub success_count_delta: u64,
     pub last_used_at: Option<String>,
+    pub token_usage_count_delta: u64,
+    pub input_tokens_delta: u64,
+    pub output_tokens_delta: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1680,10 +1691,20 @@ fn merge_stats_records(
             .or_insert_with(|| StatsEntryRecord {
                 success_count: 0,
                 last_used_at: None,
+                token_usage_count: 0,
+                input_tokens: 0,
+                output_tokens: 0,
             });
         entry.success_count = entry
             .success_count
             .saturating_add(update.success_count_delta);
+        entry.token_usage_count = entry
+            .token_usage_count
+            .saturating_add(update.token_usage_count_delta);
+        entry.input_tokens = entry.input_tokens.saturating_add(update.input_tokens_delta);
+        entry.output_tokens = entry
+            .output_tokens
+            .saturating_add(update.output_tokens_delta);
         entry.last_used_at =
             newer_timestamp(entry.last_used_at.take(), update.last_used_at.clone());
     }
@@ -3631,13 +3652,17 @@ mod tests {
             StatsEntryRecord {
                 success_count: 11,
                 last_used_at: Some("2026-04-15T00:00:00Z".to_string()),
+                token_usage_count: 3,
+                input_tokens: 120,
+                output_tokens: 45,
             },
         );
         store.save_stats(&stats).unwrap();
-        assert_eq!(
-            store.load_stats().unwrap().get("7").unwrap().success_count,
-            11
-        );
+        let loaded_stats = store.load_stats().unwrap();
+        let loaded_stats_entry = loaded_stats.get("7").unwrap();
+        assert_eq!(loaded_stats_entry.success_count, 11);
+        assert_eq!(loaded_stats_entry.input_tokens, 120);
+        assert_eq!(loaded_stats_entry.output_tokens, 45);
 
         let mut balance_cache = HashMap::new();
         balance_cache.insert(
@@ -3855,6 +3880,9 @@ mod tests {
             StatsEntryRecord {
                 success_count: 11,
                 last_used_at: Some("2026-04-15T00:00:00Z".to_string()),
+                token_usage_count: 3,
+                input_tokens: 120,
+                output_tokens: 45,
             },
         );
         store.save_stats(&initial).unwrap();
@@ -3865,6 +3893,9 @@ mod tests {
             StatsMergeRecord {
                 success_count_delta: 2,
                 last_used_at: Some("2026-04-15T01:00:00Z".to_string()),
+                token_usage_count_delta: 1,
+                input_tokens_delta: 30,
+                output_tokens_delta: 12,
             },
         );
         updates.insert(
@@ -3872,19 +3903,29 @@ mod tests {
             StatsMergeRecord {
                 success_count_delta: 1,
                 last_used_at: Some("2026-04-15T00:30:00Z".to_string()),
+                token_usage_count_delta: 1,
+                input_tokens_delta: 10,
+                output_tokens_delta: 4,
             },
         );
 
         let merged = store.merge_stats(&updates).unwrap();
         assert_eq!(merged.get("7").unwrap().success_count, 13);
+        assert_eq!(merged.get("7").unwrap().token_usage_count, 4);
+        assert_eq!(merged.get("7").unwrap().input_tokens, 150);
+        assert_eq!(merged.get("7").unwrap().output_tokens, 57);
         assert_eq!(
             merged.get("7").unwrap().last_used_at.as_deref(),
             Some("2026-04-15T01:00:00Z")
         );
         assert_eq!(merged.get("8").unwrap().success_count, 1);
+        assert_eq!(merged.get("8").unwrap().input_tokens, 10);
 
         let reloaded = store.load_stats().unwrap();
         assert_eq!(reloaded.get("7").unwrap().success_count, 13);
+        assert_eq!(reloaded.get("7").unwrap().token_usage_count, 4);
+        assert_eq!(reloaded.get("7").unwrap().input_tokens, 150);
+        assert_eq!(reloaded.get("7").unwrap().output_tokens, 57);
         assert_eq!(
             reloaded.get("7").unwrap().last_used_at.as_deref(),
             Some("2026-04-15T01:00:00Z")

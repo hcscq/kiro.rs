@@ -40,6 +40,10 @@ export interface CredentialStatusItem {
   importedAt?: string | null
   refreshTokenHash?: string
   successCount: number
+  tokenUsageCount: number
+  inputTokens: number
+  outputTokens: number
+  totalTokens: number
   lastUsedAt: string | null
   inFlight: number
   maxConcurrency?: number | null

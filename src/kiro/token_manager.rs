@@ -1387,6 +1387,18 @@ struct CredentialEntry {
     success_count: u64,
     /// 自上次成功落盘后的新增成功次数，用于跨实例合并统计
     pending_success_count_delta: u64,
+    /// 完整响应 token 用量记录次数
+    token_usage_count: u64,
+    /// 自上次落盘后的完整响应 token 用量记录次数
+    pending_token_usage_count_delta: u64,
+    /// 完整响应累计输入 tokens
+    input_tokens: u64,
+    /// 自上次落盘后的新增输入 tokens
+    pending_input_tokens_delta: u64,
+    /// 完整响应累计输出 tokens
+    output_tokens: u64,
+    /// 自上次落盘后的新增输出 tokens
+    pending_output_tokens_delta: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
     /// 当前运行中的请求数
@@ -1684,6 +1696,14 @@ pub struct CredentialEntrySnapshot {
     pub imported_at: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
+    /// 完整响应 token 用量记录次数
+    pub token_usage_count: u64,
+    /// 完整响应累计输入 tokens
+    pub input_tokens: u64,
+    /// 完整响应累计输出 tokens
+    pub output_tokens: u64,
+    /// 完整响应累计总 tokens
+    pub total_tokens: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
     /// 当前运行中的请求数
@@ -2370,6 +2390,12 @@ impl MultiTokenManager {
                     },
                     success_count: 0,
                     pending_success_count_delta: 0,
+                    token_usage_count: 0,
+                    pending_token_usage_count_delta: 0,
+                    input_tokens: 0,
+                    pending_input_tokens_delta: 0,
+                    output_tokens: 0,
+                    pending_output_tokens_delta: 0,
                     last_used_at: None,
                     active_requests: 0,
                     rate_limit_cooldown_until: None,
@@ -6825,6 +6851,12 @@ impl MultiTokenManager {
                     refresh_failure_count: 0,
                     success_count: 0,
                     pending_success_count_delta: 0,
+                    token_usage_count: 0,
+                    pending_token_usage_count_delta: 0,
+                    input_tokens: 0,
+                    pending_input_tokens_delta: 0,
+                    output_tokens: 0,
+                    pending_output_tokens_delta: 0,
                     last_used_at: None,
                     active_requests: 0,
                     rate_limit_cooldown_until: None,
@@ -6878,15 +6910,31 @@ impl MultiTokenManager {
             let next_success_count = persisted
                 .success_count
                 .saturating_add(entry.pending_success_count_delta);
+            let next_token_usage_count = persisted
+                .token_usage_count
+                .saturating_add(entry.pending_token_usage_count_delta);
+            let next_input_tokens = persisted
+                .input_tokens
+                .saturating_add(entry.pending_input_tokens_delta);
+            let next_output_tokens = persisted
+                .output_tokens
+                .saturating_add(entry.pending_output_tokens_delta);
             let next_last_used_at =
                 newer_timestamp(entry.last_used_at.clone(), persisted.last_used_at.clone());
 
-            if entry.success_count != next_success_count || entry.last_used_at != next_last_used_at
+            if entry.success_count != next_success_count
+                || entry.token_usage_count != next_token_usage_count
+                || entry.input_tokens != next_input_tokens
+                || entry.output_tokens != next_output_tokens
+                || entry.last_used_at != next_last_used_at
             {
                 changed = true;
             }
 
             entry.success_count = next_success_count;
+            entry.token_usage_count = next_token_usage_count;
+            entry.input_tokens = next_input_tokens;
+            entry.output_tokens = next_output_tokens;
             entry.last_used_at = next_last_used_at;
         }
 
@@ -6921,6 +6969,9 @@ impl MultiTokenManager {
                         StatsMergeRecord {
                             success_count_delta: e.pending_success_count_delta,
                             last_used_at: e.last_used_at.clone(),
+                            token_usage_count_delta: e.pending_token_usage_count_delta,
+                            input_tokens_delta: e.pending_input_tokens_delta,
+                            output_tokens_delta: e.pending_output_tokens_delta,
                         },
                     )
                 })
@@ -6933,9 +6984,15 @@ impl MultiTokenManager {
                 for entry in entries.iter_mut() {
                     if let Some(merged) = merged_stats.get(&entry.id.to_string()) {
                         entry.success_count = merged.success_count;
+                        entry.token_usage_count = merged.token_usage_count;
+                        entry.input_tokens = merged.input_tokens;
+                        entry.output_tokens = merged.output_tokens;
                         entry.last_used_at = merged.last_used_at.clone();
                     }
                     entry.pending_success_count_delta = 0;
+                    entry.pending_token_usage_count_delta = 0;
+                    entry.pending_input_tokens_delta = 0;
+                    entry.pending_output_tokens_delta = 0;
                 }
                 *self.last_stats_save_at.lock() = Some(Instant::now());
                 self.stats_dirty.store(false, Ordering::Relaxed);
@@ -6958,6 +7015,9 @@ impl MultiTokenManager {
                         StatsEntryRecord {
                             success_count: e.success_count,
                             last_used_at: e.last_used_at.clone(),
+                            token_usage_count: e.token_usage_count,
+                            input_tokens: e.input_tokens,
+                            output_tokens: e.output_tokens,
                         },
                     )
                 })
@@ -6969,6 +7029,9 @@ impl MultiTokenManager {
                 let mut entries = self.entries.lock();
                 for entry in entries.iter_mut() {
                     entry.pending_success_count_delta = 0;
+                    entry.pending_token_usage_count_delta = 0;
+                    entry.pending_input_tokens_delta = 0;
+                    entry.pending_output_tokens_delta = 0;
                 }
                 *self.last_stats_save_at.lock() = Some(Instant::now());
                 self.stats_dirty.store(false, Ordering::Relaxed);
@@ -7111,6 +7174,62 @@ impl MultiTokenManager {
             self.availability_notify.notify_waiters();
         }
         self.save_stats_debounced();
+    }
+
+    /// 记录指定凭据完成响应后的 token 用量。
+    pub(crate) fn record_token_usage(
+        &self,
+        id: u64,
+        input_tokens: u64,
+        output_tokens: u64,
+        request_id: Option<&str>,
+        model: Option<&str>,
+        api_type: &str,
+        token_source: &str,
+    ) {
+        let mut recorded = false;
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+                entry.token_usage_count = entry.token_usage_count.saturating_add(1);
+                entry.pending_token_usage_count_delta =
+                    entry.pending_token_usage_count_delta.saturating_add(1);
+                entry.input_tokens = entry.input_tokens.saturating_add(input_tokens);
+                entry.pending_input_tokens_delta = entry
+                    .pending_input_tokens_delta
+                    .saturating_add(input_tokens);
+                entry.output_tokens = entry.output_tokens.saturating_add(output_tokens);
+                entry.pending_output_tokens_delta = entry
+                    .pending_output_tokens_delta
+                    .saturating_add(output_tokens);
+                recorded = true;
+            }
+        }
+
+        if recorded {
+            tracing::debug!(
+                request_id = request_id.unwrap_or("unknown"),
+                api_type,
+                model = model.unwrap_or("unknown"),
+                credential_id = id,
+                input_tokens,
+                output_tokens,
+                token_source,
+                "已记录凭据 token 用量"
+            );
+            self.save_stats_debounced();
+        } else {
+            tracing::warn!(
+                request_id = request_id.unwrap_or("unknown"),
+                api_type,
+                model = model.unwrap_or("unknown"),
+                credential_id = id,
+                input_tokens,
+                output_tokens,
+                token_source,
+                "记录凭据 token 用量失败：凭据不存在"
+            );
+        }
     }
 
     /// 报告指定凭据遭遇上游 429 限流。
@@ -8563,6 +8682,10 @@ impl MultiTokenManager {
                             .clone(),
                         imported_at: e.credentials.imported_at.clone(),
                         success_count: e.success_count,
+                        token_usage_count: e.token_usage_count,
+                        input_tokens: e.input_tokens,
+                        output_tokens: e.output_tokens,
+                        total_tokens: e.input_tokens.saturating_add(e.output_tokens),
                         last_used_at: e.last_used_at.clone(),
                         active_requests,
                         max_concurrency: e
@@ -9823,6 +9946,12 @@ impl MultiTokenManager {
                 disabled_reason: None,
                 success_count: 0,
                 pending_success_count_delta: 0,
+                token_usage_count: 0,
+                pending_token_usage_count_delta: 0,
+                input_tokens: 0,
+                pending_input_tokens_delta: 0,
+                output_tokens: 0,
+                pending_output_tokens_delta: 0,
                 last_used_at: None,
                 active_requests: 0,
                 rate_limit_cooldown_until: None,
@@ -13467,6 +13596,12 @@ mod tests {
             let entry = entries.iter_mut().find(|entry| entry.id == 1).unwrap();
             entry.success_count = 2;
             entry.pending_success_count_delta = 2;
+            entry.token_usage_count = 2;
+            entry.pending_token_usage_count_delta = 2;
+            entry.input_tokens = 50;
+            entry.pending_input_tokens_delta = 50;
+            entry.output_tokens = 20;
+            entry.pending_output_tokens_delta = 20;
             entry.last_used_at = Some("2026-04-15T02:00:00Z".to_string());
         }
 
@@ -13477,6 +13612,9 @@ mod tests {
             StatsEntryRecord {
                 success_count: 5,
                 last_used_at: Some("2026-04-15T01:00:00Z".to_string()),
+                token_usage_count: 3,
+                input_tokens: 120,
+                output_tokens: 45,
             },
         );
         store.save_stats(&persisted).unwrap();
@@ -13486,6 +13624,10 @@ mod tests {
         let snapshot = manager.snapshot();
         let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
         assert_eq!(entry.success_count, 7);
+        assert_eq!(entry.token_usage_count, 5);
+        assert_eq!(entry.input_tokens, 170);
+        assert_eq!(entry.output_tokens, 65);
+        assert_eq!(entry.total_tokens, 235);
         assert_eq!(entry.last_used_at.as_deref(), Some("2026-04-15T02:00:00Z"));
 
         let stats_path = credentials_path.parent().unwrap().join("kiro_stats.json");

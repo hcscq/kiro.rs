@@ -175,6 +175,14 @@ pub struct CredentialStatusItem {
     pub imported_at: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
+    /// 完整响应 token 用量记录次数
+    pub token_usage_count: u64,
+    /// 完整响应累计输入 tokens
+    pub input_tokens: u64,
+    /// 完整响应累计输出 tokens
+    pub output_tokens: u64,
+    /// 完整响应累计总 tokens
+    pub total_tokens: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
     /// 当前运行中的请求数

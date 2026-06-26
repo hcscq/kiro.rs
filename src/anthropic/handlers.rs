@@ -48,7 +48,7 @@ use super::types::{
 };
 use super::webfetch;
 use crate::common::auth::ApiKeyAuthContext;
-use crate::kiro::provider::{PublicProviderError, RequestOptions};
+use crate::kiro::provider::{PublicProviderError, RequestOptions, ResponseUsageRecorder};
 
 const LARGE_ANTHROPIC_REQUEST_WARN_THRESHOLD_BYTES: usize = 16 * 1024 * 1024;
 const DETAILED_ANTHROPIC_PRE_UPSTREAM_TRACE_THRESHOLD_BYTES: usize = 512 * 1024;
@@ -67,6 +67,7 @@ pub(crate) struct NonStreamMessageResponse {
     pub stop_reason: String,
     pub input_tokens: i32,
     pub output_tokens: i32,
+    pub input_token_source: &'static str,
 }
 
 fn request_id_from_headers(headers: &HeaderMap) -> String {
@@ -1461,8 +1462,10 @@ async fn handle_stream_request(
         StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map)
             .with_synthetic_hidden_thinking_signature(synthesize_hidden_thinking_signature);
 
+    let usage_recorder = response.usage_recorder();
+
     // 创建 SSE 流
-    let stream = create_sse_stream(response, ctx, request_id);
+    let stream = create_sse_stream(response, ctx, request_id, usage_recorder);
 
     // 返回 SSE 响应
     Response::builder()
@@ -1537,6 +1540,7 @@ fn create_sse_stream(
     response: crate::kiro::provider::ManagedResponse,
     ctx: StreamContext,
     request_id: Option<String>,
+    usage_recorder: Option<ResponseUsageRecorder>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 处理 Kiro 响应流，同时每25秒发送 ping 保活。
     // message_start 会延迟到 contextUsageEvent 或首个可见内容事件之后发送，
@@ -1556,6 +1560,7 @@ fn create_sse_stream(
             ),
             false,
             request_id,
+            usage_recorder,
         ),
         |(
             mut body_stream,
@@ -1566,6 +1571,7 @@ fn create_sse_stream(
             mut ping_interval,
             can_ping,
             request_id,
+            usage_recorder,
         )| async move {
             if finished {
                 return None;
@@ -1586,7 +1592,7 @@ fn create_sse_stream(
                                     "Kiro Event Stream 缓冲失败"
                                 );
                                 if let Some(error_bytes) = decode_error_sse_if_fatal(&e, &decoder) {
-                                    return Some((stream::iter(vec![Ok(error_bytes)]), (body_stream, ctx, decoder, true, message_started, ping_interval, can_ping, request_id)));
+                                    return Some((stream::iter(vec![Ok(error_bytes)]), (body_stream, ctx, decoder, true, message_started, ping_interval, can_ping, request_id, usage_recorder)));
                                 }
                             }
 
@@ -1626,7 +1632,7 @@ fn create_sse_stream(
                                             "Kiro Event Stream frame 解码失败"
                                         );
                                         if let Some(error_bytes) = decode_error_sse_if_fatal(&e, &decoder) {
-                                            return Some((stream::iter(vec![Ok(error_bytes)]), (body_stream, ctx, decoder, true, message_started, ping_interval, can_ping, request_id)));
+                                            return Some((stream::iter(vec![Ok(error_bytes)]), (body_stream, ctx, decoder, true, message_started, ping_interval, can_ping, request_id, usage_recorder)));
                                         }
                                     }
                                 }
@@ -1651,7 +1657,7 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, message_started, ping_interval, next_can_ping, request_id)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, message_started, ping_interval, next_can_ping, request_id, usage_recorder)))
                         }
                         Some(Err(e)) => {
                             tracing::error!(
@@ -1663,17 +1669,21 @@ fn create_sse_stream(
                             let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_stream_error_sse(
                                 "Upstream stream ended with a transport error.",
                             ))];
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, message_started, ping_interval, can_ping, request_id)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, message_started, ping_interval, can_ping, request_id, usage_recorder)))
                         }
                         None => {
                             // 流结束，发送最终事件
                             let mut message_started = message_started;
                             let final_events = finalize_stream_events(&mut ctx, &mut message_started);
+                            if let Some(recorder) = &usage_recorder {
+                                let (input_tokens, output_tokens, token_source) = ctx.final_usage();
+                                recorder.record_complete(input_tokens, output_tokens, token_source);
+                            }
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, message_started, ping_interval, can_ping, request_id)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, message_started, ping_interval, can_ping, request_id, usage_recorder)))
                         }
                     }
                 }
@@ -1681,7 +1691,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick(), if can_ping => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, message_started, ping_interval, can_ping, request_id)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, message_started, ping_interval, can_ping, request_id, usage_recorder)))
                 }
             }
         },
@@ -2156,6 +2166,7 @@ async fn execute_non_stream_request_body(
         Ok(resp) => resp,
         Err(e) => return Err(map_provider_error(e)),
     };
+    let usage_recorder = response.usage_recorder();
 
     // 读取响应体
     let body_bytes = match response.bytes().await {
@@ -2177,13 +2188,22 @@ async fn execute_non_stream_request_body(
         }
     };
 
-    Ok(decode_non_stream_message(
+    let result = decode_non_stream_message(
         &body_bytes,
         model,
         input_tokens,
         tool_name_map,
         prefer_context_input_tokens,
-    ))
+    );
+    if let Some(recorder) = usage_recorder {
+        recorder.record_complete(
+            result.input_tokens,
+            result.output_tokens,
+            result.input_token_source,
+        );
+    }
+
+    Ok(result)
 }
 
 fn decode_non_stream_message(
@@ -2333,6 +2353,11 @@ fn decode_non_stream_message(
     } else {
         input_tokens
     };
+    let input_token_source = if prefer_context_input_tokens && context_input_tokens.is_some() {
+        "context_usage"
+    } else {
+        "billing_input_tokens"
+    };
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -2355,6 +2380,7 @@ fn decode_non_stream_message(
         stop_reason,
         input_tokens: final_input_tokens,
         output_tokens,
+        input_token_source,
     }
 }
 
@@ -2926,9 +2952,10 @@ async fn handle_stream_request_buffered(
         tool_name_map,
     )
     .with_synthetic_hidden_thinking_signature(synthesize_hidden_thinking_signature);
+    let usage_recorder = response.usage_recorder();
 
     // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx);
+    let stream = create_buffered_sse_stream(response, ctx, usage_recorder);
 
     // 返回 SSE 响应
     Response::builder()
@@ -2950,6 +2977,7 @@ async fn handle_stream_request_buffered(
 fn create_buffered_sse_stream(
     response: crate::kiro::provider::ManagedResponse,
     ctx: BufferedStreamContext,
+    usage_recorder: Option<ResponseUsageRecorder>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.into_bytes_stream();
 
@@ -2959,8 +2987,9 @@ fn create_buffered_sse_stream(
             ctx,
             EventStreamDecoder::new(),
             false,
+            usage_recorder,
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, usage_recorder)| async move {
             if finished {
                 return None;
             }
@@ -2981,7 +3010,7 @@ fn create_buffered_sse_stream(
                                         "Kiro Event Stream 缓冲失败（缓冲模式）"
                                     );
                                     if let Some(error_bytes) = decode_error_sse_if_fatal(&e, &decoder) {
-                                        return Some((stream::iter(vec![Ok(error_bytes)]), (body_stream, ctx, decoder, true)));
+                                        return Some((stream::iter(vec![Ok(error_bytes)]), (body_stream, ctx, decoder, true, usage_recorder)));
                                     }
                                 }
 
@@ -3013,7 +3042,7 @@ fn create_buffered_sse_stream(
                                                 "Kiro Event Stream frame 解码失败（缓冲模式）"
                                             );
                                             if let Some(error_bytes) = decode_error_sse_if_fatal(&e, &decoder) {
-                                                return Some((stream::iter(vec![Ok(error_bytes)]), (body_stream, ctx, decoder, true)));
+                                                return Some((stream::iter(vec![Ok(error_bytes)]), (body_stream, ctx, decoder, true, usage_recorder)));
                                             }
                                         }
                                     }
@@ -3026,16 +3055,20 @@ fn create_buffered_sse_stream(
                                 let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_stream_error_sse(
                                     "Upstream stream ended with a transport error.",
                                 ))];
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, usage_recorder)));
                             }
                             None => {
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）
                                 let all_events = ctx.finish_and_get_all_events();
+                                if let Some(recorder) = &usage_recorder {
+                                    let (input_tokens, output_tokens, token_source) = ctx.final_usage();
+                                    recorder.record_complete(input_tokens, output_tokens, token_source);
+                                }
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, usage_recorder)));
                             }
                         }
                     }
@@ -3592,6 +3625,7 @@ mod tests {
             stop_reason: "end_turn".to_string(),
             input_tokens: 10,
             output_tokens: 20,
+            input_token_source: "billing_input_tokens",
         };
 
         let coerced = coerce_structured_response(response, &output).unwrap();

@@ -543,6 +543,18 @@ impl StreamContext {
         self
     }
 
+    pub fn final_usage(&self) -> (i32, i32, &'static str) {
+        (
+            self.context_input_tokens.unwrap_or(self.input_tokens),
+            self.output_tokens,
+            if self.context_input_tokens.is_some() {
+                "context_usage"
+            } else {
+                "billing_input_tokens"
+            },
+        )
+    }
+
     /// 生成 message_start 事件
     pub fn create_message_start_event(&self) -> serde_json::Value {
         let input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
@@ -1500,6 +1512,10 @@ impl BufferedStreamContext {
         }
 
         std::mem::take(&mut self.event_buffer)
+    }
+
+    pub fn final_usage(&self) -> (i32, i32, &'static str) {
+        self.inner.final_usage()
     }
 }
 

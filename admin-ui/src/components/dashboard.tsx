@@ -45,7 +45,7 @@ const UNKNOWN_SOURCE_BATCH = '__unknown_source_batch__'
 type EnabledFilter = 'all' | 'enabled' | 'disabled'
 type AccountStatusFilter = 'all' | 'normal' | 'rate-limited' | 'abnormal'
 type QuickFilter = 'all' | 'dispatchable'
-type SortField = 'importedAt' | 'priority' | 'successCount' | 'lastUsedAt'
+type SortField = 'importedAt' | 'priority' | 'successCount' | 'totalTokens' | 'lastUsedAt'
 type SortDirection = 'asc' | 'desc'
 
 interface SegmentedOption {
@@ -278,6 +278,7 @@ export function Dashboard() {
     { value: 'importedAt', label: '导入时间' },
     { value: 'priority', label: '优先级' },
     { value: 'successCount', label: '调用次数' },
+    { value: 'totalTokens', label: 'Token 用量' },
     { value: 'lastUsedAt', label: '最后调用' },
   ]
 
@@ -376,6 +377,8 @@ export function Dashboard() {
         comparison = a.priority - b.priority
       } else if (sortField === 'successCount') {
         comparison = a.successCount - b.successCount
+      } else if (sortField === 'totalTokens') {
+        comparison = (a.totalTokens ?? 0) - (b.totalTokens ?? 0)
       } else if (sortField === 'lastUsedAt') {
         comparison = getLastUsedSortValue(a) - getLastUsedSortValue(b)
       }

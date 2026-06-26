@@ -97,6 +97,22 @@ interface CredentialCardProps {
 
 type RateLimitCooldownMode = 'global' | 'enabled' | 'disabled'
 
+const compactNumberFormatter = new Intl.NumberFormat('zh-CN', {
+  notation: 'compact',
+  maximumFractionDigits: 1,
+})
+const integerNumberFormatter = new Intl.NumberFormat('zh-CN')
+
+function formatTokenCount(value: number | null | undefined): string {
+  const normalized = Number.isFinite(value ?? 0) ? Math.max(0, value ?? 0) : 0
+  return compactNumberFormatter.format(normalized)
+}
+
+function formatInteger(value: number | null | undefined): string {
+  const normalized = Number.isFinite(value ?? 0) ? Math.max(0, value ?? 0) : 0
+  return integerNumberFormatter.format(normalized)
+}
+
 function rateLimitCooldownModeFromOverride(value: boolean | null | undefined): RateLimitCooldownMode {
   if (value === true) return 'enabled'
   if (value === false) return 'disabled'
@@ -916,6 +932,11 @@ export function CredentialCard({
     ? effectiveCredentialGroups
     : ['default']
   const credentialGroupTitle = `凭据分组：${credentialGroupLabels.join(', ')}`
+  const totalTokens = credential.totalTokens ?? 0
+  const inputTokens = credential.inputTokens ?? 0
+  const outputTokens = credential.outputTokens ?? 0
+  const tokenUsageCount = credential.tokenUsageCount ?? 0
+  const tokenUsageTitle = `完整响应 ${formatInteger(tokenUsageCount)} 次 / 输入 ${formatInteger(inputTokens)} / 输出 ${formatInteger(outputTokens)} / 合计 ${formatInteger(totalTokens)} tokens`
 
   return (
     <>
@@ -1114,6 +1135,10 @@ export function CredentialCard({
             <div className="flex items-center gap-1">
               <span className="inline-block w-2 h-2 rounded-full bg-green-500" />
               <span>成功: <span className="font-semibold text-foreground">{credential.successCount}</span></span>
+            </div>
+            <div className="flex items-center gap-1" title={tokenUsageTitle}>
+              <span className="inline-block h-2 w-2 rounded-full bg-sky-500" />
+              <span>Token: <span className="font-semibold text-foreground">{formatTokenCount(totalTokens)}</span></span>
             </div>
             <div className="flex items-center gap-1">
               <span className={cn("inline-block w-2 h-2 rounded-full", credential.failureCount > 0 ? "bg-red-500" : "bg-muted")} />

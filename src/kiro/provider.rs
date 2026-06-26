@@ -96,6 +96,7 @@ pub struct ManagedResponse {
     body: ManagedResponseBody,
     _lease: Option<CallLease>,
     trace: Option<ResponseTrace>,
+    usage_recorder: Option<ResponseUsageRecorder>,
     stream_first_chunk_already_logged: bool,
 }
 
@@ -103,6 +104,54 @@ enum ManagedResponseBody {
     Response(reqwest::Response),
     Stream(BoxStream<'static, Result<Bytes, reqwest::Error>>),
     Bytes(Bytes),
+}
+
+#[derive(Clone)]
+pub struct ResponseUsageRecorder {
+    token_manager: Arc<MultiTokenManager>,
+    credential_id: u64,
+    request_id: String,
+    api_type: &'static str,
+    model: Option<String>,
+}
+
+impl ResponseUsageRecorder {
+    fn new(
+        token_manager: Arc<MultiTokenManager>,
+        credential_id: u64,
+        request_id: String,
+        api_type: &'static str,
+        model: Option<String>,
+    ) -> Self {
+        Self {
+            token_manager,
+            credential_id,
+            request_id,
+            api_type,
+            model,
+        }
+    }
+
+    pub(crate) fn record_complete(
+        &self,
+        input_tokens: i32,
+        output_tokens: i32,
+        token_source: &str,
+    ) {
+        self.token_manager.record_token_usage(
+            self.credential_id,
+            non_negative_i32_to_u64(input_tokens),
+            non_negative_i32_to_u64(output_tokens),
+            Some(&self.request_id),
+            self.model.as_deref(),
+            self.api_type,
+            token_source,
+        );
+    }
+}
+
+fn non_negative_i32_to_u64(value: i32) -> u64 {
+    u64::try_from(value).unwrap_or_default()
 }
 
 #[derive(Debug, Clone)]
@@ -298,11 +347,17 @@ struct SlowModelCooldownTrace {
 }
 
 impl ManagedResponse {
-    fn new(response: reqwest::Response, lease: CallLease, trace: Option<ResponseTrace>) -> Self {
+    fn new(
+        response: reqwest::Response,
+        lease: CallLease,
+        trace: Option<ResponseTrace>,
+        usage_recorder: Option<ResponseUsageRecorder>,
+    ) -> Self {
         Self {
             body: ManagedResponseBody::Response(response),
             _lease: Some(lease),
             trace,
+            usage_recorder,
             stream_first_chunk_already_logged: false,
         }
     }
@@ -311,23 +366,34 @@ impl ManagedResponse {
         stream: BoxStream<'static, Result<Bytes, reqwest::Error>>,
         lease: Option<CallLease>,
         trace: Option<ResponseTrace>,
+        usage_recorder: Option<ResponseUsageRecorder>,
         first_chunk_already_logged: bool,
     ) -> Self {
         Self {
             body: ManagedResponseBody::Stream(stream),
             _lease: lease,
             trace,
+            usage_recorder,
             stream_first_chunk_already_logged: first_chunk_already_logged,
         }
     }
 
-    fn new_bytes(bytes: Bytes, lease: CallLease) -> Self {
+    fn new_bytes(
+        bytes: Bytes,
+        lease: CallLease,
+        usage_recorder: Option<ResponseUsageRecorder>,
+    ) -> Self {
         Self {
             body: ManagedResponseBody::Bytes(bytes),
             _lease: Some(lease),
             trace: None,
+            usage_recorder,
             stream_first_chunk_already_logged: false,
         }
+    }
+
+    pub(crate) fn usage_recorder(&self) -> Option<ResponseUsageRecorder> {
+        self.usage_recorder.clone()
     }
 
     pub async fn bytes(self) -> reqwest::Result<Bytes> {
@@ -335,6 +401,7 @@ impl ManagedResponse {
             body,
             _lease,
             trace,
+            usage_recorder: _,
             stream_first_chunk_already_logged: _,
         } = self;
         match body {
@@ -364,6 +431,7 @@ impl ManagedResponse {
             body,
             _lease,
             trace,
+            usage_recorder: _,
             stream_first_chunk_already_logged: _,
         } = self;
         let text = match body {
@@ -388,6 +456,7 @@ impl ManagedResponse {
             body,
             _lease,
             trace,
+            usage_recorder: _,
             stream_first_chunk_already_logged,
         } = self;
         let body_stream = match body {
@@ -2888,7 +2957,7 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx_id);
-                return Ok(ManagedResponse::new(response, lease, None));
+                return Ok(ManagedResponse::new(response, lease, None, None));
             }
 
             // 失败响应
@@ -4011,7 +4080,18 @@ impl KiroProvider {
                         ctx_id,
                     );
                     self.token_manager.report_success(ctx_id);
-                    return Ok(ManagedResponse::new_bytes(body_bytes, lease));
+                    let usage_recorder = Some(ResponseUsageRecorder::new(
+                        Arc::clone(&self.token_manager),
+                        ctx_id,
+                        request_id.clone(),
+                        api_type,
+                        model.clone(),
+                    ));
+                    return Ok(ManagedResponse::new_bytes(
+                        body_bytes,
+                        lease,
+                        usage_recorder,
+                    ));
                 }
 
                 let retryable_excluded_count = Self::request_scoped_retryable_exclusion_count(
@@ -4090,6 +4170,13 @@ impl KiroProvider {
                                 ctx_id,
                             );
                             self.token_manager.report_success(ctx_id);
+                            let usage_recorder = Some(ResponseUsageRecorder::new(
+                                Arc::clone(&self.token_manager),
+                                ctx_id,
+                                request_id.clone(),
+                                api_type,
+                                model.clone(),
+                            ));
                             let response_lease = if stream_dispatch_lease_release_enabled {
                                 tracing::info!(
                                     request_id = %request_id,
@@ -4113,6 +4200,7 @@ impl KiroProvider {
                                 stream,
                                 response_lease,
                                 Some(trace),
+                                usage_recorder,
                                 first_chunk_logged,
                             ));
                         }
@@ -4286,14 +4374,34 @@ impl KiroProvider {
                     );
                     let stream = response.bytes_stream().boxed();
                     drop(lease);
+                    let usage_recorder = Some(ResponseUsageRecorder::new(
+                        Arc::clone(&self.token_manager),
+                        ctx_id,
+                        request_id.clone(),
+                        api_type,
+                        model.clone(),
+                    ));
                     return Ok(ManagedResponse::new_stream(
                         stream,
                         None,
                         Some(trace),
+                        usage_recorder,
                         false,
                     ));
                 }
-                return Ok(ManagedResponse::new(response, lease, Some(trace)));
+                let usage_recorder = Some(ResponseUsageRecorder::new(
+                    Arc::clone(&self.token_manager),
+                    ctx_id,
+                    request_id.clone(),
+                    api_type,
+                    model.clone(),
+                ));
+                return Ok(ManagedResponse::new(
+                    response,
+                    lease,
+                    Some(trace),
+                    usage_recorder,
+                ));
             }
 
             // 失败响应：读取 body 用于日志/错误信息
