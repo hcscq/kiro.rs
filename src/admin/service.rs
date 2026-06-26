@@ -3716,6 +3716,9 @@ impl AdminService {
         let snapshot = self.token_manager.load_balancing_config_snapshot();
         let mut assigned_by_proxy_id: HashMap<String, usize> = HashMap::new();
         for entry in self.token_manager.snapshot().entries {
+            if entry.disabled {
+                continue;
+            }
             if let Some(proxy_id) = entry
                 .proxy_id
                 .as_deref()
@@ -5045,9 +5048,21 @@ mod tests {
         third.id = Some(3);
         third.machine_id = Some("machine-3".to_string());
         third.proxy_id = Some("node-b".to_string());
+        let mut disabled = available_credential();
+        disabled.id = Some(4);
+        disabled.machine_id = Some("machine-4".to_string());
+        disabled.proxy_id = Some("node-a".to_string());
+        disabled.disabled = true;
 
         let manager = Arc::new(
-            MultiTokenManager::new(config, vec![first, second, third], None, None, false).unwrap(),
+            MultiTokenManager::new(
+                config,
+                vec![first, second, third, disabled],
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
         );
         let service = AdminService::new(manager);
 

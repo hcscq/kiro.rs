@@ -2801,6 +2801,9 @@ impl MultiTokenManager {
 
         let mut counts: HashMap<String, usize> = HashMap::new();
         for credential in persisted {
+            if credential.disabled {
+                continue;
+            }
             if let Some(proxy_id) = credential
                 .proxy_id
                 .as_deref()
@@ -10713,7 +10716,10 @@ mod tests {
         existing_a.proxy_id = Some("node-a".to_string());
         let mut existing_b = available_credential(1);
         existing_b.proxy_id = Some("node-a".to_string());
-        let persisted = vec![existing_a, existing_b];
+        let mut disabled_b = available_credential(2);
+        disabled_b.proxy_id = Some("node-b".to_string());
+        disabled_b.disabled = true;
+        let persisted = vec![existing_a, existing_b, disabled_b];
 
         let mut new_credential = KiroCredentials::default();
         new_credential.refresh_token = Some("refresh-token-for-proxy-assignment".repeat(4));
