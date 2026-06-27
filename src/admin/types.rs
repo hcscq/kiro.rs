@@ -87,8 +87,71 @@ pub struct CredentialsStatusResponse {
     pub dispatchable: usize,
     /// 当前活跃凭据 ID
     pub current_id: u64,
+    /// 凭据状态修订号（共享后端启用时来自 Redis）
+    pub credentials_revision: u64,
+    /// 余额缓存修订号
+    pub balance_cache_revision: u64,
+    /// 凭据列表摘要指纹
+    pub credentials_fingerprint: u64,
     /// 各凭据状态列表
     pub credentials: Vec<CredentialStatusItem>,
+}
+
+/// 凭据列表增量请求。客户端提交当前缓存中的每个凭据 ID 与指纹。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialsDeltaRequest {
+    /// 客户端已知的凭据状态修订号
+    #[serde(default)]
+    pub since_revision: u64,
+    /// 客户端已知的余额缓存修订号
+    #[serde(default)]
+    pub balance_cache_revision: u64,
+    /// 客户端已知的全局凭据摘要指纹
+    #[serde(default)]
+    pub credentials_fingerprint: u64,
+    /// 客户端已缓存的凭据项指纹
+    #[serde(default)]
+    pub known_credentials: Vec<KnownCredentialFingerprint>,
+}
+
+/// 客户端已缓存的单个凭据指纹。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KnownCredentialFingerprint {
+    pub id: u64,
+    pub fingerprint: u64,
+}
+
+/// 凭据列表增量响应。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialsDeltaResponse {
+    /// 当前是否要求客户端退回全量刷新
+    pub reset_required: bool,
+    /// 退回全量刷新原因
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// 最新凭据状态修订号
+    pub revision: u64,
+    /// 最新余额缓存修订号
+    pub balance_revision: u64,
+    /// 最新凭据列表摘要指纹
+    pub fingerprint: u64,
+    /// 当前凭据总数
+    pub total: usize,
+    /// 当前可用凭据数量
+    pub available: usize,
+    /// 当前可立即调度的凭据数量
+    pub dispatchable: usize,
+    /// 当前活跃凭据 ID
+    pub current_id: u64,
+    /// 新增或已变化的凭据项
+    pub upserts: Vec<CredentialStatusItem>,
+    /// 已删除的凭据 ID
+    pub deleted_ids: Vec<u64>,
+    /// 响应生成时间
+    pub generated_at: DateTime<Utc>,
 }
 
 /// 单个凭据的状态信息
@@ -97,6 +160,8 @@ pub struct CredentialsStatusResponse {
 pub struct CredentialStatusItem {
     /// 凭据唯一 ID
     pub id: u64,
+    /// 单项结构/配置/异常/余额缓存指纹，用于增量更新比较
+    pub fingerprint: u64,
     /// 优先级（数字越小优先级越高）
     pub priority: u32,
     /// 是否被禁用

@@ -23,7 +23,7 @@ use crate::common::auth::{
 use crate::common::logging::summarize_upstream_error;
 use crate::http_client::{ProxyConfig, build_client, build_client_no_redirect};
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{CredentialEntrySnapshot, MultiTokenManager};
 use crate::model::account_type_preset::{
     built_in_account_type_presets, infer_standard_account_type_id_from_subscription,
 };
@@ -36,15 +36,16 @@ use super::types::{
     AddCredentialRequest, AddCredentialResponse, AdminStateEvent, BalanceResponse,
     CachedBalanceResponse, CredentialGroupConfigItem, CredentialGroupUsageItem,
     CredentialGroupsConfigResponse, CredentialProfilesResponse, CredentialStatusItem,
-    CredentialsStatusResponse, ExternalIdpLoginFlow, ExternalIdpLoginPhase,
-    ExternalIdpLoginStartResponse, ExternalIdpLoginStatus, ExternalIdpLoginStatusResponse,
-    ExternalIdpOidcDiscoverySummary, ExternalIdpProbeRequest, ExternalIdpProbeResponse,
-    ExternalIdpProbeStatus, IdcDeviceLoginStartResponse, IdcDeviceLoginStatus,
-    IdcDeviceLoginStatusResponse, LoadBalancingModeResponse, ModelCapabilitiesConfigResponse,
-    ModelCatalogItemResponse, ModelCatalogResponse, ProxyPoolConfigResponse,
-    ProxyPoolEntryResponse, SetCredentialGroupsConfigRequest, SetCredentialGroupsRequest,
-    SetCredentialModelPolicyRequest, SetCredentialProfileRequest, SetCredentialProxyRequest,
-    SetCredentialSourceRequest, SetLoadBalancingModeRequest, SetModelCapabilitiesConfigRequest,
+    CredentialsDeltaRequest, CredentialsDeltaResponse, CredentialsStatusResponse,
+    ExternalIdpLoginFlow, ExternalIdpLoginPhase, ExternalIdpLoginStartResponse,
+    ExternalIdpLoginStatus, ExternalIdpLoginStatusResponse, ExternalIdpOidcDiscoverySummary,
+    ExternalIdpProbeRequest, ExternalIdpProbeResponse, ExternalIdpProbeStatus,
+    IdcDeviceLoginStartResponse, IdcDeviceLoginStatus, IdcDeviceLoginStatusResponse,
+    LoadBalancingModeResponse, ModelCapabilitiesConfigResponse, ModelCatalogItemResponse,
+    ModelCatalogResponse, ProxyPoolConfigResponse, ProxyPoolEntryResponse,
+    SetCredentialGroupsConfigRequest, SetCredentialGroupsRequest, SetCredentialModelPolicyRequest,
+    SetCredentialProfileRequest, SetCredentialProxyRequest, SetCredentialSourceRequest,
+    SetLoadBalancingModeRequest, SetModelCapabilitiesConfigRequest,
     StandardAccountTypePresetResponse, StartExternalIdpLoginRequest, StartIdcDeviceLoginRequest,
     SubmitExternalIdpCallbackRequest,
 };
@@ -1085,8 +1086,6 @@ impl AdminService {
         let mut hasher = DefaultHasher::new();
         snapshot.total.hash(&mut hasher);
         snapshot.available.hash(&mut hasher);
-        snapshot.dispatchable.hash(&mut hasher);
-        snapshot.current_id.hash(&mut hasher);
 
         for entry in &snapshot.entries {
             entry.id.hash(&mut hasher);
@@ -1094,12 +1093,8 @@ impl AdminService {
             entry.disabled.hash(&mut hasher);
             entry.failure_count.hash(&mut hasher);
             entry.refresh_failure_count.hash(&mut hasher);
-            entry.success_count.hash(&mut hasher);
-            entry.token_usage_count.hash(&mut hasher);
-            entry.input_tokens.hash(&mut hasher);
-            entry.output_tokens.hash(&mut hasher);
-            entry.last_used_at.hash(&mut hasher);
             entry.max_concurrency.hash(&mut hasher);
+            entry.max_concurrency_override.hash(&mut hasher);
             entry.max_concurrency_source.hash(&mut hasher);
             entry.profile_arn.hash(&mut hasher);
             entry.subscription_title.hash(&mut hasher);
@@ -1128,8 +1123,18 @@ impl AdminService {
                 .suspicious_activity_recovery_success_count
                 .hash(&mut hasher);
             entry.rate_limit_cooldown_enabled.hash(&mut hasher);
+            entry.rate_limit_cooldown_enabled_override.hash(&mut hasher);
             entry.rate_limit_cooldown_enabled_source.hash(&mut hasher);
-            entry.rate_limit_hit_streak.hash(&mut hasher);
+            entry
+                .rate_limit_bucket_capacity_override
+                .map(f64::to_bits)
+                .hash(&mut hasher);
+            entry.rate_limit_bucket_capacity_source.hash(&mut hasher);
+            entry
+                .rate_limit_refill_per_second_override
+                .map(f64::to_bits)
+                .hash(&mut hasher);
+            entry.rate_limit_refill_per_second_source.hash(&mut hasher);
         }
 
         hasher.finish() & JS_SAFE_U64_MASK
@@ -1307,9 +1312,76 @@ impl AdminService {
 
     /// 获取所有凭据状态
     pub fn get_all_credentials(&self) -> Result<CredentialsStatusResponse, AdminServiceError> {
+        let (response, _) = self.build_credentials_status_response()?;
+        Ok(response)
+    }
+
+    /// 获取客户端缓存之后的凭据列表增量。
+    pub fn get_credentials_delta(
+        &self,
+        request: CredentialsDeltaRequest,
+    ) -> Result<CredentialsDeltaResponse, AdminServiceError> {
+        let (response, _) = self.build_credentials_status_response()?;
+        let known = request
+            .known_credentials
+            .into_iter()
+            .map(|item| (item.id, item.fingerprint))
+            .collect::<HashMap<_, _>>();
+        let current_ids = response
+            .credentials
+            .iter()
+            .map(|credential| credential.id)
+            .collect::<BTreeSet<_>>();
+
+        let mut upserts = Vec::new();
+        let mut deleted_ids = Vec::new();
+
+        for credential in response.credentials {
+            if known.get(&credential.id).copied() != Some(credential.fingerprint) {
+                upserts.push(credential);
+            }
+        }
+
+        for id in known.keys() {
+            if !current_ids.contains(id) {
+                deleted_ids.push(*id);
+            }
+        }
+        deleted_ids.sort_unstable();
+
+        let unchanged = request.since_revision == response.credentials_revision
+            && request.balance_cache_revision == response.balance_cache_revision
+            && request.credentials_fingerprint == response.credentials_fingerprint
+            && upserts.is_empty()
+            && deleted_ids.is_empty();
+
+        Ok(CredentialsDeltaResponse {
+            reset_required: false,
+            reason: if unchanged {
+                Some("notModified".to_string())
+            } else {
+                None
+            },
+            revision: response.credentials_revision,
+            balance_revision: response.balance_cache_revision,
+            fingerprint: response.credentials_fingerprint,
+            total: response.total,
+            available: response.available,
+            dispatchable: response.dispatchable,
+            current_id: response.current_id,
+            upserts,
+            deleted_ids,
+            generated_at: Utc::now(),
+        })
+    }
+
+    fn build_credentials_status_response(
+        &self,
+    ) -> Result<(CredentialsStatusResponse, AdminStateEvent), AdminServiceError> {
         self.sync_runtime_state_for_read()?;
         self.sync_balance_cache_if_changed()
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        let event = self.build_state_event(self.events_tx.borrow().sequence)?;
         let snapshot = self.token_manager.snapshot();
         let current_id = snapshot.current_id;
         let total = snapshot.total;
@@ -1321,110 +1393,223 @@ impl AdminService {
             .entries
             .into_iter()
             .map(|entry| {
-                let standard_account_type = infer_standard_account_type_id_from_subscription(
-                    entry.subscription_title.as_deref(),
-                    entry.subscription_type.as_deref(),
-                )
-                .map(|value| value.to_string());
-                let profile_arn = entry.profile_arn.clone();
-                let cached_balance = balance_cache
-                    .get(&entry.id)
-                    .filter(|cached| Self::is_balance_cache_fresh(cached))
-                    .filter(|cached| cached.profile_arn.as_deref() == profile_arn.as_deref())
-                    .map(|cached| CachedBalanceResponse {
-                        cached_at: cached.cached_at,
-                        balance: cached.data.clone(),
-                    });
-
-                CredentialStatusItem {
-                    id: entry.id,
-                    priority: entry.priority,
-                    disabled: entry.disabled,
-                    failure_count: entry.failure_count,
-                    is_current: entry.id == current_id,
-                    expires_at: entry.expires_at,
-                    auth_method: entry.auth_method,
-                    provider: entry.provider,
-                    has_profile_arn: entry.has_profile_arn,
-                    profile_arn,
-                    refresh_token_hash: entry.refresh_token_hash,
-                    email: entry.email,
-                    user_id: entry.user_id,
-                    subscription_title: entry.subscription_title,
-                    subscription_type: entry.subscription_type,
-                    auth_account_type: entry.auth_account_type,
-                    account_type: entry.account_type,
-                    source_supplier_id: entry.source_supplier_id,
-                    source_supplier_name: entry.source_supplier_name,
-                    source_batch: entry.source_batch,
-                    credential_groups: entry.credential_groups,
-                    resolved_account_type: entry.resolved_account_type,
-                    account_type_source: entry.account_type_source,
-                    standard_account_type,
-                    allowed_models: entry.allowed_models,
-                    blocked_models: entry.blocked_models,
-                    runtime_model_restrictions: entry.runtime_model_restrictions,
-                    available_model_ids: entry.available_model_ids,
-                    available_models_cached_at: entry.available_models_cached_at,
-                    imported_at: entry.imported_at,
-                    success_count: entry.success_count,
-                    token_usage_count: entry.token_usage_count,
-                    input_tokens: entry.input_tokens,
-                    output_tokens: entry.output_tokens,
-                    total_tokens: entry.total_tokens,
-                    last_used_at: entry.last_used_at.clone(),
-                    in_flight: entry.active_requests,
-                    max_concurrency: entry.max_concurrency,
-                    max_concurrency_override: entry.max_concurrency_override,
-                    max_concurrency_source: entry.max_concurrency_source,
-                    has_proxy: entry.has_proxy,
-                    proxy_url: entry.proxy_url,
-                    proxy_id: entry.proxy_id,
-                    refresh_failure_count: entry.refresh_failure_count,
-                    disabled_reason: entry.disabled_reason,
-                    disabled_at: entry.disabled_at,
-                    last_error_status: entry.last_error_status,
-                    last_error_summary: entry.last_error_summary,
-                    suspicious_activity_count: entry.suspicious_activity_count,
-                    suspicious_activity_first_seen_at: entry.suspicious_activity_first_seen_at,
-                    suspicious_activity_last_seen_at: entry.suspicious_activity_last_seen_at,
-                    suspicious_activity_quarantine_until: entry
-                        .suspicious_activity_quarantine_until,
-                    suspicious_activity_recovery_success_count: entry
-                        .suspicious_activity_recovery_success_count,
-                    suspicious_activity_quarantine_remaining_ms: entry
-                        .suspicious_activity_quarantine_remaining_ms,
-                    rate_limit_cooldown_enabled: entry.rate_limit_cooldown_enabled,
-                    rate_limit_cooldown_enabled_override: entry
-                        .rate_limit_cooldown_enabled_override,
-                    rate_limit_cooldown_enabled_source: entry.rate_limit_cooldown_enabled_source,
-                    cooldown_remaining_ms: entry.cooldown_remaining_ms,
-                    rate_limit_bucket_tokens: entry.rate_limit_bucket_tokens,
-                    rate_limit_bucket_capacity: entry.rate_limit_bucket_capacity,
-                    rate_limit_bucket_capacity_override: entry.rate_limit_bucket_capacity_override,
-                    rate_limit_bucket_capacity_source: entry.rate_limit_bucket_capacity_source,
-                    rate_limit_refill_per_second: entry.rate_limit_refill_per_second,
-                    rate_limit_refill_per_second_override: entry
-                        .rate_limit_refill_per_second_override,
-                    rate_limit_refill_per_second_source: entry.rate_limit_refill_per_second_source,
-                    rate_limit_refill_base_per_second: entry.rate_limit_refill_base_per_second,
-                    rate_limit_hit_streak: entry.rate_limit_hit_streak,
-                    next_ready_in_ms: entry.next_ready_in_ms,
-                    cached_balance,
-                }
+                Self::credential_status_item_from_snapshot(entry, current_id, &balance_cache)
             })
             .collect();
 
         // 按优先级排序（数字越小优先级越高）
         credentials.sort_by_key(|c| c.priority);
 
-        Ok(CredentialsStatusResponse {
-            total,
-            available,
-            dispatchable,
-            current_id,
-            credentials,
-        })
+        Ok((
+            CredentialsStatusResponse {
+                total,
+                available,
+                dispatchable,
+                current_id,
+                credentials_revision: event.credentials_revision,
+                balance_cache_revision: event.balance_cache_revision,
+                credentials_fingerprint: event.credentials_fingerprint,
+                credentials,
+            },
+            event,
+        ))
+    }
+
+    fn credential_status_item_from_snapshot(
+        entry: CredentialEntrySnapshot,
+        current_id: u64,
+        balance_cache: &HashMap<u64, CachedBalanceRecord>,
+    ) -> CredentialStatusItem {
+        let fingerprint = Self::credential_item_fingerprint(&entry, balance_cache);
+        let standard_account_type = infer_standard_account_type_id_from_subscription(
+            entry.subscription_title.as_deref(),
+            entry.subscription_type.as_deref(),
+        )
+        .map(|value| value.to_string());
+        let profile_arn = entry.profile_arn.clone();
+        let cached_balance = balance_cache
+            .get(&entry.id)
+            .filter(|cached| Self::is_balance_cache_fresh(cached))
+            .filter(|cached| cached.profile_arn.as_deref() == profile_arn.as_deref())
+            .map(|cached| CachedBalanceResponse {
+                cached_at: cached.cached_at,
+                balance: cached.data.clone(),
+            });
+
+        CredentialStatusItem {
+            id: entry.id,
+            fingerprint,
+            priority: entry.priority,
+            disabled: entry.disabled,
+            failure_count: entry.failure_count,
+            is_current: entry.id == current_id,
+            expires_at: entry.expires_at,
+            auth_method: entry.auth_method,
+            provider: entry.provider,
+            has_profile_arn: entry.has_profile_arn,
+            profile_arn,
+            refresh_token_hash: entry.refresh_token_hash,
+            email: entry.email,
+            user_id: entry.user_id,
+            subscription_title: entry.subscription_title,
+            subscription_type: entry.subscription_type,
+            auth_account_type: entry.auth_account_type,
+            account_type: entry.account_type,
+            source_supplier_id: entry.source_supplier_id,
+            source_supplier_name: entry.source_supplier_name,
+            source_batch: entry.source_batch,
+            credential_groups: entry.credential_groups,
+            resolved_account_type: entry.resolved_account_type,
+            account_type_source: entry.account_type_source,
+            standard_account_type,
+            allowed_models: entry.allowed_models,
+            blocked_models: entry.blocked_models,
+            runtime_model_restrictions: entry.runtime_model_restrictions,
+            available_model_ids: entry.available_model_ids,
+            available_models_cached_at: entry.available_models_cached_at,
+            imported_at: entry.imported_at,
+            success_count: entry.success_count,
+            token_usage_count: entry.token_usage_count,
+            input_tokens: entry.input_tokens,
+            output_tokens: entry.output_tokens,
+            total_tokens: entry.total_tokens,
+            last_used_at: entry.last_used_at.clone(),
+            in_flight: entry.active_requests,
+            max_concurrency: entry.max_concurrency,
+            max_concurrency_override: entry.max_concurrency_override,
+            max_concurrency_source: entry.max_concurrency_source,
+            has_proxy: entry.has_proxy,
+            proxy_url: entry.proxy_url,
+            proxy_id: entry.proxy_id,
+            refresh_failure_count: entry.refresh_failure_count,
+            disabled_reason: entry.disabled_reason,
+            disabled_at: entry.disabled_at,
+            last_error_status: entry.last_error_status,
+            last_error_summary: entry.last_error_summary,
+            suspicious_activity_count: entry.suspicious_activity_count,
+            suspicious_activity_first_seen_at: entry.suspicious_activity_first_seen_at,
+            suspicious_activity_last_seen_at: entry.suspicious_activity_last_seen_at,
+            suspicious_activity_quarantine_until: entry.suspicious_activity_quarantine_until,
+            suspicious_activity_recovery_success_count: entry
+                .suspicious_activity_recovery_success_count,
+            suspicious_activity_quarantine_remaining_ms: entry
+                .suspicious_activity_quarantine_remaining_ms,
+            rate_limit_cooldown_enabled: entry.rate_limit_cooldown_enabled,
+            rate_limit_cooldown_enabled_override: entry.rate_limit_cooldown_enabled_override,
+            rate_limit_cooldown_enabled_source: entry.rate_limit_cooldown_enabled_source,
+            cooldown_remaining_ms: entry.cooldown_remaining_ms,
+            rate_limit_bucket_tokens: entry.rate_limit_bucket_tokens,
+            rate_limit_bucket_capacity: entry.rate_limit_bucket_capacity,
+            rate_limit_bucket_capacity_override: entry.rate_limit_bucket_capacity_override,
+            rate_limit_bucket_capacity_source: entry.rate_limit_bucket_capacity_source,
+            rate_limit_refill_per_second: entry.rate_limit_refill_per_second,
+            rate_limit_refill_per_second_override: entry.rate_limit_refill_per_second_override,
+            rate_limit_refill_per_second_source: entry.rate_limit_refill_per_second_source,
+            rate_limit_refill_base_per_second: entry.rate_limit_refill_base_per_second,
+            rate_limit_hit_streak: entry.rate_limit_hit_streak,
+            next_ready_in_ms: entry.next_ready_in_ms,
+            cached_balance,
+        }
+    }
+
+    fn credential_item_fingerprint(
+        entry: &CredentialEntrySnapshot,
+        balance_cache: &HashMap<u64, CachedBalanceRecord>,
+    ) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        entry.id.hash(&mut hasher);
+        entry.priority.hash(&mut hasher);
+        entry.disabled.hash(&mut hasher);
+        entry.failure_count.hash(&mut hasher);
+        entry.auth_method.hash(&mut hasher);
+        entry.provider.hash(&mut hasher);
+        entry.has_profile_arn.hash(&mut hasher);
+        entry.profile_arn.hash(&mut hasher);
+        entry.expires_at.hash(&mut hasher);
+        entry.refresh_token_hash.hash(&mut hasher);
+        entry.email.hash(&mut hasher);
+        entry.user_id.hash(&mut hasher);
+        entry.subscription_title.hash(&mut hasher);
+        entry.subscription_type.hash(&mut hasher);
+        entry.auth_account_type.hash(&mut hasher);
+        entry.account_type.hash(&mut hasher);
+        entry.source_supplier_id.hash(&mut hasher);
+        entry.source_supplier_name.hash(&mut hasher);
+        entry.source_batch.hash(&mut hasher);
+        entry.credential_groups.hash(&mut hasher);
+        entry.resolved_account_type.hash(&mut hasher);
+        entry.account_type_source.hash(&mut hasher);
+        entry.allowed_models.hash(&mut hasher);
+        entry.blocked_models.hash(&mut hasher);
+        entry.runtime_model_restrictions.hash(&mut hasher);
+        entry.available_model_ids.hash(&mut hasher);
+        entry.available_models_cached_at.hash(&mut hasher);
+        entry.imported_at.hash(&mut hasher);
+        entry.max_concurrency.hash(&mut hasher);
+        entry.max_concurrency_override.hash(&mut hasher);
+        entry.max_concurrency_source.hash(&mut hasher);
+        entry.has_proxy.hash(&mut hasher);
+        entry.proxy_url.hash(&mut hasher);
+        entry.proxy_id.hash(&mut hasher);
+        entry.refresh_failure_count.hash(&mut hasher);
+        entry.disabled_reason.hash(&mut hasher);
+        entry.disabled_at.hash(&mut hasher);
+        entry.last_error_status.hash(&mut hasher);
+        entry.last_error_summary.hash(&mut hasher);
+        entry.suspicious_activity_count.hash(&mut hasher);
+        entry.suspicious_activity_first_seen_at.hash(&mut hasher);
+        entry.suspicious_activity_last_seen_at.hash(&mut hasher);
+        entry.suspicious_activity_quarantine_until.hash(&mut hasher);
+        entry
+            .suspicious_activity_recovery_success_count
+            .hash(&mut hasher);
+        entry.rate_limit_cooldown_enabled.hash(&mut hasher);
+        entry.rate_limit_cooldown_enabled_override.hash(&mut hasher);
+        entry.rate_limit_cooldown_enabled_source.hash(&mut hasher);
+        entry
+            .rate_limit_bucket_capacity_override
+            .map(f64::to_bits)
+            .hash(&mut hasher);
+        entry.rate_limit_bucket_capacity_source.hash(&mut hasher);
+        entry
+            .rate_limit_refill_per_second_override
+            .map(f64::to_bits)
+            .hash(&mut hasher);
+        entry.rate_limit_refill_per_second_source.hash(&mut hasher);
+
+        if let Some(cached) = balance_cache
+            .get(&entry.id)
+            .filter(|cached| Self::is_balance_cache_fresh(cached))
+            .filter(|cached| cached.profile_arn.as_deref() == entry.profile_arn.as_deref())
+        {
+            cached.cached_at.to_bits().hash(&mut hasher);
+            cached.profile_arn.hash(&mut hasher);
+            Self::hash_balance_response(&cached.data, &mut hasher);
+        }
+
+        hasher.finish() & JS_SAFE_U64_MASK
+    }
+
+    fn hash_balance_response(balance: &BalanceResponse, hasher: &mut DefaultHasher) {
+        balance.id.hash(hasher);
+        balance.profile_arn.hash(hasher);
+        balance.subscription_title.hash(hasher);
+        balance.subscription_type.hash(hasher);
+        balance.current_usage.to_bits().hash(hasher);
+        balance.usage_limit.to_bits().hash(hasher);
+        balance.effective_usage_limit.to_bits().hash(hasher);
+        balance.remaining.to_bits().hash(hasher);
+        balance.usage_percentage.to_bits().hash(hasher);
+        balance.next_reset_at.map(f64::to_bits).hash(hasher);
+        balance.overage_capability.hash(hasher);
+        balance.overage_status.hash(hasher);
+        balance.overage_enabled.hash(hasher);
+        balance.overage_cap.to_bits().hash(hasher);
+        balance.current_overages.to_bits().hash(hasher);
+        balance.overage_charges.to_bits().hash(hasher);
+        balance.overage_rate.map(f64::to_bits).hash(hasher);
+        balance.currency.hash(hasher);
+        balance.unit.hash(hasher);
     }
 
     /// 探测 Kiro external IdP 组织发现和 OIDC 能力
@@ -4671,6 +4856,7 @@ mod tests {
     use chrono::Duration;
 
     use crate::admin::types::BalanceResponse;
+    use crate::admin::types::KnownCredentialFingerprint;
     use crate::kiro::model::credentials::KiroCredentials;
     use crate::model::config::{Config, ProxyPoolConfig, ProxyPoolEntry};
 
@@ -4690,6 +4876,133 @@ mod tests {
         credentials.access_token = Some("token-1".to_string());
         credentials.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
         credentials
+    }
+
+    #[test]
+    fn credentials_event_fingerprint_ignores_hot_runtime_fields() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![available_credential()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let mut snapshot = manager.snapshot();
+        let baseline = AdminService::credentials_event_fingerprint(&snapshot);
+
+        snapshot.dispatchable = snapshot.dispatchable.saturating_add(1);
+        snapshot.current_id = snapshot.current_id.saturating_add(1);
+        let entry = snapshot.entries.first_mut().unwrap();
+        entry.success_count = 42;
+        entry.token_usage_count = 7;
+        entry.input_tokens = 12_000;
+        entry.output_tokens = 4_000;
+        entry.total_tokens = 16_000;
+        entry.last_used_at = Some("2026-06-27T00:00:00Z".to_string());
+        entry.active_requests = 3;
+        entry.cooldown_remaining_ms = Some(2_000);
+        entry.rate_limit_bucket_tokens = Some(0.25);
+        entry.rate_limit_hit_streak = 2;
+        entry.next_ready_in_ms = Some(1_000);
+
+        assert_eq!(
+            baseline,
+            AdminService::credentials_event_fingerprint(&snapshot)
+        );
+    }
+
+    #[test]
+    fn credentials_event_fingerprint_tracks_structural_fields() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![available_credential()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let snapshot = manager.snapshot();
+        let baseline = AdminService::credentials_event_fingerprint(&snapshot);
+
+        let mut priority_changed = snapshot.clone();
+        priority_changed.entries.first_mut().unwrap().priority = 10;
+        assert_ne!(
+            baseline,
+            AdminService::credentials_event_fingerprint(&priority_changed)
+        );
+
+        let mut disabled_changed = snapshot;
+        disabled_changed.entries.first_mut().unwrap().disabled = true;
+        disabled_changed.available = disabled_changed.available.saturating_sub(1);
+        assert_ne!(
+            baseline,
+            AdminService::credentials_event_fingerprint(&disabled_changed)
+        );
+    }
+
+    #[test]
+    fn credentials_delta_returns_only_changed_and_deleted_credentials() {
+        let mut first = available_credential();
+        first.id = Some(1);
+        let mut second = available_credential();
+        second.id = Some(2);
+        second.machine_id = Some("machine-2".to_string());
+        second.priority = 5;
+
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), vec![first, second], None, None, false)
+                .unwrap(),
+        );
+        let service = AdminService::new(manager);
+        let full = service.get_all_credentials().unwrap();
+        assert_eq!(full.credentials.len(), 2);
+
+        let unchanged = service
+            .get_credentials_delta(CredentialsDeltaRequest {
+                since_revision: full.credentials_revision,
+                balance_cache_revision: full.balance_cache_revision,
+                credentials_fingerprint: full.credentials_fingerprint,
+                known_credentials: full
+                    .credentials
+                    .iter()
+                    .map(|credential| KnownCredentialFingerprint {
+                        id: credential.id,
+                        fingerprint: credential.fingerprint,
+                    })
+                    .collect(),
+            })
+            .unwrap();
+        assert!(unchanged.upserts.is_empty());
+        assert!(unchanged.deleted_ids.is_empty());
+
+        let first_id = full.credentials[0].id;
+        let second_id = full.credentials[1].id;
+        let changed = service
+            .get_credentials_delta(CredentialsDeltaRequest {
+                since_revision: full.credentials_revision,
+                balance_cache_revision: full.balance_cache_revision,
+                credentials_fingerprint: full.credentials_fingerprint,
+                known_credentials: vec![
+                    KnownCredentialFingerprint {
+                        id: first_id,
+                        fingerprint: full.credentials[0].fingerprint,
+                    },
+                    KnownCredentialFingerprint {
+                        id: second_id,
+                        fingerprint: full.credentials[1].fingerprint.saturating_add(1),
+                    },
+                    KnownCredentialFingerprint {
+                        id: 999,
+                        fingerprint: 1,
+                    },
+                ],
+            })
+            .unwrap();
+
+        assert_eq!(changed.upserts.len(), 1);
+        assert_eq!(changed.upserts[0].id, second_id);
+        assert_eq!(changed.deleted_ids, vec![999]);
     }
 
     #[test]

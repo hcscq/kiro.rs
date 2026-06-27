@@ -4,12 +4,43 @@ export interface CredentialsStatusResponse {
   available: number
   dispatchable: number
   currentId: number
+  credentialsRevision: number
+  balanceCacheRevision: number
+  credentialsFingerprint: number
   credentials: CredentialStatusItem[]
+}
+
+export interface CredentialsDeltaRequest {
+  sinceRevision: number
+  balanceCacheRevision: number
+  credentialsFingerprint: number
+  knownCredentials: KnownCredentialFingerprint[]
+}
+
+export interface KnownCredentialFingerprint {
+  id: number
+  fingerprint: number
+}
+
+export interface CredentialsDeltaResponse {
+  resetRequired: boolean
+  reason?: string | null
+  revision: number
+  balanceRevision: number
+  fingerprint: number
+  total: number
+  available: number
+  dispatchable: number
+  currentId: number
+  upserts: CredentialStatusItem[]
+  deletedIds: number[]
+  generatedAt: string
 }
 
 // 单个凭据状态
 export interface CredentialStatusItem {
   id: number
+  fingerprint: number
   priority: number
   disabled: boolean
   failureCount: number

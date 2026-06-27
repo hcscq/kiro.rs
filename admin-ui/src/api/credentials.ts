@@ -2,6 +2,8 @@ import axios from 'axios'
 import { storage } from '@/lib/storage'
 import type {
   CredentialsStatusResponse,
+  CredentialsDeltaRequest,
+  CredentialsDeltaResponse,
   BalanceResponse,
   SuccessResponse,
   SetDisabledRequest,
@@ -136,6 +138,14 @@ function normalizeModelCapabilitiesConfigResponse(
 // 获取所有凭据状态
 export async function getCredentials(): Promise<CredentialsStatusResponse> {
   const { data } = await api.get<CredentialsStatusResponse>('/credentials')
+  return data
+}
+
+// 获取凭据列表增量
+export async function getCredentialsDelta(
+  req: CredentialsDeltaRequest
+): Promise<CredentialsDeltaResponse> {
+  const { data } = await api.post<CredentialsDeltaResponse>('/credentials/delta', req)
   return data
 }
 

@@ -1,12 +1,16 @@
 import { useEffect, useRef } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { subscribeAdminEvents } from '@/api/admin-events'
+import { getCredentialsDelta } from '@/api/credentials'
 import { storage } from '@/lib/storage'
-import type { AdminStateEvent } from '@/types/api'
+import type {
+  AdminStateEvent,
+  CredentialsDeltaResponse,
+  CredentialsStatusResponse,
+} from '@/types/api'
 
 const RECONNECT_BASE_DELAY_MS = 1000
 const RECONNECT_MAX_DELAY_MS = 30000
-const HOT_STATE_CREDENTIAL_REFRESH_MS = 5000
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -43,10 +47,68 @@ function dispatchChanged(previous: AdminStateEvent, next: AdminStateEvent): bool
   )
 }
 
+function mergeCredentialsDelta(
+  current: CredentialsStatusResponse,
+  delta: CredentialsDeltaResponse
+): CredentialsStatusResponse {
+  const deletedIds = new Set(delta.deletedIds)
+  const upserts = new Map(delta.upserts.map((credential) => [credential.id, credential]))
+  const credentials = current.credentials
+    .filter((credential) => !deletedIds.has(credential.id))
+    .map((credential) => upserts.get(credential.id) ?? credential)
+
+  for (const credential of delta.upserts) {
+    if (!current.credentials.some((item) => item.id === credential.id)) {
+      credentials.push(credential)
+    }
+  }
+
+  credentials.sort((left, right) => left.priority - right.priority || left.id - right.id)
+
+  return {
+    ...current,
+    total: delta.total,
+    available: delta.available,
+    dispatchable: delta.dispatchable,
+    currentId: delta.currentId,
+    credentialsRevision: delta.revision,
+    balanceCacheRevision: delta.balanceRevision,
+    credentialsFingerprint: delta.fingerprint,
+    credentials,
+  }
+}
+
+function applyStateSummary(
+  current: CredentialsStatusResponse,
+  event: AdminStateEvent
+): CredentialsStatusResponse {
+  if (
+    current.total === event.total &&
+    current.available === event.available &&
+    current.dispatchable === event.dispatchable &&
+    current.currentId === event.currentId
+  ) {
+    return current
+  }
+
+  return {
+    ...current,
+    total: event.total,
+    available: event.available,
+    dispatchable: event.dispatchable,
+    currentId: event.currentId,
+    credentials: current.credentials.map((credential) => ({
+      ...credential,
+      isCurrent: credential.id === event.currentId,
+    })),
+  }
+}
+
 export function AdminEventsBridge() {
   const queryClient = useQueryClient()
   const previousEventRef = useRef<AdminStateEvent | null>(null)
-  const lastHotCredentialsRefreshRef = useRef(0)
+  const deltaInFlightRef = useRef(false)
+  const deltaPendingRef = useRef(false)
 
   useEffect(() => {
     const apiKey = storage.getApiKey()
@@ -56,6 +118,56 @@ export function AdminEventsBridge() {
 
     const controller = new AbortController()
 
+    const refreshCredentialsDelta = async () => {
+      if (deltaInFlightRef.current) {
+        deltaPendingRef.current = true
+        return
+      }
+
+      deltaInFlightRef.current = true
+
+      try {
+        do {
+          deltaPendingRef.current = false
+          const current = queryClient.getQueryData<CredentialsStatusResponse>(['credentials'])
+
+          if (!current) {
+            await queryClient.invalidateQueries({ queryKey: ['credentials'] })
+            continue
+          }
+
+          const delta = await getCredentialsDelta({
+            sinceRevision: current.credentialsRevision ?? 0,
+            balanceCacheRevision: current.balanceCacheRevision ?? 0,
+            credentialsFingerprint: current.credentialsFingerprint ?? 0,
+            knownCredentials: current.credentials.map((credential) => ({
+              id: credential.id,
+              fingerprint: credential.fingerprint ?? 0,
+            })),
+          })
+
+          if (delta.resetRequired) {
+            await queryClient.invalidateQueries({ queryKey: ['credentials'] })
+            continue
+          }
+
+          queryClient.setQueryData<CredentialsStatusResponse>(['credentials'], (latest) => {
+            if (!latest) {
+              return latest
+            }
+            return mergeCredentialsDelta(latest, delta)
+          })
+        } while (deltaPendingRef.current && !controller.signal.aborted)
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          console.warn('Failed to refresh admin credentials delta', error)
+          await queryClient.invalidateQueries({ queryKey: ['credentials'] })
+        }
+      } finally {
+        deltaInFlightRef.current = false
+      }
+    }
+
     const handleState = (event: AdminStateEvent) => {
       const previous = previousEventRef.current
       previousEventRef.current = event
@@ -64,20 +176,12 @@ export function AdminEventsBridge() {
         return
       }
 
+      queryClient.setQueryData<CredentialsStatusResponse>(['credentials'], (current) =>
+        current ? applyStateSummary(current, event) : current
+      )
+
       if (credentialsChanged(previous, event)) {
-        lastHotCredentialsRefreshRef.current = Date.now()
-        queryClient.invalidateQueries({ queryKey: ['credentials'] })
-      } else if (
-        previous.inFlight !== event.inFlight ||
-        previous.dispatchable !== event.dispatchable ||
-        previous.rateLimited !== event.rateLimited ||
-        previous.abnormal !== event.abnormal
-      ) {
-        const now = Date.now()
-        if (now - lastHotCredentialsRefreshRef.current >= HOT_STATE_CREDENTIAL_REFRESH_MS) {
-          lastHotCredentialsRefreshRef.current = now
-          queryClient.invalidateQueries({ queryKey: ['credentials'] })
-        }
+        void refreshCredentialsDelta()
       }
 
       if (dispatchChanged(previous, event)) {

@@ -23,7 +23,7 @@ pub struct AccountTypeDispatchPolicy {
     pub rate_limit_refill_per_second: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeModelRestriction {
     pub model: String,
