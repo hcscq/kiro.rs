@@ -16,8 +16,8 @@ use super::{
     middleware::AdminState,
     service::ExternalIdpCallbackAction,
     types::{
-        AddCredentialRequest, CredentialsDeltaRequest, ExternalIdpProbeRequest,
-        SetCredentialGroupsConfigRequest, SetCredentialGroupsRequest,
+        AddCredentialRequest, CredentialsDeltaRequest, CredentialsRuntimeDeltaRequest,
+        ExternalIdpProbeRequest, SetCredentialGroupsConfigRequest, SetCredentialGroupsRequest,
         SetCredentialModelPolicyRequest, SetCredentialProfileRequest, SetCredentialProxyRequest,
         SetCredentialRateLimitConfigRequest, SetCredentialSourceRequest, SetDisabledRequest,
         SetLoadBalancingModeRequest, SetMaxConcurrencyRequest, SetModelCapabilitiesConfigRequest,
@@ -80,6 +80,18 @@ pub async fn get_credentials_delta(
     Json(request): Json<CredentialsDeltaRequest>,
 ) -> impl IntoResponse {
     match state.service.get_credentials_delta(request) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/runtime-delta
+/// 获取凭据热运行态增量
+pub async fn get_credentials_runtime_delta(
+    State(state): State<AdminState>,
+    Json(request): Json<CredentialsRuntimeDeltaRequest>,
+) -> impl IntoResponse {
+    match state.service.get_credentials_runtime_delta(request) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

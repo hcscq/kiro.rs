@@ -37,10 +37,44 @@ export interface CredentialsDeltaResponse {
   generatedAt: string
 }
 
+export interface CredentialsRuntimeDeltaRequest {
+  knownRuntime: KnownCredentialRuntimeFingerprint[]
+}
+
+export interface KnownCredentialRuntimeFingerprint {
+  id: number
+  runtimeFingerprint: number
+}
+
+export interface CredentialsRuntimeDeltaResponse {
+  updates: CredentialRuntimeStatusItem[]
+  deletedIds: number[]
+  generatedAt: string
+}
+
+export interface CredentialRuntimeStatusItem {
+  id: number
+  runtimeFingerprint: number
+  successCount: number
+  tokenUsageCount: number
+  inputTokens: number
+  outputTokens: number
+  totalTokens: number
+  lastUsedAt: string | null
+  inFlight: number
+  cooldownRemainingMs?: number | null
+  rateLimitBucketTokens?: number | null
+  rateLimitBucketCapacity?: number | null
+  rateLimitRefillPerSecond?: number | null
+  rateLimitHitStreak: number
+  nextReadyInMs?: number | null
+}
+
 // 单个凭据状态
 export interface CredentialStatusItem {
   id: number
   fingerprint: number
+  runtimeFingerprint: number
   priority: number
   disabled: boolean
   failureCount: number

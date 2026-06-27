@@ -154,6 +154,56 @@ pub struct CredentialsDeltaResponse {
     pub generated_at: DateTime<Utc>,
 }
 
+/// 凭据运行态增量请求。客户端提交当前缓存中的每个凭据 ID 与运行态指纹。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialsRuntimeDeltaRequest {
+    /// 客户端已缓存的凭据运行态指纹
+    #[serde(default)]
+    pub known_runtime: Vec<KnownCredentialRuntimeFingerprint>,
+}
+
+/// 客户端已缓存的单个凭据运行态指纹。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KnownCredentialRuntimeFingerprint {
+    pub id: u64,
+    pub runtime_fingerprint: u64,
+}
+
+/// 凭据运行态增量响应。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialsRuntimeDeltaResponse {
+    /// 新增或已变化的凭据运行态
+    pub updates: Vec<CredentialRuntimeStatusItem>,
+    /// 客户端缓存中已不存在的凭据 ID
+    pub deleted_ids: Vec<u64>,
+    /// 响应生成时间
+    pub generated_at: DateTime<Utc>,
+}
+
+/// 单个凭据的热运行态字段。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialRuntimeStatusItem {
+    pub id: u64,
+    pub runtime_fingerprint: u64,
+    pub success_count: u64,
+    pub token_usage_count: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub last_used_at: Option<String>,
+    pub in_flight: usize,
+    pub cooldown_remaining_ms: Option<u64>,
+    pub rate_limit_bucket_tokens: Option<f64>,
+    pub rate_limit_bucket_capacity: Option<f64>,
+    pub rate_limit_refill_per_second: Option<f64>,
+    pub rate_limit_hit_streak: u32,
+    pub next_ready_in_ms: Option<u64>,
+}
+
 /// 单个凭据的状态信息
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -162,6 +212,8 @@ pub struct CredentialStatusItem {
     pub id: u64,
     /// 单项结构/配置/异常/余额缓存指纹，用于增量更新比较
     pub fingerprint: u64,
+    /// 单项热运行态指纹，用于局部更新高频字段
+    pub runtime_fingerprint: u64,
     /// 优先级（数字越小优先级越高）
     pub priority: u32,
     /// 是否被禁用

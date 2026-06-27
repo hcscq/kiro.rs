@@ -11,9 +11,9 @@ use super::{
         clear_credential_runtime_model_restrictions, clear_credential_suspicious_activity,
         delete_credential, force_refresh_token, get_admin_events, get_all_credentials,
         get_credential_balance, get_credential_groups_config, get_credential_profiles,
-        get_credentials_delta, get_external_idp_login_status, get_idc_device_login_status,
-        get_load_balancing_mode, get_model_capabilities_config, get_model_catalog,
-        handle_external_idp_callback, probe_external_idp, reset_failure_count,
+        get_credentials_delta, get_credentials_runtime_delta, get_external_idp_login_status,
+        get_idc_device_login_status, get_load_balancing_mode, get_model_capabilities_config,
+        get_model_catalog, handle_external_idp_callback, probe_external_idp, reset_failure_count,
         set_credential_disabled, set_credential_groups, set_credential_groups_config,
         set_credential_max_concurrency, set_credential_model_policy, set_credential_overage_status,
         set_credential_priority, set_credential_profile, set_credential_proxy,
@@ -29,6 +29,7 @@ use super::{
 /// # 端点
 /// - `GET /credentials` - 获取所有凭据状态
 /// - `POST /credentials/delta` - 获取凭据列表增量
+/// - `POST /credentials/runtime-delta` - 获取凭据热运行态增量
 /// - `GET /events` - 订阅 Admin 实时状态事件
 /// - `POST /credentials` - 添加新凭据
 /// - `DELETE /credentials/:id` - 删除凭据
@@ -70,6 +71,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(get_all_credentials).post(add_credential),
         )
         .route("/credentials/delta", post(get_credentials_delta))
+        .route(
+            "/credentials/runtime-delta",
+            post(get_credentials_runtime_delta),
+        )
         .route("/events", get(get_admin_events))
         .route("/auth/idc-device/start", post(start_idc_device_login))
         .route(

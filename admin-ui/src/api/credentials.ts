@@ -4,6 +4,8 @@ import type {
   CredentialsStatusResponse,
   CredentialsDeltaRequest,
   CredentialsDeltaResponse,
+  CredentialsRuntimeDeltaRequest,
+  CredentialsRuntimeDeltaResponse,
   BalanceResponse,
   SuccessResponse,
   SetDisabledRequest,
@@ -146,6 +148,17 @@ export async function getCredentialsDelta(
   req: CredentialsDeltaRequest
 ): Promise<CredentialsDeltaResponse> {
   const { data } = await api.post<CredentialsDeltaResponse>('/credentials/delta', req)
+  return data
+}
+
+// 获取凭据热运行态增量
+export async function getCredentialsRuntimeDelta(
+  req: CredentialsRuntimeDeltaRequest
+): Promise<CredentialsRuntimeDeltaResponse> {
+  const { data } = await api.post<CredentialsRuntimeDeltaResponse>(
+    '/credentials/runtime-delta',
+    req
+  )
   return data
 }
 

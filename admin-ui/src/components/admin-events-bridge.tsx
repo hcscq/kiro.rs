@@ -1,16 +1,18 @@
 import { useEffect, useRef } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { subscribeAdminEvents } from '@/api/admin-events'
-import { getCredentialsDelta } from '@/api/credentials'
+import { getCredentialsDelta, getCredentialsRuntimeDelta } from '@/api/credentials'
 import { storage } from '@/lib/storage'
 import type {
   AdminStateEvent,
   CredentialsDeltaResponse,
+  CredentialsRuntimeDeltaResponse,
   CredentialsStatusResponse,
 } from '@/types/api'
 
 const RECONNECT_BASE_DELAY_MS = 1000
 const RECONNECT_MAX_DELAY_MS = 30000
+const RUNTIME_DELTA_MIN_INTERVAL_MS = 5000
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -47,6 +49,15 @@ function dispatchChanged(previous: AdminStateEvent, next: AdminStateEvent): bool
   )
 }
 
+function runtimeChanged(previous: AdminStateEvent, next: AdminStateEvent): boolean {
+  return (
+    previous.inFlight !== next.inFlight ||
+    previous.dispatchable !== next.dispatchable ||
+    previous.rateLimited !== next.rateLimited ||
+    previous.abnormal !== next.abnormal
+  )
+}
+
 function mergeCredentialsDelta(
   current: CredentialsStatusResponse,
   delta: CredentialsDeltaResponse
@@ -75,6 +86,48 @@ function mergeCredentialsDelta(
     balanceCacheRevision: delta.balanceRevision,
     credentialsFingerprint: delta.fingerprint,
     credentials,
+  }
+}
+
+function mergeCredentialsRuntimeDelta(
+  current: CredentialsStatusResponse,
+  delta: CredentialsRuntimeDeltaResponse
+): CredentialsStatusResponse {
+  if (delta.updates.length === 0 && delta.deletedIds.length === 0) {
+    return current
+  }
+
+  const deletedIds = new Set(delta.deletedIds)
+  const updates = new Map(delta.updates.map((runtime) => [runtime.id, runtime]))
+
+  return {
+    ...current,
+    credentials: current.credentials
+      .filter((credential) => !deletedIds.has(credential.id))
+      .map((credential) => {
+        const runtime = updates.get(credential.id)
+        if (!runtime) {
+          return credential
+        }
+
+        return {
+          ...credential,
+          runtimeFingerprint: runtime.runtimeFingerprint,
+          successCount: runtime.successCount,
+          tokenUsageCount: runtime.tokenUsageCount,
+          inputTokens: runtime.inputTokens,
+          outputTokens: runtime.outputTokens,
+          totalTokens: runtime.totalTokens,
+          lastUsedAt: runtime.lastUsedAt,
+          inFlight: runtime.inFlight,
+          cooldownRemainingMs: runtime.cooldownRemainingMs,
+          rateLimitBucketTokens: runtime.rateLimitBucketTokens,
+          rateLimitBucketCapacity: runtime.rateLimitBucketCapacity,
+          rateLimitRefillPerSecond: runtime.rateLimitRefillPerSecond,
+          rateLimitHitStreak: runtime.rateLimitHitStreak,
+          nextReadyInMs: runtime.nextReadyInMs,
+        }
+      }),
   }
 }
 
@@ -109,6 +162,10 @@ export function AdminEventsBridge() {
   const previousEventRef = useRef<AdminStateEvent | null>(null)
   const deltaInFlightRef = useRef(false)
   const deltaPendingRef = useRef(false)
+  const runtimeDeltaInFlightRef = useRef(false)
+  const runtimeDeltaPendingRef = useRef(false)
+  const lastRuntimeDeltaAtRef = useRef(0)
+  const runtimeDeltaTimerRef = useRef<number | null>(null)
 
   useEffect(() => {
     const apiKey = storage.getApiKey()
@@ -168,6 +225,66 @@ export function AdminEventsBridge() {
       }
     }
 
+    const refreshCredentialsRuntimeDelta = async () => {
+      const now = Date.now()
+      if (now - lastRuntimeDeltaAtRef.current < RUNTIME_DELTA_MIN_INTERVAL_MS) {
+        runtimeDeltaPendingRef.current = true
+        if (runtimeDeltaTimerRef.current === null) {
+          runtimeDeltaTimerRef.current = window.setTimeout(() => {
+            runtimeDeltaTimerRef.current = null
+            void refreshCredentialsRuntimeDelta()
+          }, RUNTIME_DELTA_MIN_INTERVAL_MS - (now - lastRuntimeDeltaAtRef.current))
+        }
+        return
+      }
+
+      if (runtimeDeltaInFlightRef.current) {
+        runtimeDeltaPendingRef.current = true
+        return
+      }
+
+      runtimeDeltaInFlightRef.current = true
+
+      try {
+        do {
+          runtimeDeltaPendingRef.current = false
+          lastRuntimeDeltaAtRef.current = Date.now()
+          const current = queryClient.getQueryData<CredentialsStatusResponse>(['credentials'])
+
+          if (!current) {
+            return
+          }
+
+          const delta = await getCredentialsRuntimeDelta({
+            knownRuntime: current.credentials.map((credential) => ({
+              id: credential.id,
+              runtimeFingerprint: credential.runtimeFingerprint ?? 0,
+            })),
+          })
+
+          queryClient.setQueryData<CredentialsStatusResponse>(['credentials'], (latest) => {
+            if (!latest) {
+              return latest
+            }
+            return mergeCredentialsRuntimeDelta(latest, delta)
+          })
+
+          if (runtimeDeltaPendingRef.current && !controller.signal.aborted) {
+            const elapsed = Date.now() - lastRuntimeDeltaAtRef.current
+            if (elapsed < RUNTIME_DELTA_MIN_INTERVAL_MS) {
+              await sleep(RUNTIME_DELTA_MIN_INTERVAL_MS - elapsed, controller.signal)
+            }
+          }
+        } while (runtimeDeltaPendingRef.current && !controller.signal.aborted)
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          console.warn('Failed to refresh admin credentials runtime delta', error)
+        }
+      } finally {
+        runtimeDeltaInFlightRef.current = false
+      }
+    }
+
     const handleState = (event: AdminStateEvent) => {
       const previous = previousEventRef.current
       previousEventRef.current = event
@@ -182,6 +299,10 @@ export function AdminEventsBridge() {
 
       if (credentialsChanged(previous, event)) {
         void refreshCredentialsDelta()
+      }
+
+      if (runtimeChanged(previous, event)) {
+        void refreshCredentialsRuntimeDelta()
       }
 
       if (dispatchChanged(previous, event)) {
@@ -223,6 +344,9 @@ export function AdminEventsBridge() {
     void run()
 
     return () => {
+      if (runtimeDeltaTimerRef.current !== null) {
+        window.clearTimeout(runtimeDeltaTimerRef.current)
+      }
       controller.abort()
     }
   }, [queryClient])

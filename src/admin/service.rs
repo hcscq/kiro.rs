@@ -35,8 +35,9 @@ use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, AdminStateEvent, BalanceResponse,
     CachedBalanceResponse, CredentialGroupConfigItem, CredentialGroupUsageItem,
-    CredentialGroupsConfigResponse, CredentialProfilesResponse, CredentialStatusItem,
-    CredentialsDeltaRequest, CredentialsDeltaResponse, CredentialsStatusResponse,
+    CredentialGroupsConfigResponse, CredentialProfilesResponse, CredentialRuntimeStatusItem,
+    CredentialStatusItem, CredentialsDeltaRequest, CredentialsDeltaResponse,
+    CredentialsRuntimeDeltaRequest, CredentialsRuntimeDeltaResponse, CredentialsStatusResponse,
     ExternalIdpLoginFlow, ExternalIdpLoginPhase, ExternalIdpLoginStartResponse,
     ExternalIdpLoginStatus, ExternalIdpLoginStatusResponse, ExternalIdpOidcDiscoverySummary,
     ExternalIdpProbeRequest, ExternalIdpProbeResponse, ExternalIdpProbeStatus,
@@ -1375,6 +1376,48 @@ impl AdminService {
         })
     }
 
+    /// 获取客户端缓存之后的凭据热运行态增量。
+    pub fn get_credentials_runtime_delta(
+        &self,
+        request: CredentialsRuntimeDeltaRequest,
+    ) -> Result<CredentialsRuntimeDeltaResponse, AdminServiceError> {
+        self.sync_runtime_state_for_read()?;
+        let snapshot = self.token_manager.snapshot();
+        let known = request
+            .known_runtime
+            .into_iter()
+            .map(|item| (item.id, item.runtime_fingerprint))
+            .collect::<HashMap<_, _>>();
+        let current_ids = snapshot
+            .entries
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<BTreeSet<_>>();
+
+        let mut updates = Vec::new();
+        let mut deleted_ids = Vec::new();
+
+        for entry in &snapshot.entries {
+            let runtime = Self::credential_runtime_status_item_from_snapshot(entry);
+            if known.get(&runtime.id).copied() != Some(runtime.runtime_fingerprint) {
+                updates.push(runtime);
+            }
+        }
+
+        for id in known.keys() {
+            if !current_ids.contains(id) {
+                deleted_ids.push(*id);
+            }
+        }
+        deleted_ids.sort_unstable();
+
+        Ok(CredentialsRuntimeDeltaResponse {
+            updates,
+            deleted_ids,
+            generated_at: Utc::now(),
+        })
+    }
+
     fn build_credentials_status_response(
         &self,
     ) -> Result<(CredentialsStatusResponse, AdminStateEvent), AdminServiceError> {
@@ -1421,6 +1464,7 @@ impl AdminService {
         balance_cache: &HashMap<u64, CachedBalanceRecord>,
     ) -> CredentialStatusItem {
         let fingerprint = Self::credential_item_fingerprint(&entry, balance_cache);
+        let runtime_fingerprint = Self::credential_runtime_fingerprint(&entry);
         let standard_account_type = infer_standard_account_type_id_from_subscription(
             entry.subscription_title.as_deref(),
             entry.subscription_type.as_deref(),
@@ -1439,6 +1483,7 @@ impl AdminService {
         CredentialStatusItem {
             id: entry.id,
             fingerprint,
+            runtime_fingerprint,
             priority: entry.priority,
             disabled: entry.disabled,
             failure_count: entry.failure_count,
@@ -1510,6 +1555,56 @@ impl AdminService {
             next_ready_in_ms: entry.next_ready_in_ms,
             cached_balance,
         }
+    }
+
+    fn credential_runtime_status_item_from_snapshot(
+        entry: &CredentialEntrySnapshot,
+    ) -> CredentialRuntimeStatusItem {
+        CredentialRuntimeStatusItem {
+            id: entry.id,
+            runtime_fingerprint: Self::credential_runtime_fingerprint(entry),
+            success_count: entry.success_count,
+            token_usage_count: entry.token_usage_count,
+            input_tokens: entry.input_tokens,
+            output_tokens: entry.output_tokens,
+            total_tokens: entry.total_tokens,
+            last_used_at: entry.last_used_at.clone(),
+            in_flight: entry.active_requests,
+            cooldown_remaining_ms: entry.cooldown_remaining_ms,
+            rate_limit_bucket_tokens: entry.rate_limit_bucket_tokens,
+            rate_limit_bucket_capacity: entry.rate_limit_bucket_capacity,
+            rate_limit_refill_per_second: entry.rate_limit_refill_per_second,
+            rate_limit_hit_streak: entry.rate_limit_hit_streak,
+            next_ready_in_ms: entry.next_ready_in_ms,
+        }
+    }
+
+    fn credential_runtime_fingerprint(entry: &CredentialEntrySnapshot) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        entry.id.hash(&mut hasher);
+        entry.success_count.hash(&mut hasher);
+        entry.token_usage_count.hash(&mut hasher);
+        entry.input_tokens.hash(&mut hasher);
+        entry.output_tokens.hash(&mut hasher);
+        entry.total_tokens.hash(&mut hasher);
+        entry.last_used_at.hash(&mut hasher);
+        entry.active_requests.hash(&mut hasher);
+        entry.cooldown_remaining_ms.hash(&mut hasher);
+        entry
+            .rate_limit_bucket_tokens
+            .map(f64::to_bits)
+            .hash(&mut hasher);
+        entry
+            .rate_limit_bucket_capacity
+            .map(f64::to_bits)
+            .hash(&mut hasher);
+        entry
+            .rate_limit_refill_per_second
+            .map(f64::to_bits)
+            .hash(&mut hasher);
+        entry.rate_limit_hit_streak.hash(&mut hasher);
+        entry.next_ready_in_ms.hash(&mut hasher);
+        hasher.finish() & JS_SAFE_U64_MASK
     }
 
     fn credential_item_fingerprint(
@@ -4856,7 +4951,7 @@ mod tests {
     use chrono::Duration;
 
     use crate::admin::types::BalanceResponse;
-    use crate::admin::types::KnownCredentialFingerprint;
+    use crate::admin::types::{KnownCredentialFingerprint, KnownCredentialRuntimeFingerprint};
     use crate::kiro::model::credentials::KiroCredentials;
     use crate::model::config::{Config, ProxyPoolConfig, ProxyPoolEntry};
 
@@ -5002,6 +5097,100 @@ mod tests {
 
         assert_eq!(changed.upserts.len(), 1);
         assert_eq!(changed.upserts[0].id, second_id);
+        assert_eq!(changed.deleted_ids, vec![999]);
+    }
+
+    #[test]
+    fn credential_runtime_fingerprint_tracks_hot_fields() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![available_credential()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let mut snapshot = manager.snapshot();
+        let entry = snapshot.entries.first_mut().unwrap();
+        let structural = AdminService::credential_item_fingerprint(entry, &HashMap::new());
+        let runtime = AdminService::credential_runtime_fingerprint(entry);
+
+        entry.success_count = 9;
+        entry.token_usage_count = 3;
+        entry.input_tokens = 1_000;
+        entry.output_tokens = 2_000;
+        entry.total_tokens = 3_000;
+        entry.last_used_at = Some("2026-06-27T00:00:00Z".to_string());
+        entry.active_requests = 2;
+        entry.cooldown_remaining_ms = Some(500);
+        entry.rate_limit_bucket_tokens = Some(0.5);
+        entry.rate_limit_hit_streak = 1;
+        entry.next_ready_in_ms = Some(250);
+
+        assert_eq!(
+            structural,
+            AdminService::credential_item_fingerprint(entry, &HashMap::new())
+        );
+        assert_ne!(runtime, AdminService::credential_runtime_fingerprint(entry));
+    }
+
+    #[test]
+    fn credentials_runtime_delta_returns_only_changed_and_deleted_runtime() {
+        let mut first = available_credential();
+        first.id = Some(1);
+        let mut second = available_credential();
+        second.id = Some(2);
+        second.machine_id = Some("machine-2".to_string());
+        second.priority = 5;
+
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), vec![first, second], None, None, false)
+                .unwrap(),
+        );
+        let service = AdminService::new(manager);
+        let full = service.get_all_credentials().unwrap();
+        assert_eq!(full.credentials.len(), 2);
+
+        let unchanged = service
+            .get_credentials_runtime_delta(CredentialsRuntimeDeltaRequest {
+                known_runtime: full
+                    .credentials
+                    .iter()
+                    .map(|credential| KnownCredentialRuntimeFingerprint {
+                        id: credential.id,
+                        runtime_fingerprint: credential.runtime_fingerprint,
+                    })
+                    .collect(),
+            })
+            .unwrap();
+        assert!(unchanged.updates.is_empty());
+        assert!(unchanged.deleted_ids.is_empty());
+
+        let first_id = full.credentials[0].id;
+        let second_id = full.credentials[1].id;
+        let changed = service
+            .get_credentials_runtime_delta(CredentialsRuntimeDeltaRequest {
+                known_runtime: vec![
+                    KnownCredentialRuntimeFingerprint {
+                        id: first_id,
+                        runtime_fingerprint: full.credentials[0].runtime_fingerprint,
+                    },
+                    KnownCredentialRuntimeFingerprint {
+                        id: second_id,
+                        runtime_fingerprint: full.credentials[1]
+                            .runtime_fingerprint
+                            .saturating_add(1),
+                    },
+                    KnownCredentialRuntimeFingerprint {
+                        id: 999,
+                        runtime_fingerprint: 1,
+                    },
+                ],
+            })
+            .unwrap();
+
+        assert_eq!(changed.updates.len(), 1);
+        assert_eq!(changed.updates[0].id, second_id);
         assert_eq!(changed.deleted_ids, vec![999]);
     }
 
