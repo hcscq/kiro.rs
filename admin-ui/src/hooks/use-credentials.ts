@@ -44,7 +44,7 @@ export function useCredentials() {
   return useQuery({
     queryKey: ['credentials'],
     queryFn: getCredentials,
-    refetchInterval: 30000, // 每 30 秒刷新一次
+    refetchInterval: 60000, // SSE 事件会触发即时刷新，这里保留低频兜底
   })
 }
 

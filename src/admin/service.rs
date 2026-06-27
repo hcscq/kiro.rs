@@ -1,14 +1,20 @@
 //! Admin API 业务逻辑服务
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, hash_map::DefaultHasher};
+use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::Duration as StdDuration;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::common::auth::{
@@ -27,18 +33,18 @@ use crate::state::{CachedBalanceRecord, RuntimeCoordinationStatus, StateChangeKi
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CachedBalanceResponse,
-    CredentialGroupConfigItem, CredentialGroupUsageItem, CredentialGroupsConfigResponse,
-    CredentialProfilesResponse, CredentialStatusItem, CredentialsStatusResponse,
-    ExternalIdpLoginFlow, ExternalIdpLoginPhase, ExternalIdpLoginStartResponse,
-    ExternalIdpLoginStatus, ExternalIdpLoginStatusResponse, ExternalIdpOidcDiscoverySummary,
-    ExternalIdpProbeRequest, ExternalIdpProbeResponse, ExternalIdpProbeStatus,
-    IdcDeviceLoginStartResponse, IdcDeviceLoginStatus, IdcDeviceLoginStatusResponse,
-    LoadBalancingModeResponse, ModelCapabilitiesConfigResponse, ModelCatalogItemResponse,
-    ModelCatalogResponse, ProxyPoolConfigResponse, ProxyPoolEntryResponse,
-    SetCredentialGroupsConfigRequest, SetCredentialGroupsRequest, SetCredentialModelPolicyRequest,
-    SetCredentialProfileRequest, SetCredentialProxyRequest, SetCredentialSourceRequest,
-    SetLoadBalancingModeRequest, SetModelCapabilitiesConfigRequest,
+    AddCredentialRequest, AddCredentialResponse, AdminStateEvent, BalanceResponse,
+    CachedBalanceResponse, CredentialGroupConfigItem, CredentialGroupUsageItem,
+    CredentialGroupsConfigResponse, CredentialProfilesResponse, CredentialStatusItem,
+    CredentialsStatusResponse, ExternalIdpLoginFlow, ExternalIdpLoginPhase,
+    ExternalIdpLoginStartResponse, ExternalIdpLoginStatus, ExternalIdpLoginStatusResponse,
+    ExternalIdpOidcDiscoverySummary, ExternalIdpProbeRequest, ExternalIdpProbeResponse,
+    ExternalIdpProbeStatus, IdcDeviceLoginStartResponse, IdcDeviceLoginStatus,
+    IdcDeviceLoginStatusResponse, LoadBalancingModeResponse, ModelCapabilitiesConfigResponse,
+    ModelCatalogItemResponse, ModelCatalogResponse, ProxyPoolConfigResponse,
+    ProxyPoolEntryResponse, SetCredentialGroupsConfigRequest, SetCredentialGroupsRequest,
+    SetCredentialModelPolicyRequest, SetCredentialProfileRequest, SetCredentialProxyRequest,
+    SetCredentialSourceRequest, SetLoadBalancingModeRequest, SetModelCapabilitiesConfigRequest,
     StandardAccountTypePresetResponse, StartExternalIdpLoginRequest, StartIdcDeviceLoginRequest,
     SubmitExternalIdpCallbackRequest,
 };
@@ -57,6 +63,8 @@ const KIRO_IDE_EXTERNAL_IDP_REDIRECT_URI: &str = "kiro://kiro.oauth/callback";
 const KIRO_WEB_PORTAL_ENDPOINT: &str =
     "https://app.kiro.dev/service/KiroWebPortalService/operation/GetLoginMetadata";
 const UPSTREAM_ERROR_EXCERPT_CHARS: usize = 240;
+const ADMIN_EVENTS_SAMPLE_INTERVAL: StdDuration = StdDuration::from_secs(2);
+const JS_SAFE_U64_MASK: u64 = (1_u64 << 53) - 1;
 const IDC_GRANT_SCOPES: &[&str] = &[
     "codewhisperer:completions",
     "codewhisperer:analysis",
@@ -72,6 +80,8 @@ pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
     balance_cache: Mutex<HashMap<u64, CachedBalanceRecord>>,
     last_balance_cache_revision: Mutex<u64>,
+    events_tx: watch::Sender<AdminStateEvent>,
+    events_watcher_started: AtomicBool,
     idc_device_login_sessions: Mutex<HashMap<String, IdcDeviceLoginSession>>,
     external_idp_login_sessions: Mutex<HashMap<String, ExternalIdpLoginSession>>,
 }
@@ -890,14 +900,322 @@ impl AdminService {
                 0
             }
         };
+        let initial_event =
+            Self::build_state_event_for_manager(&token_manager, 0).unwrap_or_else(|err| {
+                tracing::warn!("初始化 Admin 实时状态失败，将使用空快照: {}", err);
+                AdminStateEvent {
+                    sequence: 0,
+                    credentials_revision: 0,
+                    dispatch_revision: 0,
+                    balance_cache_revision,
+                    credentials_fingerprint: 0,
+                    dispatch_fingerprint: 0,
+                    total: 0,
+                    available: 0,
+                    dispatchable: 0,
+                    in_flight: 0,
+                    waiting_requests: 0,
+                    rate_limited: 0,
+                    abnormal: 0,
+                    current_id: 0,
+                    generated_at: Utc::now(),
+                }
+            });
+        let (events_tx, _) = watch::channel(initial_event);
 
         Self {
             token_manager,
             balance_cache: Mutex::new(balance_cache),
             last_balance_cache_revision: Mutex::new(balance_cache_revision),
+            events_tx,
+            events_watcher_started: AtomicBool::new(false),
             idc_device_login_sessions: Mutex::new(HashMap::new()),
             external_idp_login_sessions: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn subscribe_state_events(self: &Arc<Self>) -> watch::Receiver<AdminStateEvent> {
+        self.ensure_events_watcher_started();
+        self.events_tx.subscribe()
+    }
+
+    fn ensure_events_watcher_started(self: &Arc<Self>) {
+        if self
+            .events_watcher_started
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+
+        let service = Arc::clone(self);
+        tokio::spawn(async move {
+            service.run_events_watcher().await;
+        });
+    }
+
+    async fn run_events_watcher(self: Arc<Self>) {
+        let mut sequence = self.events_tx.borrow().sequence;
+        let mut interval = tokio::time::interval(ADMIN_EVENTS_SAMPLE_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            interval.tick().await;
+
+            if self.events_tx.receiver_count() == 0 {
+                self.events_watcher_started.store(false, Ordering::SeqCst);
+                if self.events_tx.receiver_count() == 0 {
+                    break;
+                }
+                if self
+                    .events_watcher_started
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+                {
+                    break;
+                }
+            }
+
+            match self.build_state_event(sequence) {
+                Ok(mut event) => {
+                    let current = self.events_tx.borrow().clone();
+                    if Self::state_event_observed_fields_changed(&current, &event) {
+                        sequence = sequence.saturating_add(1);
+                        event.sequence = sequence;
+                        if self.events_tx.send(event).is_err() {
+                            tracing::debug!("Admin 实时状态广播暂无订阅者");
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!("生成 Admin 实时状态失败: {}", err);
+                }
+            }
+        }
+    }
+
+    fn state_event_observed_fields_changed(
+        current: &AdminStateEvent,
+        next: &AdminStateEvent,
+    ) -> bool {
+        current.credentials_revision != next.credentials_revision
+            || current.dispatch_revision != next.dispatch_revision
+            || current.balance_cache_revision != next.balance_cache_revision
+            || current.credentials_fingerprint != next.credentials_fingerprint
+            || current.dispatch_fingerprint != next.dispatch_fingerprint
+            || current.total != next.total
+            || current.available != next.available
+            || current.dispatchable != next.dispatchable
+            || current.in_flight != next.in_flight
+            || current.waiting_requests != next.waiting_requests
+            || current.rate_limited != next.rate_limited
+            || current.abnormal != next.abnormal
+            || current.current_id != next.current_id
+    }
+
+    fn build_state_event(&self, sequence: u64) -> Result<AdminStateEvent, AdminServiceError> {
+        self.sync_runtime_state_for_read()?;
+        Self::build_state_event_for_manager(&self.token_manager, sequence)
+    }
+
+    fn build_state_event_for_manager(
+        token_manager: &MultiTokenManager,
+        sequence: u64,
+    ) -> Result<AdminStateEvent, AdminServiceError> {
+        let revisions = token_manager
+            .state_store()
+            .state_change_revisions()
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        let snapshot = token_manager.snapshot();
+        let dispatch = token_manager.load_balancing_config_snapshot();
+        let credentials_fingerprint = Self::credentials_event_fingerprint(&snapshot);
+        let dispatch_fingerprint = Self::dispatch_event_fingerprint(&dispatch);
+        let in_flight = snapshot
+            .entries
+            .iter()
+            .map(|entry| entry.active_requests)
+            .sum();
+        let rate_limited = snapshot
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.cooldown_remaining_ms.unwrap_or_default() > 0
+                    || entry.next_ready_in_ms.unwrap_or_default() > 0
+                    || entry.rate_limit_hit_streak > 0
+                    || entry
+                        .rate_limit_bucket_tokens
+                        .zip(entry.rate_limit_bucket_capacity)
+                        .is_some_and(|(tokens, capacity)| capacity > 0.0 && tokens < 1.0)
+            })
+            .count();
+        let abnormal = snapshot
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.disabled
+                    || entry.failure_count > 0
+                    || entry.refresh_failure_count > 0
+                    || entry.last_error_status.is_some()
+                    || entry.suspicious_activity_count > 0
+            })
+            .count();
+
+        Ok(AdminStateEvent {
+            sequence,
+            credentials_revision: revisions.credentials,
+            dispatch_revision: revisions.dispatch_config,
+            balance_cache_revision: revisions.balance_cache,
+            credentials_fingerprint,
+            dispatch_fingerprint,
+            total: snapshot.total,
+            available: snapshot.available,
+            dispatchable: snapshot.dispatchable,
+            in_flight,
+            waiting_requests: dispatch.waiting_requests,
+            rate_limited,
+            abnormal,
+            current_id: snapshot.current_id,
+            generated_at: Utc::now(),
+        })
+    }
+
+    fn credentials_event_fingerprint(
+        snapshot: &crate::kiro::token_manager::ManagerSnapshot,
+    ) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        snapshot.total.hash(&mut hasher);
+        snapshot.available.hash(&mut hasher);
+        snapshot.dispatchable.hash(&mut hasher);
+        snapshot.current_id.hash(&mut hasher);
+
+        for entry in &snapshot.entries {
+            entry.id.hash(&mut hasher);
+            entry.priority.hash(&mut hasher);
+            entry.disabled.hash(&mut hasher);
+            entry.failure_count.hash(&mut hasher);
+            entry.refresh_failure_count.hash(&mut hasher);
+            entry.success_count.hash(&mut hasher);
+            entry.token_usage_count.hash(&mut hasher);
+            entry.input_tokens.hash(&mut hasher);
+            entry.output_tokens.hash(&mut hasher);
+            entry.last_used_at.hash(&mut hasher);
+            entry.max_concurrency.hash(&mut hasher);
+            entry.max_concurrency_source.hash(&mut hasher);
+            entry.profile_arn.hash(&mut hasher);
+            entry.subscription_title.hash(&mut hasher);
+            entry.subscription_type.hash(&mut hasher);
+            entry.auth_account_type.hash(&mut hasher);
+            entry.account_type.hash(&mut hasher);
+            entry.resolved_account_type.hash(&mut hasher);
+            entry.source_supplier_id.hash(&mut hasher);
+            entry.source_supplier_name.hash(&mut hasher);
+            entry.source_batch.hash(&mut hasher);
+            entry.credential_groups.hash(&mut hasher);
+            entry.allowed_models.hash(&mut hasher);
+            entry.blocked_models.hash(&mut hasher);
+            entry.available_model_ids.hash(&mut hasher);
+            entry.available_models_cached_at.hash(&mut hasher);
+            entry.has_proxy.hash(&mut hasher);
+            entry.proxy_id.hash(&mut hasher);
+            entry.disabled_reason.hash(&mut hasher);
+            entry.disabled_at.hash(&mut hasher);
+            entry.last_error_status.hash(&mut hasher);
+            entry.last_error_summary.hash(&mut hasher);
+            entry.suspicious_activity_count.hash(&mut hasher);
+            entry.suspicious_activity_last_seen_at.hash(&mut hasher);
+            entry.suspicious_activity_quarantine_until.hash(&mut hasher);
+            entry
+                .suspicious_activity_recovery_success_count
+                .hash(&mut hasher);
+            entry.rate_limit_cooldown_enabled.hash(&mut hasher);
+            entry.rate_limit_cooldown_enabled_source.hash(&mut hasher);
+            entry.rate_limit_hit_streak.hash(&mut hasher);
+        }
+
+        hasher.finish() & JS_SAFE_U64_MASK
+    }
+
+    fn dispatch_event_fingerprint(
+        dispatch: &crate::kiro::token_manager::LoadBalancingConfigSnapshot,
+    ) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        dispatch.mode.hash(&mut hasher);
+        dispatch.session_affinity_enabled.hash(&mut hasher);
+        dispatch.queue_max_size.hash(&mut hasher);
+        dispatch.queue_max_wait_ms.hash(&mut hasher);
+        dispatch.rate_limit_cooldown_ms.hash(&mut hasher);
+        dispatch.rate_limit_cooldown_enabled.hash(&mut hasher);
+        dispatch.suspicious_activity_cooldown_ms.hash(&mut hasher);
+        dispatch
+            .suspicious_activity_cooldown_enabled
+            .hash(&mut hasher);
+        dispatch
+            .suspicious_activity_prefer_clean_credentials
+            .hash(&mut hasher);
+        dispatch
+            .suspicious_activity_auto_disable_enabled
+            .hash(&mut hasher);
+        dispatch
+            .suspicious_activity_auto_disable_threshold
+            .hash(&mut hasher);
+        dispatch
+            .suspicious_activity_auto_disable_window_ms
+            .hash(&mut hasher);
+        dispatch
+            .suspicious_activity_auto_clear_enabled
+            .hash(&mut hasher);
+        dispatch
+            .suspicious_activity_auto_clear_success_threshold
+            .hash(&mut hasher);
+        dispatch
+            .suspicious_activity_auto_clear_after_ms
+            .hash(&mut hasher);
+        dispatch.model_cooldown_enabled.hash(&mut hasher);
+        dispatch.default_max_concurrency.hash(&mut hasher);
+        dispatch
+            .rate_limit_bucket_capacity
+            .to_bits()
+            .hash(&mut hasher);
+        dispatch
+            .rate_limit_refill_per_second
+            .to_bits()
+            .hash(&mut hasher);
+        dispatch
+            .rate_limit_refill_min_per_second
+            .to_bits()
+            .hash(&mut hasher);
+        dispatch
+            .rate_limit_refill_recovery_step_per_success
+            .to_bits()
+            .hash(&mut hasher);
+        dispatch
+            .rate_limit_refill_backoff_factor
+            .to_bits()
+            .hash(&mut hasher);
+        dispatch
+            .stream_dispatch_lease_release_enabled
+            .hash(&mut hasher);
+        dispatch
+            .response_thinking_signature_compat_enabled
+            .hash(&mut hasher);
+        dispatch.proxy_pool.enabled.hash(&mut hasher);
+        dispatch.proxy_pool.require_proxy.hash(&mut hasher);
+        dispatch.proxy_pool.assignment_strategy.hash(&mut hasher);
+        dispatch.proxy_pool.failover.enabled.hash(&mut hasher);
+        dispatch
+            .proxy_pool
+            .failover
+            .failure_threshold
+            .hash(&mut hasher);
+        dispatch.proxy_pool.failover.cooldown_secs.hash(&mut hasher);
+        dispatch.proxy_pool.failover.probe_url.hash(&mut hasher);
+        for proxy in &dispatch.proxy_pool.proxies {
+            proxy.id.hash(&mut hasher);
+            proxy.weight.hash(&mut hasher);
+            proxy.enabled.hash(&mut hasher);
+            proxy.expected_egress_ip.hash(&mut hasher);
+        }
+        hasher.finish() & JS_SAFE_U64_MASK
     }
 
     fn normalize_and_validate_credential_groups(

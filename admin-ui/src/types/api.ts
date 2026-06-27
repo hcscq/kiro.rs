@@ -85,6 +85,24 @@ export interface CachedBalanceResponse {
   balance: BalanceResponse
 }
 
+export interface AdminStateEvent {
+  sequence: number
+  credentialsRevision: number
+  dispatchRevision: number
+  balanceCacheRevision: number
+  credentialsFingerprint: number
+  dispatchFingerprint: number
+  total: number
+  available: number
+  dispatchable: number
+  inFlight: number
+  waitingRequests: number
+  rateLimited: number
+  abnormal: number
+  currentId: number
+  generatedAt: string
+}
+
 // 余额响应
 export interface BalanceResponse {
   id: number

@@ -12,6 +12,7 @@ use crate::model::config::{
 use crate::model::model_policy::{
     AccountTypeDispatchPolicy, ModelSupportPolicy, RuntimeModelRestriction,
 };
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 
 fn deserialize_optional_nullable<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
@@ -286,6 +287,42 @@ pub struct CachedBalanceResponse {
     pub cached_at: f64,
     /// 缓存的额度数据
     pub balance: BalanceResponse,
+}
+
+/// Admin 实时状态事件，仅包含轻量摘要和修订号。
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminStateEvent {
+    /// 服务端事件序号，每次摘要变化时递增
+    pub sequence: u64,
+    /// 凭据状态修订号（共享后端启用时来自 Redis）
+    pub credentials_revision: u64,
+    /// 调度配置修订号（共享后端启用时来自 Redis）
+    pub dispatch_revision: u64,
+    /// 余额缓存修订号（共享后端启用时来自 Redis）
+    pub balance_cache_revision: u64,
+    /// 凭据摘要指纹，本地状态后端没有共享修订号时用于变更检测
+    pub credentials_fingerprint: u64,
+    /// 调度配置摘要指纹，本地状态后端没有共享修订号时用于变更检测
+    pub dispatch_fingerprint: u64,
+    /// 凭据总数
+    pub total: usize,
+    /// 可用凭据数量（未禁用）
+    pub available: usize,
+    /// 当前可立即调度的凭据数量
+    pub dispatchable: usize,
+    /// 当前运行中的请求总数
+    pub in_flight: usize,
+    /// 等待队列中的请求数
+    pub waiting_requests: usize,
+    /// 当前有 429 冷却、bucket 等待或连续 429 的凭据数量
+    pub rate_limited: usize,
+    /// 当前禁用、失败、刷新失败或有最近错误的凭据数量
+    pub abnormal: usize,
+    /// 当前选中的凭据 ID
+    pub current_id: u64,
+    /// 事件生成时间
+    pub generated_at: DateTime<Utc>,
 }
 
 // ============ 操作请求 ============

@@ -6,6 +6,7 @@ import { ModelPoliciesPage } from '@/components/model-policies-page'
 import { SettingsPage } from '@/components/settings-page'
 import { MainLayout } from '@/components/layout/main-layout'
 import { Toaster } from '@/components/ui/sonner'
+import { AdminEventsBridge } from '@/components/admin-events-bridge'
 import { useQueryClient } from '@tanstack/react-query'
 
 type AppTab = 'dashboard' | 'model-policies' | 'settings'
@@ -37,19 +38,22 @@ function App() {
   return (
     <>
       {isLoggedIn ? (
-        <MainLayout 
-          activeTab={activeTab} 
-          onTabChange={setActiveTab} 
-          onLogout={handleLogout}
-        >
-          {activeTab === 'dashboard' ? (
-            <Dashboard />
-          ) : activeTab === 'model-policies' ? (
-            <ModelPoliciesPage />
-          ) : (
-            <SettingsPage />
-          )}
-        </MainLayout>
+        <>
+          <AdminEventsBridge />
+          <MainLayout
+            activeTab={activeTab}
+            onTabChange={setActiveTab}
+            onLogout={handleLogout}
+          >
+            {activeTab === 'dashboard' ? (
+              <Dashboard />
+            ) : activeTab === 'model-policies' ? (
+              <ModelPoliciesPage />
+            ) : (
+              <SettingsPage />
+            )}
+          </MainLayout>
+        </>
       ) : (
         <LoginPage onLogin={handleLogin} />
       )}

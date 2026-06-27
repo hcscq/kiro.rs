@@ -1,12 +1,16 @@
 //! Admin API HTTP 处理器
 
-use std::collections::HashMap;
+use std::{collections::HashMap, convert::Infallible, time::Duration};
 
 use axum::{
     Json,
     extract::{Path, Query, State},
-    response::{Html, IntoResponse, Redirect, Response},
+    response::{
+        Html, IntoResponse, Redirect, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
 };
+use futures::stream::{self, Stream};
 
 use super::{
     middleware::AdminState,
@@ -67,6 +71,44 @@ pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoRe
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
+}
+
+/// GET /api/admin/events
+/// 订阅 Admin 实时状态事件
+pub async fn get_admin_events(
+    State(state): State<AdminState>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let receiver = state.service.subscribe_state_events();
+    let initial = receiver.borrow().clone();
+    let stream = stream::unfold(
+        (receiver, Some(initial)),
+        |(mut receiver, pending)| async move {
+            let event = if let Some(event) = pending {
+                event
+            } else if receiver.changed().await.is_ok() {
+                receiver.borrow().clone()
+            } else {
+                return None;
+            };
+
+            let event = Event::default()
+                .event("state")
+                .id(event.sequence.to_string())
+                .json_data(event)
+                .unwrap_or_else(|err| {
+                    tracing::warn!("序列化 Admin 实时状态事件失败: {}", err);
+                    Event::default().event("error").data("serialization_failed")
+                });
+
+            Some((Ok(event), (receiver, None)))
+        },
+    );
+
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("admin-events-heartbeat"),
+    )
 }
 
 /// POST /api/admin/credentials/:id/disabled
