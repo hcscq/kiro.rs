@@ -217,8 +217,12 @@ function formatDispatchSourceLabel(
   switch (source) {
     case 'credential':
       return '凭据显式覆盖'
+    case 'auth-account-type+account-type':
+      return '认证+订阅组合策略'
+    case 'auth-account-type':
+      return '认证类型策略'
     case 'account-type':
-      return '账号类型策略'
+      return '订阅类型策略'
     case 'global-default':
       return '全局默认'
     default:

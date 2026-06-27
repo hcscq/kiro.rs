@@ -202,6 +202,25 @@ pub fn normalize_account_type_dispatch_policies(
     normalized
 }
 
+pub fn normalize_nested_account_type_dispatch_policies(
+    policies: &mut BTreeMap<String, BTreeMap<String, AccountTypeDispatchPolicy>>,
+) -> BTreeMap<String, BTreeMap<String, AccountTypeDispatchPolicy>> {
+    let mut normalized = BTreeMap::new();
+    for (outer_key, inner) in std::mem::take(policies) {
+        let Some(outer_account_type) = normalize_account_type(&outer_key) else {
+            continue;
+        };
+        let mut inner = inner;
+        let inner_normalized = normalize_account_type_dispatch_policies(&mut inner);
+        if inner_normalized.is_empty() {
+            continue;
+        }
+        normalized.insert(outer_account_type, inner_normalized);
+    }
+    *policies = normalized.clone();
+    normalized
+}
+
 pub fn matches_model_entry(entry: &str, selector: &NormalizedModelSelector) -> bool {
     entry == selector.exact || entry == selector.family
 }
@@ -229,6 +248,7 @@ mod tests {
         AccountTypeDispatchPolicy, ModelSupportPolicy, RuntimeModelRestriction,
         matches_model_entry, normalize_account_type, normalize_account_type_dispatch_policies,
         normalize_model_entries, normalize_model_selector, normalize_model_token,
+        normalize_nested_account_type_dispatch_policies,
     };
     use std::collections::BTreeMap;
 
@@ -362,6 +382,41 @@ mod tests {
                 .get("power")
                 .and_then(AccountTypeDispatchPolicy::effective_max_concurrency),
             Some(32)
+        );
+    }
+
+    #[test]
+    fn normalize_nested_account_type_dispatch_policies_normalizes_both_keys() {
+        let inner = BTreeMap::from([
+            (
+                " Power ".to_string(),
+                AccountTypeDispatchPolicy {
+                    max_concurrency: Some(2),
+                    rate_limit_bucket_capacity: None,
+                    rate_limit_refill_per_second: None,
+                },
+            ),
+            ("empty".to_string(), AccountTypeDispatchPolicy::default()),
+        ]);
+        let mut policies = BTreeMap::from([
+            (" Enterprise ".to_string(), inner.clone()),
+            ("blank".to_string(), BTreeMap::new()),
+        ]);
+
+        let normalized = normalize_nested_account_type_dispatch_policies(&mut policies);
+
+        assert_eq!(
+            normalized
+                .get("enterprise")
+                .and_then(|inner| inner.get("power"))
+                .and_then(AccountTypeDispatchPolicy::effective_max_concurrency),
+            Some(2)
+        );
+        assert!(!normalized.contains_key("blank"));
+        assert!(
+            !normalized
+                .get("enterprise")
+                .is_some_and(|inner| inner.contains_key("empty"))
         );
     }
 }

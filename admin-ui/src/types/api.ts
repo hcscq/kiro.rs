@@ -114,7 +114,13 @@ export interface CredentialStatusItem {
   inFlight: number
   maxConcurrency?: number | null
   maxConcurrencyOverride?: number | null
-  maxConcurrencySource?: 'credential' | 'account-type' | 'global-default' | null
+  maxConcurrencySource?:
+    | 'credential'
+    | 'auth-account-type+account-type'
+    | 'auth-account-type'
+    | 'account-type'
+    | 'global-default'
+    | null
   hasProxy: boolean
   proxyUrl?: string
   proxyId?: string | null
@@ -136,10 +142,22 @@ export interface CredentialStatusItem {
   rateLimitBucketTokens?: number | null
   rateLimitBucketCapacity?: number | null
   rateLimitBucketCapacityOverride?: number | null
-  rateLimitBucketCapacitySource?: 'credential' | 'account-type' | 'global-default' | null
+  rateLimitBucketCapacitySource?:
+    | 'credential'
+    | 'auth-account-type+account-type'
+    | 'auth-account-type'
+    | 'account-type'
+    | 'global-default'
+    | null
   rateLimitRefillPerSecond?: number | null
   rateLimitRefillPerSecondOverride?: number | null
-  rateLimitRefillPerSecondSource?: 'credential' | 'account-type' | 'global-default' | null
+  rateLimitRefillPerSecondSource?:
+    | 'credential'
+    | 'auth-account-type+account-type'
+    | 'auth-account-type'
+    | 'account-type'
+    | 'global-default'
+    | null
   rateLimitRefillBasePerSecond?: number | null
   rateLimitHitStreak: number
   nextReadyInMs?: number | null
@@ -729,10 +747,20 @@ export interface UpdateLoadBalancingConfigRequest {
 export interface ModelCapabilitiesConfigResponse {
   accountTypePolicies: Record<string, ModelSupportPolicy>
   accountTypeDispatchPolicies: Record<string, AccountTypeDispatchPolicy>
+  authAccountTypeDispatchPolicies: Record<string, AccountTypeDispatchPolicy>
+  authAccountTypeAccountTypeDispatchPolicies: Record<
+    string,
+    Record<string, AccountTypeDispatchPolicy>
+  >
   standardAccountTypePresets: StandardAccountTypePreset[]
 }
 
 export interface UpdateModelCapabilitiesConfigRequest {
   accountTypePolicies?: Record<string, ModelSupportPolicy>
   accountTypeDispatchPolicies?: Record<string, AccountTypeDispatchPolicy>
+  authAccountTypeDispatchPolicies?: Record<string, AccountTypeDispatchPolicy>
+  authAccountTypeAccountTypeDispatchPolicies?: Record<
+    string,
+    Record<string, AccountTypeDispatchPolicy>
+  >
 }

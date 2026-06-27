@@ -44,6 +44,8 @@ impl ResolvedAccountTypeSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchSettingSource {
     Credential,
+    AuthAccountTypeAccountType,
+    AuthAccountType,
     AccountType,
     GlobalDefault,
 }
@@ -52,6 +54,8 @@ impl DispatchSettingSource {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Credential => "credential",
+            Self::AuthAccountTypeAccountType => "auth-account-type+account-type",
+            Self::AuthAccountType => "auth-account-type",
             Self::AccountType => "account-type",
             Self::GlobalDefault => "global-default",
         }

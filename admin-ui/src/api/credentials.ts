@@ -123,6 +123,25 @@ function normalizeModelCapabilitiesConfigResponse(
       normalizeAccountTypeDispatchPolicy(policy),
     ])
   )
+  const authAccountTypeDispatchPolicies = Object.fromEntries(
+    Object.entries(value?.authAccountTypeDispatchPolicies ?? {}).map(([accountType, policy]) => [
+      accountType,
+      normalizeAccountTypeDispatchPolicy(policy),
+    ])
+  )
+  const authAccountTypeAccountTypeDispatchPolicies = Object.fromEntries(
+    Object.entries(value?.authAccountTypeAccountTypeDispatchPolicies ?? {}).map(
+      ([authAccountType, policies]) => [
+        authAccountType,
+        Object.fromEntries(
+          Object.entries(policies ?? {}).map(([accountType, policy]) => [
+            accountType,
+            normalizeAccountTypeDispatchPolicy(policy),
+          ])
+        ),
+      ]
+    )
+  )
 
   const standardAccountTypePresets = Array.isArray(value?.standardAccountTypePresets)
     ? value.standardAccountTypePresets
@@ -133,6 +152,8 @@ function normalizeModelCapabilitiesConfigResponse(
   return {
     accountTypePolicies,
     accountTypeDispatchPolicies,
+    authAccountTypeDispatchPolicies,
+    authAccountTypeAccountTypeDispatchPolicies,
     standardAccountTypePresets,
   }
 }

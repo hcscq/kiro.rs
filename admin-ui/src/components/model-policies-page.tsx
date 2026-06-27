@@ -269,6 +269,8 @@ export function ModelPoliciesPage() {
   const [dispatchPolicyRows, setDispatchPolicyRows] = useState<AccountTypeDispatchPolicyRow[]>([])
   const [modelCapabilitiesJson, setModelCapabilitiesJson] = useState('{\n  \n}')
   const [dispatchPoliciesJson, setDispatchPoliciesJson] = useState('{\n  \n}')
+  const [authDispatchPoliciesJson, setAuthDispatchPoliciesJson] = useState('{\n  \n}')
+  const [combinedDispatchPoliciesJson, setCombinedDispatchPoliciesJson] = useState('{\n  \n}')
 
   const modelCatalog = modelCatalogData?.models ?? []
   const standardAccountTypePresets = modelCapabilitiesData?.standardAccountTypePresets ?? []
@@ -284,6 +286,12 @@ export function ModelPoliciesPage() {
         modelCapabilitiesData?.accountTypeDispatchPolicies,
         standardAccountTypePresets
       )
+    )
+    Object.keys(modelCapabilitiesData?.authAccountTypeDispatchPolicies ?? {}).forEach((value) =>
+      values.add(value)
+    )
+    Object.keys(modelCapabilitiesData?.authAccountTypeAccountTypeDispatchPolicies ?? {}).forEach(
+      (value) => values.add(value)
     )
 
     for (const row of policyRows) {
@@ -306,6 +314,8 @@ export function ModelPoliciesPage() {
     dispatchPolicyRows,
     modelCapabilitiesData?.accountTypeDispatchPolicies,
     modelCapabilitiesData?.accountTypePolicies,
+    modelCapabilitiesData?.authAccountTypeAccountTypeDispatchPolicies,
+    modelCapabilitiesData?.authAccountTypeDispatchPolicies,
     policyRows,
     standardAccountTypePresets,
   ])
@@ -322,6 +332,16 @@ export function ModelPoliciesPage() {
     )
     setDispatchPoliciesJson(
       JSON.stringify(modelCapabilitiesData.accountTypeDispatchPolicies ?? {}, null, 2)
+    )
+    setAuthDispatchPoliciesJson(
+      JSON.stringify(modelCapabilitiesData.authAccountTypeDispatchPolicies ?? {}, null, 2)
+    )
+    setCombinedDispatchPoliciesJson(
+      JSON.stringify(
+        modelCapabilitiesData.authAccountTypeAccountTypeDispatchPolicies ?? {},
+        null,
+        2
+      )
     )
   }, [modelCapabilitiesData])
 
@@ -429,6 +449,72 @@ export function ModelPoliciesPage() {
             JSON.stringify(response.accountTypeDispatchPolicies ?? {}, null, 2)
           )
           toast.success('账号类型调度策略已更新')
+        },
+        onError: (error) => {
+          toast.error(`保存失败: ${extractErrorMessage(error)}`)
+        },
+      }
+    )
+  }
+
+  const handleSaveAuthDispatchPoliciesJson = () => {
+    let parsed: Record<string, AccountTypeDispatchPolicy>
+    try {
+      const raw = authDispatchPoliciesJson.trim() || '{}'
+      const value = JSON.parse(raw)
+      if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+        toast.error('认证类型调度策略必须是一个 JSON 对象')
+        return
+      }
+      parsed = value as Record<string, AccountTypeDispatchPolicy>
+    } catch (error) {
+      toast.error(`认证类型调度策略 JSON 解析失败: ${extractErrorMessage(error)}`)
+      return
+    }
+
+    setModelCapabilitiesConfig(
+      { authAccountTypeDispatchPolicies: parsed },
+      {
+        onSuccess: (response) => {
+          setAuthDispatchPoliciesJson(
+            JSON.stringify(response.authAccountTypeDispatchPolicies ?? {}, null, 2)
+          )
+          toast.success('认证类型调度策略已更新')
+        },
+        onError: (error) => {
+          toast.error(`保存失败: ${extractErrorMessage(error)}`)
+        },
+      }
+    )
+  }
+
+  const handleSaveCombinedDispatchPoliciesJson = () => {
+    let parsed: Record<string, Record<string, AccountTypeDispatchPolicy>>
+    try {
+      const raw = combinedDispatchPoliciesJson.trim() || '{}'
+      const value = JSON.parse(raw)
+      if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+        toast.error('组合调度策略必须是一个 JSON 对象')
+        return
+      }
+      parsed = value as Record<string, Record<string, AccountTypeDispatchPolicy>>
+    } catch (error) {
+      toast.error(`组合调度策略 JSON 解析失败: ${extractErrorMessage(error)}`)
+      return
+    }
+
+    setModelCapabilitiesConfig(
+      { authAccountTypeAccountTypeDispatchPolicies: parsed },
+      {
+        onSuccess: (response) => {
+          setCombinedDispatchPoliciesJson(
+            JSON.stringify(
+              response.authAccountTypeAccountTypeDispatchPolicies ?? {},
+              null,
+              2
+            )
+          )
+          toast.success('组合调度策略已更新')
         },
         onError: (error) => {
           toast.error(`保存失败: ${extractErrorMessage(error)}`)
@@ -744,7 +830,7 @@ export function ModelPoliciesPage() {
         <CardHeader>
           <CardTitle>账号类型调度策略</CardTitle>
           <CardDescription>
-            维护“账号类型 → 默认并发 / bucket 覆盖”映射，让同类账号自动套用统一承载参数。
+            维护“订阅账号类型 → 默认并发 / bucket 覆盖”映射，让同类订阅档位自动套用统一承载参数。
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
@@ -878,7 +964,7 @@ export function ModelPoliciesPage() {
 
           <div className="flex items-center justify-between gap-4">
             <p className="text-sm text-muted-foreground">
-              这里适合沉淀长期稳定的承载参数，例如 `power` 类型固定更高并发、关闭本地 bucket 覆盖。
+              这里只适合订阅档位差异。企业/个人认证类型差异请优先使用下面的认证类型策略。
             </p>
             <Button onClick={handleSaveDispatchPoliciesVisual} disabled={isSettingCapabilities}>
               <Save className="mr-2 h-4 w-4" />
@@ -912,6 +998,70 @@ export function ModelPoliciesPage() {
               </div>
             </div>
           </details>
+        </CardContent>
+      </Card>
+
+      <Card className="border-muted shadow-sm">
+        <CardHeader>
+          <CardTitle>认证类型调度策略</CardTitle>
+          <CardDescription>
+            维护 social / builder-id / enterprise / idc 的默认并发和 bucket 覆盖，优先级高于订阅账号类型策略。
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <textarea
+            rows={12}
+            value={authDispatchPoliciesJson}
+            onChange={(e) => setAuthDispatchPoliciesJson(e.target.value)}
+            spellCheck={false}
+            className="flex min-h-[240px] w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+            placeholder={`{\n  "social": {\n    "maxConcurrency": 1,\n    "rateLimitBucketCapacity": 2,\n    "rateLimitRefillPerSecond": 0.2\n  },\n  "enterprise": {\n    "maxConcurrency": 16,\n    "rateLimitBucketCapacity": 12,\n    "rateLimitRefillPerSecond": 1.5\n  }\n}`}
+          />
+          <div className="flex items-center justify-between gap-4">
+            <p className="text-sm text-muted-foreground">
+              字段缺失时会继续向后回退到订阅类型策略或全局默认；`0` 表示对该字段禁用 bucket。
+            </p>
+            <Button
+              variant="outline"
+              onClick={handleSaveAuthDispatchPoliciesJson}
+              disabled={isSettingCapabilities}
+            >
+              <Save className="mr-2 h-4 w-4" />
+              保存认证策略 JSON
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card className="border-muted shadow-sm">
+        <CardHeader>
+          <CardTitle>组合调度策略</CardTitle>
+          <CardDescription>
+            维护“认证类型 → 订阅账号类型 → 调度覆盖”，用于区分 enterprise+power 与 social+power 等同档位不同 RPM 场景。
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <textarea
+            rows={12}
+            value={combinedDispatchPoliciesJson}
+            onChange={(e) => setCombinedDispatchPoliciesJson(e.target.value)}
+            spellCheck={false}
+            className="flex min-h-[240px] w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+            placeholder={`{\n  "enterprise": {\n    "power": {\n      "maxConcurrency": 32,\n      "rateLimitBucketCapacity": 16,\n      "rateLimitRefillPerSecond": 2\n    }\n  },\n  "social": {\n    "power": {\n      "maxConcurrency": 1\n    }\n  }\n}`}
+          />
+          <div className="flex items-center justify-between gap-4">
+            <p className="text-sm text-muted-foreground">
+              组合策略优先级最高；单个字段留空时，会继续从认证类型策略、订阅类型策略、全局默认依次继承。
+            </p>
+            <Button
+              variant="outline"
+              onClick={handleSaveCombinedDispatchPoliciesJson}
+              disabled={isSettingCapabilities}
+            >
+              <Save className="mr-2 h-4 w-4" />
+              保存组合策略 JSON
+            </Button>
+          </div>
         </CardContent>
       </Card>
     </div>

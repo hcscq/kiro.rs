@@ -125,9 +125,35 @@
   },
   "accountTypeDispatchPolicies": {
     "power": {
-      "maxConcurrency": 32,
-      "rateLimitBucketCapacity": 0,
-      "rateLimitRefillPerSecond": 0
+      "maxConcurrency": 1,
+      "rateLimitBucketCapacity": 2,
+      "rateLimitRefillPerSecond": 0.2
+    }
+  },
+  "authAccountTypeDispatchPolicies": {
+    "social": {
+      "maxConcurrency": 1,
+      "rateLimitBucketCapacity": 2,
+      "rateLimitRefillPerSecond": 0.2
+    },
+    "builder-id": {
+      "maxConcurrency": 2,
+      "rateLimitBucketCapacity": 3,
+      "rateLimitRefillPerSecond": 0.4
+    },
+    "enterprise": {
+      "maxConcurrency": 16,
+      "rateLimitBucketCapacity": 12,
+      "rateLimitRefillPerSecond": 1.5
+    }
+  },
+  "authAccountTypeAccountTypeDispatchPolicies": {
+    "enterprise": {
+      "power": {
+        "maxConcurrency": 32,
+        "rateLimitBucketCapacity": 16,
+        "rateLimitRefillPerSecond": 2
+      }
     }
   }
 }

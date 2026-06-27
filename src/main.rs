@@ -1427,6 +1427,8 @@ mod tests {
             proxy_pool: ProxyPoolConfig::default(),
             account_type_policies: std::collections::BTreeMap::new(),
             account_type_dispatch_policies: std::collections::BTreeMap::new(),
+            auth_account_type_dispatch_policies: std::collections::BTreeMap::new(),
+            auth_account_type_account_type_dispatch_policies: std::collections::BTreeMap::new(),
             credential_groups: Vec::new(),
         };
 

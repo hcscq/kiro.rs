@@ -11,7 +11,7 @@ use crate::common::auth::{
 
 use super::model_policy::{
     AccountTypeDispatchPolicy, ModelSupportPolicy, normalize_account_type_dispatch_policies,
-    normalize_account_type_policies,
+    normalize_account_type_policies, normalize_nested_account_type_dispatch_policies,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -968,6 +968,15 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub account_type_dispatch_policies: BTreeMap<String, AccountTypeDispatchPolicy>,
 
+    /// 认证账号类型默认调度策略（social / builder-id / enterprise / idc）
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub auth_account_type_dispatch_policies: BTreeMap<String, AccountTypeDispatchPolicy>,
+
+    /// 认证账号类型 + 订阅账号类型组合调度策略
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub auth_account_type_account_type_dispatch_policies:
+        BTreeMap<String, BTreeMap<String, AccountTypeDispatchPolicy>>,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -1321,6 +1330,8 @@ impl Default for Config {
             server_web_tools_mode: ServerWebToolsMode::default(),
             account_type_policies: BTreeMap::new(),
             account_type_dispatch_policies: BTreeMap::new(),
+            auth_account_type_dispatch_policies: BTreeMap::new(),
+            auth_account_type_account_type_dispatch_policies: BTreeMap::new(),
             config_path: None,
         }
     }
@@ -1468,6 +1479,10 @@ impl Config {
     fn normalize(&mut self) {
         normalize_account_type_policies(&mut self.account_type_policies);
         normalize_account_type_dispatch_policies(&mut self.account_type_dispatch_policies);
+        normalize_account_type_dispatch_policies(&mut self.auth_account_type_dispatch_policies);
+        normalize_nested_account_type_dispatch_policies(
+            &mut self.auth_account_type_account_type_dispatch_policies,
+        );
         let had_explicit_credential_groups = !self.credential_groups.is_empty();
         for api_key in &mut self.api_keys {
             api_key.id = api_key
@@ -1948,6 +1963,12 @@ mod tests {
         assert_eq!(config.conversion_runtime.max_request_weight, 8);
         assert!(config.kiro_request_body_guard.enabled);
         assert_eq!(config.kiro_request_body_guard.max_bytes, 30 * 1024 * 1024);
+        assert!(config.auth_account_type_dispatch_policies.is_empty());
+        assert!(
+            config
+                .auth_account_type_account_type_dispatch_policies
+                .is_empty()
+        );
     }
 
     #[test]

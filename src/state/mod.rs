@@ -21,7 +21,7 @@ use crate::model::config::{
 };
 use crate::model::model_policy::{
     AccountTypeDispatchPolicy, ModelSupportPolicy, normalize_account_type_dispatch_policies,
-    normalize_account_type_policies,
+    normalize_account_type_policies, normalize_nested_account_type_dispatch_policies,
 };
 
 const STATS_FILE_NAME: &str = "kiro_stats.json";
@@ -914,6 +914,11 @@ pub struct PersistedDispatchConfig {
     pub account_type_policies: BTreeMap<String, ModelSupportPolicy>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub account_type_dispatch_policies: BTreeMap<String, AccountTypeDispatchPolicy>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub auth_account_type_dispatch_policies: BTreeMap<String, AccountTypeDispatchPolicy>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub auth_account_type_account_type_dispatch_policies:
+        BTreeMap<String, BTreeMap<String, AccountTypeDispatchPolicy>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub credential_groups: Vec<CredentialGroupConfig>,
 }
@@ -986,6 +991,15 @@ impl PersistedDispatchConfig {
         normalize_account_type_policies(&mut account_type_policies);
         let mut account_type_dispatch_policies = config.account_type_dispatch_policies.clone();
         normalize_account_type_dispatch_policies(&mut account_type_dispatch_policies);
+        let mut auth_account_type_dispatch_policies =
+            config.auth_account_type_dispatch_policies.clone();
+        normalize_account_type_dispatch_policies(&mut auth_account_type_dispatch_policies);
+        let mut auth_account_type_account_type_dispatch_policies = config
+            .auth_account_type_account_type_dispatch_policies
+            .clone();
+        normalize_nested_account_type_dispatch_policies(
+            &mut auth_account_type_account_type_dispatch_policies,
+        );
         Self {
             mode: config.load_balancing_mode.clone(),
             session_affinity_enabled: config.session_affinity_enabled,
@@ -1026,6 +1040,8 @@ impl PersistedDispatchConfig {
             proxy_pool: config.proxy_pool.clone(),
             account_type_policies,
             account_type_dispatch_policies,
+            auth_account_type_dispatch_policies,
+            auth_account_type_account_type_dispatch_policies,
             credential_groups: config.credential_groups.clone(),
         }
     }
@@ -1071,6 +1087,11 @@ impl PersistedDispatchConfig {
         config.proxy_pool = self.proxy_pool.clone();
         config.account_type_policies = self.account_type_policies.clone();
         config.account_type_dispatch_policies = self.account_type_dispatch_policies.clone();
+        config.auth_account_type_dispatch_policies =
+            self.auth_account_type_dispatch_policies.clone();
+        config.auth_account_type_account_type_dispatch_policies = self
+            .auth_account_type_account_type_dispatch_policies
+            .clone();
         if !self.credential_groups.is_empty() {
             config.credential_groups = normalize_credential_group_catalog(&self.credential_groups);
         }
@@ -3980,6 +4001,15 @@ mod tests {
             proxy_pool: ProxyPoolConfig::default(),
             account_type_policies: BTreeMap::new(),
             account_type_dispatch_policies: BTreeMap::new(),
+            auth_account_type_dispatch_policies: BTreeMap::from([(
+                "social".to_string(),
+                AccountTypeDispatchPolicy {
+                    max_concurrency: Some(1),
+                    rate_limit_bucket_capacity: Some(2.0),
+                    rate_limit_refill_per_second: Some(0.2),
+                },
+            )]),
+            auth_account_type_account_type_dispatch_policies: BTreeMap::new(),
             credential_groups: vec![CredentialGroupConfig::default_group()],
         };
 

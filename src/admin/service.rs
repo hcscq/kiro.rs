@@ -1240,6 +1240,47 @@ impl AdminService {
             proxy.enabled.hash(&mut hasher);
             proxy.expected_egress_ip.hash(&mut hasher);
         }
+        for (account_type, policy) in &dispatch.account_type_dispatch_policies {
+            account_type.hash(&mut hasher);
+            policy.max_concurrency.hash(&mut hasher);
+            policy
+                .rate_limit_bucket_capacity
+                .map(f64::to_bits)
+                .hash(&mut hasher);
+            policy
+                .rate_limit_refill_per_second
+                .map(f64::to_bits)
+                .hash(&mut hasher);
+        }
+        for (auth_account_type, policy) in &dispatch.auth_account_type_dispatch_policies {
+            auth_account_type.hash(&mut hasher);
+            policy.max_concurrency.hash(&mut hasher);
+            policy
+                .rate_limit_bucket_capacity
+                .map(f64::to_bits)
+                .hash(&mut hasher);
+            policy
+                .rate_limit_refill_per_second
+                .map(f64::to_bits)
+                .hash(&mut hasher);
+        }
+        for (auth_account_type, policies) in
+            &dispatch.auth_account_type_account_type_dispatch_policies
+        {
+            auth_account_type.hash(&mut hasher);
+            for (account_type, policy) in policies {
+                account_type.hash(&mut hasher);
+                policy.max_concurrency.hash(&mut hasher);
+                policy
+                    .rate_limit_bucket_capacity
+                    .map(f64::to_bits)
+                    .hash(&mut hasher);
+                policy
+                    .rate_limit_refill_per_second
+                    .map(f64::to_bits)
+                    .hash(&mut hasher);
+            }
+        }
         hasher.finish() & JS_SAFE_U64_MASK
     }
 
@@ -4431,6 +4472,12 @@ impl AdminService {
             account_type_dispatch_policies: self
                 .token_manager
                 .account_type_dispatch_policies_snapshot(),
+            auth_account_type_dispatch_policies: self
+                .token_manager
+                .auth_account_type_dispatch_policies_snapshot(),
+            auth_account_type_account_type_dispatch_policies: self
+                .token_manager
+                .auth_account_type_account_type_dispatch_policies_snapshot(),
             standard_account_type_presets: built_in_account_type_presets()
                 .iter()
                 .map(|preset| StandardAccountTypePresetResponse {
@@ -4647,7 +4694,13 @@ impl AdminService {
     ) -> Result<ModelCapabilitiesConfigResponse, AdminServiceError> {
         self.ensure_runtime_write_leader()?;
 
-        if req.account_type_policies.is_none() && req.account_type_dispatch_policies.is_none() {
+        if req.account_type_policies.is_none()
+            && req.account_type_dispatch_policies.is_none()
+            && req.auth_account_type_dispatch_policies.is_none()
+            && req
+                .auth_account_type_account_type_dispatch_policies
+                .is_none()
+        {
             return self.get_model_capabilities_config();
         }
 
@@ -4655,6 +4708,8 @@ impl AdminService {
             .set_account_type_strategy_config(
                 req.account_type_policies,
                 req.account_type_dispatch_policies,
+                req.auth_account_type_dispatch_policies,
+                req.auth_account_type_account_type_dispatch_policies,
             )
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 

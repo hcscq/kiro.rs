@@ -1553,6 +1553,9 @@ pub struct StandardAccountTypePresetResponse {
 pub struct ModelCapabilitiesConfigResponse {
     pub account_type_policies: BTreeMap<String, ModelSupportPolicy>,
     pub account_type_dispatch_policies: BTreeMap<String, AccountTypeDispatchPolicy>,
+    pub auth_account_type_dispatch_policies: BTreeMap<String, AccountTypeDispatchPolicy>,
+    pub auth_account_type_account_type_dispatch_policies:
+        BTreeMap<String, BTreeMap<String, AccountTypeDispatchPolicy>>,
     pub standard_account_type_presets: Vec<StandardAccountTypePresetResponse>,
 }
 
@@ -1575,6 +1578,9 @@ pub struct ModelCatalogResponse {
 pub struct SetModelCapabilitiesConfigRequest {
     pub account_type_policies: Option<BTreeMap<String, ModelSupportPolicy>>,
     pub account_type_dispatch_policies: Option<BTreeMap<String, AccountTypeDispatchPolicy>>,
+    pub auth_account_type_dispatch_policies: Option<BTreeMap<String, AccountTypeDispatchPolicy>>,
+    pub auth_account_type_account_type_dispatch_policies:
+        Option<BTreeMap<String, BTreeMap<String, AccountTypeDispatchPolicy>>>,
 }
 
 // ============ 通用响应 ============

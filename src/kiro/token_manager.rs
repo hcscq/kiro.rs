@@ -27,7 +27,7 @@ use crate::http_client::{ProxyConfig, build_client, build_client_no_redirect};
 use crate::kiro::machine_id;
 use crate::kiro::model::available_models::ListAvailableModelsResponse;
 use crate::kiro::model::available_profiles::{AvailableProfile, ListAvailableProfilesResponse};
-use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::credentials::{DispatchSettingSource, KiroCredentials};
 use crate::kiro::model::token_refresh::{
     ExternalIdpDiscoveryResponse, ExternalIdpRefreshResponse, IdcRefreshRequest,
     IdcRefreshResponse, RefreshRequest, RefreshResponse,
@@ -41,6 +41,7 @@ use crate::model::config::{
 use crate::model::model_policy::{
     AccountTypeDispatchPolicy, ModelSupportPolicy, normalize_account_type_dispatch_policies,
     normalize_account_type_policies, normalize_model_entries, normalize_model_selector,
+    normalize_nested_account_type_dispatch_policies,
 };
 use crate::state::{
     CachedBalanceRecord, CredentialCompareAndSwapResult, CredentialHealthPatch,
@@ -1844,6 +1845,10 @@ pub struct LoadBalancingConfigSnapshot {
     pub thinking_signature_validation_mode: ThinkingSignatureValidationMode,
     pub response_thinking_signature_compat_enabled: bool,
     pub proxy_pool: ProxyPoolConfig,
+    pub account_type_dispatch_policies: BTreeMap<String, AccountTypeDispatchPolicy>,
+    pub auth_account_type_dispatch_policies: BTreeMap<String, AccountTypeDispatchPolicy>,
+    pub auth_account_type_account_type_dispatch_policies:
+        BTreeMap<String, BTreeMap<String, AccountTypeDispatchPolicy>>,
     pub waiting_requests: usize,
 }
 
@@ -1894,6 +1899,14 @@ struct DispatchConfig {
     proxy_pool: ProxyPoolConfig,
     account_type_policies: BTreeMap<String, ModelSupportPolicy>,
     account_type_dispatch_policies: BTreeMap<String, AccountTypeDispatchPolicy>,
+    auth_account_type_dispatch_policies: BTreeMap<String, AccountTypeDispatchPolicy>,
+    auth_account_type_account_type_dispatch_policies:
+        BTreeMap<String, BTreeMap<String, AccountTypeDispatchPolicy>>,
+}
+
+struct DispatchPolicyCandidate<'a> {
+    source: DispatchSettingSource,
+    policy: &'a AccountTypeDispatchPolicy,
 }
 
 impl DispatchConfig {
@@ -1916,6 +1929,15 @@ impl DispatchConfig {
         normalize_account_type_policies(&mut account_type_policies);
         let mut account_type_dispatch_policies = config.account_type_dispatch_policies.clone();
         normalize_account_type_dispatch_policies(&mut account_type_dispatch_policies);
+        let mut auth_account_type_dispatch_policies =
+            config.auth_account_type_dispatch_policies.clone();
+        normalize_account_type_dispatch_policies(&mut auth_account_type_dispatch_policies);
+        let mut auth_account_type_account_type_dispatch_policies = config
+            .auth_account_type_account_type_dispatch_policies
+            .clone();
+        normalize_nested_account_type_dispatch_policies(
+            &mut auth_account_type_account_type_dispatch_policies,
+        );
 
         Self {
             mode: config.load_balancing_mode.clone(),
@@ -1970,6 +1992,8 @@ impl DispatchConfig {
             proxy_pool: config.proxy_pool.clone(),
             account_type_policies,
             account_type_dispatch_policies,
+            auth_account_type_dispatch_policies,
+            auth_account_type_account_type_dispatch_policies,
         }
     }
 
@@ -1995,23 +2019,95 @@ impl DispatchConfig {
         credentials.account_type_dispatch_policy(&self.account_type_dispatch_policies)
     }
 
+    fn auth_account_type_dispatch_policy_for<'a>(
+        &'a self,
+        credentials: &KiroCredentials,
+    ) -> Option<&'a AccountTypeDispatchPolicy> {
+        let auth_account_type = credentials.detected_auth_account_type()?;
+        self.auth_account_type_dispatch_policies
+            .get(auth_account_type.as_str())
+    }
+
+    fn auth_account_type_account_type_dispatch_policy_for<'a>(
+        &'a self,
+        credentials: &'a KiroCredentials,
+    ) -> Option<&'a AccountTypeDispatchPolicy> {
+        let auth_account_type = credentials.detected_auth_account_type()?;
+        let resolved_account_type = credentials.resolved_account_type()?;
+        self.auth_account_type_account_type_dispatch_policies
+            .get(auth_account_type.as_str())
+            .and_then(|policies| policies.get(resolved_account_type.as_str()))
+    }
+
+    fn dispatch_policy_candidates_for<'a>(
+        &'a self,
+        credentials: &'a KiroCredentials,
+    ) -> Vec<DispatchPolicyCandidate<'a>> {
+        let mut candidates = Vec::with_capacity(3);
+        if let Some(policy) = self.auth_account_type_account_type_dispatch_policy_for(credentials) {
+            candidates.push(DispatchPolicyCandidate {
+                source: DispatchSettingSource::AuthAccountTypeAccountType,
+                policy,
+            });
+        }
+        if let Some(policy) = self.auth_account_type_dispatch_policy_for(credentials) {
+            candidates.push(DispatchPolicyCandidate {
+                source: DispatchSettingSource::AuthAccountType,
+                policy,
+            });
+        }
+        if let Some(policy) = self.account_type_dispatch_policy_for(credentials) {
+            candidates.push(DispatchPolicyCandidate {
+                source: DispatchSettingSource::AccountType,
+                policy,
+            });
+        }
+        candidates
+    }
+
+    fn first_dispatch_policy_value_for<T>(
+        &self,
+        credentials: &KiroCredentials,
+        extractor: impl Fn(&AccountTypeDispatchPolicy) -> Option<T>,
+    ) -> Option<(T, DispatchSettingSource)> {
+        self.dispatch_policy_candidates_for(credentials)
+            .into_iter()
+            .find_map(|candidate| {
+                extractor(candidate.policy).map(|value| (value, candidate.source))
+            })
+    }
+
     fn effective_max_concurrency_for(&self, credentials: &KiroCredentials) -> Option<usize> {
-        credentials.effective_max_concurrency_with_policy(
-            self.default_max_concurrency,
-            self.account_type_dispatch_policy_for(credentials),
-        )
+        credentials
+            .max_concurrency_override()
+            .or_else(|| {
+                self.first_dispatch_policy_value_for(
+                    credentials,
+                    AccountTypeDispatchPolicy::effective_max_concurrency,
+                )
+                .map(|(value, _)| value)
+            })
+            .or(self.default_max_concurrency)
+            .and_then(|limit| usize::try_from(limit).ok())
+            .filter(|limit| *limit > 0)
     }
 
     fn effective_max_concurrency_source_for(
         &self,
         credentials: &KiroCredentials,
     ) -> Option<String> {
-        credentials
-            .effective_max_concurrency_source(
-                self.default_max_concurrency,
-                self.account_type_dispatch_policy_for(credentials),
-            )
-            .map(|source| source.as_str().to_string())
+        if credentials.max_concurrency_override().is_some() {
+            return Some(DispatchSettingSource::Credential.as_str().to_string());
+        }
+        if let Some((_, source)) = self.first_dispatch_policy_value_for(
+            credentials,
+            AccountTypeDispatchPolicy::effective_max_concurrency,
+        ) {
+            return Some(source.as_str().to_string());
+        }
+        self.default_max_concurrency
+            .filter(|limit| *limit > 0)
+            .map(|_| DispatchSettingSource::GlobalDefault.as_str().to_string())
     }
 
     fn rate_limit_cooldown_enabled_for(&self, credentials: &KiroCredentials) -> bool {
@@ -2031,40 +2127,60 @@ impl DispatchConfig {
         &self,
         credentials: &KiroCredentials,
     ) -> Option<String> {
-        credentials
-            .effective_rate_limit_bucket_capacity_source(
-                self.rate_limit_bucket_capacity,
-                self.account_type_dispatch_policy_for(credentials),
-            )
-            .map(|source| source.as_str().to_string())
+        if credentials.rate_limit_bucket_capacity_override().is_some() {
+            return Some(DispatchSettingSource::Credential.as_str().to_string());
+        }
+        if let Some((_, source)) = self.first_dispatch_policy_value_for(
+            credentials,
+            AccountTypeDispatchPolicy::rate_limit_bucket_capacity_override,
+        ) {
+            return Some(source.as_str().to_string());
+        }
+        self.rate_limit_bucket_capacity
+            .is_finite()
+            .then(|| DispatchSettingSource::GlobalDefault.as_str().to_string())
     }
 
     fn rate_limit_refill_per_second_source_for(
         &self,
         credentials: &KiroCredentials,
     ) -> Option<String> {
-        credentials
-            .effective_rate_limit_refill_per_second_source(
-                self.rate_limit_refill_per_second,
-                self.account_type_dispatch_policy_for(credentials),
-            )
-            .map(|source| source.as_str().to_string())
+        if credentials
+            .rate_limit_refill_per_second_override()
+            .is_some()
+        {
+            return Some(DispatchSettingSource::Credential.as_str().to_string());
+        }
+        if let Some((_, source)) = self.first_dispatch_policy_value_for(
+            credentials,
+            AccountTypeDispatchPolicy::rate_limit_refill_per_second_override,
+        ) {
+            return Some(source.as_str().to_string());
+        }
+        self.rate_limit_refill_per_second
+            .is_finite()
+            .then(|| DispatchSettingSource::GlobalDefault.as_str().to_string())
     }
 
     fn bucket_policy_for(&self, credentials: &KiroCredentials) -> Option<TokenBucketPolicy> {
-        let account_type_dispatch_policy = self.account_type_dispatch_policy_for(credentials);
         let capacity = credentials
             .rate_limit_bucket_capacity_override()
             .or_else(|| {
-                account_type_dispatch_policy
-                    .and_then(AccountTypeDispatchPolicy::rate_limit_bucket_capacity_override)
+                self.first_dispatch_policy_value_for(
+                    credentials,
+                    AccountTypeDispatchPolicy::rate_limit_bucket_capacity_override,
+                )
+                .map(|(value, _)| value)
             })
             .unwrap_or(self.rate_limit_bucket_capacity);
         let refill_per_second = credentials
             .rate_limit_refill_per_second_override()
             .or_else(|| {
-                account_type_dispatch_policy
-                    .and_then(AccountTypeDispatchPolicy::rate_limit_refill_per_second_override)
+                self.first_dispatch_policy_value_for(
+                    credentials,
+                    AccountTypeDispatchPolicy::rate_limit_refill_per_second_override,
+                )
+                .map(|(value, _)| value)
             })
             .unwrap_or(self.rate_limit_refill_per_second);
 
@@ -5026,12 +5142,8 @@ impl MultiTokenManager {
             "分配凭据 #{} 处理请求，当前运行中请求数: {}{}",
             selected_id,
             entry.active_requests,
-            entry
-                .credentials
-                .effective_max_concurrency_with_policy(
-                    dispatch.default_max_concurrency,
-                    dispatch.account_type_dispatch_policy_for(&entry.credentials),
-                )
+            dispatch
+                .effective_max_concurrency_for(&entry.credentials)
                 .map(|limit| format!("/{}", limit))
                 .unwrap_or_default()
         );
@@ -5393,11 +5505,8 @@ impl MultiTokenManager {
                     "通过共享调度热态分配凭据 #{}，全局运行中请求数: {}{}",
                     selected_id,
                     reservation.snapshot.active_requests,
-                    selected_credentials
-                        .effective_max_concurrency_with_policy(
-                            dispatch.default_max_concurrency,
-                            dispatch.account_type_dispatch_policy_for(&selected_credentials),
-                        )
+                    dispatch
+                        .effective_max_concurrency_for(&selected_credentials)
                         .map(|limit| format!("/{}", limit))
                         .unwrap_or_default()
                 );
@@ -6719,6 +6828,10 @@ impl MultiTokenManager {
                 != next.rate_limit_refill_recovery_step_per_success
             || previous.rate_limit_refill_backoff_factor != next.rate_limit_refill_backoff_factor
             || previous.account_type_dispatch_policies != next.account_type_dispatch_policies
+            || previous.auth_account_type_dispatch_policies
+                != next.auth_account_type_dispatch_policies
+            || previous.auth_account_type_account_type_dispatch_policies
+                != next.auth_account_type_account_type_dispatch_policies
         {
             self.reconfigure_rate_limit_runtime(&next);
         }
@@ -8688,12 +8801,8 @@ impl MultiTokenManager {
                         total_tokens: e.input_tokens.saturating_add(e.output_tokens),
                         last_used_at: e.last_used_at.clone(),
                         active_requests,
-                        max_concurrency: e
-                            .credentials
-                            .effective_max_concurrency_with_policy(
-                                dispatch.default_max_concurrency,
-                                dispatch.account_type_dispatch_policy_for(&e.credentials),
-                            )
+                        max_concurrency: dispatch
+                            .effective_max_concurrency_for(&e.credentials)
                             .and_then(|limit| u32::try_from(limit).ok()),
                         max_concurrency_override: e.credentials.max_concurrency_override(),
                         max_concurrency_source: dispatch
@@ -10138,6 +10247,13 @@ impl MultiTokenManager {
             response_thinking_signature_compat_enabled: dispatch
                 .response_thinking_signature_compat_enabled,
             proxy_pool: dispatch.proxy_pool.clone(),
+            account_type_dispatch_policies: dispatch.account_type_dispatch_policies.clone(),
+            auth_account_type_dispatch_policies: dispatch
+                .auth_account_type_dispatch_policies
+                .clone(),
+            auth_account_type_account_type_dispatch_policies: dispatch
+                .auth_account_type_account_type_dispatch_policies
+                .clone(),
             waiting_requests: self.queue_depth(),
         }
     }
@@ -10150,6 +10266,19 @@ impl MultiTokenManager {
         &self,
     ) -> BTreeMap<String, AccountTypeDispatchPolicy> {
         self.dispatch_config().account_type_dispatch_policies
+    }
+
+    pub fn auth_account_type_dispatch_policies_snapshot(
+        &self,
+    ) -> BTreeMap<String, AccountTypeDispatchPolicy> {
+        self.dispatch_config().auth_account_type_dispatch_policies
+    }
+
+    pub fn auth_account_type_account_type_dispatch_policies_snapshot(
+        &self,
+    ) -> BTreeMap<String, BTreeMap<String, AccountTypeDispatchPolicy>> {
+        self.dispatch_config()
+            .auth_account_type_account_type_dispatch_policies
     }
 
     pub fn supports_model(&self, model: &str) -> bool {
@@ -10250,6 +10379,12 @@ impl MultiTokenManager {
                 proxy_pool: dispatch.proxy_pool.clone(),
                 account_type_policies: dispatch.account_type_policies.clone(),
                 account_type_dispatch_policies: dispatch.account_type_dispatch_policies.clone(),
+                auth_account_type_dispatch_policies: dispatch
+                    .auth_account_type_dispatch_policies
+                    .clone(),
+                auth_account_type_account_type_dispatch_policies: dispatch
+                    .auth_account_type_account_type_dispatch_policies
+                    .clone(),
                 credential_groups: self.credential_group_catalog_snapshot(),
             })?;
         self.try_bump_state_change_revision(StateChangeKind::DispatchConfig);
@@ -10297,7 +10432,7 @@ impl MultiTokenManager {
         mut account_type_policies: BTreeMap<String, ModelSupportPolicy>,
     ) -> anyhow::Result<()> {
         crate::model::model_policy::normalize_account_type_policies(&mut account_type_policies);
-        self.set_account_type_strategy_config(Some(account_type_policies), None)
+        self.set_account_type_strategy_config(Some(account_type_policies), None, None, None)
     }
 
     pub fn set_account_type_dispatch_policies(
@@ -10307,22 +10442,46 @@ impl MultiTokenManager {
         crate::model::model_policy::normalize_account_type_dispatch_policies(
             &mut account_type_dispatch_policies,
         );
-        self.set_account_type_strategy_config(None, Some(account_type_dispatch_policies))
+        self.set_account_type_strategy_config(
+            None,
+            Some(account_type_dispatch_policies),
+            None,
+            None,
+        )
     }
 
     pub fn set_account_type_strategy_config(
         &self,
         account_type_policies: Option<BTreeMap<String, ModelSupportPolicy>>,
         account_type_dispatch_policies: Option<BTreeMap<String, AccountTypeDispatchPolicy>>,
+        auth_account_type_dispatch_policies: Option<BTreeMap<String, AccountTypeDispatchPolicy>>,
+        auth_account_type_account_type_dispatch_policies: Option<
+            BTreeMap<String, BTreeMap<String, AccountTypeDispatchPolicy>>,
+        >,
     ) -> anyhow::Result<()> {
         let previous = self.dispatch_config();
         let mut next = previous.clone();
 
-        if let Some(account_type_policies) = account_type_policies {
+        if let Some(mut account_type_policies) = account_type_policies {
+            normalize_account_type_policies(&mut account_type_policies);
             next.account_type_policies = account_type_policies;
         }
-        if let Some(account_type_dispatch_policies) = account_type_dispatch_policies {
+        if let Some(mut account_type_dispatch_policies) = account_type_dispatch_policies {
+            normalize_account_type_dispatch_policies(&mut account_type_dispatch_policies);
             next.account_type_dispatch_policies = account_type_dispatch_policies;
+        }
+        if let Some(mut auth_account_type_dispatch_policies) = auth_account_type_dispatch_policies {
+            normalize_account_type_dispatch_policies(&mut auth_account_type_dispatch_policies);
+            next.auth_account_type_dispatch_policies = auth_account_type_dispatch_policies;
+        }
+        if let Some(mut auth_account_type_account_type_dispatch_policies) =
+            auth_account_type_account_type_dispatch_policies
+        {
+            normalize_nested_account_type_dispatch_policies(
+                &mut auth_account_type_account_type_dispatch_policies,
+            );
+            next.auth_account_type_account_type_dispatch_policies =
+                auth_account_type_account_type_dispatch_policies;
         }
 
         if previous == next {
@@ -10337,7 +10496,12 @@ impl MultiTokenManager {
             return Err(err);
         }
 
-        if previous.account_type_dispatch_policies != next.account_type_dispatch_policies {
+        if previous.account_type_dispatch_policies != next.account_type_dispatch_policies
+            || previous.auth_account_type_dispatch_policies
+                != next.auth_account_type_dispatch_policies
+            || previous.auth_account_type_account_type_dispatch_policies
+                != next.auth_account_type_account_type_dispatch_policies
+        {
             self.reconfigure_rate_limit_runtime(&next);
         }
         self.availability_notify.notify_waiters();
@@ -10563,6 +10727,10 @@ impl MultiTokenManager {
                 != next.rate_limit_refill_recovery_step_per_success
             || previous.rate_limit_refill_backoff_factor != next.rate_limit_refill_backoff_factor
             || previous.account_type_dispatch_policies != next.account_type_dispatch_policies
+            || previous.auth_account_type_dispatch_policies
+                != next.auth_account_type_dispatch_policies
+            || previous.auth_account_type_account_type_dispatch_policies
+                != next.auth_account_type_account_type_dispatch_policies
         {
             self.reconfigure_rate_limit_runtime(&next);
         }
@@ -11752,6 +11920,107 @@ mod tests {
         assert_eq!(entry.max_concurrency, Some(32));
         assert_eq!(entry.rate_limit_bucket_capacity, None);
         assert_eq!(entry.rate_limit_refill_per_second, None);
+    }
+
+    #[test]
+    fn test_auth_account_type_dispatch_policy_overrides_subscription_policy() {
+        let mut config = Config::default();
+        config.default_max_concurrency = Some(3);
+        config.account_type_dispatch_policies.insert(
+            "power".to_string(),
+            AccountTypeDispatchPolicy {
+                max_concurrency: Some(32),
+                rate_limit_bucket_capacity: Some(0.0),
+                rate_limit_refill_per_second: Some(0.0),
+            },
+        );
+        config.auth_account_type_dispatch_policies.insert(
+            "social".to_string(),
+            AccountTypeDispatchPolicy {
+                max_concurrency: Some(1),
+                rate_limit_bucket_capacity: Some(2.0),
+                rate_limit_refill_per_second: Some(0.2),
+            },
+        );
+
+        let mut cred = available_credential(0);
+        cred.auth_method = Some("social".to_string());
+        cred.subscription_title = Some("KIRO POWER".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+
+        assert_eq!(entry.max_concurrency, Some(1));
+        assert_eq!(
+            entry.max_concurrency_source.as_deref(),
+            Some("auth-account-type")
+        );
+        assert_eq!(entry.rate_limit_bucket_capacity, Some(2.0));
+        assert_eq!(
+            entry.rate_limit_bucket_capacity_source.as_deref(),
+            Some("auth-account-type")
+        );
+        assert_eq!(entry.rate_limit_refill_per_second, Some(0.2));
+        assert_eq!(
+            entry.rate_limit_refill_per_second_source.as_deref(),
+            Some("auth-account-type")
+        );
+    }
+
+    #[test]
+    fn test_auth_and_subscription_dispatch_policy_overrides_auth_policy_by_field() {
+        let mut config = Config::default();
+        config.default_max_concurrency = Some(3);
+        config.auth_account_type_dispatch_policies.insert(
+            "enterprise".to_string(),
+            AccountTypeDispatchPolicy {
+                max_concurrency: Some(16),
+                rate_limit_bucket_capacity: Some(8.0),
+                rate_limit_refill_per_second: Some(1.0),
+            },
+        );
+        config
+            .auth_account_type_account_type_dispatch_policies
+            .insert(
+                "enterprise".to_string(),
+                BTreeMap::from([(
+                    "power".to_string(),
+                    AccountTypeDispatchPolicy {
+                        max_concurrency: Some(32),
+                        rate_limit_bucket_capacity: None,
+                        rate_limit_refill_per_second: None,
+                    },
+                )]),
+            );
+
+        let mut cred = available_credential(0);
+        cred.auth_method = Some("idc".to_string());
+        cred.provider = Some("Enterprise".to_string());
+        cred.start_url = Some("https://example.awsapps.com/start".to_string());
+        cred.subscription_title = Some("KIRO POWER".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+
+        assert_eq!(entry.auth_account_type.as_deref(), Some("enterprise"));
+        assert_eq!(entry.resolved_account_type.as_deref(), Some("power"));
+        assert_eq!(entry.max_concurrency, Some(32));
+        assert_eq!(
+            entry.max_concurrency_source.as_deref(),
+            Some("auth-account-type+account-type")
+        );
+        assert_eq!(entry.rate_limit_bucket_capacity, Some(8.0));
+        assert_eq!(
+            entry.rate_limit_bucket_capacity_source.as_deref(),
+            Some("auth-account-type")
+        );
+        assert_eq!(entry.rate_limit_refill_per_second, Some(1.0));
+        assert_eq!(
+            entry.rate_limit_refill_per_second_source.as_deref(),
+            Some("auth-account-type")
+        );
     }
 
     #[test]
@@ -13478,6 +13747,15 @@ mod tests {
             proxy_pool: ProxyPoolConfig::default(),
             account_type_policies: BTreeMap::new(),
             account_type_dispatch_policies: BTreeMap::new(),
+            auth_account_type_dispatch_policies: BTreeMap::from([(
+                "enterprise".to_string(),
+                AccountTypeDispatchPolicy {
+                    max_concurrency: Some(12),
+                    rate_limit_bucket_capacity: Some(8.0),
+                    rate_limit_refill_per_second: Some(1.0),
+                },
+            )]),
+            auth_account_type_account_type_dispatch_policies: BTreeMap::new(),
             credential_groups: vec![crate::model::config::CredentialGroupConfig {
                 name: "stable".to_string(),
                 display_name: Some("Stable".to_string()),
@@ -13526,6 +13804,13 @@ mod tests {
                 .credential_group_catalog_snapshot()
                 .iter()
                 .any(|group| group.name == "stable")
+        );
+        assert_eq!(
+            manager
+                .auth_account_type_dispatch_policies_snapshot()
+                .get("enterprise")
+                .and_then(AccountTypeDispatchPolicy::effective_max_concurrency),
+            Some(12)
         );
         assert_eq!(snapshot.request_weighting.tools_bonus, 1.0);
         assert!(!snapshot.stream_dispatch_lease_release_enabled);
