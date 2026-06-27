@@ -1151,7 +1151,11 @@ export function CredentialCard({
               </div>
             )}
             {credential.rateLimitHitStreak > 0 && (
-              <Badge variant="warning" className="px-1.5 py-0 text-[10px]">
+              <Badge
+                variant={cooldownSummary || nextReadySummary ? 'warning' : 'outline'}
+                className="px-1.5 py-0 text-[10px]"
+                title="最近连续命中 429 的次数；不等同于当前仍在冷却"
+              >
                 连续 429: {credential.rateLimitHitStreak}
               </Badge>
             )}

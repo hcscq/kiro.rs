@@ -102,11 +102,17 @@ function normalizeSourceBatch(credential: CredentialStatusItem): string | null {
 }
 
 function isRateLimitedCredential(credential: CredentialStatusItem): boolean {
+  const bucketWaiting =
+    credential.rateLimitBucketCapacity !== undefined &&
+    credential.rateLimitBucketCapacity !== null &&
+    credential.rateLimitBucketCapacity > 0 &&
+    (credential.rateLimitBucketTokens ?? 0) < 1
+
   return (
     (credential.cooldownRemainingMs ?? 0) > 0 ||
     (credential.suspiciousActivityQuarantineRemainingMs ?? 0) > 0 ||
-    credential.rateLimitHitStreak > 0 ||
-    (credential.nextReadyInMs ?? 0) > 0
+    (credential.nextReadyInMs ?? 0) > 0 ||
+    bucketWaiting
   )
 }
 

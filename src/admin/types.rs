@@ -197,6 +197,7 @@ pub struct CredentialRuntimeStatusItem {
     pub last_used_at: Option<String>,
     pub in_flight: usize,
     pub cooldown_remaining_ms: Option<u64>,
+    pub suspicious_activity_quarantine_remaining_ms: Option<u64>,
     pub rate_limit_bucket_tokens: Option<f64>,
     pub rate_limit_bucket_capacity: Option<f64>,
     pub rate_limit_refill_per_second: Option<f64>,
@@ -422,6 +423,8 @@ pub struct AdminStateEvent {
     pub credentials_fingerprint: u64,
     /// 调度配置摘要指纹，本地状态后端没有共享修订号时用于变更检测
     pub dispatch_fingerprint: u64,
+    /// 凭据热运行态摘要指纹，用于触发轻量运行态增量刷新
+    pub runtime_fingerprint: u64,
     /// 凭据总数
     pub total: usize,
     /// 可用凭据数量（未禁用）
@@ -432,7 +435,7 @@ pub struct AdminStateEvent {
     pub in_flight: usize,
     /// 等待队列中的请求数
     pub waiting_requests: usize,
-    /// 当前有 429 冷却、bucket 等待或连续 429 的凭据数量
+    /// 当前有 429 冷却、bucket 等待或 suspicious activity 隔离的凭据数量
     pub rate_limited: usize,
     /// 当前禁用、失败、刷新失败或有最近错误的凭据数量
     pub abnormal: usize,

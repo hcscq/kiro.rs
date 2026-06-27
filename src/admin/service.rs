@@ -912,6 +912,7 @@ impl AdminService {
                     balance_cache_revision,
                     credentials_fingerprint: 0,
                     dispatch_fingerprint: 0,
+                    runtime_fingerprint: 0,
                     total: 0,
                     available: 0,
                     dispatchable: 0,
@@ -1005,6 +1006,7 @@ impl AdminService {
             || current.balance_cache_revision != next.balance_cache_revision
             || current.credentials_fingerprint != next.credentials_fingerprint
             || current.dispatch_fingerprint != next.dispatch_fingerprint
+            || current.runtime_fingerprint != next.runtime_fingerprint
             || current.total != next.total
             || current.available != next.available
             || current.dispatchable != next.dispatchable
@@ -1032,6 +1034,7 @@ impl AdminService {
         let dispatch = token_manager.load_balancing_config_snapshot();
         let credentials_fingerprint = Self::credentials_event_fingerprint(&snapshot);
         let dispatch_fingerprint = Self::dispatch_event_fingerprint(&dispatch);
+        let runtime_fingerprint = Self::runtime_event_fingerprint(&snapshot);
         let in_flight = snapshot
             .entries
             .iter()
@@ -1040,15 +1043,7 @@ impl AdminService {
         let rate_limited = snapshot
             .entries
             .iter()
-            .filter(|entry| {
-                entry.cooldown_remaining_ms.unwrap_or_default() > 0
-                    || entry.next_ready_in_ms.unwrap_or_default() > 0
-                    || entry.rate_limit_hit_streak > 0
-                    || entry
-                        .rate_limit_bucket_tokens
-                        .zip(entry.rate_limit_bucket_capacity)
-                        .is_some_and(|(tokens, capacity)| capacity > 0.0 && tokens < 1.0)
-            })
+            .filter(|entry| Self::credential_has_current_rate_limit_wait(entry))
             .count();
         let abnormal = snapshot
             .entries
@@ -1069,6 +1064,7 @@ impl AdminService {
             balance_cache_revision: revisions.balance_cache,
             credentials_fingerprint,
             dispatch_fingerprint,
+            runtime_fingerprint,
             total: snapshot.total,
             available: snapshot.available,
             dispatchable: snapshot.dispatchable,
@@ -1136,6 +1132,29 @@ impl AdminService {
                 .map(f64::to_bits)
                 .hash(&mut hasher);
             entry.rate_limit_refill_per_second_source.hash(&mut hasher);
+        }
+
+        hasher.finish() & JS_SAFE_U64_MASK
+    }
+
+    fn credential_has_current_rate_limit_wait(entry: &CredentialEntrySnapshot) -> bool {
+        entry.cooldown_remaining_ms.unwrap_or_default() > 0
+            || entry
+                .suspicious_activity_quarantine_remaining_ms
+                .unwrap_or_default()
+                > 0
+            || entry.next_ready_in_ms.unwrap_or_default() > 0
+            || entry
+                .rate_limit_bucket_tokens
+                .zip(entry.rate_limit_bucket_capacity)
+                .is_some_and(|(tokens, capacity)| capacity > 0.0 && tokens < 1.0)
+    }
+
+    fn runtime_event_fingerprint(snapshot: &crate::kiro::token_manager::ManagerSnapshot) -> u64 {
+        let mut hasher = DefaultHasher::new();
+
+        for entry in &snapshot.entries {
+            Self::credential_runtime_fingerprint(entry).hash(&mut hasher);
         }
 
         hasher.finish() & JS_SAFE_U64_MASK
@@ -1571,6 +1590,8 @@ impl AdminService {
             last_used_at: entry.last_used_at.clone(),
             in_flight: entry.active_requests,
             cooldown_remaining_ms: entry.cooldown_remaining_ms,
+            suspicious_activity_quarantine_remaining_ms: entry
+                .suspicious_activity_quarantine_remaining_ms,
             rate_limit_bucket_tokens: entry.rate_limit_bucket_tokens,
             rate_limit_bucket_capacity: entry.rate_limit_bucket_capacity,
             rate_limit_refill_per_second: entry.rate_limit_refill_per_second,
@@ -1590,6 +1611,9 @@ impl AdminService {
         entry.last_used_at.hash(&mut hasher);
         entry.active_requests.hash(&mut hasher);
         entry.cooldown_remaining_ms.hash(&mut hasher);
+        entry
+            .suspicious_activity_quarantine_remaining_ms
+            .hash(&mut hasher);
         entry
             .rate_limit_bucket_tokens
             .map(f64::to_bits)
@@ -5123,6 +5147,7 @@ mod tests {
         entry.last_used_at = Some("2026-06-27T00:00:00Z".to_string());
         entry.active_requests = 2;
         entry.cooldown_remaining_ms = Some(500);
+        entry.suspicious_activity_quarantine_remaining_ms = Some(1_500);
         entry.rate_limit_bucket_tokens = Some(0.5);
         entry.rate_limit_hit_streak = 1;
         entry.next_ready_in_ms = Some(250);
@@ -5132,6 +5157,85 @@ mod tests {
             AdminService::credential_item_fingerprint(entry, &HashMap::new())
         );
         assert_ne!(runtime, AdminService::credential_runtime_fingerprint(entry));
+    }
+
+    #[test]
+    fn runtime_event_fingerprint_tracks_hot_fields() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![available_credential()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let mut snapshot = manager.snapshot();
+        let baseline = AdminService::runtime_event_fingerprint(&snapshot);
+        let credentials_fingerprint = AdminService::credentials_event_fingerprint(&snapshot);
+
+        let entry = snapshot.entries.first_mut().unwrap();
+        entry.success_count = 4;
+        entry.token_usage_count = 2;
+        entry.input_tokens = 600;
+        entry.output_tokens = 300;
+        entry.total_tokens = 900;
+        entry.last_used_at = Some("2026-06-27T00:00:00Z".to_string());
+        entry.active_requests = 1;
+        entry.cooldown_remaining_ms = Some(1_000);
+        entry.suspicious_activity_quarantine_remaining_ms = Some(2_000);
+        entry.rate_limit_bucket_tokens = Some(0.25);
+        entry.rate_limit_hit_streak = 1;
+        entry.next_ready_in_ms = Some(500);
+
+        assert_eq!(
+            credentials_fingerprint,
+            AdminService::credentials_event_fingerprint(&snapshot)
+        );
+        assert_ne!(baseline, AdminService::runtime_event_fingerprint(&snapshot));
+    }
+
+    #[test]
+    fn state_event_change_detection_includes_runtime_fingerprint() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![available_credential()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let current = AdminService::build_state_event_for_manager(&manager, 1).unwrap();
+        let mut next = current.clone();
+        next.runtime_fingerprint = next.runtime_fingerprint.saturating_add(1);
+
+        assert!(AdminService::state_event_observed_fields_changed(
+            &current, &next
+        ));
+    }
+
+    #[test]
+    fn state_event_rate_limited_ignores_hit_streak_without_current_wait() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![available_credential()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let mut snapshot = manager.snapshot();
+        let entry = snapshot.entries.first_mut().unwrap();
+        entry.rate_limit_hit_streak = 3;
+        entry.cooldown_remaining_ms = None;
+        entry.suspicious_activity_quarantine_remaining_ms = None;
+        entry.next_ready_in_ms = None;
+        entry.rate_limit_bucket_tokens = Some(1.0);
+        entry.rate_limit_bucket_capacity = Some(1.0);
+
+        assert!(!AdminService::credential_has_current_rate_limit_wait(entry));
+
+        entry.cooldown_remaining_ms = Some(500);
+        assert!(AdminService::credential_has_current_rate_limit_wait(entry));
     }
 
     #[test]

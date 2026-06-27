@@ -63,6 +63,7 @@ export interface CredentialRuntimeStatusItem {
   lastUsedAt: string | null
   inFlight: number
   cooldownRemainingMs?: number | null
+  suspiciousActivityQuarantineRemainingMs?: number | null
   rateLimitBucketTokens?: number | null
   rateLimitBucketCapacity?: number | null
   rateLimitRefillPerSecond?: number | null
@@ -157,6 +158,7 @@ export interface AdminStateEvent {
   balanceCacheRevision: number
   credentialsFingerprint: number
   dispatchFingerprint: number
+  runtimeFingerprint: number
   total: number
   available: number
   dispatchable: number

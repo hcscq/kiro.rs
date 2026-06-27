@@ -54,7 +54,8 @@ function runtimeChanged(previous: AdminStateEvent, next: AdminStateEvent): boole
     previous.inFlight !== next.inFlight ||
     previous.dispatchable !== next.dispatchable ||
     previous.rateLimited !== next.rateLimited ||
-    previous.abnormal !== next.abnormal
+    previous.abnormal !== next.abnormal ||
+    previous.runtimeFingerprint !== next.runtimeFingerprint
   )
 }
 
@@ -121,6 +122,8 @@ function mergeCredentialsRuntimeDelta(
           lastUsedAt: runtime.lastUsedAt,
           inFlight: runtime.inFlight,
           cooldownRemainingMs: runtime.cooldownRemainingMs,
+          suspiciousActivityQuarantineRemainingMs:
+            runtime.suspiciousActivityQuarantineRemainingMs,
           rateLimitBucketTokens: runtime.rateLimitBucketTokens,
           rateLimitBucketCapacity: runtime.rateLimitBucketCapacity,
           rateLimitRefillPerSecond: runtime.rateLimitRefillPerSecond,

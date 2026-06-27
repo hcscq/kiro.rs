@@ -8620,10 +8620,7 @@ impl MultiTokenManager {
                                 .map(|remaining| {
                                     remaining.as_millis().min(u128::from(u64::MAX)) as u64
                                 })
-                        })
-                        .into_iter()
-                        .chain(suspicious_activity_quarantine_remaining_ms)
-                        .max();
+                        });
                     let next_ready_in_ms = shared_runtime
                         .as_ref()
                         .and_then(|runtime| runtime.next_ready_at_epoch_ms)
