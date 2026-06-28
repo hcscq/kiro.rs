@@ -619,6 +619,9 @@ const MAX_DOCUMENT_EXTRACT_BYTES: usize = 64 * 1024 * 1024;
 // 4_500_001 bytes with DOCUMENT_SIZE_EXCEEDED and accepts 4_500_000 bytes.
 const KIRO_MAX_DOCUMENT_BYTES: usize = 4_500_000;
 const KIRO_MAX_DOCUMENTS_PER_CONVERSATION: usize = 5;
+// Bedrock/Kiro rejects conversations whose combined image + document attachment
+// count exceeds 100. Keep current attachments intact and trim older history.
+const KIRO_MAX_IMAGES_AND_DOCUMENTS_PER_CONVERSATION: usize = 100;
 const PDF_SIGNATURE_SCAN_BYTES: usize = 1024;
 const MAX_INLINE_DOCUMENT_TEXT_CHARS: usize = 40_000;
 const MAX_RENDERED_DOCUMENT_TEXT_CHARS: usize = 7_200;
@@ -976,6 +979,13 @@ fn convert_request_with_options(
     merge_consecutive_history_assistant_messages(&mut history);
     repair_history_tool_result_pairing_for_kiro(&mut history, &validated_tool_results);
     remove_empty_history_user_messages(&mut history);
+    enforce_kiro_conversation_attachment_limit(
+        &mut history,
+        &merged_current.images,
+        &merged_current.documents,
+    );
+    remove_empty_history_user_messages(&mut history);
+    merge_consecutive_history_assistant_messages(&mut history);
 
     if history.len() > KIRO_MAX_SAFE_HISTORY_ENTRIES {
         tracing::warn!(
@@ -1596,6 +1606,88 @@ fn dedupe_documents_across_conversation(
     }
 
     Ok(())
+}
+
+fn history_attachment_count(history: &[Message]) -> usize {
+    history
+        .iter()
+        .filter_map(|message| match message {
+            Message::User(user) => {
+                Some(user.user_input_message.images.len() + user.user_input_message.documents.len())
+            }
+            Message::Assistant(_) => None,
+        })
+        .sum()
+}
+
+fn remove_oldest_items<T>(items: &mut Vec<T>, remaining_to_remove: &mut usize) -> usize {
+    if *remaining_to_remove == 0 || items.is_empty() {
+        return 0;
+    }
+
+    let remove_count = (*remaining_to_remove).min(items.len());
+    items.drain(0..remove_count);
+    *remaining_to_remove -= remove_count;
+    remove_count
+}
+
+fn enforce_kiro_conversation_attachment_limit(
+    history: &mut [Message],
+    current_images: &[KiroImage],
+    current_documents: &[KiroDocument],
+) -> usize {
+    let current_attachment_count = current_images.len() + current_documents.len();
+    let original_history_attachment_count = history_attachment_count(history);
+    let total_attachment_count = current_attachment_count + original_history_attachment_count;
+    if total_attachment_count <= KIRO_MAX_IMAGES_AND_DOCUMENTS_PER_CONVERSATION {
+        return 0;
+    }
+
+    let mut remaining_to_remove =
+        total_attachment_count - KIRO_MAX_IMAGES_AND_DOCUMENTS_PER_CONVERSATION;
+    let mut removed_history_images = 0usize;
+    let mut removed_history_documents = 0usize;
+
+    for message in history.iter_mut() {
+        if remaining_to_remove == 0 {
+            break;
+        }
+        let Message::User(user_msg) = message else {
+            continue;
+        };
+        removed_history_images += remove_oldest_items(
+            &mut user_msg.user_input_message.images,
+            &mut remaining_to_remove,
+        );
+    }
+
+    for message in history.iter_mut() {
+        if remaining_to_remove == 0 {
+            break;
+        }
+        let Message::User(user_msg) = message else {
+            continue;
+        };
+        removed_history_documents += remove_oldest_items(
+            &mut user_msg.user_input_message.documents,
+            &mut remaining_to_remove,
+        );
+    }
+
+    let removed_total = removed_history_images + removed_history_documents;
+    if removed_total > 0 {
+        tracing::info!(
+            current_attachment_count,
+            original_history_attachment_count,
+            remaining_history_attachment_count = history_attachment_count(history),
+            max_attachment_count = KIRO_MAX_IMAGES_AND_DOCUMENTS_PER_CONVERSATION,
+            removed_history_images,
+            removed_history_documents,
+            "裁剪最旧 history 附件，避免 Bedrock IMAGE_COUNT_EXCEEDED"
+        );
+    }
+
+    removed_total
 }
 
 fn kiro_image_format_from_data_url_suffix(suffix: &str) -> String {
@@ -4195,6 +4287,20 @@ mod tests {
             }
         }
         (tool_uses, tool_results)
+    }
+
+    fn conversation_attachment_count(history: &[Message], current: &UserInputMessage) -> usize {
+        history
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(user) => Some(
+                    user.user_input_message.images.len() + user.user_input_message.documents.len(),
+                ),
+                Message::Assistant(_) => None,
+            })
+            .sum::<usize>()
+            + current.images.len()
+            + current.documents.len()
     }
 
     fn tool_pair_messages(count: usize) -> Vec<super::super::types::Message> {
@@ -8651,6 +8757,111 @@ mod tests {
             }
             other => panic!("history[1] should be original assistant, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_convert_request_trims_old_history_images_to_conversation_attachment_limit() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let mut messages = Vec::new();
+        for index in 0..11 {
+            let mut content = repeated_png_image_blocks(10);
+            content.push(serde_json::json!({
+                "type": "text",
+                "text": format!("history screenshots {index}")
+            }));
+            messages.push(AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::Value::Array(content),
+            });
+            messages.push(AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!("OK"),
+            });
+        }
+
+        let mut current = repeated_png_image_blocks(4);
+        current.push(serde_json::json!({
+            "type": "text",
+            "text": "Use the latest screenshots."
+        }));
+        messages.push(AnthropicMessage {
+            role: "user".to_string(),
+            content: serde_json::Value::Array(current),
+        });
+
+        let state = convert_request(&request_from_messages(messages))
+            .expect("conversation image overflow should be trimmed")
+            .conversation_state;
+        let current = &state.current_message.user_input_message;
+
+        assert_eq!(current.images.len(), 4, "current attachments are protected");
+        assert_eq!(
+            conversation_attachment_count(&state.history, current),
+            KIRO_MAX_IMAGES_AND_DOCUMENTS_PER_CONVERSATION
+        );
+        match &state.history[0] {
+            Message::User(user) => {
+                assert_eq!(
+                    user.user_input_message.content, "history screenshots 0",
+                    "oldest text history should remain after attachment trim"
+                );
+                assert_eq!(
+                    user.user_input_message.images.len(),
+                    0,
+                    "oldest history attachments should be trimmed first"
+                );
+            }
+            other => panic!("history[0] should be user, got {other:?}"),
+        }
+        let latest_history_images = state
+            .history
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                Message::User(user)
+                    if user.user_input_message.content == "history screenshots 10" =>
+                {
+                    Some(user.user_input_message.images.len())
+                }
+                _ => None,
+            })
+            .expect("latest history turn should remain");
+        assert_eq!(latest_history_images, 10);
+    }
+
+    #[test]
+    fn test_convert_request_trims_split_current_overflow_chunks_to_attachment_limit() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let mut content = repeated_png_image_blocks(105);
+        content.push(serde_json::json!({
+            "type": "text",
+            "text": "Describe the final images."
+        }));
+
+        let state = convert_request(&request_from_messages(vec![AnthropicMessage {
+            role: "user".to_string(),
+            content: serde_json::Value::Array(content),
+        }]))
+        .expect("single image-heavy current message should be split and trimmed")
+        .conversation_state;
+        let current = &state.current_message.user_input_message;
+
+        assert_eq!(current.images.len(), 5);
+        assert_eq!(
+            conversation_attachment_count(&state.history, current),
+            KIRO_MAX_IMAGES_AND_DOCUMENTS_PER_CONVERSATION
+        );
+        let history_images = state
+            .history
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(user) => Some(user.user_input_message.images.len()),
+                Message::Assistant(_) => None,
+            })
+            .sum::<usize>();
+        assert_eq!(history_images, 95);
     }
 
     #[test]
