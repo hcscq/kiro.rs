@@ -1456,6 +1456,10 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
                   </div>
                 )}
 
+                <div className="text-xs text-muted-foreground">
+                  下载登录脚本会在登录会话创建后出现，脚本会包含本次登录链接和回调捕获器。
+                </div>
+
                 <DialogFooter>
                   <Button
                     type="button"
@@ -1483,7 +1487,7 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
                     ) : (
                       <LogIn className="h-4 w-4" />
                     )}
-                    开始登录
+                    开始登录并生成脚本
                   </Button>
                 </DialogFooter>
               </form>
