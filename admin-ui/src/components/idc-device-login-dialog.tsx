@@ -13,6 +13,7 @@ import {
   Send,
   Server,
   Shuffle,
+  ShieldCheck,
   Tags,
   XCircle,
 } from 'lucide-react'
@@ -73,6 +74,7 @@ type LoginMode = 'idc' | 'external_idp'
 type LoginProvider = 'BuilderId' | 'Enterprise'
 type ExternalIdpSession = ExternalIdpLoginStartResponse | ExternalIdpLoginStatusResponse
 type LoginSession = IdcDeviceLoginStartResponse | IdcDeviceLoginStatusResponse | ExternalIdpSession
+type ExternalIdpHelperLaunchMode = 'none' | 'clean-profile' | 'incognito'
 
 const DEFAULT_IDC_AUTH_REGIONS = [
   'us-east-1',
@@ -133,12 +135,31 @@ function isExternalIdpSession(session: LoginSession): session is ExternalIdpSess
   return 'phase' in session
 }
 
-function buildWindowsExternalIdpCallbackHelperScript(origin: string, sessionId: string): string {
+function externalIdpHelperLaunchModeLabel(mode: ExternalIdpHelperLaunchMode): string {
+  switch (mode) {
+    case 'clean-profile':
+      return '干净 Chrome'
+    case 'incognito':
+      return '隐身 Chrome'
+    default:
+      return '仅捕获器'
+  }
+}
+
+function buildWindowsExternalIdpCallbackHelperScript(
+  origin: string,
+  sessionId: string,
+  authUrl: string | undefined,
+  launchMode: ExternalIdpHelperLaunchMode
+): string {
   const baseUrl = origin.replace(/\/+$/, '')
   const stateEndpoint = `${baseUrl}/api/admin/auth/external-idp/callback`
   const sessionEndpoint = `${baseUrl}/api/admin/auth/external-idp/${encodeURIComponent(sessionId)}/callback`
   return `$StateEndpoint = ${JSON.stringify(stateEndpoint)}
 $SessionEndpoint = ${JSON.stringify(sessionEndpoint)}
+$SessionId = ${JSON.stringify(sessionId)}
+$LoginUrl = ${JSON.stringify(authUrl || '')}
+$LaunchMode = ${JSON.stringify(launchMode)}
 $InstallDir = Join-Path $env:LOCALAPPDATA "kiro-rs-callback"
 New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 $ScriptPath = Join-Path $InstallDir "kiro-callback.ps1"
@@ -178,6 +199,52 @@ New-Item -Path "HKCU:\\Software\\Classes\\kiro\\shell\\open\\command" -Force | O
 $Command = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $ScriptPath + '" "%1"'
 Set-Item -Path "HKCU:\\Software\\Classes\\kiro\\shell\\open\\command" -Value $Command
 Write-Host "Registered kiro:// callback helper"
+
+function Find-Chrome {
+  $Candidates = @(
+    (Join-Path $env:ProgramFiles "Google\\Chrome\\Application\\chrome.exe"),
+    (Join-Path \${env:ProgramFiles(x86)} "Google\\Chrome\\Application\\chrome.exe"),
+    (Join-Path $env:LOCALAPPDATA "Google\\Chrome\\Application\\chrome.exe")
+  )
+  foreach ($Candidate in $Candidates) {
+    if ($Candidate -and (Test-Path $Candidate)) { return $Candidate }
+  }
+  $Command = Get-Command "chrome.exe" -ErrorAction SilentlyContinue
+  if ($Command) { return $Command.Source }
+  return $null
+}
+
+function Quote-ProcessArg([string]$Value) {
+  return '"' + $Value.Replace('"', '\\"') + '"'
+}
+
+function Open-LoginUrl {
+  if ([string]::IsNullOrWhiteSpace($LoginUrl) -or $LaunchMode -eq "none") { return }
+
+  $Chrome = Find-Chrome
+  if (-not $Chrome) {
+    try { Set-Clipboard -Value $LoginUrl } catch {}
+    Write-Warning "Chrome was not found. The login URL was copied to the clipboard when possible."
+    return
+  }
+
+  $Args = @("--new-window", "--no-first-run", "--no-default-browser-check")
+  if ($LaunchMode -eq "incognito") {
+    $Args += "--incognito"
+  } elseif ($LaunchMode -eq "clean-profile") {
+    $ProfileRoot = Join-Path $InstallDir "chrome-profiles"
+    New-Item -ItemType Directory -Path $ProfileRoot -Force | Out-Null
+    $RunSuffix = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds().ToString()
+    $ProfilePath = Join-Path $ProfileRoot ($SessionId + "-" + $RunSuffix)
+    New-Item -ItemType Directory -Path $ProfilePath -Force | Out-Null
+    $Args += "--user-data-dir=$(Quote-ProcessArg $ProfilePath)"
+  }
+  $Args += (Quote-ProcessArg $LoginUrl)
+  Start-Process -FilePath $Chrome -ArgumentList ($Args -join " ")
+  Write-Host "Opened login URL with Chrome launch mode: $LaunchMode"
+}
+
+Open-LoginUrl
 `
 }
 
@@ -198,8 +265,18 @@ function chunkString(value: string, size: number): string[] {
   return chunks
 }
 
-function buildWindowsExternalIdpCallbackHelperInstaller(origin: string, sessionId: string): string {
-  const installerScript = buildWindowsExternalIdpCallbackHelperScript(origin, sessionId)
+function buildWindowsExternalIdpCallbackHelperInstaller(
+  origin: string,
+  sessionId: string,
+  authUrl: string | undefined,
+  launchMode: ExternalIdpHelperLaunchMode
+): string {
+  const installerScript = buildWindowsExternalIdpCallbackHelperScript(
+    origin,
+    sessionId,
+    authUrl,
+    launchMode
+  )
   const chunks = chunkString(base64EncodeUtf8(installerScript), 76)
     .map((chunk) => `echo ${chunk}`)
     .join('\r\n')
@@ -651,12 +728,7 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
       const response = await startExternalIdpLogin(payload)
       setSessionMode('external_idp')
       setSession(response)
-      const popup = window.open(response.authUrl, '_blank', 'noreferrer')
-      if (!popup) {
-        toast.warning('登录页面被浏览器拦截，请手动打开')
-      } else {
-        toast.success('登录已开始')
-      }
+      toast.success('登录会话已创建，请选择打开方式')
     } catch (error) {
       toast.error(`启动 External IdP 登录失败: ${extractErrorMessage(error)}`)
     } finally {
@@ -781,18 +853,26 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
     }
   }
 
-  const handleDownloadExternalCallbackHelper = () => {
+  const handleDownloadExternalCallbackHelper = (
+    launchMode: ExternalIdpHelperLaunchMode = 'none'
+  ) => {
     if (!session || sessionMode !== 'external_idp' || !isExternalIdpSession(session)) {
       toast.error('请先开始 External IdP 登录')
       return
     }
 
     try {
+      const url = sessionAuthUrl(session)
       downloadTextFile(
         'install-kiro-rs-callback-helper.cmd',
-        buildWindowsExternalIdpCallbackHelperInstaller(window.location.origin, session.sessionId)
+        buildWindowsExternalIdpCallbackHelperInstaller(
+          window.location.origin,
+          session.sessionId,
+          url,
+          launchMode
+        )
       )
-      toast.success('Windows 捕获器安装器已下载')
+      toast.success(`${externalIdpHelperLaunchModeLabel(launchMode)}脚本已下载`)
     } catch {
       toast.error('下载失败')
     }
@@ -1099,7 +1179,7 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
 
   return (
     <Dialog open={open} onOpenChange={handleDialogOpenChange}>
-      <DialogContent className="sm:max-w-2xl max-h-[85vh] overflow-y-auto">
+      <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-3xl">
         <DialogHeader>
           <DialogTitle>在线登录</DialogTitle>
         </DialogHeader>
@@ -1467,25 +1547,72 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
             </div>
 
             {authUrl ? (
-              <div className="grid gap-2 sm:grid-cols-2">
-                <Button asChild>
-                  <a
-                    href={authUrl}
-                    target="_blank"
-                    rel="noreferrer"
+              <div className="rounded-md border p-4">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 text-sm font-medium">
+                    <ExternalLink className="h-4 w-4 text-muted-foreground" />
+                    {sessionMode === 'external_idp' ? '打开登录页' : '打开验证页'}
+                  </div>
+                  {sessionMode === 'external_idp' && <Badge variant="secondary">Windows 助手</Badge>}
+                </div>
+                <div
+                  className={cn(
+                    'mt-3 grid gap-2',
+                    sessionMode === 'external_idp' ? 'sm:grid-cols-2 lg:grid-cols-3' : 'sm:grid-cols-2'
+                  )}
+                >
+                  {sessionMode === 'external_idp' && (
+                    <>
+                      <Button
+                        type="button"
+                        className="w-full"
+                        onClick={() => handleDownloadExternalCallbackHelper('clean-profile')}
+                      >
+                        <ShieldCheck className="h-4 w-4" />
+                        干净 Chrome
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        className="w-full"
+                        onClick={() => handleDownloadExternalCallbackHelper('incognito')}
+                      >
+                        <ExternalLink className="h-4 w-4" />
+                        隐身 Chrome
+                      </Button>
+                    </>
+                  )}
+                  <Button
+                    asChild
+                    variant={sessionMode === 'external_idp' ? 'outline' : 'default'}
+                    className="w-full"
                   >
-                    <ExternalLink className="h-4 w-4" />
-                    {sessionMode === 'external_idp' &&
-                    isExternalIdpSession(session) &&
-                    (session.flow === 'pkce' || session.flow === 'kiro-pkce')
-                      ? '打开登录页面'
-                      : '打开验证页面'}
-                  </a>
-                </Button>
-                <Button type="button" variant="outline" onClick={handleCopyAuthUrl}>
-                  <Copy className="h-4 w-4" />
-                  {sessionMode === 'external_idp' ? '复制登录链接' : '复制验证链接'}
-                </Button>
+                    <a href={authUrl} target="_blank" rel="noreferrer">
+                      <ExternalLink className="h-4 w-4" />
+                      {sessionMode === 'external_idp' ? '普通打开' : '打开验证页'}
+                    </a>
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="w-full"
+                    onClick={handleCopyAuthUrl}
+                  >
+                    <Copy className="h-4 w-4" />
+                    {sessionMode === 'external_idp' ? '复制链接' : '复制验证链接'}
+                  </Button>
+                  {sessionMode === 'external_idp' && (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="w-full"
+                      onClick={() => handleDownloadExternalCallbackHelper('none')}
+                    >
+                      <Download className="h-4 w-4" />
+                      仅捕获器
+                    </Button>
+                  )}
+                </div>
               </div>
             ) : null}
 
@@ -1511,15 +1638,7 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
                     className="flex w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
                   />
                 </div>
-                <div className="grid gap-2 sm:grid-cols-2">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    onClick={handleDownloadExternalCallbackHelper}
-                  >
-                    <Download className="h-4 w-4" />
-                    下载捕获器
-                  </Button>
+                <div className="flex justify-end">
                   <Button type="submit" disabled={submittingCallback}>
                     {submittingCallback ? (
                       <Loader2 className="h-4 w-4 animate-spin" />
