@@ -726,6 +726,116 @@ pub struct ConversionResult {
     pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
     /// 工具名称映射（短名称 → 原始名称），仅当存在超长工具名时非空
     pub tool_name_map: HashMap<String, String>,
+    /// 多模态转换与裁剪摘要，仅包含计数和来源分类，不包含正文或附件内容。
+    pub multimodal_stats: ConversionMultimodalStats,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ConversionLogContext {
+    pub request_id: Option<String>,
+    pub route: Option<String>,
+    pub model: Option<String>,
+    pub body_bytes: Option<usize>,
+    pub message_count: Option<usize>,
+}
+
+impl ConversionLogContext {
+    pub(crate) fn for_request(
+        request_id: Option<&str>,
+        route: &str,
+        model: &str,
+        body_bytes: Option<usize>,
+        message_count: usize,
+    ) -> Self {
+        Self {
+            request_id: request_id.map(ToOwned::to_owned),
+            route: Some(route.to_string()),
+            model: Some(model.to_string()),
+            body_bytes,
+            message_count: Some(message_count),
+        }
+    }
+
+    fn request_id(&self) -> &str {
+        self.request_id.as_deref().unwrap_or("")
+    }
+
+    fn route(&self) -> &str {
+        self.route.as_deref().unwrap_or("")
+    }
+
+    fn model(&self) -> &str {
+        self.model.as_deref().unwrap_or("")
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConversionMultimodalStats {
+    pub request_image_count: usize,
+    pub request_document_count: usize,
+    pub current_cluster_image_count: usize,
+    pub current_cluster_document_count: usize,
+    pub current_split: CurrentImageSplitStats,
+    pub converted_current_image_count: usize,
+    pub converted_current_document_count: usize,
+    pub converted_history_image_count: usize,
+    pub converted_history_document_count: usize,
+    pub attachment_trim: AttachmentTrimStats,
+}
+
+impl ConversionMultimodalStats {
+    pub fn converted_attachment_count(&self) -> usize {
+        self.converted_current_image_count
+            + self.converted_current_document_count
+            + self.converted_history_image_count
+            + self.converted_history_document_count
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CurrentImageSplitStats {
+    pub total_images: usize,
+    pub moved_image_count: usize,
+    pub current_image_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AttachmentTrimStats {
+    pub current_attachment_count: usize,
+    pub original_history_attachment_count: usize,
+    pub synthetic_history_attachment_count: usize,
+    pub preexisting_history_attachment_count: usize,
+    pub remaining_history_attachment_count: usize,
+    pub max_attachment_count: usize,
+    pub removed_history_images: usize,
+    pub removed_history_documents: usize,
+    pub trim_source: AttachmentTrimSource,
+}
+
+impl AttachmentTrimStats {
+    pub fn removed_total(&self) -> usize {
+        self.removed_history_images + self.removed_history_documents
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AttachmentTrimSource {
+    #[default]
+    None,
+    PreexistingHistory,
+    CurrentSplit,
+    MixedPreexistingAndCurrentSplit,
+}
+
+impl AttachmentTrimSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::PreexistingHistory => "preexisting_history",
+            Self::CurrentSplit => "current_split",
+            Self::MixedPreexistingAndCurrentSplit => "mixed_preexisting_history_and_current_split",
+        }
+    }
 }
 
 /// 转换错误
@@ -840,7 +950,20 @@ pub fn convert_request_with_probe(
     req: &MessagesRequest,
     probe: UpstreamProbe,
 ) -> Result<ConversionResult, ConversionError> {
-    convert_request_with_options(req, probe, structured_history_tool_pair_limit())
+    convert_request_with_options(
+        req,
+        probe,
+        structured_history_tool_pair_limit(),
+        ConversionLogContext::default(),
+    )
+}
+
+pub(crate) fn convert_request_with_context(
+    req: &MessagesRequest,
+    probe: UpstreamProbe,
+    context: ConversionLogContext,
+) -> Result<ConversionResult, ConversionError> {
+    convert_request_with_options(req, probe, structured_history_tool_pair_limit(), context)
 }
 
 fn structured_history_tool_pair_limit() -> usize {
@@ -859,6 +982,7 @@ fn convert_request_with_options(
     req: &MessagesRequest,
     probe: UpstreamProbe,
     structured_history_tool_pair_limit: usize,
+    log_context: ConversionLogContext,
 ) -> Result<ConversionResult, ConversionError> {
     // 1. 映射模型
     let model_id = map_model(&req.model)
@@ -905,6 +1029,16 @@ fn convert_request_with_options(
     let current_message_start = trailing_user_message_cluster_start(messages);
     let current_messages: Vec<_> = messages[current_message_start..].iter().collect();
     let mut merged_current = merge_user_message_parts(&current_messages)?;
+    let request_content_stats = request_multimodal_content_stats(messages);
+    let current_cluster_image_count = merged_current.images.len();
+    let current_cluster_document_count = merged_current.documents.len();
+    let mut multimodal_stats = ConversionMultimodalStats {
+        request_image_count: request_content_stats.image_count,
+        request_document_count: request_content_stats.document_count,
+        current_cluster_image_count,
+        current_cluster_document_count,
+        ..ConversionMultimodalStats::default()
+    };
     if let Some(output) = structured_outputs::json_schema_output(req) {
         append_structured_output_instruction(&mut merged_current.content, &output.schema);
     }
@@ -958,6 +1092,8 @@ fn convert_request_with_options(
         &model_id,
         &probe,
         &mut merged_current,
+        &log_context,
+        &mut multimodal_stats,
     );
     dedupe_documents_across_conversation(&mut history, &mut merged_current.documents)?;
     inject_document_fallback_text(
@@ -979,13 +1115,20 @@ fn convert_request_with_options(
     merge_consecutive_history_assistant_messages(&mut history);
     repair_history_tool_result_pairing_for_kiro(&mut history, &validated_tool_results);
     remove_empty_history_user_messages(&mut history);
-    enforce_kiro_conversation_attachment_limit(
+    multimodal_stats.attachment_trim = enforce_kiro_conversation_attachment_limit(
         &mut history,
         &merged_current.images,
         &merged_current.documents,
+        multimodal_stats.current_split.moved_image_count,
+        &log_context,
     );
     remove_empty_history_user_messages(&mut history);
     merge_consecutive_history_assistant_messages(&mut history);
+    let history_attachments = history_attachment_stats(&history);
+    multimodal_stats.converted_history_image_count = history_attachments.image_count;
+    multimodal_stats.converted_history_document_count = history_attachments.document_count;
+    multimodal_stats.converted_current_image_count = merged_current.images.len();
+    multimodal_stats.converted_current_document_count = merged_current.documents.len();
 
     if history.len() > KIRO_MAX_SAFE_HISTORY_ENTRIES {
         tracing::warn!(
@@ -1064,6 +1207,7 @@ fn convert_request_with_options(
         conversation_state,
         additional_model_request_fields,
         tool_name_map,
+        multimodal_stats,
     })
 }
 
@@ -1620,6 +1764,87 @@ fn history_attachment_count(history: &[Message]) -> usize {
         .sum()
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct AttachmentCount {
+    image_count: usize,
+    document_count: usize,
+}
+
+fn history_attachment_stats(history: &[Message]) -> AttachmentCount {
+    let mut stats = AttachmentCount::default();
+    for message in history {
+        let Message::User(user) = message else {
+            continue;
+        };
+        stats.image_count += user.user_input_message.images.len();
+        stats.document_count += user.user_input_message.documents.len();
+    }
+    stats
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RequestMultimodalContentStats {
+    image_count: usize,
+    document_count: usize,
+}
+
+fn request_multimodal_content_stats(
+    messages: &[super::types::Message],
+) -> RequestMultimodalContentStats {
+    let mut stats = RequestMultimodalContentStats::default();
+    for message in messages {
+        inspect_request_multimodal_value(&message.content, &mut stats);
+    }
+    stats
+}
+
+fn inspect_request_multimodal_value(
+    value: &serde_json::Value,
+    stats: &mut RequestMultimodalContentStats,
+) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                inspect_request_multimodal_value(item, stats);
+            }
+        }
+        serde_json::Value::Object(obj) => inspect_request_multimodal_object(obj, stats),
+        _ => {}
+    }
+}
+
+fn inspect_request_multimodal_object(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    stats: &mut RequestMultimodalContentStats,
+) {
+    match obj.get("type").and_then(serde_json::Value::as_str) {
+        Some("image") | Some("image_url") => stats.image_count += 1,
+        Some("document") | Some("document_url") | Some("documentUrl") => {
+            stats.document_count += 1;
+        }
+        Some("resource") => {
+            let mime_type = obj
+                .get("resource")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|resource| {
+                    resource
+                        .get("mime_type")
+                        .or_else(|| resource.get("mimeType"))
+                })
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            if mime_type.starts_with("image/") {
+                stats.image_count += 1;
+            } else if !mime_type.is_empty() {
+                stats.document_count += 1;
+            }
+        }
+        _ => {}
+    }
+}
+
 fn remove_oldest_items<T>(items: &mut Vec<T>, remaining_to_remove: &mut usize) -> usize {
     if *remaining_to_remove == 0 || items.is_empty() {
         return 0;
@@ -1635,12 +1860,24 @@ fn enforce_kiro_conversation_attachment_limit(
     history: &mut [Message],
     current_images: &[KiroImage],
     current_documents: &[KiroDocument],
-) -> usize {
+    synthetic_history_attachment_count: usize,
+    log_context: &ConversionLogContext,
+) -> AttachmentTrimStats {
     let current_attachment_count = current_images.len() + current_documents.len();
     let original_history_attachment_count = history_attachment_count(history);
     let total_attachment_count = current_attachment_count + original_history_attachment_count;
     if total_attachment_count <= KIRO_MAX_IMAGES_AND_DOCUMENTS_PER_CONVERSATION {
-        return 0;
+        return AttachmentTrimStats {
+            current_attachment_count,
+            original_history_attachment_count,
+            synthetic_history_attachment_count: synthetic_history_attachment_count
+                .min(original_history_attachment_count),
+            preexisting_history_attachment_count: original_history_attachment_count
+                .saturating_sub(synthetic_history_attachment_count),
+            remaining_history_attachment_count: original_history_attachment_count,
+            max_attachment_count: KIRO_MAX_IMAGES_AND_DOCUMENTS_PER_CONVERSATION,
+            ..AttachmentTrimStats::default()
+        };
     }
 
     let mut remaining_to_remove =
@@ -1675,19 +1912,67 @@ fn enforce_kiro_conversation_attachment_limit(
     }
 
     let removed_total = removed_history_images + removed_history_documents;
+    let synthetic_history_attachment_count =
+        synthetic_history_attachment_count.min(original_history_attachment_count);
+    let preexisting_history_attachment_count =
+        original_history_attachment_count.saturating_sub(synthetic_history_attachment_count);
+    let trim_source = attachment_trim_source(
+        removed_total,
+        synthetic_history_attachment_count,
+        preexisting_history_attachment_count,
+    );
+    let remaining_history_attachment_count = history_attachment_count(history);
+    let stats = AttachmentTrimStats {
+        current_attachment_count,
+        original_history_attachment_count,
+        synthetic_history_attachment_count,
+        preexisting_history_attachment_count,
+        remaining_history_attachment_count,
+        max_attachment_count: KIRO_MAX_IMAGES_AND_DOCUMENTS_PER_CONVERSATION,
+        removed_history_images,
+        removed_history_documents,
+        trim_source,
+    };
     if removed_total > 0 {
         tracing::info!(
+            request_id = %log_context.request_id(),
+            route = %log_context.route(),
+            model = %log_context.model(),
+            body_bytes = log_context.body_bytes,
+            message_count = log_context.message_count,
             current_attachment_count,
             original_history_attachment_count,
-            remaining_history_attachment_count = history_attachment_count(history),
+            synthetic_history_attachment_count,
+            preexisting_history_attachment_count,
+            remaining_history_attachment_count,
             max_attachment_count = KIRO_MAX_IMAGES_AND_DOCUMENTS_PER_CONVERSATION,
             removed_history_images,
             removed_history_documents,
+            removed_total,
+            trim_source = trim_source.as_str(),
             "裁剪最旧 history 附件，避免 Bedrock IMAGE_COUNT_EXCEEDED"
         );
     }
 
-    removed_total
+    stats
+}
+
+fn attachment_trim_source(
+    removed_total: usize,
+    synthetic_history_attachment_count: usize,
+    preexisting_history_attachment_count: usize,
+) -> AttachmentTrimSource {
+    if removed_total == 0 {
+        AttachmentTrimSource::None
+    } else if preexisting_history_attachment_count == 0 && synthetic_history_attachment_count > 0 {
+        AttachmentTrimSource::CurrentSplit
+    } else if synthetic_history_attachment_count == 0
+        || removed_total <= preexisting_history_attachment_count
+    {
+        AttachmentTrimSource::PreexistingHistory
+    } else {
+        AttachmentTrimSource::MixedPreexistingAndCurrentSplit
+    }
 }
 
 fn kiro_image_format_from_data_url_suffix(suffix: &str) -> String {
@@ -3770,6 +4055,8 @@ fn move_current_extra_images_to_history_for_image_compat(
     model_id: &str,
     probe: &UpstreamProbe,
     merged_current: &mut MergedUserMessageParts,
+    log_context: &ConversionLogContext,
+    stats: &mut ConversionMultimodalStats,
 ) {
     if merged_current.images.len() <= 1 {
         return;
@@ -3785,12 +4072,22 @@ fn move_current_extra_images_to_history_for_image_compat(
         let moved_image_count: usize = overflow_chunks.iter().map(Vec::len).sum();
 
         tracing::info!(
+            request_id = %log_context.request_id(),
+            route = %log_context.route(),
+            model = %log_context.model(),
+            body_bytes = log_context.body_bytes,
+            message_count = log_context.message_count,
             total_images,
             moved_image_count,
             current_image_count = overflow_final_images.len(),
             "拆分 current image-heavy user message：将前置图片块下沉到 history，保留最后一块在 current"
         );
 
+        stats.current_split = CurrentImageSplitStats {
+            total_images,
+            moved_image_count,
+            current_image_count: overflow_final_images.len(),
+        };
         history_image_chunks.extend(overflow_chunks);
         current_images = overflow_final_images;
     }
@@ -5672,8 +5969,13 @@ mod tests {
         });
         let req = request_from_messages(messages);
 
-        let result = convert_request_with_options(&req, UpstreamProbe::default(), configured_limit)
-            .expect("conversion should succeed");
+        let result = convert_request_with_options(
+            &req,
+            UpstreamProbe::default(),
+            configured_limit,
+            ConversionLogContext::default(),
+        )
+        .expect("conversion should succeed");
         let state = result.conversation_state;
         let history = &state.history;
         let (tool_uses, tool_results) = history_structured_tool_counts(history);
@@ -5786,8 +6088,13 @@ mod tests {
         });
         let req = request_from_messages(messages);
 
-        let result = convert_request_with_options(&req, UpstreamProbe::default(), configured_limit)
-            .expect("conversion should succeed");
+        let result = convert_request_with_options(
+            &req,
+            UpstreamProbe::default(),
+            configured_limit,
+            ConversionLogContext::default(),
+        )
+        .expect("conversion should succeed");
         let state = result.conversation_state;
         let (tool_uses, history_tool_results) = history_structured_tool_counts(&state.history);
         let current_tool_results = &state
@@ -8790,9 +9097,10 @@ mod tests {
             content: serde_json::Value::Array(current),
         });
 
-        let state = convert_request(&request_from_messages(messages))
-            .expect("conversation image overflow should be trimmed")
-            .conversation_state;
+        let result = convert_request(&request_from_messages(messages))
+            .expect("conversation image overflow should be trimmed");
+        let stats = result.multimodal_stats;
+        let state = result.conversation_state;
         let current = &state.current_message.user_input_message;
 
         assert_eq!(current.images.len(), 4, "current attachments are protected");
@@ -8828,6 +9136,20 @@ mod tests {
             })
             .expect("latest history turn should remain");
         assert_eq!(latest_history_images, 10);
+        assert_eq!(stats.request_image_count, 114);
+        assert_eq!(stats.current_split.moved_image_count, 0);
+        assert_eq!(stats.converted_current_image_count, 4);
+        assert_eq!(stats.converted_history_image_count, 96);
+        assert_eq!(stats.attachment_trim.removed_total(), 14);
+        assert_eq!(
+            stats.attachment_trim.trim_source,
+            AttachmentTrimSource::PreexistingHistory
+        );
+        assert_eq!(
+            stats.attachment_trim.preexisting_history_attachment_count,
+            110
+        );
+        assert_eq!(stats.attachment_trim.synthetic_history_attachment_count, 0);
     }
 
     #[test]
@@ -8840,12 +9162,13 @@ mod tests {
             "text": "Describe the final images."
         }));
 
-        let state = convert_request(&request_from_messages(vec![AnthropicMessage {
+        let result = convert_request(&request_from_messages(vec![AnthropicMessage {
             role: "user".to_string(),
             content: serde_json::Value::Array(content),
         }]))
-        .expect("single image-heavy current message should be split and trimmed")
-        .conversation_state;
+        .expect("single image-heavy current message should be split and trimmed");
+        let stats = result.multimodal_stats;
+        let state = result.conversation_state;
         let current = &state.current_message.user_input_message;
 
         assert_eq!(current.images.len(), 5);
@@ -8862,6 +9185,30 @@ mod tests {
             })
             .sum::<usize>();
         assert_eq!(history_images, 95);
+        assert_eq!(stats.request_image_count, 105);
+        assert_eq!(
+            stats.current_split,
+            CurrentImageSplitStats {
+                total_images: 105,
+                moved_image_count: 100,
+                current_image_count: 5,
+            }
+        );
+        assert_eq!(stats.converted_current_image_count, 5);
+        assert_eq!(stats.converted_history_image_count, 95);
+        assert_eq!(stats.attachment_trim.removed_total(), 5);
+        assert_eq!(
+            stats.attachment_trim.trim_source,
+            AttachmentTrimSource::CurrentSplit
+        );
+        assert_eq!(
+            stats.attachment_trim.preexisting_history_attachment_count,
+            0
+        );
+        assert_eq!(
+            stats.attachment_trim.synthetic_history_attachment_count,
+            100
+        );
     }
 
     #[test]

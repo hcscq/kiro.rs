@@ -13,7 +13,9 @@ use tokio::{sync::Notify, task, time::timeout};
 use crate::model::config::ConversionRuntimeConfig;
 
 use super::{
-    converter::{ConversionError, ConversionResult, convert_request_with_probe},
+    converter::{
+        ConversionError, ConversionLogContext, ConversionResult, convert_request_with_context,
+    },
     probe::UpstreamProbe,
     types::MessagesRequest,
 };
@@ -249,6 +251,7 @@ impl ConversionRuntime {
         payload: &MessagesRequest,
         probe: UpstreamProbe,
         body_bytes: Option<usize>,
+        context: ConversionLogContext,
     ) -> Result<ConversionResult, ConversionRuntimeError> {
         let workload = ConversionWorkload::estimate(
             payload,
@@ -265,7 +268,7 @@ impl ConversionRuntime {
         let convert_started_at = Instant::now();
         let result = task::spawn_blocking(move || {
             catch_unwind(AssertUnwindSafe(|| {
-                convert_request_with_probe(&payload, probe)
+                convert_request_with_context(&payload, probe, context)
             }))
         })
         .await

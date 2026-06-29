@@ -29,7 +29,7 @@ use tokio::time::{Instant, interval_at};
 use uuid::Uuid;
 
 use super::conversion_runtime::{ConversionRuntime, ConversionRuntimeError};
-use super::converter::{ConversionError, ConversionResult};
+use super::converter::{ConversionError, ConversionLogContext, ConversionResult};
 use super::diagnostics;
 use super::extractor::AnthropicJson;
 use super::middleware::{ANTHROPIC_RUNTIME_LEADER_REQUIRED_HEADER, AppState};
@@ -131,7 +131,17 @@ async fn convert_request_on_runtime(
     route: &str,
     body_bytes: Option<usize>,
 ) -> Result<ConversionResult, Response> {
-    match conversion_runtime.convert(payload, probe, body_bytes).await {
+    let context = ConversionLogContext::for_request(
+        request_id,
+        route,
+        &payload.model,
+        body_bytes,
+        payload.messages.len(),
+    );
+    match conversion_runtime
+        .convert(payload, probe, body_bytes, context)
+        .await
+    {
         Ok(result) => Ok(result),
         Err(err) => Err(conversion_runtime_error_response(err, request_id, route)),
     }
@@ -228,6 +238,55 @@ fn log_converted_tool_schema_diagnostics(
             "skipped converted tool input_schema diagnostics due to budget"
         );
     }
+}
+
+fn log_multimodal_conversion_summary(
+    request_id: Option<&str>,
+    route: &str,
+    model: &str,
+    body_bytes: Option<usize>,
+    conversion_result: &ConversionResult,
+) {
+    let stats = &conversion_result.multimodal_stats;
+    if stats.request_image_count <= 10
+        && stats.current_split.moved_image_count == 0
+        && stats.attachment_trim.removed_total() == 0
+    {
+        return;
+    }
+
+    let request_id = request_id.unwrap_or("");
+    let trim = stats.attachment_trim;
+    tracing::info!(
+        request_id = %request_id,
+        route = %route,
+        model = %model,
+        mapped_model_id = %conversion_result.model_id,
+        body_bytes,
+        request_image_count = stats.request_image_count,
+        request_document_count = stats.request_document_count,
+        current_cluster_image_count = stats.current_cluster_image_count,
+        current_cluster_document_count = stats.current_cluster_document_count,
+        current_split_total_images = stats.current_split.total_images,
+        current_split_moved_image_count = stats.current_split.moved_image_count,
+        current_split_current_image_count = stats.current_split.current_image_count,
+        converted_current_image_count = stats.converted_current_image_count,
+        converted_current_document_count = stats.converted_current_document_count,
+        converted_history_image_count = stats.converted_history_image_count,
+        converted_history_document_count = stats.converted_history_document_count,
+        converted_attachment_count = stats.converted_attachment_count(),
+        trim_removed_total = trim.removed_total(),
+        trim_removed_history_images = trim.removed_history_images,
+        trim_removed_history_documents = trim.removed_history_documents,
+        trim_source = trim.trim_source.as_str(),
+        trim_original_history_attachment_count = trim.original_history_attachment_count,
+        trim_synthetic_history_attachment_count = trim.synthetic_history_attachment_count,
+        trim_preexisting_history_attachment_count = trim.preexisting_history_attachment_count,
+        trim_remaining_history_attachment_count = trim.remaining_history_attachment_count,
+        trim_current_attachment_count = trim.current_attachment_count,
+        trim_max_attachment_count = trim.max_attachment_count,
+        "Anthropic multimodal conversion summary"
+    );
 }
 
 fn non_2020_12_schema_uri(schema: &serde_json::Value) -> Option<&str> {
@@ -1253,6 +1312,13 @@ pub async fn post_messages(
         &payload.model,
         &conversion_result,
     );
+    log_multimodal_conversion_summary(
+        Some(&request_id),
+        "messages",
+        &payload.model,
+        Some(body_bytes),
+        &conversion_result,
+    );
 
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
     let kiro_request = KiroRequest {
@@ -1756,6 +1822,13 @@ pub(crate) async fn execute_non_stream_round(
         request_id.as_deref(),
         "non_stream_round",
         &payload.model,
+        &conversion_result,
+    );
+    log_multimodal_conversion_summary(
+        request_id.as_deref(),
+        "non_stream_round",
+        &payload.model,
+        None,
         &conversion_result,
     );
 
@@ -2732,6 +2805,13 @@ pub async fn post_messages_cc(
         Some(&request_id),
         "cc_messages",
         &payload.model,
+        &conversion_result,
+    );
+    log_multimodal_conversion_summary(
+        Some(&request_id),
+        "cc_messages",
+        &payload.model,
+        Some(body_bytes),
         &conversion_result,
     );
 
