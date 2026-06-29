@@ -1551,7 +1551,7 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="flex items-center gap-2 text-sm font-medium">
                     <ExternalLink className="h-4 w-4 text-muted-foreground" />
-                    {sessionMode === 'external_idp' ? '打开登录页' : '打开验证页'}
+                    {sessionMode === 'external_idp' ? '下载登录脚本或打开登录页' : '打开验证页'}
                   </div>
                   {sessionMode === 'external_idp' && <Badge variant="secondary">Windows 助手</Badge>}
                 </div>
@@ -1568,8 +1568,8 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
                         className="w-full"
                         onClick={() => handleDownloadExternalCallbackHelper('clean-profile')}
                       >
-                        <ShieldCheck className="h-4 w-4" />
-                        干净 Chrome
+                        <Download className="h-4 w-4" />
+                        下载登录脚本
                       </Button>
                       <Button
                         type="button"
@@ -1577,8 +1577,8 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
                         className="w-full"
                         onClick={() => handleDownloadExternalCallbackHelper('incognito')}
                       >
-                        <ExternalLink className="h-4 w-4" />
-                        隐身 Chrome
+                        <ShieldCheck className="h-4 w-4" />
+                        下载隐身脚本
                       </Button>
                     </>
                   )}
@@ -1589,7 +1589,7 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
                   >
                     <a href={authUrl} target="_blank" rel="noreferrer">
                       <ExternalLink className="h-4 w-4" />
-                      {sessionMode === 'external_idp' ? '普通打开' : '打开验证页'}
+                      {sessionMode === 'external_idp' ? '普通打开链接' : '打开验证页'}
                     </a>
                   </Button>
                   <Button
@@ -1609,7 +1609,7 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
                       onClick={() => handleDownloadExternalCallbackHelper('none')}
                     >
                       <Download className="h-4 w-4" />
-                      仅捕获器
+                      只下载捕获器
                     </Button>
                   )}
                 </div>
