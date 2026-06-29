@@ -75,15 +75,9 @@ type LoginProvider = 'BuilderId' | 'Enterprise'
 type ExternalIdpSession = ExternalIdpLoginStartResponse | ExternalIdpLoginStatusResponse
 type LoginSession = IdcDeviceLoginStartResponse | IdcDeviceLoginStatusResponse | ExternalIdpSession
 type LoginHelperLaunchMode = 'none' | 'clean-profile' | 'incognito'
-type LoginHelperCallbackMode = 'none' | 'kiro-scheme'
 
 interface WindowsLoginHelperOptions {
   origin: string
-  sessionId: string
-  loginUrl: string | undefined
-  launchMode: LoginHelperLaunchMode
-  callbackMode: LoginHelperCallbackMode
-  userCode?: string
 }
 
 const DEFAULT_IDC_AUTH_REGIONS = [
@@ -157,58 +151,17 @@ function loginHelperLaunchModeLabel(mode: LoginHelperLaunchMode): string {
 }
 
 function buildWindowsLoginHelperScript(options: WindowsLoginHelperOptions): string {
-  const { origin, sessionId, loginUrl, launchMode, callbackMode, userCode } = options
+  const { origin } = options
   const baseUrl = origin.replace(/\/+$/, '')
   const stateEndpoint = `${baseUrl}/api/admin/auth/external-idp/callback`
-  const sessionEndpoint = `${baseUrl}/api/admin/auth/external-idp/${encodeURIComponent(sessionId)}/callback`
   return `$StateEndpoint = ${JSON.stringify(stateEndpoint)}
-$SessionEndpoint = ${JSON.stringify(sessionEndpoint)}
-$SessionId = ${JSON.stringify(sessionId)}
-$LoginUrl = ${JSON.stringify(loginUrl || '')}
-$LaunchMode = ${JSON.stringify(launchMode)}
-$CallbackMode = ${JSON.stringify(callbackMode)}
-$UserCode = ${JSON.stringify(userCode || '')}
 $InstallDir = Join-Path $env:LOCALAPPDATA "kiro-rs-callback"
 New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-$ScriptPath = Join-Path $InstallDir "kiro-callback.ps1"
-$ScriptBody = @'
-param([string]$CallbackUrl)
+
+$LoginScriptPath = Join-Path $InstallDir "kiro-login-helper.ps1"
+$LoginScriptBody = @'
+param([string]$LaunchUrl)
 $ErrorActionPreference = "Stop"
-if ([string]::IsNullOrWhiteSpace($CallbackUrl)) { exit 1 }
-$StateEndpoint = "__STATE_ENDPOINT__"
-$SessionEndpoint = "__SESSION_ENDPOINT__"
-$LogPath = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "callback.log"
-try {
-  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-  Add-Type -AssemblyName System.Web
-  $Body = @{ callbackUrl = $CallbackUrl } | ConvertTo-Json -Compress
-  $Uri = [Uri]$CallbackUrl
-  $Params = [System.Web.HttpUtility]::ParseQueryString($Uri.Query)
-  $Endpoint = if ([string]::IsNullOrWhiteSpace($Params["state"])) { $SessionEndpoint } else { $StateEndpoint }
-  $Response = Invoke-RestMethod -Method Post -Uri $Endpoint -ContentType "application/json" -Body $Body
-  Add-Content -Path $LogPath -Value ("{0} submitted callback endpoint={1} status={2}" -f (Get-Date).ToString("s"), $Endpoint, $Response.status)
-} catch {
-  $Message = $_.Exception.Message
-  Add-Content -Path $LogPath -Value ("{0} failed: {1}" -f (Get-Date).ToString("s"), $Message)
-  try {
-  $Shell = New-Object -ComObject WScript.Shell
-    $PopupMessage = "kiro-rs callback failed. See " + $LogPath + [Environment]::NewLine + $Message
-    $Shell.Popup($PopupMessage, 12, "kiro-rs callback", 48) | Out-Null
-  } catch {}
-  exit 1
-}
-'@
-if ($CallbackMode -eq "kiro-scheme") {
-  $ScriptBody = $ScriptBody.Replace("__STATE_ENDPOINT__", $StateEndpoint).Replace("__SESSION_ENDPOINT__", $SessionEndpoint)
-  Set-Content -Path $ScriptPath -Value $ScriptBody -Encoding UTF8
-  New-Item -Path "HKCU:\\Software\\Classes\\kiro" -Force | Out-Null
-  Set-Item -Path "HKCU:\\Software\\Classes\\kiro" -Value "URL:Kiro OAuth Callback"
-  New-ItemProperty -Path "HKCU:\\Software\\Classes\\kiro" -Name "URL Protocol" -Value "" -PropertyType String -Force | Out-Null
-  New-Item -Path "HKCU:\\Software\\Classes\\kiro\\shell\\open\\command" -Force | Out-Null
-  $Command = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $ScriptPath + '" "%1"'
-  Set-Item -Path "HKCU:\\Software\\Classes\\kiro\\shell\\open\\command" -Value $Command
-  Write-Host "Registered kiro:// callback helper"
-}
 
 function Find-Chrome {
   $Candidates = @(
@@ -228,42 +181,97 @@ function Quote-ProcessArg([string]$Value) {
   return '"' + $Value.Replace('"', '\\"') + '"'
 }
 
-function Open-LoginUrl {
-  if ([string]::IsNullOrWhiteSpace($LoginUrl) -or $LaunchMode -eq "none") { return }
-
-  if (-not [string]::IsNullOrWhiteSpace($UserCode)) {
-    try {
-      Set-Clipboard -Value $UserCode
-      Write-Host "Copied device user code to clipboard: $UserCode"
-    } catch {
-      Write-Host "Device user code: $UserCode"
-    }
-  }
-
-  $Chrome = Find-Chrome
-  if (-not $Chrome) {
-    try { Set-Clipboard -Value $LoginUrl } catch {}
-    Write-Warning "Chrome was not found. The login URL was copied to the clipboard when possible."
-    return
-  }
-
-  $Args = @("--new-window", "--no-first-run", "--no-default-browser-check")
-  if ($LaunchMode -eq "incognito") {
-    $Args += "--incognito"
-  } elseif ($LaunchMode -eq "clean-profile") {
-    $ProfileRoot = Join-Path $InstallDir "chrome-profiles"
-    New-Item -ItemType Directory -Path $ProfileRoot -Force | Out-Null
-    $RunSuffix = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds().ToString()
-    $ProfilePath = Join-Path $ProfileRoot ($SessionId + "-" + $RunSuffix)
-    New-Item -ItemType Directory -Path $ProfilePath -Force | Out-Null
-    $Args += "--user-data-dir=$(Quote-ProcessArg $ProfilePath)"
-  }
-  $Args += (Quote-ProcessArg $LoginUrl)
-  Start-Process -FilePath $Chrome -ArgumentList ($Args -join " ")
-  Write-Host "Opened login URL with Chrome launch mode: $LaunchMode"
+function Get-QueryParam([Uri]$Uri, [string]$Name) {
+  Add-Type -AssemblyName System.Web
+  $Params = [System.Web.HttpUtility]::ParseQueryString($Uri.Query)
+  return $Params[$Name]
 }
 
-Open-LoginUrl
+if ([string]::IsNullOrWhiteSpace($LaunchUrl)) { exit 1 }
+$Uri = [Uri]$LaunchUrl
+$LoginUrl = Get-QueryParam $Uri "url"
+$LaunchMode = Get-QueryParam $Uri "mode"
+$SessionId = Get-QueryParam $Uri "sessionId"
+$UserCode = Get-QueryParam $Uri "userCode"
+
+if ([string]::IsNullOrWhiteSpace($LoginUrl)) { exit 1 }
+if ([string]::IsNullOrWhiteSpace($LaunchMode)) { $LaunchMode = "clean-profile" }
+
+if (-not [string]::IsNullOrWhiteSpace($UserCode)) {
+  try {
+    Set-Clipboard -Value $UserCode
+    Write-Host "Copied device user code to clipboard: $UserCode"
+  } catch {
+    Write-Host "Device user code: $UserCode"
+  }
+}
+
+$Chrome = Find-Chrome
+if (-not $Chrome) {
+  try { Set-Clipboard -Value $LoginUrl } catch {}
+  Write-Warning "Chrome was not found. The login URL was copied to the clipboard when possible."
+  exit 1
+}
+
+$Args = @("--new-window", "--no-first-run", "--no-default-browser-check")
+if ($LaunchMode -eq "incognito") {
+  $Args += "--incognito"
+} else {
+  $ProfileRoot = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "chrome-profiles"
+  New-Item -ItemType Directory -Path $ProfileRoot -Force | Out-Null
+  $SafeSessionId = if ([string]::IsNullOrWhiteSpace($SessionId)) { "session" } else { $SessionId -replace '[^a-zA-Z0-9_.-]', '_' }
+  $RunSuffix = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds().ToString()
+  $ProfilePath = Join-Path $ProfileRoot ($SafeSessionId + "-" + $RunSuffix)
+  New-Item -ItemType Directory -Path $ProfilePath -Force | Out-Null
+  $Args += "--user-data-dir=$(Quote-ProcessArg $ProfilePath)"
+}
+$Args += (Quote-ProcessArg $LoginUrl)
+Start-Process -FilePath $Chrome -ArgumentList ($Args -join " ")
+'@
+Set-Content -Path $LoginScriptPath -Value $LoginScriptBody -Encoding UTF8
+
+$CallbackScriptPath = Join-Path $InstallDir "kiro-callback.ps1"
+$CallbackScriptBody = @'
+param([string]$CallbackUrl)
+$ErrorActionPreference = "Stop"
+if ([string]::IsNullOrWhiteSpace($CallbackUrl)) { exit 1 }
+$StateEndpoint = "__STATE_ENDPOINT__"
+$LogPath = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "callback.log"
+try {
+  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+  $Body = @{ callbackUrl = $CallbackUrl } | ConvertTo-Json -Compress
+  $Response = Invoke-RestMethod -Method Post -Uri $StateEndpoint -ContentType "application/json" -Body $Body
+  Add-Content -Path $LogPath -Value ("{0} submitted callback status={1}" -f (Get-Date).ToString("s"), $Response.status)
+} catch {
+  $Message = $_.Exception.Message
+  Add-Content -Path $LogPath -Value ("{0} failed: {1}" -f (Get-Date).ToString("s"), $Message)
+  try {
+    $Shell = New-Object -ComObject WScript.Shell
+    $PopupMessage = "kiro-rs callback failed. See " + $LogPath + [Environment]::NewLine + $Message
+    $Shell.Popup($PopupMessage, 12, "kiro-rs callback", 48) | Out-Null
+  } catch {}
+  exit 1
+}
+'@
+$CallbackScriptBody = $CallbackScriptBody.Replace("__STATE_ENDPOINT__", $StateEndpoint)
+Set-Content -Path $CallbackScriptPath -Value $CallbackScriptBody -Encoding UTF8
+
+New-Item -Path "HKCU:\\Software\\Classes\\kiro-rs-login" -Force | Out-Null
+Set-Item -Path "HKCU:\\Software\\Classes\\kiro-rs-login" -Value "URL:Kiro Login Helper"
+New-ItemProperty -Path "HKCU:\\Software\\Classes\\kiro-rs-login" -Name "URL Protocol" -Value "" -PropertyType String -Force | Out-Null
+New-Item -Path "HKCU:\\Software\\Classes\\kiro-rs-login\\shell\\open\\command" -Force | Out-Null
+$LoginCommand = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $LoginScriptPath + '" "%1"'
+Set-Item -Path "HKCU:\\Software\\Classes\\kiro-rs-login\\shell\\open\\command" -Value $LoginCommand
+
+New-Item -Path "HKCU:\\Software\\Classes\\kiro" -Force | Out-Null
+Set-Item -Path "HKCU:\\Software\\Classes\\kiro" -Value "URL:Kiro OAuth Callback"
+New-ItemProperty -Path "HKCU:\\Software\\Classes\\kiro" -Name "URL Protocol" -Value "" -PropertyType String -Force | Out-Null
+New-Item -Path "HKCU:\\Software\\Classes\\kiro\\shell\\open\\command" -Force | Out-Null
+$CallbackCommand = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $CallbackScriptPath + '" "%1"'
+Set-Item -Path "HKCU:\\Software\\Classes\\kiro\\shell\\open\\command" -Value $CallbackCommand
+
+Write-Host "Installed kiro-rs-login:// browser launcher"
+Write-Host "Installed kiro:// OAuth callback helper"
 `
 }
 
@@ -340,6 +348,26 @@ function sessionAuthUrl(session: LoginSession): string | undefined {
     return session.verificationUriComplete || session.authUrl || session.verificationUri
   }
   return undefined
+}
+
+function buildLoginHelperLaunchUrl(
+  session: LoginSession,
+  launchMode: Exclude<LoginHelperLaunchMode, 'none'>
+): string | undefined {
+  const loginUrl = sessionAuthUrl(session)
+  if (!loginUrl) return undefined
+
+  const params = new URLSearchParams({
+    mode: launchMode,
+    sessionId: session.sessionId,
+    url: loginUrl,
+  })
+  const userCode = sessionUserCode(session)
+  if (userCode) {
+    params.set('userCode', userCode)
+  }
+
+  return `kiro-rs-login://open?${params.toString()}`
 }
 
 function probeStatusText(status: ExternalIdpProbeStatus): string {
@@ -862,33 +890,34 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
     }
   }
 
-  const handleDownloadLoginHelper = (launchMode: LoginHelperLaunchMode = 'none') => {
+  const handleDownloadLoginHelperInstaller = () => {
+    try {
+      downloadTextFile(
+        'install-kiro-rs-login-helper.cmd',
+        buildWindowsLoginHelperInstaller({
+          origin: window.location.origin,
+        })
+      )
+      toast.success('本机登录助手安装器已下载')
+    } catch {
+      toast.error('下载失败')
+    }
+  }
+
+  const handleOpenLoginHelper = (launchMode: Exclude<LoginHelperLaunchMode, 'none'>) => {
     if (!session) {
       toast.error('请先开始登录')
       return
     }
 
-    try {
-      const url = sessionAuthUrl(session)
-      const callbackMode: LoginHelperCallbackMode =
-        sessionMode === 'external_idp' && isExternalIdpSession(session)
-          ? 'kiro-scheme'
-          : 'none'
-      downloadTextFile(
-        'kiro-rs-login-helper.cmd',
-        buildWindowsLoginHelperInstaller({
-          origin: window.location.origin,
-          sessionId: session.sessionId,
-          loginUrl: url,
-          launchMode,
-          callbackMode,
-          userCode: sessionUserCode(session),
-        })
-      )
-      toast.success(`${loginHelperLaunchModeLabel(launchMode)}脚本已下载`)
-    } catch {
-      toast.error('下载失败')
+    const url = buildLoginHelperLaunchUrl(session, launchMode)
+    if (!url) {
+      toast.error('登录链接不存在或已过期')
+      return
     }
+
+    window.location.href = url
+    toast.success(`已请求本机助手打开${loginHelperLaunchModeLabel(launchMode)}；未响应时请先安装本机助手`)
   }
 
   const statusTone =
@@ -1564,7 +1593,7 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="flex items-center gap-2 text-sm font-medium">
                     <ExternalLink className="h-4 w-4 text-muted-foreground" />
-                    下载登录脚本或打开登录页
+                    本机助手打开登录页
                   </div>
                   <Badge variant="secondary">
                     {sessionMode === 'external_idp' ? '包含回调捕获' : '无需回调'}
@@ -1574,19 +1603,28 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
                   <Button
                     type="button"
                     className="w-full"
-                    onClick={() => handleDownloadLoginHelper('clean-profile')}
+                    onClick={() => handleOpenLoginHelper('clean-profile')}
                   >
-                    <Download className="h-4 w-4" />
-                    下载干净浏览器脚本
+                    <ExternalLink className="h-4 w-4" />
+                    干净浏览器打开
                   </Button>
                   <Button
                     type="button"
                     variant="outline"
                     className="w-full"
-                    onClick={() => handleDownloadLoginHelper('incognito')}
+                    onClick={() => handleOpenLoginHelper('incognito')}
                   >
                     <ShieldCheck className="h-4 w-4" />
-                    下载隐身脚本
+                    隐身打开
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="w-full"
+                    onClick={handleDownloadLoginHelperInstaller}
+                  >
+                    <Download className="h-4 w-4" />
+                    安装本机助手
                   </Button>
                   <Button
                     asChild
@@ -1612,10 +1650,10 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
                       type="button"
                       variant="outline"
                       className="w-full"
-                      onClick={() => handleDownloadLoginHelper('none')}
+                      onClick={handleDownloadLoginHelperInstaller}
                     >
                       <Download className="h-4 w-4" />
-                      只下载捕获器
+                      安装回调捕获
                     </Button>
                   )}
                 </div>
