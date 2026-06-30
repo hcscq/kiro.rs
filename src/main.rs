@@ -49,10 +49,14 @@ use tokio::{
     time::{Duration, Instant as TokioInstant, sleep},
 };
 
-const READINESS_DRAIN_FILE: &str = "/tmp/kiro-rs-drain";
+const LEGACY_DRAIN_FILE: &str = "/tmp/kiro-rs-drain";
+const READINESS_DRAIN_FILE: &str = "/tmp/kiro-rs-readiness-drain";
+const REQUEST_DRAIN_FILE: &str = "/tmp/kiro-rs-request-drain";
+const SHUTDOWN_READINESS_PROPAGATION_DELAY: Duration = Duration::from_secs(30);
 const SHUTDOWN_DRAIN_DELAY: Duration = Duration::from_secs(5);
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(720);
 const MAX_DRAIN_WAIT_TIMEOUT: Duration = Duration::from_secs(720);
+const MAX_SOFT_DRAIN_DELAY: Duration = Duration::from_secs(120);
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const BACKGROUND_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const READINESS_SNAPSHOT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -89,7 +93,8 @@ struct FileRollbackExportManifest {
 
 #[derive(Default)]
 struct RuntimeHealth {
-    draining: AtomicBool,
+    readiness_draining: AtomicBool,
+    request_draining: AtomicBool,
     credentials_total: AtomicUsize,
     credentials_available: AtomicUsize,
     credentials_dispatchable: AtomicUsize,
@@ -102,12 +107,20 @@ struct ReadinessSnapshot {
 }
 
 impl RuntimeHealth {
-    fn mark_draining(&self) -> bool {
-        !self.draining.swap(true, Ordering::SeqCst)
+    fn mark_readiness_draining(&self) -> bool {
+        !self.readiness_draining.swap(true, Ordering::SeqCst)
     }
 
-    fn is_draining(&self) -> bool {
-        self.draining.load(Ordering::SeqCst)
+    fn mark_request_draining(&self) -> bool {
+        !self.request_draining.swap(true, Ordering::SeqCst)
+    }
+
+    fn is_readiness_draining(&self) -> bool {
+        self.readiness_draining.load(Ordering::SeqCst)
+    }
+
+    fn is_request_draining(&self) -> bool {
+        self.request_draining.load(Ordering::SeqCst)
     }
 
     fn update_readiness_snapshot(&self, total: usize, available: usize, dispatchable: usize) {
@@ -125,6 +138,13 @@ impl RuntimeHealth {
             dispatchable: self.credentials_dispatchable.load(Ordering::Relaxed),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum DrainMode {
+    Soft,
+    Hard,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -153,6 +173,22 @@ impl DrainSnapshot {
 struct DrainQuery {
     #[serde(default)]
     wait_seconds: Option<u64>,
+    #[serde(default)]
+    mode: Option<DrainMode>,
+    #[serde(default)]
+    soft_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DrainState {
+    readiness_draining: bool,
+    request_draining: bool,
+}
+
+impl DrainState {
+    fn any_draining(&self) -> bool {
+        self.readiness_draining || self.request_draining
+    }
 }
 
 struct BackgroundTask {
@@ -469,25 +505,68 @@ fn export_file_state(
     Ok(())
 }
 
-fn drain_file_present() -> bool {
-    Path::new(READINESS_DRAIN_FILE).exists()
+fn drain_file_present(path: &str) -> bool {
+    Path::new(path).exists()
 }
 
 fn clear_drain_signal() -> std::io::Result<()> {
-    match std::fs::remove_file(READINESS_DRAIN_FILE) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err),
+    for path in [LEGACY_DRAIN_FILE, READINESS_DRAIN_FILE, REQUEST_DRAIN_FILE] {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+fn write_drain_file(path: &str) {
+    if let Err(err) = std::fs::write(path, b"draining\n") {
+        tracing::warn!(path, "写入 drain 标记失败: {}", err);
     }
 }
 
-fn mark_draining(health: &RuntimeHealth, reason: &str) {
-    if health.mark_draining() {
-        tracing::info!(reason, "marking runtime as draining");
+fn mark_readiness_draining(health: &RuntimeHealth, reason: &str) -> bool {
+    let marked = health.mark_readiness_draining();
+    if marked {
+        tracing::info!(reason, "marking runtime readiness as draining");
     }
-    if let Err(err) = std::fs::write(READINESS_DRAIN_FILE, b"draining\n") {
-        tracing::warn!("写入 readiness drain 标记失败: {}", err);
+    write_drain_file(READINESS_DRAIN_FILE);
+    marked
+}
+
+fn mark_request_draining(health: &RuntimeHealth, reason: &str) {
+    mark_readiness_draining(health, reason);
+    if health.mark_request_draining() {
+        tracing::info!(reason, "marking runtime requests as draining");
     }
+    write_drain_file(REQUEST_DRAIN_FILE);
+}
+
+fn drain_state(health: &RuntimeHealth) -> DrainState {
+    let legacy_draining = drain_file_present(LEGACY_DRAIN_FILE);
+    let request_draining =
+        health.is_request_draining() || drain_file_present(REQUEST_DRAIN_FILE) || legacy_draining;
+    let readiness_draining = health.is_readiness_draining()
+        || drain_file_present(READINESS_DRAIN_FILE)
+        || request_draining;
+
+    DrainState {
+        readiness_draining,
+        request_draining,
+    }
+}
+
+async fn soft_drain_delay(duration: Duration, reason: &'static str) {
+    if duration.is_zero() {
+        return;
+    }
+    tracing::info!(
+        reason,
+        delay_ms = duration.as_millis(),
+        "waiting for readiness drain propagation before hard request drain"
+    );
+    sleep(duration).await;
 }
 
 fn drain_snapshot(
@@ -562,12 +641,14 @@ async fn wait_for_drain(
 
 fn drain_status_json(
     snapshot: DrainSnapshot,
-    draining: bool,
+    state: DrainState,
     elapsed_ms: u128,
 ) -> serde_json::Value {
     json!({
         "status": if snapshot.is_drained() { "drained" } else { "draining" },
-        "draining": draining,
+        "draining": state.any_draining(),
+        "readinessDraining": state.readiness_draining,
+        "requestDraining": state.request_draining,
         "activeRequests": snapshot.active_requests,
         "waitingRequests": snapshot.waiting_requests,
         "conversionInFlight": snapshot.conversion_in_flight,
@@ -587,20 +668,20 @@ async fn ready_handler(
     conversion_runtime: Arc<anthropic::ConversionRuntime>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let snapshot = health.readiness_snapshot();
-    let draining = health.is_draining() || drain_file_present();
+    let state = drain_state(&health);
     let drain = drain_snapshot(&token_manager, &conversion_runtime);
     let conversion = conversion_runtime.stats();
     let conversion_metrics = conversion.metrics;
     let conversion_wait_ms = conversion_metrics.wait_ms;
     let conversion_convert_ms = conversion_metrics.convert_ms;
     let conversion_saturated = conversion.is_saturated();
-    let ready = !draining && snapshot.total > 0;
+    let ready = !state.readiness_draining && snapshot.total > 0;
     let status = if ready {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    let reason = if draining {
+    let reason = if state.readiness_draining {
         "draining"
     } else if snapshot.total == 0 {
         "no_credentials"
@@ -612,6 +693,8 @@ async fn ready_handler(
         status,
         Json(json!({
             "status": if ready { "ok" } else { reason },
+            "readiness_draining": state.readiness_draining,
+            "request_draining": state.request_draining,
             "credentials_total": snapshot.total,
             "credentials_available": snapshot.available,
             "credentials_dispatchable": snapshot.dispatchable,
@@ -674,14 +757,24 @@ async fn drain_handler(
     Query(query): Query<DrainQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let started_at = TokioInstant::now();
-    mark_draining(&runtime_health, "drain endpoint requested");
+    let mode = query.mode.unwrap_or(DrainMode::Hard);
+    mark_readiness_draining(&runtime_health, "drain endpoint requested");
+    let soft_delay = query
+        .soft_seconds
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::ZERO)
+        .min(MAX_SOFT_DRAIN_DELAY);
+    if mode == DrainMode::Hard {
+        soft_drain_delay(soft_delay, "drain_endpoint").await;
+        mark_request_draining(&runtime_health, "drain endpoint requested");
+    }
     let wait_duration = query
         .wait_seconds
         .map(Duration::from_secs)
         .unwrap_or(Duration::ZERO)
         .min(MAX_DRAIN_WAIT_TIMEOUT);
 
-    let snapshot = if wait_duration.is_zero() {
+    let snapshot = if mode == DrainMode::Soft || wait_duration.is_zero() {
         drain_snapshot(&token_manager, &conversion_runtime)
     } else {
         wait_for_drain(
@@ -695,6 +788,8 @@ async fn drain_handler(
 
     let status = if snapshot.is_drained() {
         StatusCode::OK
+    } else if mode == DrainMode::Soft {
+        StatusCode::OK
     } else {
         StatusCode::ACCEPTED
     };
@@ -703,7 +798,7 @@ async fn drain_handler(
         status,
         Json(drain_status_json(
             snapshot,
-            runtime_health.is_draining() || drain_file_present(),
+            drain_state(&runtime_health),
             started_at.elapsed().as_millis(),
         )),
     )
@@ -786,8 +881,7 @@ async fn drain_gate_middleware(
     next: Next,
 ) -> Response {
     let path = request.uri().path().to_string();
-    if is_message_request(request.method(), &path)
-        && (runtime_health.is_draining() || drain_file_present())
+    if is_message_request(request.method(), &path) && drain_state(&runtime_health).request_draining
     {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -844,7 +938,17 @@ async fn shutdown_signal(
     }
 
     tracing::info!("shutdown signal received, marking readiness false");
-    mark_draining(&health, "shutdown signal received");
+    let was_already_draining = drain_state(&health).readiness_draining;
+    mark_readiness_draining(&health, "shutdown signal received");
+    if was_already_draining {
+        tracing::info!(
+            reason = "shutdown_signal",
+            "runtime readiness was already draining; skipping propagation delay"
+        );
+    } else {
+        soft_drain_delay(SHUTDOWN_READINESS_PROPAGATION_DELAY, "shutdown_signal").await;
+    }
+    mark_request_draining(&health, "shutdown signal received");
     let _ = wait_for_drain(
         token_manager,
         conversion_runtime,
@@ -1509,5 +1613,39 @@ mod tests {
             conversion_waiting: 0,
         };
         assert!(drained.is_drained());
+    }
+
+    #[test]
+    fn drain_state_distinguishes_readiness_and_request_drain() {
+        clear_drain_signal().unwrap();
+        let health = RuntimeHealth::default();
+
+        let initial = drain_state(&health);
+        assert!(!initial.any_draining());
+        assert!(!initial.readiness_draining);
+        assert!(!initial.request_draining);
+
+        mark_readiness_draining(&health, "test");
+        let soft = drain_state(&health);
+        assert!(soft.any_draining());
+        assert!(soft.readiness_draining);
+        assert!(!soft.request_draining);
+
+        mark_request_draining(&health, "test");
+        let hard = drain_state(&health);
+        assert!(hard.any_draining());
+        assert!(hard.readiness_draining);
+        assert!(hard.request_draining);
+
+        clear_drain_signal().unwrap();
+        let health = RuntimeHealth::default();
+        write_drain_file(LEGACY_DRAIN_FILE);
+
+        let state = drain_state(&health);
+        assert!(state.any_draining());
+        assert!(state.readiness_draining);
+        assert!(state.request_draining);
+
+        clear_drain_signal().unwrap();
     }
 }
