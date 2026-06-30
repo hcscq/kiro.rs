@@ -503,6 +503,10 @@ pub struct StreamContext {
     synthesize_hidden_thinking_signature: bool,
     /// 是否已经补齐过隐藏 synthetic thinking block
     synthetic_hidden_thinking_emitted: bool,
+    /// 非 thinking 模式下，上游 Opus 4.7/4.8 可能先发送隐藏 reasoning。
+    /// 这类内容不能转发为 thinking，但仍应尽早打开一个可见 content block，
+    /// 避免下游网关只看到 message_start/ping 后触发首内容超时。
+    hidden_reasoning_text_block_started: bool,
 }
 
 impl StreamContext {
@@ -535,6 +539,7 @@ impl StreamContext {
             thinking_ordinal: 0,
             synthesize_hidden_thinking_signature: false,
             synthetic_hidden_thinking_emitted: false,
+            hidden_reasoning_text_block_started: false,
         }
     }
 
@@ -666,6 +671,16 @@ impl StreamContext {
     fn process_reasoning_content(&mut self, event: &ReasoningContentEvent) -> Vec<SseEvent> {
         let mut events = Vec::new();
         if !self.thinking_enabled {
+            let text = event.text.as_str();
+            let has_signature = event
+                .signature
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty());
+            if (!text.is_empty() || has_signature) && !self.hidden_reasoning_text_block_started {
+                self.hidden_reasoning_text_block_started = true;
+                let _ = self.ensure_text_block_started(&mut events);
+            }
             return events;
         }
 
@@ -1007,10 +1022,7 @@ impl StreamContext {
     /// 当发生 tool_use 时，状态机会自动关闭当前文本块；后续文本会自动创建新的文本块继续输出。
     ///
     /// 返回值包含可能的 content_block_start 事件和 content_block_delta 事件。
-    fn create_text_delta_events(&mut self, text: &str) -> Vec<SseEvent> {
-        let mut events = Vec::new();
-        events.extend(self.synthesize_hidden_thinking_block_events());
-
+    fn ensure_text_block_started(&mut self, events: &mut Vec<SseEvent>) -> i32 {
         // 如果当前 text_block_index 指向的块已经被关闭（例如 tool_use 开始时自动 stop），
         // 则丢弃该索引并创建新的文本块继续输出，避免 delta 被状态机拒绝导致“吞字”。
         if let Some(idx) = self.text_block_index {
@@ -1020,7 +1032,7 @@ impl StreamContext {
         }
 
         // 获取或创建文本块索引
-        let text_index = if let Some(idx) = self.text_block_index {
+        if let Some(idx) = self.text_block_index {
             idx
         } else {
             // 文本块尚未创建，需要先创建
@@ -1042,7 +1054,14 @@ impl StreamContext {
             );
             events.extend(start_events);
             idx
-        };
+        }
+    }
+
+    fn create_text_delta_events(&mut self, text: &str) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        events.extend(self.synthesize_hidden_thinking_block_events());
+
+        let text_index = self.ensure_text_block_started(&mut events);
 
         // 发送 content_block_delta 事件
         if let Some(delta_event) = self.state_manager.handle_content_block_delta(
@@ -1306,6 +1325,29 @@ impl StreamContext {
         }
 
         events.extend(self.close_reasoning_thinking_block_events());
+
+        if self.hidden_reasoning_text_block_started
+            && self.output_tokens == 0
+            && !self.state_manager.has_tool_use
+        {
+            if let Some(text_index) = self.text_block_index {
+                if self.state_manager.is_block_open_of_type(text_index, "text") {
+                    if let Some(delta_event) = self.state_manager.handle_content_block_delta(
+                        text_index,
+                        json!({
+                            "type": "content_block_delta",
+                            "index": text_index,
+                            "delta": {
+                                "type": "text_delta",
+                                "text": " "
+                            }
+                        }),
+                    ) {
+                        events.push(delta_event);
+                    }
+                }
+            }
+        }
 
         // 若最终没有任何非 thinking 内容块，需要补一个最小 text 块，
         // 避免输出成为仅有 message_* 或 thinking-only 的 Anthropic SSE，导致兼容性问题。
@@ -2323,6 +2365,59 @@ mod tests {
         let signature = collect_first_signature(&all).expect("signature_delta should be emitted");
         let req = request_with_stream_thinking("step".to_string(), signature);
         validate_thinking_signatures(&req).expect("fallback stream signature should validate");
+    }
+
+    #[test]
+    fn test_non_thinking_reasoning_content_opens_text_block_without_leaking_reasoning() {
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-4-8", 1, false, HashMap::new());
+        let mut all = ctx.generate_initial_events();
+
+        all.extend(ctx.process_kiro_event(&reasoning_event(r#"{"text":"hidden step"}"#)));
+
+        assert!(
+            all.iter().any(|e| {
+                e.event == "content_block_start"
+                    && e.data["index"].as_i64() == Some(0)
+                    && e.data["content_block"]["type"] == "text"
+            }),
+            "hidden reasoning should open a text content block for downstream readiness"
+        );
+        assert!(
+            all.iter().all(|e| {
+                !(e.event == "content_block_start" && e.data["content_block"]["type"] == "thinking")
+                    && !(e.event == "content_block_delta"
+                        && e.data["delta"]["type"] == "thinking_delta")
+            }),
+            "non-thinking hidden reasoning must not be exposed as thinking"
+        );
+        assert_eq!(collect_text_content(&all), "");
+    }
+
+    #[test]
+    fn test_non_thinking_reasoning_reuses_text_block_for_later_answer() {
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-4-8", 1, false, HashMap::new());
+        let mut all = ctx.generate_initial_events();
+
+        all.extend(ctx.process_kiro_event(&reasoning_event(r#"{"text":"hidden"}"#)));
+        all.extend(ctx.process_assistant_response("answer"));
+        all.extend(ctx.generate_final_events());
+
+        let text_starts = all
+            .iter()
+            .filter(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "text"
+            })
+            .count();
+        assert_eq!(
+            text_starts, 1,
+            "later visible text should reuse the readiness text block"
+        );
+        assert_eq!(collect_text_content(&all), "answer");
+        assert!(
+            all.iter()
+                .any(|e| e.event == "content_block_stop" && e.data["index"].as_i64() == Some(0)),
+            "the readiness text block should be closed at stream end"
+        );
     }
 
     #[test]
