@@ -1076,6 +1076,7 @@ struct StreamContentStartProbe {
     reasoning_text_bytes: usize,
     tool_use_events: usize,
     error_events: usize,
+    completion_evidence_events: usize,
 }
 
 impl StreamContentStartProbe {
@@ -1091,6 +1092,7 @@ impl StreamContentStartProbe {
             reasoning_text_bytes: 0,
             tool_use_events: 0,
             error_events: 0,
+            completion_evidence_events: 0,
         }
     }
 
@@ -1100,11 +1102,13 @@ impl StreamContentStartProbe {
             Event::ToolUse(_) => {
                 self.non_error_events = self.non_error_events.saturating_add(1);
                 self.tool_use_events = self.tool_use_events.saturating_add(1);
+                self.completion_evidence_events = self.completion_evidence_events.saturating_add(1);
                 true
             }
             Event::AssistantResponse(resp) => {
                 self.non_error_events = self.non_error_events.saturating_add(1);
                 self.assistant_events = self.assistant_events.saturating_add(1);
+                self.completion_evidence_events = self.completion_evidence_events.saturating_add(1);
                 self.assistant_content_bytes = self
                     .assistant_content_bytes
                     .saturating_add(resp.content.len());
@@ -1116,7 +1120,16 @@ impl StreamContentStartProbe {
                 self.reasoning_text_bytes = self
                     .reasoning_text_bytes
                     .saturating_add(reasoning.text.len());
-                !reasoning.text.is_empty() || reasoning.signature.is_some()
+                let has_reasoning = !reasoning.text.is_empty() || reasoning.signature.is_some();
+                if has_reasoning {
+                    self.completion_evidence_events =
+                        self.completion_evidence_events.saturating_add(1);
+                }
+                has_reasoning
+            }
+            Event::Metering(()) => {
+                self.non_error_events = self.non_error_events.saturating_add(1);
+                false
             }
             Event::Error { .. } | Event::Exception { .. } => {
                 self.error_events = self.error_events.saturating_add(1);
@@ -1170,6 +1183,7 @@ impl StreamContentStartProbe {
             reasoning_text_bytes: self.reasoning_text_bytes,
             tool_use_events: self.tool_use_events,
             error_events: self.error_events,
+            completion_evidence_events: self.completion_evidence_events,
         }
     }
 }
@@ -1192,6 +1206,19 @@ struct StreamContentStartProbeDiagnostics {
     reasoning_text_bytes: usize,
     tool_use_events: usize,
     error_events: usize,
+    completion_evidence_events: usize,
+}
+
+impl StreamContentStartProbeDiagnostics {
+    fn has_usable_output(&self) -> bool {
+        self.assistant_content_bytes > 0
+            || self.reasoning_text_bytes > 0
+            || self.tool_use_events > 0
+    }
+
+    fn is_legal_empty_completion(&self) -> bool {
+        !self.has_usable_output() && self.completion_evidence_events > 0 && self.error_events == 0
+    }
 }
 
 enum StreamContentStartPrefetch {
@@ -1204,6 +1231,13 @@ enum StreamContentStartPrefetch {
         probe_diagnostics: StreamContentStartProbeDiagnostics,
     },
     TimedOut {
+        stream: BoxStream<'static, Result<Bytes, reqwest::Error>>,
+        first_chunk_logged: bool,
+        elapsed: Duration,
+        prefetched_bytes: usize,
+        probe_diagnostics: StreamContentStartProbeDiagnostics,
+    },
+    EndedWithoutContent {
         elapsed: Duration,
         prefetched_bytes: usize,
         probe_diagnostics: StreamContentStartProbeDiagnostics,
@@ -2540,7 +2574,11 @@ impl KiroProvider {
                         probe_diagnostics,
                     });
                 }
+                let prefetched_stream = stream::iter(prefetched.into_iter().map(Ok));
+                let stream = prefetched_stream.chain(body_stream).boxed();
                 return Ok(StreamContentStartPrefetch::TimedOut {
+                    stream,
+                    first_chunk_logged,
                     elapsed: started_at.elapsed(),
                     prefetched_bytes,
                     probe_diagnostics: probe.diagnostics(),
@@ -2562,7 +2600,11 @@ impl KiroProvider {
                             probe_diagnostics,
                         });
                     }
+                    let prefetched_stream = stream::iter(prefetched.into_iter().map(Ok));
+                    let stream = prefetched_stream.chain(body_stream).boxed();
                     return Ok(StreamContentStartPrefetch::TimedOut {
+                        stream,
+                        first_chunk_logged,
                         elapsed: started_at.elapsed(),
                         prefetched_bytes,
                         probe_diagnostics: probe.diagnostics(),
@@ -2654,6 +2696,15 @@ impl KiroProvider {
                 Ok(Some(Err(err))) => return Err(err.into()),
                 Ok(None) => {
                     let probe_diagnostics = probe.diagnostics();
+                    if !probe_diagnostics.has_usable_output()
+                        && !probe_diagnostics.is_legal_empty_completion()
+                    {
+                        return Ok(StreamContentStartPrefetch::EndedWithoutContent {
+                            elapsed: started_at.elapsed(),
+                            prefetched_bytes,
+                            probe_diagnostics,
+                        });
+                    }
                     let prefetched_stream = stream::iter(prefetched.into_iter().map(Ok));
                     let stream = prefetched_stream.chain(body_stream).boxed();
                     return Ok(StreamContentStartPrefetch::Ready {
@@ -2661,7 +2712,11 @@ impl KiroProvider {
                         first_chunk_logged,
                         prefetched_bytes,
                         elapsed: started_at.elapsed(),
-                        ready_reason: "upstream_stream_ended",
+                        ready_reason: if probe_diagnostics.is_legal_empty_completion() {
+                            "upstream_stream_ended_with_empty_completion"
+                        } else {
+                            "upstream_stream_ended"
+                        },
                         probe_diagnostics,
                     });
                 }
@@ -4107,15 +4162,9 @@ impl KiroProvider {
                     content_start_probe_budget.is_some_and(|remaining| {
                         remaining >= MIN_STREAM_FIRST_CONTENT_FAILOVER_REMAINING
                     });
-                let can_failover_slow_first_content = slow_first_content_failovers
-                    < MAX_SLOW_FIRST_CONTENT_FAILOVERS
-                    && scoped_candidate_count > 1;
-                let should_guard_final_first_content_attempt = slow_first_content_failovers > 0;
                 let should_probe_stream_content_start = is_stream
                     && options.wait_for_stream_content_start
-                    && has_content_start_probe_budget
-                    && (can_failover_slow_first_content
-                        || should_guard_final_first_content_attempt);
+                    && has_content_start_probe_budget;
 
                 if should_probe_stream_content_start {
                     let prefetch_budget = content_start_probe_budget
@@ -4159,6 +4208,8 @@ impl KiroProvider {
                                     probe_diagnostics.reasoning_text_bytes,
                                 prefetch_tool_use_events = probe_diagnostics.tool_use_events,
                                 prefetch_error_events = probe_diagnostics.error_events,
+                                prefetch_completion_evidence_events =
+                                    probe_diagnostics.completion_evidence_events,
                                 slow_first_content_failovers,
                                 max_slow_first_content_failovers = MAX_SLOW_FIRST_CONTENT_FAILOVERS,
                                 "上游流预读已满足首内容块调度条件"
@@ -4204,6 +4255,8 @@ impl KiroProvider {
                             ));
                         }
                         Ok(StreamContentStartPrefetch::TimedOut {
+                            stream,
+                            first_chunk_logged,
                             elapsed,
                             prefetched_bytes,
                             probe_diagnostics,
@@ -4277,6 +4330,8 @@ impl KiroProvider {
                                     probe_diagnostics.reasoning_text_bytes,
                                 prefetch_tool_use_events = probe_diagnostics.tool_use_events,
                                 prefetch_error_events = probe_diagnostics.error_events,
+                                prefetch_completion_evidence_events =
+                                    probe_diagnostics.completion_evidence_events,
                                 slow_first_content_failovers,
                                 max_slow_first_content_failovers = MAX_SLOW_FIRST_CONTENT_FAILOVERS,
                                 scoped_candidate_count,
@@ -4326,7 +4381,91 @@ impl KiroProvider {
                                 last_error = Some(timeout_error);
                                 continue;
                             }
-                            return Err(timeout_error);
+                            self.token_manager.record_session_affinity(
+                                model.as_deref(),
+                                options.session_affinity_key.as_deref(),
+                                ctx_id,
+                            );
+                            self.token_manager.report_success(ctx_id);
+                            let usage_recorder = Some(ResponseUsageRecorder::new(
+                                Arc::clone(&self.token_manager),
+                                ctx_id,
+                                request_id.clone(),
+                                api_type,
+                                model.clone(),
+                            ));
+                            let response_lease = if stream_dispatch_lease_release_enabled {
+                                tracing::info!(
+                                    request_id = %request_id,
+                                    api_type,
+                                    model = model.as_deref().unwrap_or("unknown"),
+                                    credential_id = ctx_id,
+                                    attempt = attempt + 1,
+                                    max_retries,
+                                    region = %region,
+                                    request_body_bytes,
+                                    prefetched_bytes,
+                                    stream_dispatch_lease_release_reason =
+                                        "content_start_prefetch_timeout_without_failover",
+                                    "流式请求首内容块预读超时但无可用故障转移，继续转发上游流并提前释放调度 lease"
+                                );
+                                drop(lease);
+                                None
+                            } else {
+                                Some(lease)
+                            };
+                            return Ok(ManagedResponse::new_stream(
+                                stream,
+                                response_lease,
+                                Some(trace),
+                                usage_recorder,
+                                first_chunk_logged,
+                            ));
+                        }
+                        Ok(StreamContentStartPrefetch::EndedWithoutContent {
+                            elapsed,
+                            prefetched_bytes,
+                            probe_diagnostics,
+                        }) => {
+                            tracing::warn!(
+                                request_id = %request_id,
+                                api_type,
+                                model = model.as_deref().unwrap_or("unknown"),
+                                credential_id = ctx_id,
+                                attempt = attempt + 1,
+                                max_retries,
+                                region = %region,
+                                request_body_bytes,
+                                prefetched_bytes,
+                                prefetch_elapsed_ms = elapsed.as_millis(),
+                                prefetch_observed_events = probe_diagnostics.observed_events,
+                                prefetch_non_error_events = probe_diagnostics.non_error_events,
+                                prefetch_assistant_events = probe_diagnostics.assistant_events,
+                                prefetch_assistant_content_bytes =
+                                    probe_diagnostics.assistant_content_bytes,
+                                prefetch_reasoning_events = probe_diagnostics.reasoning_events,
+                                prefetch_reasoning_text_bytes =
+                                    probe_diagnostics.reasoning_text_bytes,
+                                prefetch_tool_use_events = probe_diagnostics.tool_use_events,
+                                prefetch_error_events = probe_diagnostics.error_events,
+                                prefetch_completion_evidence_events =
+                                    probe_diagnostics.completion_evidence_events,
+                                "上游流提前结束且没有合法空完成证据"
+                            );
+                            return Err(anyhow::Error::new(PublicProviderError::bad_gateway(
+                                format!(
+                                    "{} API 上游流提前结束且没有合法空完成证据: request_id={} credential_id={} attempt={} prefetched_bytes={} observed_events={} completion_evidence_events={} total_elapsed_ms={}",
+                                    api_type,
+                                    request_id,
+                                    ctx_id,
+                                    attempt + 1,
+                                    prefetched_bytes,
+                                    probe_diagnostics.observed_events,
+                                    probe_diagnostics.completion_evidence_events,
+                                    overall_started_at.elapsed().as_millis()
+                                ),
+                                "Upstream stream ended before a complete response was received. Retry later.",
+                            )));
                         }
                         Err(err) => {
                             tracing::warn!(
@@ -5392,7 +5531,12 @@ mod tests {
     use crate::kiro::parser::crc::crc32;
     use crate::kiro::parser::frame::PRELUDE_SIZE;
     use crate::model::config::Config;
-    use axum::{Router, body::Body, response::Response, routing::get};
+    use axum::{
+        Router,
+        body::Body,
+        response::Response,
+        routing::{get, post},
+    };
     use std::convert::Infallible;
     use tokio::net::TcpListener;
 
@@ -5501,6 +5645,110 @@ mod tests {
         let message_crc = crc32(&frame);
         frame.extend_from_slice(&message_crc.to_be_bytes());
         frame
+    }
+
+    async fn prefetch_probe_result_for_chunks(
+        chunks: Vec<Vec<u8>>,
+        thinking_enabled: bool,
+    ) -> StreamContentStartPrefetch {
+        let app = Router::new().route(
+            "/stream",
+            get(move || {
+                let chunks = chunks.clone();
+                async move {
+                    let body_stream = stream::iter(
+                        chunks
+                            .into_iter()
+                            .map(|chunk| Ok::<Bytes, Infallible>(Bytes::from(chunk))),
+                    );
+
+                    Response::builder()
+                        .status(200)
+                        .header("content-type", AMAZON_EVENTSTREAM_CONTENT_TYPE)
+                        .body(Body::from_stream(body_stream))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let response = reqwest::get(format!("http://{addr}/stream")).await.unwrap();
+        let trace = test_response_trace(Some(AMAZON_EVENTSTREAM_CONTENT_TYPE));
+        let result = KiroProvider::prefetch_until_stream_content_start(
+            response,
+            &trace,
+            Duration::from_secs(5),
+            thinking_enabled,
+        )
+        .await
+        .unwrap();
+        server.abort();
+        result
+    }
+
+    async fn provider_for_fake_stream_chunks(
+        chunks: Vec<Vec<u8>>,
+    ) -> (KiroProvider, tokio::task::JoinHandle<()>) {
+        let app = Router::new().route(
+            "/generateAssistantResponse",
+            post(move || {
+                let chunks = chunks.clone();
+                async move {
+                    let body_stream = stream::iter(
+                        chunks
+                            .into_iter()
+                            .map(|chunk| Ok::<Bytes, Infallible>(Bytes::from(chunk))),
+                    );
+
+                    Response::builder()
+                        .status(200)
+                        .header("content-type", AMAZON_EVENTSTREAM_CONTENT_TYPE)
+                        .body(Body::from_stream(body_stream))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = Config::default();
+        config.runtime_endpoint = Some(format!("http://{addr}"));
+        let credentials = KiroCredentials {
+            access_token: Some("test-access-token".to_string()),
+            refresh_token: Some("test-refresh-token".to_string()),
+            expires_at: Some("2099-01-01T00:00:00Z".to_string()),
+            provider: Some("BuilderId".to_string()),
+            api_region: Some("us-east-1".to_string()),
+            machine_id: Some("a".repeat(64)),
+            proxy_url: Some(KiroCredentials::PROXY_DIRECT.to_string()),
+            ..Default::default()
+        };
+
+        (create_test_provider(config, credentials), server)
+    }
+
+    fn assert_upstream_empty_stream_bad_gateway(err: anyhow::Error) {
+        let public = err
+            .downcast_ref::<PublicProviderError>()
+            .expect("empty stream should map to PublicProviderError");
+        assert_eq!(public.status_code(), 502);
+        assert_eq!(public.error_type(), "api_error");
+        assert_eq!(
+            public.public_message(),
+            "Upstream stream ended before a complete response was received. Retry later."
+        );
+        assert!(
+            public
+                .to_string()
+                .contains("上游流提前结束且没有合法空完成证据")
+        );
     }
 
     #[test]
@@ -6882,6 +7130,9 @@ mod tests {
             StreamContentStartPrefetch::TimedOut { .. } => {
                 panic!("hidden reasoning should not wait for the prefetch timeout")
             }
+            StreamContentStartPrefetch::EndedWithoutContent { .. } => {
+                panic!("hidden reasoning should be treated as usable output")
+            }
         }
     }
 
@@ -6903,6 +7154,176 @@ mod tests {
             !non_thinking_probe
                 .should_release_after_stream_activity(STREAM_CONTENT_START_ACTIVITY_READY_BYTES)
         );
+    }
+
+    #[tokio::test]
+    async fn test_stream_content_prefetch_rejects_direct_empty_eof() {
+        let result = prefetch_probe_result_for_chunks(Vec::new(), false).await;
+
+        match result {
+            StreamContentStartPrefetch::EndedWithoutContent {
+                probe_diagnostics,
+                prefetched_bytes,
+                ..
+            } => {
+                assert_eq!(prefetched_bytes, 0);
+                assert_eq!(probe_diagnostics.observed_events, 0);
+                assert_eq!(probe_diagnostics.completion_evidence_events, 0);
+            }
+            StreamContentStartPrefetch::Ready { ready_reason, .. } => {
+                panic!("direct EOF must not be ready: {ready_reason}")
+            }
+            StreamContentStartPrefetch::TimedOut { .. } => {
+                panic!("direct EOF should be classified immediately")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stream_content_prefetch_rejects_context_usage_only_eof() {
+        let frame = event_frame("contextUsageEvent", br#"{"contextUsagePercentage":12.5}"#);
+        let result = prefetch_probe_result_for_chunks(vec![frame], false).await;
+
+        match result {
+            StreamContentStartPrefetch::EndedWithoutContent {
+                probe_diagnostics, ..
+            } => {
+                assert_eq!(probe_diagnostics.observed_events, 1);
+                assert_eq!(probe_diagnostics.non_error_events, 1);
+                assert_eq!(probe_diagnostics.completion_evidence_events, 0);
+                assert!(!probe_diagnostics.is_legal_empty_completion());
+            }
+            StreamContentStartPrefetch::Ready { ready_reason, .. } => {
+                panic!("contextUsage-only EOF must not be ready: {ready_reason}")
+            }
+            StreamContentStartPrefetch::TimedOut { .. } => {
+                panic!("contextUsage-only EOF should be classified immediately")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stream_content_prefetch_accepts_empty_assistant_completion() {
+        let frame = event_frame("assistantResponseEvent", br#"{"content":""}"#);
+        let result = prefetch_probe_result_for_chunks(vec![frame], false).await;
+
+        match result {
+            StreamContentStartPrefetch::Ready {
+                ready_reason,
+                probe_diagnostics,
+                ..
+            } => {
+                assert_eq!(ready_reason, "upstream_stream_ended_with_empty_completion");
+                assert_eq!(probe_diagnostics.assistant_events, 1);
+                assert_eq!(probe_diagnostics.assistant_content_bytes, 0);
+                assert_eq!(probe_diagnostics.completion_evidence_events, 1);
+                assert!(probe_diagnostics.is_legal_empty_completion());
+            }
+            StreamContentStartPrefetch::EndedWithoutContent { .. } => {
+                panic!("empty assistant response is a legal empty completion")
+            }
+            StreamContentStartPrefetch::TimedOut { .. } => {
+                panic!("empty assistant EOF should be classified immediately")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stream_content_prefetch_rejects_metering_only_eof() {
+        let frame = event_frame("meteringEvent", br#"{"unit":"credit","usage":0.0}"#);
+        let result = prefetch_probe_result_for_chunks(vec![frame], false).await;
+
+        match result {
+            StreamContentStartPrefetch::EndedWithoutContent {
+                probe_diagnostics, ..
+            } => {
+                assert_eq!(probe_diagnostics.observed_events, 1);
+                assert_eq!(probe_diagnostics.non_error_events, 1);
+                assert_eq!(probe_diagnostics.completion_evidence_events, 0);
+                assert!(!probe_diagnostics.is_legal_empty_completion());
+            }
+            StreamContentStartPrefetch::Ready { ready_reason, .. } => {
+                panic!("metering-only EOF must not be ready: {ready_reason}")
+            }
+            StreamContentStartPrefetch::TimedOut { .. } => {
+                panic!("metering-only EOF should be classified immediately")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stream_content_prefetch_accepts_normal_text() {
+        let frame = event_frame("assistantResponseEvent", br#"{"content":"hello"}"#);
+        let result = prefetch_probe_result_for_chunks(vec![frame], false).await;
+
+        match result {
+            StreamContentStartPrefetch::Ready {
+                ready_reason,
+                probe_diagnostics,
+                ..
+            } => {
+                assert_eq!(ready_reason, "content_start_observed");
+                assert_eq!(probe_diagnostics.assistant_content_bytes, 5);
+                assert!(probe_diagnostics.has_usable_output());
+            }
+            StreamContentStartPrefetch::EndedWithoutContent { .. } => {
+                panic!("text response should be ready")
+            }
+            StreamContentStartPrefetch::TimedOut { .. } => {
+                panic!("text response should be ready")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_provider_stream_request_rejects_direct_empty_eventstream_eof() {
+        let (provider, server) = provider_for_fake_stream_chunks(Vec::new()).await;
+
+        let result = provider
+            .call_api_stream_with_options(
+                r#"{"conversationState":{"currentMessage":{"userInputMessage":{"modelId":"claude-sonnet-4.5","content":"hello"}}}}"#,
+                RequestOptions {
+                    request_id: Some("test-empty-stream-eof".to_string()),
+                    model_id: Some("claude-sonnet-4.5".to_string()),
+                    wait_for_stream_content_start: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        server.abort();
+        let err = match result {
+            Ok(_) => panic!("empty EventStream EOF should fail before downstream streaming"),
+            Err(err) => err,
+        };
+        assert_upstream_empty_stream_bad_gateway(err);
+    }
+
+    #[tokio::test]
+    async fn test_provider_stream_request_rejects_context_usage_only_eventstream_eof() {
+        let frame = event_frame("contextUsageEvent", br#"{"contextUsagePercentage":12.5}"#);
+        let (provider, server) = provider_for_fake_stream_chunks(vec![frame]).await;
+
+        let result = provider
+            .call_api_stream_with_options(
+                r#"{"conversationState":{"currentMessage":{"userInputMessage":{"modelId":"claude-sonnet-4.5","content":"hello"}}}}"#,
+                RequestOptions {
+                    request_id: Some("test-context-only-stream-eof".to_string()),
+                    model_id: Some("claude-sonnet-4.5".to_string()),
+                    wait_for_stream_content_start: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        server.abort();
+        let err = match result {
+            Ok(_) => {
+                panic!("contextUsage-only EventStream EOF should fail before downstream streaming")
+            }
+            Err(err) => err,
+        };
+        assert_upstream_empty_stream_bad_gateway(err);
     }
 
     #[test]
