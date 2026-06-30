@@ -1116,8 +1116,7 @@ impl StreamContentStartProbe {
                 self.reasoning_text_bytes = self
                     .reasoning_text_bytes
                     .saturating_add(reasoning.text.len());
-                self.thinking_enabled
-                    && (!reasoning.text.is_empty() || reasoning.signature.is_some())
+                !reasoning.text.is_empty() || reasoning.signature.is_some()
             }
             Event::Error { .. } | Event::Exception { .. } => {
                 self.error_events = self.error_events.saturating_add(1);
@@ -6797,7 +6796,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stream_content_start_probe_thinking_accepts_reasoning_content() {
+    fn test_stream_content_start_probe_accepts_reasoning_content() {
         let event = Event::ReasoningContent(
             serde_json::from_str(r#"{"text":"thinking","signature":"sig"}"#).unwrap(),
         );
@@ -6809,10 +6808,81 @@ mod tests {
         assert_eq!(diagnostics.reasoning_text_bytes, 8);
 
         let mut non_thinking_probe = StreamContentStartProbe::new(false);
-        assert!(!non_thinking_probe.observe(&event));
+        assert!(non_thinking_probe.observe(&event));
         let diagnostics = non_thinking_probe.diagnostics();
         assert_eq!(diagnostics.reasoning_events, 1);
         assert_eq!(diagnostics.reasoning_text_bytes, 8);
+    }
+
+    #[test]
+    fn test_stream_content_start_probe_accepts_reasoning_signature_only() {
+        let event =
+            Event::ReasoningContent(serde_json::from_str(r#"{"signature":"sig"}"#).unwrap());
+
+        let mut probe = StreamContentStartProbe::new(false);
+        assert!(probe.observe(&event));
+        let diagnostics = probe.diagnostics();
+        assert_eq!(diagnostics.reasoning_events, 1);
+        assert_eq!(diagnostics.reasoning_text_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn test_stream_content_prefetch_releases_hidden_reasoning_without_thinking() {
+        let event = event_frame("reasoningContentEvent", br#"{"text":"thinking"}"#);
+        let app = Router::new().route(
+            "/stream",
+            get(move || {
+                let event = event.clone();
+                async move {
+                    let body_stream =
+                        stream::once(async move { Ok::<Bytes, Infallible>(Bytes::from(event)) })
+                            .chain(stream::pending::<Result<Bytes, Infallible>>());
+
+                    Response::builder()
+                        .status(200)
+                        .header("content-type", AMAZON_EVENTSTREAM_CONTENT_TYPE)
+                        .body(Body::from_stream(body_stream))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let response = reqwest::get(format!("http://{addr}/stream")).await.unwrap();
+        let trace = test_response_trace(Some(AMAZON_EVENTSTREAM_CONTENT_TYPE));
+        let result = KiroProvider::prefetch_until_stream_content_start(
+            response,
+            &trace,
+            Duration::from_secs(5),
+            false,
+        )
+        .await
+        .unwrap();
+        server.abort();
+
+        match result {
+            StreamContentStartPrefetch::Ready {
+                elapsed,
+                ready_reason,
+                probe_diagnostics,
+                ..
+            } => {
+                assert_eq!(ready_reason, "content_start_observed");
+                assert!(
+                    elapsed < Duration::from_secs(1),
+                    "hidden reasoning should release immediately, elapsed={elapsed:?}"
+                );
+                assert_eq!(probe_diagnostics.reasoning_events, 1);
+                assert_eq!(probe_diagnostics.reasoning_text_bytes, 8);
+            }
+            StreamContentStartPrefetch::TimedOut { .. } => {
+                panic!("hidden reasoning should not wait for the prefetch timeout")
+            }
+        }
     }
 
     #[test]
