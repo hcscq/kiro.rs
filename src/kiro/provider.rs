@@ -78,6 +78,7 @@ const DEFAULT_CAPTURE_400_MAX_PER_CLASS: usize = 3;
 const DEFAULT_CAPTURE_400_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_CAPTURE_400_TTL_HOURS: u64 = 24;
 const DEFAULT_CAPTURE_400_MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+const SEMANTIC_EMPTY_ANTHROPIC_RESPONSE_CLASS: &str = "semantic_empty_anthropic_response";
 
 /// Kiro API Provider
 ///
@@ -171,6 +172,10 @@ impl ResponseUsageRecorder {
             self.api_type,
             token_source,
         );
+    }
+
+    pub(crate) fn credential_id(&self) -> u64 {
+        self.credential_id
     }
 }
 
@@ -1376,6 +1381,23 @@ struct Capture400Request<'a> {
     request_body: &'a str,
 }
 
+#[derive(Debug)]
+pub(crate) struct SemanticEmptyResponseCapture<'a> {
+    pub request_id: Option<&'a str>,
+    pub api_type: &'static str,
+    pub model: &'a str,
+    pub credential_id: Option<u64>,
+    pub stream: bool,
+    pub request_body: &'a str,
+    pub upstream_response_body: &'a [u8],
+    pub decoded_stop_reason: &'a str,
+    pub decoded_content_blocks: usize,
+    pub decoded_input_tokens: i32,
+    pub decoded_output_tokens: i32,
+    pub stats_input_tokens: i32,
+    pub stats_input_token_source: &'static str,
+}
+
 #[derive(Debug, Clone)]
 struct CaptureFilePair {
     meta_path: PathBuf,
@@ -1453,8 +1475,12 @@ fn now_millis() -> u128 {
 }
 
 fn sha256_hex_str(value: &str) -> String {
+    sha256_hex_bytes(value.as_bytes())
+}
+
+fn sha256_hex_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(value.as_bytes());
+    hasher.update(bytes);
     hex::encode(hasher.finalize())
 }
 
@@ -1569,6 +1595,102 @@ fn capture_400_request_body_for_diagnostics_inner(
         request_body_bytes = req.request_body.len(),
         capture_dir = %class_dir.display(),
         "已保存上游 400 请求体诊断样本"
+    );
+
+    Ok(())
+}
+
+pub(crate) fn capture_semantic_empty_response_for_diagnostics(
+    req: SemanticEmptyResponseCapture<'_>,
+) {
+    let config = Capture400BodiesConfig::from_env();
+    if !config.enabled || config.max_per_class == 0 {
+        return;
+    }
+
+    if let Err(err) = capture_semantic_empty_response_for_diagnostics_inner(&config, req) {
+        tracing::warn!(error = %err, "保存语义空响应请求体诊断失败");
+    }
+}
+
+fn capture_semantic_empty_response_for_diagnostics_inner(
+    config: &Capture400BodiesConfig,
+    req: SemanticEmptyResponseCapture<'_>,
+) -> anyhow::Result<()> {
+    let request_id = req.request_id.unwrap_or("unknown");
+    let base_dir = &config.dir;
+    let class_dir = base_dir.join(SEMANTIC_EMPTY_ANTHROPIC_RESPONSE_CLASS);
+    fs::create_dir_all(&class_dir)?;
+    set_private_dir_permissions(base_dir);
+    set_private_dir_permissions(&class_dir);
+
+    let request_hash = sha256_hex_str(req.request_body);
+    let response_hash = sha256_hex_bytes(req.upstream_response_body);
+    let name = format!(
+        "{}-{}-{}",
+        now_millis(),
+        sanitize_capture_component(request_id, 96),
+        &request_hash[..16]
+    );
+    let body_path = class_dir.join(format!("{name}.body.json"));
+    let meta_path = class_dir.join(format!("{name}.meta.json"));
+    let body_saved = req.request_body.len() <= config.max_body_bytes;
+
+    if body_saved {
+        write_private_file(&body_path, req.request_body.as_bytes())?;
+    }
+
+    let metadata = serde_json::json!({
+        "captured_at": chrono::Utc::now().to_rfc3339(),
+        "request_id": request_id,
+        "api_type": req.api_type,
+        "model": req.model,
+        "credential_id": req.credential_id,
+        "stream": req.stream,
+        "status_code": 200,
+        "error_class": SEMANTIC_EMPTY_ANTHROPIC_RESPONSE_CLASS,
+        "error_summary": "Anthropic-compatible non-stream response decoded to empty content",
+        "request_body_bytes": req.request_body.len(),
+        "request_sha256": request_hash,
+        "body_saved": body_saved,
+        "body_file": if body_saved { Some(body_path.file_name().and_then(|name| name.to_str()).unwrap_or_default()) } else { None },
+        "body_omitted_reason": if body_saved { None } else { Some("request body exceeds KIRO_CAPTURE_400_MAX_BODY_BYTES") },
+        "upstream_response_body_bytes": req.upstream_response_body.len(),
+        "upstream_response_sha256": response_hash,
+        "upstream_response_body_excerpt_utf8_lossy": truncate_lossy_bytes_for_log(req.upstream_response_body, 4096),
+        "decoded_stop_reason": req.decoded_stop_reason,
+        "decoded_content_blocks": req.decoded_content_blocks,
+        "decoded_input_tokens": req.decoded_input_tokens,
+        "decoded_output_tokens": req.decoded_output_tokens,
+        "stats_input_tokens": req.stats_input_tokens,
+        "stats_input_token_source": req.stats_input_token_source,
+        "max_body_bytes": config.max_body_bytes,
+        "max_per_class": config.max_per_class,
+        "ttl_seconds": config.ttl.as_secs(),
+        "max_total_bytes": config.max_total_bytes
+    });
+    let metadata_bytes = serde_json::to_vec_pretty(&metadata)?;
+    if let Err(err) = write_private_file(&meta_path, &metadata_bytes) {
+        if body_saved {
+            let _ = fs::remove_file(&body_path);
+        }
+        return Err(err.into());
+    }
+
+    prune_capture_class(&class_dir, config.max_per_class, config.ttl);
+    prune_capture_expired_in_tree(base_dir, config.ttl);
+    prune_capture_total(base_dir, config.max_total_bytes);
+
+    tracing::warn!(
+        request_id,
+        error_class = SEMANTIC_EMPTY_ANTHROPIC_RESPONSE_CLASS,
+        body_saved,
+        request_body_bytes = req.request_body.len(),
+        upstream_response_body_bytes = req.upstream_response_body.len(),
+        decoded_stop_reason = req.decoded_stop_reason,
+        decoded_output_tokens = req.decoded_output_tokens,
+        capture_dir = %class_dir.display(),
+        "已保存语义空响应请求体诊断样本"
     );
 
     Ok(())
@@ -1723,6 +1845,18 @@ fn truncate_log_string(value: &str, limit: usize) -> String {
         end -= 1;
     }
     format!("{}...", &value[..end])
+}
+
+fn truncate_lossy_bytes_for_log(bytes: &[u8], limit: usize) -> String {
+    if limit == 0 || bytes.is_empty() {
+        return String::new();
+    }
+    let end = bytes.len().min(limit);
+    let mut value = String::from_utf8_lossy(&bytes[..end]).into_owned();
+    if bytes.len() > end {
+        value.push_str("...");
+    }
+    value
 }
 
 impl KiroProvider {
@@ -6486,6 +6620,28 @@ mod tests {
         }
     }
 
+    fn semantic_empty_capture_test_request<'a>(
+        request_id: &'a str,
+        request_body: &'a str,
+        upstream_response_body: &'a [u8],
+    ) -> SemanticEmptyResponseCapture<'a> {
+        SemanticEmptyResponseCapture {
+            request_id: Some(request_id),
+            api_type: "非流式",
+            model: "claude-sonnet-4.6",
+            credential_id: Some(919),
+            stream: false,
+            request_body,
+            upstream_response_body,
+            decoded_stop_reason: "end_turn",
+            decoded_content_blocks: 0,
+            decoded_input_tokens: 123,
+            decoded_output_tokens: 1,
+            stats_input_tokens: 123,
+            stats_input_token_source: "billing_input_tokens",
+        }
+    }
+
     #[test]
     fn test_capture_400_error_classifies_common_failures() {
         assert_eq!(
@@ -6544,6 +6700,75 @@ mod tests {
         }
 
         let class_dir = dir.join("request_body_invalid");
+        let pairs = capture_pairs_in_dir(&class_dir);
+        assert_eq!(pairs.len(), 2);
+        for pair in &pairs {
+            assert!(pair.meta_path.exists());
+            assert!(pair.body_path.exists());
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_capture_semantic_empty_response_saves_request_body_and_metadata() {
+        let dir = unique_capture_test_dir("capture-semantic-empty");
+        let config = test_capture_config(dir.clone());
+        let request_body = r#"{"conversationState":{"currentMessage":{"content":"empty?"}}}"#;
+        let upstream_response_body = b"";
+
+        capture_semantic_empty_response_for_diagnostics_inner(
+            &config,
+            semantic_empty_capture_test_request(
+                "semantic-empty-request",
+                request_body,
+                upstream_response_body,
+            ),
+        )
+        .expect("capture should succeed");
+
+        let class_dir = dir.join(SEMANTIC_EMPTY_ANTHROPIC_RESPONSE_CLASS);
+        let pairs = capture_pairs_in_dir(&class_dir);
+        assert_eq!(pairs.len(), 1);
+        assert!(pairs[0].body_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(&pairs[0].body_path).unwrap(),
+            request_body
+        );
+
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&pairs[0].meta_path).unwrap()).unwrap();
+        assert_eq!(
+            metadata["error_class"],
+            SEMANTIC_EMPTY_ANTHROPIC_RESPONSE_CLASS
+        );
+        assert_eq!(metadata["status_code"], 200);
+        assert_eq!(metadata["request_id"], "semantic-empty-request");
+        assert_eq!(metadata["credential_id"], 919);
+        assert_eq!(metadata["decoded_content_blocks"], 0);
+        assert_eq!(metadata["decoded_stop_reason"], "end_turn");
+        assert_eq!(metadata["upstream_response_body_bytes"], 0);
+        assert_eq!(metadata["body_saved"], true);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_capture_semantic_empty_response_prunes_per_class() {
+        let dir = unique_capture_test_dir("capture-semantic-empty-prune");
+        let config = test_capture_config(dir.clone());
+
+        for index in 0..3 {
+            let body = format!(r#"{{"conversationState":{{"index":{index}}}}}"#);
+            capture_semantic_empty_response_for_diagnostics_inner(
+                &config,
+                semantic_empty_capture_test_request(&format!("semantic-empty-{index}"), &body, b""),
+            )
+            .expect("capture should succeed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let class_dir = dir.join(SEMANTIC_EMPTY_ANTHROPIC_RESPONSE_CLASS);
         let pairs = capture_pairs_in_dir(&class_dir);
         assert_eq!(pairs.len(), 2);
         for pair in &pairs {

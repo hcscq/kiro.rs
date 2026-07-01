@@ -48,7 +48,10 @@ use super::types::{
 };
 use super::webfetch;
 use crate::common::auth::ApiKeyAuthContext;
-use crate::kiro::provider::{PublicProviderError, RequestOptions, ResponseUsageRecorder};
+use crate::kiro::provider::{
+    PublicProviderError, RequestOptions, ResponseUsageRecorder, SemanticEmptyResponseCapture,
+    capture_semantic_empty_response_for_diagnostics,
+};
 
 const LARGE_ANTHROPIC_REQUEST_WARN_THRESHOLD_BYTES: usize = 16 * 1024 * 1024;
 const DETAILED_ANTHROPIC_PRE_UPSTREAM_TRACE_THRESHOLD_BYTES: usize = 512 * 1024;
@@ -2242,6 +2245,9 @@ async fn execute_non_stream_request_body(
         Err(e) => return Err(map_provider_error(e)),
     };
     let usage_recorder = response.usage_recorder();
+    let credential_id_for_diagnostics = usage_recorder
+        .as_ref()
+        .map(ResponseUsageRecorder::credential_id);
 
     // 读取响应体
     let body_bytes = match response.bytes().await {
@@ -2270,6 +2276,34 @@ async fn execute_non_stream_request_body(
         tool_name_map,
         prefer_context_input_tokens,
     );
+    if result.is_semantic_empty_anthropic_response() {
+        tracing::warn!(
+            request_id = request_id_for_log.as_deref().unwrap_or(""),
+            model,
+            credential_id = credential_id_for_diagnostics.unwrap_or_default(),
+            request_body_bytes = request_body.len(),
+            upstream_response_body_bytes = body_bytes.len(),
+            decoded_stop_reason = %result.stop_reason,
+            decoded_input_tokens = result.input_tokens,
+            decoded_output_tokens = result.output_tokens,
+            "非流式上游响应解码后 Anthropic content 为空，保存诊断样本"
+        );
+        capture_semantic_empty_response_for_diagnostics(SemanticEmptyResponseCapture {
+            request_id: request_id_for_log.as_deref(),
+            api_type: "非流式",
+            model,
+            credential_id: credential_id_for_diagnostics,
+            stream: false,
+            request_body,
+            upstream_response_body: &body_bytes,
+            decoded_stop_reason: &result.stop_reason,
+            decoded_content_blocks: result.content.len(),
+            decoded_input_tokens: result.input_tokens,
+            decoded_output_tokens: result.output_tokens,
+            stats_input_tokens: result.stats_input_tokens,
+            stats_input_token_source: result.stats_input_token_source,
+        });
+    }
     if let Some(recorder) = usage_recorder {
         recorder.record_complete(
             result.stats_input_tokens,
@@ -2451,6 +2485,12 @@ fn decode_non_stream_message(
         output_tokens,
         stats_input_tokens: input_tokens,
         stats_input_token_source: "billing_input_tokens",
+    }
+}
+
+impl NonStreamMessageResponse {
+    pub(crate) fn is_semantic_empty_anthropic_response(&self) -> bool {
+        self.content.is_empty()
     }
 }
 
@@ -3391,6 +3431,31 @@ mod tests {
         let message_crc = crc32(&frame);
         frame.extend_from_slice(&message_crc.to_be_bytes());
         frame
+    }
+
+    #[test]
+    fn test_decode_non_stream_semantic_empty_response_detects_empty_content() {
+        let body = event_frame("contextUsageEvent", br#"{"contextUsagePercentage":10.0}"#);
+        let response =
+            decode_non_stream_message(&body, "claude-sonnet-4-6", 123, HashMap::new(), false);
+
+        assert!(response.content.is_empty());
+        assert!(response.is_semantic_empty_anthropic_response());
+    }
+
+    #[test]
+    fn test_decode_non_stream_semantic_empty_response_allows_tool_use_only() {
+        let body = event_frame(
+            "toolUseEvent",
+            br#"{"name":"read_file","toolUseId":"toolu_01","input":"{\"path\":\"README.md\"}","stop":true}"#,
+        );
+        let response =
+            decode_non_stream_message(&body, "claude-sonnet-4-6", 123, HashMap::new(), false);
+
+        assert_eq!(response.content.len(), 1);
+        assert_eq!(response.content[0]["type"], "tool_use");
+        assert_eq!(response.stop_reason, "tool_use");
+        assert!(!response.is_semantic_empty_anthropic_response());
     }
 
     #[test]
