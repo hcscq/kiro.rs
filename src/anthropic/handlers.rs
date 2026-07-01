@@ -1118,6 +1118,7 @@ pub async fn post_messages(
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
+    normalize_thinking_for_model(&mut payload);
 
     let thinking_signature_validation_mode = provider.thinking_signature_validation_mode();
     let signature_validation_started_at = Instant::now();
@@ -2455,7 +2456,7 @@ fn decode_non_stream_message(
 
 /// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
 ///
-/// - Opus 4.7/4.8：覆写为 adaptive 类型，并默认显示 summarized thinking
+/// - Opus 4.7/4.8 与 Sonnet 5：覆写为 adaptive 类型，并默认显示 summarized thinking
 /// - 其他模型：覆写为 enabled 类型
 /// - budget_tokens 固定为 20000
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
@@ -2464,9 +2465,9 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         return;
     }
 
-    let is_adaptive_opus = is_adaptive_opus_model(&payload.model);
+    let is_adaptive_model = is_adaptive_thinking_model(&payload.model);
 
-    let thinking_type = if is_adaptive_opus {
+    let thinking_type = if is_adaptive_model {
         "adaptive"
     } else {
         "enabled"
@@ -2480,7 +2481,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
 
     payload.thinking = Some(Thinking {
         thinking_type: thinking_type.to_string(),
-        display: if is_adaptive_opus {
+        display: if is_adaptive_model {
             Some("summarized".to_string())
         } else {
             None
@@ -2488,13 +2489,17 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         budget_tokens: 20000,
     });
 
-    if is_adaptive_opus {
+    if is_adaptive_model {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
             format: None,
             effort_explicit: false,
         });
     }
+}
+
+fn is_adaptive_thinking_model(model: &str) -> bool {
+    is_adaptive_opus_model(model) || is_sonnet_5_model(model)
 }
 
 fn is_adaptive_opus_model(model: &str) -> bool {
@@ -2504,6 +2509,65 @@ fn is_adaptive_opus_model(model: &str) -> bool {
             || model_lower.contains("4.8")
             || model_lower.contains("4-7")
             || model_lower.contains("4.7"))
+}
+
+fn is_sonnet_5_model(model: &str) -> bool {
+    let model_lower = model.to_lowercase();
+    model_lower.contains("sonnet")
+        && (model_lower.contains("sonnet-5")
+            || model_lower.contains("sonnet.5")
+            || model_lower.contains("sonnet_5"))
+}
+
+fn normalize_thinking_for_model(payload: &mut MessagesRequest) {
+    if !is_sonnet_5_model(&payload.model) {
+        return;
+    }
+
+    let Some(thinking) = payload.thinking.as_mut() else {
+        return;
+    };
+
+    if thinking.thinking_type != "enabled" {
+        return;
+    }
+
+    let effort = payload
+        .output_config
+        .as_ref()
+        .filter(|config| config.effort_explicit)
+        .map(|config| config.effort.clone())
+        .unwrap_or_else(|| effort_for_legacy_thinking_budget(thinking.budget_tokens).to_string());
+
+    tracing::info!(
+        model = %payload.model,
+        budget_tokens = thinking.budget_tokens,
+        effort = %effort,
+        "Sonnet 5 does not use legacy thinking budget; normalized enabled thinking to adaptive effort"
+    );
+
+    thinking.thinking_type = "adaptive".to_string();
+    thinking
+        .display
+        .get_or_insert_with(|| "summarized".to_string());
+    payload.output_config = Some(OutputConfig {
+        effort,
+        format: payload
+            .output_config
+            .as_ref()
+            .and_then(|config| config.format.clone()),
+        effort_explicit: true,
+    });
+}
+
+fn effort_for_legacy_thinking_budget(budget_tokens: i32) -> &'static str {
+    if budget_tokens >= 16_000 {
+        "high"
+    } else if budget_tokens >= 4_000 {
+        "medium"
+    } else {
+        "low"
+    }
 }
 
 fn system_contains_thinking_tags(system: Option<&Vec<super::types::SystemMessage>>) -> bool {
@@ -2634,6 +2698,7 @@ pub async fn post_messages_cc(
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
+    normalize_thinking_for_model(&mut payload);
 
     let thinking_signature_validation_mode = provider.thinking_signature_validation_mode();
     let signature_validation_started_at = Instant::now();
@@ -3160,7 +3225,8 @@ mod tests {
     use super::{
         ANTHROPIC_RUNTIME_LEADER_REQUIRED_HEADER, NonStreamMessageResponse,
         coerce_structured_response, conversion_runtime_error_response, decode_non_stream_message,
-        finalize_stream_events, is_adaptive_opus_model, map_provider_error, non_2020_12_schema_uri,
+        finalize_stream_events, is_adaptive_opus_model, is_adaptive_thinking_model,
+        map_provider_error, non_2020_12_schema_uri, normalize_thinking_for_model,
         override_thinking_from_model_name, prepare_stream_events_for_emit,
         request_thinking_enabled, should_synthesize_hidden_thinking_signature_for_request,
         validate_thinking_signature_payload,
@@ -3170,7 +3236,7 @@ mod tests {
     use crate::anthropic::stream::{SseEvent, StreamContext};
     use crate::anthropic::structured_outputs::JsonSchemaOutput;
     use crate::anthropic::thinking_compat::sign_thinking_block;
-    use crate::anthropic::types::{Message, MessagesRequest, Thinking};
+    use crate::anthropic::types::{Message, MessagesRequest, OutputConfig, Thinking};
     use crate::kiro::model::events::{ContextUsageEvent, Event};
     use crate::kiro::parser::crc::crc32;
     use crate::kiro::parser::frame::PRELUDE_SIZE;
@@ -3431,6 +3497,16 @@ mod tests {
     }
 
     #[test]
+    fn test_is_adaptive_thinking_model_accepts_sonnet_5() {
+        assert!(is_adaptive_thinking_model("claude-sonnet-5"));
+        assert!(is_adaptive_thinking_model("claude-sonnet-5-thinking"));
+        assert!(is_adaptive_thinking_model(
+            "us.anthropic.claude-sonnet-5-v1"
+        ));
+        assert!(!is_adaptive_thinking_model("claude-sonnet-4-6"));
+    }
+
+    #[test]
     fn test_override_thinking_from_model_name_uses_adaptive_for_opus_4_8() {
         let mut payload = base_request("claude-opus-4-8-thinking");
 
@@ -3446,6 +3522,105 @@ mod tests {
                 .map(|config| config.effort.as_str()),
             Some("high")
         );
+    }
+
+    #[test]
+    fn test_override_thinking_from_model_name_uses_adaptive_for_sonnet_5() {
+        let mut payload = base_request("claude-sonnet-5-thinking");
+
+        override_thinking_from_model_name(&mut payload);
+
+        let thinking = payload.thinking.expect("thinking should be set");
+        assert_eq!(thinking.thinking_type, "adaptive");
+        assert_eq!(thinking.display.as_deref(), Some("summarized"));
+        assert_eq!(
+            payload
+                .output_config
+                .as_ref()
+                .map(|config| config.effort.as_str()),
+            Some("high")
+        );
+        assert!(
+            payload
+                .output_config
+                .as_ref()
+                .is_some_and(|config| !config.effort_explicit)
+        );
+    }
+
+    #[test]
+    fn test_normalize_thinking_for_model_rewrites_sonnet_5_enabled_budget() {
+        let mut payload = base_request("claude-sonnet-5");
+        payload.thinking = Some(Thinking {
+            thinking_type: "enabled".to_string(),
+            display: None,
+            budget_tokens: 12_000,
+        });
+
+        normalize_thinking_for_model(&mut payload);
+
+        let thinking = payload.thinking.expect("thinking should remain present");
+        assert_eq!(thinking.thinking_type, "adaptive");
+        assert_eq!(thinking.display.as_deref(), Some("summarized"));
+        assert_eq!(
+            payload
+                .output_config
+                .as_ref()
+                .map(|config| config.effort.as_str()),
+            Some("medium")
+        );
+        assert!(
+            payload
+                .output_config
+                .as_ref()
+                .is_some_and(|config| config.effort_explicit)
+        );
+    }
+
+    #[test]
+    fn test_normalize_thinking_for_model_keeps_explicit_sonnet_5_effort() {
+        let mut payload = base_request("claude-sonnet-5");
+        payload.thinking = Some(Thinking {
+            thinking_type: "enabled".to_string(),
+            display: None,
+            budget_tokens: 20_000,
+        });
+        payload.output_config = Some(OutputConfig {
+            effort: "low".to_string(),
+            format: None,
+            effort_explicit: true,
+        });
+
+        normalize_thinking_for_model(&mut payload);
+
+        assert_eq!(
+            payload
+                .output_config
+                .as_ref()
+                .map(|config| config.effort.as_str()),
+            Some("low")
+        );
+    }
+
+    #[test]
+    fn test_normalize_thinking_for_model_leaves_sonnet_5_disabled() {
+        let mut payload = base_request("claude-sonnet-5");
+        payload.thinking = Some(Thinking {
+            thinking_type: "disabled".to_string(),
+            display: None,
+            budget_tokens: 20_000,
+        });
+
+        normalize_thinking_for_model(&mut payload);
+
+        assert_eq!(
+            payload
+                .thinking
+                .as_ref()
+                .map(|thinking| thinking.thinking_type.as_str()),
+            Some("disabled")
+        );
+        assert!(payload.output_config.is_none());
     }
 
     #[test]

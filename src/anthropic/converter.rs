@@ -1242,7 +1242,8 @@ fn build_additional_model_request_fields(
 
 fn model_uses_output_config_effort(model_id: &str) -> bool {
     let model = model_id.to_ascii_lowercase();
-    model.contains("claude-opus-4.8")
+    model.contains("claude-sonnet-5")
+        || model.contains("claude-opus-4.8")
         || model.contains("claude-opus-4-8")
         || model.contains("claude-opus-4.7")
         || model.contains("claude-opus-4-7")
@@ -4831,7 +4832,7 @@ mod tests {
     }
 
     #[test]
-    fn test_adaptive_sonnet_does_not_send_additional_effort_field() {
+    fn test_adaptive_sonnet_4_5_does_not_send_additional_effort_field() {
         use super::super::types::{OutputConfig, Thinking};
 
         let mut req = request_from_messages(vec![super::super::types::Message {
@@ -4851,6 +4852,77 @@ mod tests {
         });
 
         let result = convert_request(&req).expect("adaptive sonnet request should convert");
+
+        assert!(result.additional_model_request_fields.is_none());
+    }
+
+    #[test]
+    fn test_adaptive_sonnet_5_sends_output_config_effort_additional_field() {
+        use super::super::types::{OutputConfig, Thinking};
+        use crate::kiro::model::requests::kiro::KiroRequest;
+
+        let mut req = request_from_messages(vec![super::super::types::Message {
+            role: "user".to_string(),
+            content: serde_json::json!("hello"),
+        }]);
+        req.model = "claude-sonnet-5".to_string();
+        req.thinking = Some(Thinking {
+            thinking_type: "adaptive".to_string(),
+            display: None,
+            budget_tokens: 20_000,
+        });
+        req.output_config = Some(OutputConfig {
+            effort: "medium".to_string(),
+            format: None,
+            effort_explicit: true,
+        });
+
+        let result = convert_request(&req).expect("adaptive sonnet 5 request should convert");
+
+        assert_eq!(
+            result
+                .additional_model_request_fields
+                .as_ref()
+                .and_then(|fields| fields.fields.get("output_config"))
+                .and_then(|value| value.get("effort"))
+                .and_then(|value| value.as_str()),
+            Some("medium")
+        );
+
+        let request = KiroRequest {
+            conversation_state: result.conversation_state,
+            additional_model_request_fields: result.additional_model_request_fields,
+            profile_arn: None,
+        };
+        let json = serde_json::to_value(request).expect("request should serialize");
+
+        assert_eq!(
+            json["additionalModelRequestFields"]["output_config"]["effort"],
+            "medium"
+        );
+    }
+
+    #[test]
+    fn test_adaptive_sonnet_5_without_explicit_effort_omits_additional_field() {
+        use super::super::types::{OutputConfig, Thinking};
+
+        let mut req = request_from_messages(vec![super::super::types::Message {
+            role: "user".to_string(),
+            content: serde_json::json!("hello"),
+        }]);
+        req.model = "claude-sonnet-5".to_string();
+        req.thinking = Some(Thinking {
+            thinking_type: "adaptive".to_string(),
+            display: None,
+            budget_tokens: 20_000,
+        });
+        req.output_config = Some(OutputConfig {
+            effort: "high".to_string(),
+            format: None,
+            effort_explicit: false,
+        });
+
+        let result = convert_request(&req).expect("adaptive sonnet 5 request should convert");
 
         assert!(result.additional_model_request_fields.is_none());
     }
