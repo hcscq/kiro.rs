@@ -7,7 +7,21 @@ pub struct BuiltInModelCatalogItem {
     pub max_tokens: i32,
 }
 
-const BUILT_IN_MODEL_CATALOG: [BuiltInModelCatalogItem; 14] = [
+const BUILT_IN_MODEL_CATALOG: [BuiltInModelCatalogItem; 16] = [
+    BuiltInModelCatalogItem {
+        api_id: "claude-sonnet-5",
+        policy_id: "claude-sonnet-5",
+        display_name: "Claude Sonnet 5",
+        created: 1782864000,
+        max_tokens: 64000,
+    },
+    BuiltInModelCatalogItem {
+        api_id: "claude-sonnet-5-thinking",
+        policy_id: "claude-sonnet-5-thinking",
+        display_name: "Claude Sonnet 5 (Thinking)",
+        created: 1782864000,
+        max_tokens: 64000,
+    },
     BuiltInModelCatalogItem {
         api_id: "claude-opus-4-8",
         policy_id: "claude-opus-4.8",
@@ -110,4 +124,30 @@ const BUILT_IN_MODEL_CATALOG: [BuiltInModelCatalogItem; 14] = [
 
 pub fn built_in_model_catalog() -> &'static [BuiltInModelCatalogItem] {
     &BUILT_IN_MODEL_CATALOG
+}
+
+#[cfg(test)]
+mod tests {
+    use super::built_in_model_catalog;
+
+    #[test]
+    fn built_in_catalog_includes_sonnet_5_variants() {
+        let catalog = built_in_model_catalog();
+
+        let sonnet_5 = catalog
+            .iter()
+            .find(|item| item.api_id == "claude-sonnet-5")
+            .expect("catalog should include claude-sonnet-5");
+        assert_eq!(sonnet_5.policy_id, "claude-sonnet-5");
+        assert_eq!(sonnet_5.display_name, "Claude Sonnet 5");
+        assert_eq!(sonnet_5.max_tokens, 64000);
+
+        let sonnet_5_thinking = catalog
+            .iter()
+            .find(|item| item.api_id == "claude-sonnet-5-thinking")
+            .expect("catalog should include claude-sonnet-5-thinking");
+        assert_eq!(sonnet_5_thinking.policy_id, "claude-sonnet-5-thinking");
+        assert_eq!(sonnet_5_thinking.display_name, "Claude Sonnet 5 (Thinking)");
+        assert_eq!(sonnet_5_thinking.max_tokens, 64000);
+    }
 }

@@ -2361,6 +2361,51 @@ mod tests {
     }
 
     #[test]
+    fn test_available_models_keeps_sonnet_5_when_cached() {
+        let creds = KiroCredentials {
+            available_model_ids: vec!["claude-sonnet-5".to_string()],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            creds
+                .effective_model_id_for_request("claude-sonnet-5-thinking")
+                .as_deref(),
+            Some("claude-sonnet-5")
+        );
+    }
+
+    #[test]
+    fn test_available_models_does_not_downgrade_sonnet_5_to_cached_sonnet_4_6() {
+        let creds = KiroCredentials {
+            available_model_ids: vec!["claude-sonnet-4.6".to_string()],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            creds
+                .effective_model_id_for_request("claude-sonnet-5")
+                .as_deref(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_available_models_does_not_use_sonnet_5_as_opus_fallback() {
+        let creds = KiroCredentials {
+            available_model_ids: vec!["claude-sonnet-5".to_string()],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            creds
+                .effective_model_id_for_request("claude-opus-4.7")
+                .as_deref(),
+            None
+        );
+    }
+
+    #[test]
     fn test_auth_and_api_region_independent() {
         // auth_region 和 api_region 互不影响
         let mut config = Config::default();

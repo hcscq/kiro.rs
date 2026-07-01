@@ -230,6 +230,10 @@ fn normalize_non_negative_finite(value: Option<f64>) -> Option<f64> {
 }
 
 fn normalize_known_model_alias(model: &str) -> String {
+    if model == "claude-sonnet-5" || model.starts_with("claude-sonnet-5-") {
+        return "claude-sonnet-5".to_string();
+    }
+
     model
         .replace("claude-opus-4-8", "claude-opus-4.8")
         .replace("claude-opus-4-7", "claude-opus-4.7")
@@ -265,6 +269,18 @@ mod tests {
         assert_eq!(
             normalize_model_token("claude-opus-4-6-thinking"),
             Some("claude-opus-4.6-thinking".to_string())
+        );
+        assert_eq!(
+            normalize_model_token("claude-sonnet-5-thinking"),
+            Some("claude-sonnet-5-thinking".to_string())
+        );
+        assert_eq!(
+            normalize_model_token("claude-sonnet-5-0-thinking"),
+            Some("claude-sonnet-5-thinking".to_string())
+        );
+        assert_eq!(
+            normalize_model_token("claude-sonnet-5-20260701-thinking"),
+            Some("claude-sonnet-5-thinking".to_string())
         );
     }
 

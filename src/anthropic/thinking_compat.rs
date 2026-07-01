@@ -715,6 +715,8 @@ fn synthetic_signature_model_id(model: &str) -> &'static str {
         "claude-opus-4-8"
     } else if lower.contains("claude-opus-4.7") || lower.contains("claude-opus-4-7") {
         "claude-opus-4-7"
+    } else if lower.contains("claude-sonnet-5") || lower.contains("claude-sonnet.5") {
+        "claude-sonnet-5"
     } else if lower.contains("claude-sonnet-4.6") || lower.contains("claude-sonnet-4-6") {
         "claude-sonnet-4-6"
     } else if lower.contains("claude-sonnet-4.5") || lower.contains("claude-sonnet-4-5") {
@@ -990,6 +992,14 @@ mod tests {
                 if detail.reason == ThinkingSignatureInvalidReason::OrdinalMismatch
                     && detail.signed_ordinal == 0
         ));
+    }
+
+    #[test]
+    fn test_sign_thinking_block_uses_sonnet_5_model_marker() {
+        let signature = sign_thinking_block(0, "hello", "claude-sonnet-5-thinking");
+        let raw = decode_signature(&signature).expect("signature should decode");
+
+        assert_standard_synthetic_signature_markers(&raw, b"claude-sonnet-5");
     }
 
     #[test]

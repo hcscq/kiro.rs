@@ -661,6 +661,7 @@ static PDF_PAGES_COUNT_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 ///
 /// 按照用户要求：
+/// - sonnet 5 → claude-sonnet-5
 /// - sonnet 4.6/4-6 → claude-sonnet-4.6
 /// - 其他 sonnet → claude-sonnet-4.5
 /// - opus 4.5/4-5 → claude-opus-4.5
@@ -672,7 +673,9 @@ pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
 
     if model_lower.contains("sonnet") {
-        if model_lower.contains("4-6") || model_lower.contains("4.6") {
+        if model_lower.contains("sonnet-5") || model_lower.contains("sonnet.5") {
+            Some("claude-sonnet-5".to_string())
+        } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
             Some("claude-sonnet-4.6".to_string())
         } else {
             Some("claude-sonnet-4.5".to_string())
@@ -702,7 +705,8 @@ pub fn map_model(model: &str) -> Option<String> {
 pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
         Some(mapped)
-            if mapped == "claude-sonnet-4.6"
+            if mapped == "claude-sonnet-5"
+                || mapped == "claude-sonnet-4.6"
                 || mapped == "claude-opus-4.6"
                 || mapped == "claude-opus-4.7"
                 || mapped == "claude-opus-4.8" =>
@@ -5434,6 +5438,26 @@ mod tests {
     }
 
     #[test]
+    fn test_map_model_sonnet_5() {
+        assert_eq!(
+            map_model("claude-sonnet-5"),
+            Some("claude-sonnet-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-sonnet-5-thinking"),
+            Some("claude-sonnet-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-sonnet-5-20260701"),
+            Some("claude-sonnet-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-sonnet-4-5-20250929"),
+            Some("claude-sonnet-4.5".to_string())
+        );
+    }
+
+    #[test]
     fn test_map_model_thinking_suffix_opus_4_5() {
         // thinking 后缀不应影响 opus 4.5 模型映射
         let result = map_model("claude-opus-4-5-20251101-thinking");
@@ -5469,6 +5493,15 @@ mod tests {
         assert_eq!(get_context_window_size("claude-opus-4-8"), 1_000_000);
         assert_eq!(
             get_context_window_size("claude-opus-4.8-thinking"),
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn test_get_context_window_size_sonnet_5_is_1m() {
+        assert_eq!(get_context_window_size("claude-sonnet-5"), 1_000_000);
+        assert_eq!(
+            get_context_window_size("claude-sonnet-5-thinking"),
             1_000_000
         );
     }
