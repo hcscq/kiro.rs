@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useState } from 'react'
-import { KeyRound, Plus, Save, Trash2 } from 'lucide-react'
+import { Eye, EyeOff, KeyRound, Plus, RefreshCw, Save, Trash2 } from 'lucide-react'
 import { toast } from 'sonner'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { CredentialGroupPicker } from '@/components/credential-group-picker'
 import { useApiKeysConfig, useSetApiKeysConfig } from '@/hooks/use-credentials'
 import { formatCredentialGroupsInput, normalizeCredentialGroups } from '@/lib/credential-groups'
@@ -12,28 +13,57 @@ import { extractErrorMessage } from '@/lib/utils'
 import type { ApiKeyConfigItem, ApiKeyConfigUpdateItem } from '@/types/api'
 
 interface ApiKeyDraft {
+  draftUid: string
   id: string
   keyMask: string
   key: string
+  keyVisible: boolean
   allowedCredentialGroups: string
   isNew: boolean
 }
 
+let nextDraftUid = 0
+
+function createDraftUid() {
+  nextDraftUid += 1
+  return `api-key-draft-${Date.now()}-${nextDraftUid}`
+}
+
+function generateApiKey() {
+  const cryptoApi = globalThis.crypto
+  if (!cryptoApi?.getRandomValues) {
+    throw new Error('当前浏览器不支持安全随机数生成')
+  }
+
+  const bytes = new Uint8Array(32)
+  cryptoApi.getRandomValues(bytes)
+  let binary = ''
+  bytes.forEach((byte) => {
+    binary += String.fromCharCode(byte)
+  })
+
+  return `kiro_sk_${btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')}`
+}
+
 function toDraft(item: ApiKeyConfigItem): ApiKeyDraft {
   return {
+    draftUid: createDraftUid(),
     id: item.id,
     keyMask: item.keyMask,
     key: '',
+    keyVisible: false,
     allowedCredentialGroups: formatCredentialGroupsInput(item.allowedCredentialGroups),
     isNew: false,
   }
 }
 
-function newDraft(index: number): ApiKeyDraft {
+function newDraft(index: number, key: string): ApiKeyDraft {
   return {
+    draftUid: createDraftUid(),
     id: `api-key-${index}`,
     keyMask: '',
-    key: '',
+    key,
+    keyVisible: Boolean(key),
     allowedCredentialGroups: 'default',
     isNew: true,
   }
@@ -43,12 +73,14 @@ export function ApiKeysSettings() {
   const { data, isLoading } = useApiKeysConfig()
   const { mutate: saveApiKeys, isPending } = useSetApiKeysConfig()
   const [legacyApiKey, setLegacyApiKey] = useState('')
+  const [legacyKeyVisible, setLegacyKeyVisible] = useState(false)
   const [keepLegacy, setKeepLegacy] = useState(false)
   const [drafts, setDrafts] = useState<ApiKeyDraft[]>([])
 
   useEffect(() => {
     setKeepLegacy(Boolean(data?.legacyFullAccessKey))
     setLegacyApiKey('')
+    setLegacyKeyVisible(false)
     setDrafts((data?.keys ?? []).map(toDraft))
   }, [data])
 
@@ -67,11 +99,43 @@ export function ApiKeysSettings() {
     while (existingIds.has(`api-key-${index}`)) {
       index += 1
     }
-    setDrafts((current) => [...current, newDraft(index)])
+    let key = ''
+    try {
+      key = generateApiKey()
+    } catch (error) {
+      toast.error(extractErrorMessage(error))
+    }
+    setDrafts((current) => [...current, newDraft(index, key)])
   }
 
   const removeDraft = (index: number) => {
     setDrafts((current) => current.filter((_, draftIndex) => draftIndex !== index))
+  }
+
+  const generateLegacyApiKey = () => {
+    try {
+      setLegacyApiKey(generateApiKey())
+      setKeepLegacy(true)
+      setLegacyKeyVisible(true)
+    } catch (error) {
+      toast.error(extractErrorMessage(error))
+    }
+  }
+
+  const generateDraftApiKey = (index: number) => {
+    try {
+      updateDraft(index, { key: generateApiKey(), keyVisible: true })
+    } catch (error) {
+      toast.error(extractErrorMessage(error))
+    }
+  }
+
+  const toggleDraftKeyVisible = (index: number) => {
+    setDrafts((current) =>
+      current.map((draft, draftIndex) =>
+        draftIndex === index ? { ...draft, keyVisible: !draft.keyVisible } : draft
+      )
+    )
   }
 
   const handleSave = () => {
@@ -175,14 +239,55 @@ export function ApiKeysSettings() {
                 </span>
               )}
             </div>
-            <Input
-              value={legacyApiKey}
-              onChange={(event) => setLegacyApiKey(event.target.value)}
-              placeholder={keepLegacy ? '留空保留当前 legacy key' : '填写后启用全量访问 key'}
-              disabled={isPending || !keepLegacy}
-              type="password"
-              autoComplete="new-password"
-            />
+            <div className="flex min-w-0 flex-1 gap-2">
+              <div className="relative min-w-0 flex-1">
+                <Input
+                  className="pr-10 font-mono"
+                  value={legacyApiKey}
+                  onChange={(event) => setLegacyApiKey(event.target.value)}
+                  placeholder={keepLegacy ? '留空保留当前 legacy key' : '填写后启用全量访问 key'}
+                  disabled={isPending || !keepLegacy}
+                  type={legacyKeyVisible ? 'text' : 'password'}
+                  autoComplete="new-password"
+                />
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      className="absolute right-1 top-1/2 h-8 w-8 -translate-y-1/2"
+                      onMouseDown={(event) => event.preventDefault()}
+                      onClick={() => setLegacyKeyVisible((value) => !value)}
+                      disabled={isPending || !legacyApiKey}
+                      aria-label={legacyKeyVisible ? '隐藏 legacy API Key' : '显示 legacy API Key'}
+                    >
+                      {legacyKeyVisible ? (
+                        <EyeOff className="h-4 w-4" />
+                      ) : (
+                        <Eye className="h-4 w-4" />
+                      )}
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>{legacyKeyVisible ? '隐藏密钥' : '显示密钥'}</TooltipContent>
+                </Tooltip>
+              </div>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="icon"
+                    onClick={generateLegacyApiKey}
+                    disabled={isPending}
+                    aria-label="生成 legacy API Key"
+                  >
+                    <RefreshCw className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>生成随机密钥</TooltipContent>
+              </Tooltip>
+            </div>
             <Button
               type="button"
               variant={keepLegacy ? 'secondary' : 'outline'}
@@ -197,22 +302,63 @@ export function ApiKeysSettings() {
 
         <div className="space-y-3">
           {drafts.map((draft, index) => (
-            <div key={`${draft.id}-${index}`} className="rounded-md border p-3">
-              <div className="grid gap-3 lg:grid-cols-[minmax(120px,180px)_minmax(180px,1fr)_minmax(260px,1.5fr)_auto] lg:items-start">
+            <div key={draft.draftUid} className="rounded-md border p-3">
+              <div className="grid gap-3 lg:grid-cols-[minmax(120px,180px)_minmax(260px,1.2fr)_minmax(260px,1.5fr)_auto] lg:items-start">
                 <Input
                   value={draft.id}
                   onChange={(event) => updateDraft(index, { id: event.target.value })}
                   placeholder="key-id"
                   disabled={isPending}
                 />
-                <Input
-                  value={draft.key}
-                  onChange={(event) => updateDraft(index, { key: event.target.value })}
-                  placeholder={draft.isNew ? '客户端 API Key' : `留空保留 ${draft.keyMask}`}
-                  disabled={isPending}
-                  type="password"
-                  autoComplete="new-password"
-                />
+                <div className="flex min-w-0 gap-2">
+                  <div className="relative min-w-0 flex-1">
+                    <Input
+                      className="pr-10 font-mono"
+                      value={draft.key}
+                      onChange={(event) => updateDraft(index, { key: event.target.value })}
+                      placeholder={draft.isNew ? '客户端 API Key' : `留空保留 ${draft.keyMask}`}
+                      disabled={isPending}
+                      type={draft.keyVisible ? 'text' : 'password'}
+                      autoComplete="new-password"
+                    />
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          className="absolute right-1 top-1/2 h-8 w-8 -translate-y-1/2"
+                          onMouseDown={(event) => event.preventDefault()}
+                          onClick={() => toggleDraftKeyVisible(index)}
+                          disabled={isPending || !draft.key}
+                          aria-label={draft.keyVisible ? '隐藏 API Key' : '显示 API Key'}
+                        >
+                          {draft.keyVisible ? (
+                            <EyeOff className="h-4 w-4" />
+                          ) : (
+                            <Eye className="h-4 w-4" />
+                          )}
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>{draft.keyVisible ? '隐藏密钥' : '显示密钥'}</TooltipContent>
+                    </Tooltip>
+                  </div>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="icon"
+                        onClick={() => generateDraftApiKey(index)}
+                        disabled={isPending}
+                        aria-label="生成 API Key"
+                      >
+                        <RefreshCw className="h-4 w-4" />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>生成随机密钥</TooltipContent>
+                  </Tooltip>
+                </div>
                 <CredentialGroupPicker
                   value={draft.allowedCredentialGroups}
                   onChange={(value) => updateDraft(index, { allowedCredentialGroups: value })}
