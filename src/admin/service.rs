@@ -4574,28 +4574,9 @@ impl AdminService {
         .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?;
         self.validate_catalog_keeps_existing_references(&groups)?;
 
-        let previous_groups = self.token_manager.credential_group_catalog_snapshot();
         self.token_manager
             .set_credential_group_catalog_config(groups.clone())
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
-
-        if let Some(config_path) = self.token_manager.config().config_path() {
-            let mut config = Config::load(config_path).map_err(|err| {
-                let _ = self
-                    .token_manager
-                    .set_credential_group_catalog_config(previous_groups.clone());
-                AdminServiceError::InternalError(err.to_string())
-            })?;
-            config.credential_groups = groups.clone();
-            if let Err(err) = config.save() {
-                let _ = self
-                    .token_manager
-                    .set_credential_group_catalog_config(previous_groups);
-                return Err(AdminServiceError::InternalError(err.to_string()));
-            }
-        } else {
-            tracing::warn!("配置文件路径未知，凭据分组目录仅通过运行时状态持久化");
-        }
 
         self.get_credential_groups_config()
     }
@@ -5043,6 +5024,15 @@ mod tests {
         dir.join("credentials.json")
     }
 
+    fn temp_config_path(test_name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kiro-admin-service-{test_name}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("config.json")
+    }
+
     fn available_credential() -> KiroCredentials {
         let mut credentials = KiroCredentials::default();
         credentials.id = Some(1);
@@ -5177,6 +5167,44 @@ mod tests {
         assert_eq!(changed.upserts.len(), 1);
         assert_eq!(changed.upserts[0].id, second_id);
         assert_eq!(changed.deleted_ids, vec![999]);
+    }
+
+    #[test]
+    fn set_credential_groups_config_persists_via_state_store() {
+        let config_path = temp_config_path("credential-groups-config");
+        let config = Config::load(&config_path).unwrap();
+        let manager = Arc::new(
+            MultiTokenManager::new(config, vec![available_credential()], None, None, false)
+                .unwrap(),
+        );
+        let service = AdminService::new(manager.clone());
+
+        let response = service
+            .set_credential_groups_config(SetCredentialGroupsConfigRequest {
+                groups: vec![CredentialGroupConfigItem {
+                    name: "stable".to_string(),
+                    display_name: Some("Stable".to_string()),
+                    description: Some("Production pool".to_string()),
+                    enabled: true,
+                }],
+            })
+            .unwrap();
+
+        assert!(response.groups.iter().any(|group| group.name == "default"));
+        assert!(response.groups.iter().any(|group| group.name == "stable"));
+        assert!(
+            manager
+                .credential_group_catalog_snapshot()
+                .iter()
+                .any(|group| group.name == "stable")
+        );
+
+        let persisted = Config::load(&config_path).unwrap();
+        assert!(persisted.credential_groups.iter().any(|group| {
+            group.name == "stable" && group.display_name.as_deref() == Some("Stable")
+        }));
+
+        std::fs::remove_dir_all(config_path.parent().unwrap()).unwrap();
     }
 
     #[test]
