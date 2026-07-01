@@ -207,6 +207,14 @@ export function Dashboard() {
   const { data: modelCapabilitiesData } = useModelCapabilitiesConfig()
   const { data: modelCatalogData } = useModelCatalog()
   const credentials = data?.credentials || []
+  const updateCredentialBalance = (balance: BalanceResponse) => {
+    setBalanceMap(prev => {
+      const next = new Map(prev)
+      next.set(balance.id, balance)
+      return next
+    })
+    queryClient.setQueryData(['credential-balance', balance.id], balance)
+  }
   const currentCredential = credentials.find(credential => credential.id === data?.currentId)
   const selectedCredential = selectedCredentialId === null
     ? null
@@ -487,11 +495,7 @@ export function Dashboard() {
 
     try {
       const balance = await getCredentialBalance(id)
-      setBalanceMap(prev => {
-        const next = new Map(prev)
-        next.set(id, balance)
-        return next
-      })
+      updateCredentialBalance(balance)
     } catch {
       // 弹窗会展示独立查询错误，这里静默跳过卡片回填失败
     } finally {
@@ -713,12 +717,7 @@ export function Dashboard() {
       try {
         const balance = await setCredentialOverageStatus(id, enabled)
         successCount++
-        setBalanceMap(prev => {
-          const next = new Map(prev)
-          next.set(id, balance)
-          return next
-        })
-        queryClient.setQueryData(['credential-balance', id], balance)
+        updateCredentialBalance(balance)
       } catch (error) {
         failCount++
         if (failedLabels.length < 3) {
@@ -896,11 +895,7 @@ export function Dashboard() {
         const balance = await getCredentialBalance(id)
         successCount++
 
-        setBalanceMap(prev => {
-          const next = new Map(prev)
-          next.set(id, balance)
-          return next
-        })
+        updateCredentialBalance(balance)
       } catch (error) {
         failCount++
       } finally {
@@ -973,6 +968,7 @@ export function Dashboard() {
       try {
         const balance = await getCredentialBalance(id)
         successCount++
+        updateCredentialBalance(balance)
 
         // 更新为成功状态
         setVerifyResults(prev => {
@@ -1455,13 +1451,7 @@ export function Dashboard() {
         credentialLabel={selectedCredentialLabel}
         open={balanceDialogOpen}
         onOpenChange={setBalanceDialogOpen}
-        onBalanceUpdated={(balance) => {
-          setBalanceMap(prev => {
-            const next = new Map(prev)
-            next.set(balance.id, balance)
-            return next
-          })
-        }}
+        onBalanceUpdated={updateCredentialBalance}
       />
 
       {/* 添加凭据对话框 */}

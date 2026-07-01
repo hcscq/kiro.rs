@@ -1,3 +1,4 @@
+import { useEffect, useRef } from 'react'
 import {
   Dialog,
   DialogContent,
@@ -30,7 +31,22 @@ export function BalanceDialog({
   onBalanceUpdated,
 }: BalanceDialogProps) {
   const queryClient = useQueryClient()
-  const { data: balance, isLoading, error } = useCredentialBalance(credentialId)
+  const { data: balance, isLoading, error } = useCredentialBalance(
+    credentialId,
+    open
+  )
+  const onBalanceUpdatedRef = useRef(onBalanceUpdated)
+
+  useEffect(() => {
+    onBalanceUpdatedRef.current = onBalanceUpdated
+  }, [onBalanceUpdated])
+
+  useEffect(() => {
+    if (balance) {
+      onBalanceUpdatedRef.current?.(balance)
+    }
+  }, [balance])
+
   const setOverage = useMutation({
     mutationFn: (enabled: boolean) => setCredentialOverageStatus(credentialId!, enabled),
     onSuccess: (updatedBalance) => {
