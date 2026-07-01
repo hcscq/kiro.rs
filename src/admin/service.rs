@@ -4977,6 +4977,21 @@ impl AdminService {
         self.token_manager
             .sync_external_state_if_changed()
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        self.refresh_api_key_registry_from_runtime_config()?;
+        Ok(())
+    }
+
+    fn refresh_api_key_registry_from_runtime_config(&self) -> Result<(), AdminServiceError> {
+        let Some(registry) = &self.api_key_registry else {
+            return Ok(());
+        };
+
+        let (api_key, api_keys) = self.token_manager.api_key_config_snapshot();
+        let entries = self
+            .token_manager
+            .api_key_config_to_auth_entries(api_key, api_keys)
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        registry.replace(entries);
         Ok(())
     }
 
@@ -5397,6 +5412,49 @@ mod tests {
         assert_eq!(persisted.api_keys.len(), 1);
         assert_eq!(persisted.api_keys[0].id.as_deref(), Some("stable"));
         assert_eq!(persisted.api_keys[0].key, "client-stable");
+
+        std::fs::remove_dir_all(config_path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn get_api_keys_config_refreshes_stale_registry_from_runtime_config() {
+        let config_path = temp_config_path("api-keys-refresh-registry");
+        let mut config = Config::load(&config_path).unwrap();
+        config.api_key = Some("legacy-old".to_string());
+        config.save().expect("seed config should be writable");
+        let manager = Arc::new(
+            MultiTokenManager::new(config, vec![available_credential()], None, None, false)
+                .unwrap(),
+        );
+        let initial_entries = manager
+            .api_key_config_to_auth_entries(Some("legacy-old".to_string()), Vec::new())
+            .unwrap();
+        let registry = ApiKeyRegistry::new(initial_entries);
+
+        manager
+            .set_api_key_config(
+                None,
+                vec![ApiKeyConfig {
+                    id: Some("stable".to_string()),
+                    key: "client-stable".to_string(),
+                    allowed_credential_groups: vec![DEFAULT_CREDENTIAL_GROUP.to_string()],
+                }],
+            )
+            .unwrap();
+        assert!(registry.find("client-stable").is_none());
+
+        let service = AdminService::new_with_api_key_registry(
+            manager,
+            Some(registry.clone()),
+            Some("admin-key".to_string()),
+        );
+        let response = service.get_api_keys_config().unwrap();
+
+        assert!(!response.legacy_full_access_key);
+        assert_eq!(response.keys.len(), 1);
+        assert_eq!(response.keys[0].id, "stable");
+        assert!(registry.find("legacy-old").is_none());
+        assert!(registry.find("client-stable").is_some());
 
         std::fs::remove_dir_all(config_path.parent().unwrap()).unwrap();
     }
