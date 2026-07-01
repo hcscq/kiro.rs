@@ -9,7 +9,7 @@ use axum::{
     routing::{get, post},
 };
 
-use crate::common::auth::ApiKeyAuthEntry;
+use crate::common::auth::{ApiKeyAuthEntry, ApiKeyRegistry};
 use crate::kiro::provider::KiroProvider;
 
 use super::{
@@ -89,7 +89,21 @@ pub fn create_router_with_provider_and_api_keys(
     kiro_provider: Option<KiroProvider>,
     conversion_runtime: Arc<ConversionRuntime>,
 ) -> Router {
-    let mut state = AppState::new_with_api_keys(api_keys, thinking_signature_key_material)
+    create_router_with_provider_and_api_key_registry(
+        ApiKeyRegistry::new(api_keys),
+        thinking_signature_key_material,
+        kiro_provider,
+        conversion_runtime,
+    )
+}
+
+pub fn create_router_with_provider_and_api_key_registry(
+    api_keys: ApiKeyRegistry,
+    thinking_signature_key_material: impl AsRef<str>,
+    kiro_provider: Option<KiroProvider>,
+    conversion_runtime: Arc<ConversionRuntime>,
+) -> Router {
+    let mut state = AppState::new_with_api_key_registry(api_keys, thinking_signature_key_material)
         .with_conversion_runtime(conversion_runtime);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);

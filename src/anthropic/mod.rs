@@ -24,13 +24,13 @@
 
 mod body_budget;
 mod conversion_runtime;
-mod converter;
+pub(crate) mod converter;
 mod diagnostics;
 mod extractor;
 mod handlers;
 mod middleware;
 mod multimodal;
-mod probe;
+pub(crate) mod probe;
 mod router;
 mod stream;
 mod structured_outputs;
@@ -40,4 +40,4 @@ mod webfetch;
 mod websearch;
 
 pub(crate) use conversion_runtime::ConversionRuntime;
-pub use router::create_router_with_provider_and_api_keys;
+pub use router::create_router_with_provider_and_api_key_registry;

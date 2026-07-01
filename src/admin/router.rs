@@ -10,16 +10,17 @@ use super::{
         add_credential, cancel_external_idp_login, cancel_idc_device_login,
         clear_credential_runtime_model_restrictions, clear_credential_suspicious_activity,
         delete_credential, force_refresh_token, get_admin_events, get_all_credentials,
-        get_credential_balance, get_credential_groups_config, get_credential_profiles,
-        get_credentials_delta, get_credentials_runtime_delta, get_external_idp_login_status,
-        get_idc_device_login_status, get_load_balancing_mode, get_model_capabilities_config,
-        get_model_catalog, handle_external_idp_callback, probe_external_idp, reset_failure_count,
-        set_credential_disabled, set_credential_groups, set_credential_groups_config,
-        set_credential_max_concurrency, set_credential_model_policy, set_credential_overage_status,
-        set_credential_priority, set_credential_profile, set_credential_proxy,
-        set_credential_rate_limit_config, set_credential_source, set_load_balancing_mode,
-        set_model_capabilities_config, start_external_idp_login, start_idc_device_login,
-        submit_external_idp_callback, submit_external_idp_callback_by_state,
+        get_api_keys_config, get_credential_balance, get_credential_groups_config,
+        get_credential_profiles, get_credentials_delta, get_credentials_runtime_delta,
+        get_external_idp_login_status, get_idc_device_login_status, get_load_balancing_mode,
+        get_model_capabilities_config, get_model_catalog, handle_external_idp_callback,
+        probe_external_idp, reset_failure_count, set_api_keys_config, set_credential_disabled,
+        set_credential_groups, set_credential_groups_config, set_credential_max_concurrency,
+        set_credential_model_policy, set_credential_overage_status, set_credential_priority,
+        set_credential_profile, set_credential_proxy, set_credential_rate_limit_config,
+        set_credential_source, set_load_balancing_mode, set_model_capabilities_config,
+        start_external_idp_login, start_idc_device_login, submit_external_idp_callback,
+        submit_external_idp_callback_by_state,
     },
     middleware::{AdminState, admin_auth_middleware, admin_write_routing_middleware},
 };
@@ -51,6 +52,8 @@ use super::{
 /// - `PUT /config/load-balancing` - 设置负载均衡与等待队列配置
 /// - `GET /config/credential-groups` - 获取凭据分组目录
 /// - `PUT /config/credential-groups` - 设置凭据分组目录
+/// - `GET /config/api-keys` - 获取客户端 API Key 配置
+/// - `PUT /config/api-keys` - 设置客户端 API Key 配置
 /// - `GET /config/model-capabilities` - 获取账号类型模型策略
 /// - `GET /config/model-catalog` - 获取内置模型目录
 /// - `PUT /config/model-capabilities` - 设置账号类型模型策略
@@ -145,6 +148,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/credential-groups",
             get(get_credential_groups_config).put(set_credential_groups_config),
+        )
+        .route(
+            "/config/api-keys",
+            get(get_api_keys_config).put(set_api_keys_config),
         )
         .route(
             "/config/model-capabilities",

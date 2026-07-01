@@ -1476,14 +1476,10 @@ impl Config {
         Ok(())
     }
 
-    fn normalize(&mut self) {
-        normalize_account_type_policies(&mut self.account_type_policies);
-        normalize_account_type_dispatch_policies(&mut self.account_type_dispatch_policies);
-        normalize_account_type_dispatch_policies(&mut self.auth_account_type_dispatch_policies);
-        normalize_nested_account_type_dispatch_policies(
-            &mut self.auth_account_type_account_type_dispatch_policies,
-        );
-        let had_explicit_credential_groups = !self.credential_groups.is_empty();
+    pub fn normalize_api_key_configs(&mut self) {
+        if let Some(api_key) = self.api_key.as_mut() {
+            *api_key = api_key.trim().to_string();
+        }
         for api_key in &mut self.api_keys {
             api_key.id = api_key
                 .id
@@ -1495,6 +1491,21 @@ impl Config {
             api_key.allowed_credential_groups =
                 normalize_credential_groups(&api_key.allowed_credential_groups);
         }
+    }
+
+    pub fn validate_api_key_configs(&self) -> anyhow::Result<()> {
+        self.validate_api_keys()
+    }
+
+    fn normalize(&mut self) {
+        normalize_account_type_policies(&mut self.account_type_policies);
+        normalize_account_type_dispatch_policies(&mut self.account_type_dispatch_policies);
+        normalize_account_type_dispatch_policies(&mut self.auth_account_type_dispatch_policies);
+        normalize_nested_account_type_dispatch_policies(
+            &mut self.auth_account_type_account_type_dispatch_policies,
+        );
+        let had_explicit_credential_groups = !self.credential_groups.is_empty();
+        self.normalize_api_key_configs();
         let mut credential_groups = normalize_credential_group_catalog(&self.credential_groups);
         if !had_explicit_credential_groups {
             let mut known = credential_groups

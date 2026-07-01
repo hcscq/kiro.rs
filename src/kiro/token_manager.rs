@@ -2250,6 +2250,8 @@ pub struct MultiTokenManager {
     is_multiple_format: bool,
     /// 调度配置（负载均衡模式、排队参数）
     dispatch_config: Mutex<DispatchConfig>,
+    /// 客户端 API key 配置。认证热路径使用 ApiKeyRegistry，这里用于 Admin 与持久化。
+    api_key_config: Mutex<(Option<String>, Vec<crate::model::config::ApiKeyConfig>)>,
     /// 凭据分组目录只用于管理写入治理，不参与热路径调度匹配。
     credential_group_catalog: Mutex<Vec<CredentialGroupConfig>>,
     /// 可用性变更通知（并发释放、凭据启用、配置变更等）
@@ -2463,6 +2465,7 @@ impl MultiTokenManager {
         let state_store = StateStore::from_config(&config, credentials_path.clone())?;
         let initial_state_change_revisions = state_store.state_change_revisions()?;
         let dispatch_config = DispatchConfig::from_config(&config);
+        let api_key_config = (config.api_key.clone(), config.api_keys.clone());
         let credential_group_catalog = config.credential_groups.clone();
         let now = Instant::now();
 
@@ -2555,6 +2558,7 @@ impl MultiTokenManager {
             current_id: Mutex::new(initial_id),
             is_multiple_format,
             dispatch_config: Mutex::new(dispatch_config),
+            api_key_config: Mutex::new(api_key_config),
             credential_group_catalog: Mutex::new(credential_group_catalog),
             availability_notify: Arc::new(Notify::new()),
             waiting_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -2595,6 +2599,55 @@ impl MultiTokenManager {
     /// 获取配置的引用
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    pub fn api_key_config_snapshot(
+        &self,
+    ) -> (Option<String>, Vec<crate::model::config::ApiKeyConfig>) {
+        self.api_key_config.lock().clone()
+    }
+
+    pub fn api_key_config_to_auth_entries(
+        &self,
+        api_key: Option<String>,
+        api_keys: Vec<crate::model::config::ApiKeyConfig>,
+    ) -> anyhow::Result<Vec<crate::common::auth::ApiKeyAuthEntry>> {
+        let mut config = self.config.clone();
+        config.api_key = api_key;
+        config.api_keys = api_keys;
+        config.credential_groups = self.credential_group_catalog_snapshot();
+        config.normalize_api_key_configs();
+        config.validate_api_key_configs()?;
+        config.api_key_auth_entries()
+    }
+
+    pub fn set_api_key_config(
+        &self,
+        api_key: Option<String>,
+        api_keys: Vec<crate::model::config::ApiKeyConfig>,
+    ) -> anyhow::Result<Vec<crate::common::auth::ApiKeyAuthEntry>> {
+        let mut config = self.config.clone();
+        config.api_key = api_key;
+        config.api_keys = api_keys;
+        config.credential_groups = self.credential_group_catalog_snapshot();
+        config.normalize_api_key_configs();
+        config.validate_api_key_configs()?;
+        let entries = config.api_key_auth_entries()?;
+        let next = (config.api_key.clone(), config.api_keys.clone());
+        let previous = self.api_key_config_snapshot();
+        if previous == next {
+            return Ok(entries);
+        }
+
+        let _state_write_guard = self.state_write_lock.lock();
+        *self.api_key_config.lock() = next;
+
+        if let Err(err) = self.persist_dispatch_config(&self.dispatch_config()) {
+            *self.api_key_config.lock() = previous;
+            return Err(err);
+        }
+
+        Ok(entries)
     }
 
     pub fn credential_group_catalog_snapshot(&self) -> Vec<CredentialGroupConfig> {
@@ -6785,16 +6838,21 @@ impl MultiTokenManager {
         } else {
             Some(config.credential_groups.clone())
         };
+        let next_api_key_config = (config.api_key.clone(), config.api_keys.clone());
+        let api_key_config_changed = next_api_key_config != self.api_key_config_snapshot();
         let catalog_changed = next_catalog
             .as_ref()
             .is_some_and(|groups| *groups != self.credential_group_catalog_snapshot());
 
-        if previous == next && !catalog_changed {
+        if previous == next && !catalog_changed && !api_key_config_changed {
             return false;
         }
 
         if previous != next {
             *self.dispatch_config.lock() = next.clone();
+        }
+        if api_key_config_changed {
+            *self.api_key_config.lock() = next_api_key_config;
         }
         if let Some(groups) = next_catalog {
             self.set_credential_group_catalog_snapshot(groups);
@@ -10377,6 +10435,9 @@ impl MultiTokenManager {
                 response_thinking_signature_compat_enabled: dispatch
                     .response_thinking_signature_compat_enabled,
                 proxy_pool: dispatch.proxy_pool.clone(),
+                api_key_configured: true,
+                api_key: self.api_key_config_snapshot().0,
+                api_keys: self.api_key_config_snapshot().1,
                 account_type_policies: dispatch.account_type_policies.clone(),
                 account_type_dispatch_policies: dispatch.account_type_dispatch_policies.clone(),
                 auth_account_type_dispatch_policies: dispatch
@@ -13708,6 +13769,9 @@ mod tests {
                 .unwrap();
 
         let persisted = PersistedDispatchConfig {
+            api_key_configured: false,
+            api_key: None,
+            api_keys: Vec::new(),
             mode: "balanced".to_string(),
             session_affinity_enabled: true,
             queue_max_size: 8,

@@ -4,6 +4,8 @@ use axum::{
     body::Body,
     http::{Request, header},
 };
+use parking_lot::RwLock;
+use std::sync::Arc;
 use subtle::ConstantTimeEq;
 
 pub const DEFAULT_CREDENTIAL_GROUP: &str = "default";
@@ -54,6 +56,34 @@ pub struct ApiKeyAuthEntry {
     pub id: String,
     pub key: String,
     pub credential_group_scope: CredentialGroupScope,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ApiKeyRegistry {
+    entries: Arc<RwLock<Vec<ApiKeyAuthEntry>>>,
+}
+
+impl ApiKeyRegistry {
+    pub fn new(entries: Vec<ApiKeyAuthEntry>) -> Self {
+        Self {
+            entries: Arc::new(RwLock::new(entries)),
+        }
+    }
+
+    pub fn replace(&self, entries: Vec<ApiKeyAuthEntry>) {
+        *self.entries.write() = entries;
+    }
+
+    pub fn find(&self, key: &str) -> Option<ApiKeyAuthEntry> {
+        let entries = self.entries.read();
+        let mut matched_entry = None;
+        for entry in entries.iter() {
+            if constant_time_eq(key, &entry.key) {
+                matched_entry = Some(entry.clone());
+            }
+        }
+        matched_entry
+    }
 }
 
 pub fn normalize_credential_group(value: &str) -> Option<String> {

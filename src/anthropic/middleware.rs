@@ -18,7 +18,7 @@ use axum::{
 use futures::TryStreamExt;
 use reqwest::Client;
 
-use crate::common::auth::{self, ApiKeyAuthContext, ApiKeyAuthEntry};
+use crate::common::auth::{self, ApiKeyAuthContext, ApiKeyAuthEntry, ApiKeyRegistry};
 use crate::kiro::provider::KiroProvider;
 
 use super::{
@@ -104,7 +104,7 @@ impl BufferedAnthropicRequest {
 #[derive(Clone)]
 pub struct AppState {
     /// API key 注册表
-    pub api_keys: Arc<Vec<ApiKeyAuthEntry>>,
+    pub api_keys: ApiKeyRegistry,
     /// Kiro Provider（可选，用于实际 API 调用）
     /// 内部使用 MultiTokenManager，已支持线程安全的多凭据管理
     pub kiro_provider: Option<Arc<KiroProvider>>,
@@ -122,16 +122,26 @@ impl AppState {
             key: api_key.clone(),
             credential_group_scope: auth::CredentialGroupScope::all(),
         }];
-        Self::new_with_api_keys(api_keys, api_key)
+        Self::new_with_api_key_registry(ApiKeyRegistry::new(api_keys), api_key)
     }
 
     pub fn new_with_api_keys(
         api_keys: Vec<ApiKeyAuthEntry>,
         thinking_signature_key_material: impl AsRef<str>,
     ) -> Self {
+        Self::new_with_api_key_registry(
+            ApiKeyRegistry::new(api_keys),
+            thinking_signature_key_material,
+        )
+    }
+
+    pub fn new_with_api_key_registry(
+        api_keys: ApiKeyRegistry,
+        thinking_signature_key_material: impl AsRef<str>,
+    ) -> Self {
         init_thinking_signature_key(thinking_signature_key_material.as_ref());
         Self {
-            api_keys: Arc::new(api_keys),
+            api_keys,
             kiro_provider: None,
             conversion_runtime: Arc::new(ConversionRuntime::default()),
             client: Client::builder()
@@ -388,14 +398,7 @@ pub async fn auth_middleware(
 ) -> Response {
     match auth::extract_api_key(&request) {
         Some(key) => {
-            let mut matched_entry = None;
-            for entry in state.api_keys.iter() {
-                if auth::constant_time_eq(&key, &entry.key) {
-                    matched_entry = Some(entry);
-                }
-            }
-
-            if let Some(entry) = matched_entry {
+            if let Some(entry) = state.api_keys.find(&key) {
                 request.extensions_mut().insert(ApiKeyAuthContext {
                     id: entry.id.clone(),
                     credential_group_scope: entry.credential_group_scope.clone(),

@@ -229,6 +229,7 @@ GitHub Actions 镜像构建：
 | `sessionAffinityEnabled` | boolean | `false` | 是否启用会话到凭据的软亲和调度；启用后同一模型+会话优先复用上次成功凭据，凭据不可调度时回退现有策略 |
 | `defaultMaxConcurrency` | number | - | 全局默认单账号并发上限；仅在凭据未单独配置 `maxConcurrency` 时生效，留空或 <= 0 表示不限制 |
 | `accountTypeDispatchPolicies` | object | - | 账号类型默认调度策略；可按 `power` / `pro-plus` 等类型统一覆盖 `maxConcurrency`、`rateLimitBucketCapacity`、`rateLimitRefillPerSecond` |
+| `authAccountTypeDispatchPolicies` | object | - | 认证账号类型默认调度策略；可按 `enterprise` / `social` / `builder-id` / `idc` 统一覆盖调度能力 |
 | `queueMaxSize` | number | `0` | 等待队列最大长度；`0` 表示禁用等待队列 |
 | `queueMaxWaitMs` | number | `0` | 单请求最大排队等待时间（毫秒）；`0` 表示禁用等待队列 |
 | `rateLimitCooldownMs` | number | `2000` | 单账号触发上游 `429` 后的冷却时间（毫秒）；仅在 `rateLimitCooldownEnabled=true` 时生效 |
@@ -388,7 +389,7 @@ GitHub Actions 镜像构建：
 当 `stateBackend` 设为 `postgres` 时，`kiro-rs` 会将以下持久化状态写入 PostgreSQL：
 
 - 凭据列表
-- Admin API 修改后的调度配置（包括 `thinkingSignatureValidationMode`）
+- Admin API 修改后的调度配置（包括 `thinkingSignatureValidationMode`）和客户端 API Key 配置
 - 统计缓存
 
 当同时配置 `stateRedisUrl` 时，以下短生命周期状态会优先写入 Redis：
@@ -400,7 +401,7 @@ GitHub Actions 镜像构建：
 
 启动行为如下：
 
-- 优先从 PostgreSQL 加载调度配置和凭据
+- 优先从 PostgreSQL 加载调度配置、客户端 API Key 配置和凭据
 - 如果 PostgreSQL 中还没有调度配置，会用当前 `config.json` 初始化
 - 如果 PostgreSQL 中还没有凭据，会用本地 `credentials.json` 做一次种子导入
 - 如果配置了 Redis，Admin API 启动时会优先从 Redis 读取余额缓存
@@ -595,6 +596,69 @@ kiro-rs \
 - 自动故障转移到下一个可用凭据
 - 多凭据格式下 Token 刷新后自动回写到源文件
 
+### 上游配额探测
+
+`quota-probe` 用于按凭据类型探测上游真实承载边界，输出 JSONL 观测记录。该命令会读取当前配置和凭据快照，但运行时使用临时 file state，并关闭本地 bucket / Redis 共享调度热态，避免本地限流干扰上游 `429` 观测。
+
+先确认筛选条件：
+
+```bash
+./target/release/kiro-rs \
+  --config config/config.json \
+  --credentials config/credentials.json \
+  quota-probe \
+  --auth-account-type enterprise \
+  --mode ramp-rpm \
+  --rpm 6 \
+  --max-rpm 60 \
+  --rpm-step 6 \
+  --dry-run
+```
+
+小步探测企业凭据 RPM：
+
+```bash
+./target/release/kiro-rs \
+  --config config/config.json \
+  --credentials config/credentials.json \
+  quota-probe \
+  --auth-account-type enterprise \
+  --mode ramp-rpm \
+  --rpm 6 \
+  --max-rpm 60 \
+  --rpm-step 6 \
+  --requests-per-step 10 \
+  --concurrency 1 \
+  --input-tokens 256 \
+  --max-tokens 64 \
+  --stop-on-429 \
+  --output probe-enterprise.jsonl
+```
+
+TPM 探测建议固定较低 RPM，通过 `ramp-tpm` 逐步放大单请求输入 token：
+
+```bash
+./target/release/kiro-rs \
+  --config config/config.json \
+  --credentials config/credentials.json \
+  quota-probe \
+  --auth-account-type social \
+  --mode ramp-tpm \
+  --rpm 6 \
+  --tpm 6000 \
+  --max-tpm 30000 \
+  --tpm-step 6000 \
+  --requests-per-step 5 \
+  --concurrency 1 \
+  --max-tokens 64 \
+  --stop-on-429 \
+  --output probe-social-tpm.jsonl
+```
+
+个人类凭据建议先分别测试 `social` 与 `builder-id`，不要一开始合并成同一档。JSONL 中的 `targetRpm`、`requestedTpm`、`targetTpm`、`statusCode`、`retryAfter`、`latencyMs`、`responseBodyBytes` 可用于找稳定 429 阈值；生产配置建议取稳定阈值的 75%-85%，RPM 可换算为 `rateLimitRefillPerSecond = RPM / 60`，TPM 可换算为 token bucket 容量/回填策略的参考值。
+
+当前环境的一轮低强度实测结果：仅发现 `social/pro-plus` 凭据，`6/12/18/24/30 RPM` 各 10 次请求均为 `200`，未触发上游 `429`；未发现可测试的 `enterprise` 凭据。
+
 ### Region 配置
 
 支持多级 Region 配置，分别控制 Token 刷新和 API 请求使用的区域。
@@ -765,6 +829,10 @@ RUST_LOG=debug ./target/release/kiro-rs
   - `POST /api/admin/credentials/:id/groups` - 设置凭据分组标记
   - `POST /api/admin/credentials/:id/model-policy` - 设置凭据级模型策略
   - `GET /api/admin/credentials/:id/balance` - 获取凭据余额
+  - `GET /api/admin/config/api-keys` - 获取客户端 API Key 配置（仅返回脱敏 Key）
+  - `PUT /api/admin/config/api-keys` - 热更新客户端 API Key 与可用凭据分组
+  - `GET /api/admin/config/credential-groups` - 获取凭据分组目录
+  - `PUT /api/admin/config/credential-groups` - 更新凭据分组目录
   - `GET /api/admin/config/load-balancing` - 获取当前负载均衡、默认并发、限流和 thinking 签名校验配置
   - `PUT /api/admin/config/load-balancing` - 更新负载均衡、默认并发、限流和 thinking 签名校验配置
   - `GET /api/admin/config/model-capabilities` - 获取账号类型模型/调度策略

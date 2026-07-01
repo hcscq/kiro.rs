@@ -16,6 +16,7 @@ import {
   useSetLoadBalancingMode,
 } from '@/hooks/use-credentials'
 import { CredentialGroupsSettings } from '@/components/credential-groups-settings'
+import { ApiKeysSettings } from '@/components/api-keys-settings'
 import { extractErrorMessage } from '@/lib/utils'
 import { Save, AlertCircle, Info, Plus, Trash2 } from 'lucide-react'
 import type {
@@ -1002,6 +1003,7 @@ export function SettingsPage() {
       </div>
 
       <CredentialGroupsSettings />
+      <ApiKeysSettings />
 
       <Card className="border-muted shadow-sm">
         <CardHeader>

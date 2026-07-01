@@ -15,9 +15,10 @@ use serde::{Deserialize, Serialize};
 use crate::admin::types::BalanceResponse;
 use crate::kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use crate::model::config::{
-    Config, CredentialGroupConfig, KiroRequestBodyGuardConfig, NonStreamBodyReadTimeoutConfig,
-    ProxyPoolConfig, RequestWeightingConfig, StateBackendKind, StreamPreSseFailoverConfig,
-    ThinkingSignatureValidationMode, normalize_credential_group_catalog,
+    ApiKeyConfig, Config, CredentialGroupConfig, KiroRequestBodyGuardConfig,
+    NonStreamBodyReadTimeoutConfig, ProxyPoolConfig, RequestWeightingConfig, StateBackendKind,
+    StreamPreSseFailoverConfig, ThinkingSignatureValidationMode,
+    normalize_credential_group_catalog,
 };
 use crate::model::model_policy::{
     AccountTypeDispatchPolicy, ModelSupportPolicy, normalize_account_type_dispatch_policies,
@@ -860,6 +861,12 @@ pub struct DispatchLeaseReservation {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PersistedDispatchConfig {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub api_key_configured: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub api_keys: Vec<ApiKeyConfig>,
     pub mode: String,
     #[serde(default)]
     pub session_affinity_enabled: bool,
@@ -1001,6 +1008,9 @@ impl PersistedDispatchConfig {
             &mut auth_account_type_account_type_dispatch_policies,
         );
         Self {
+            api_key_configured: config.api_key.is_some() || !config.api_keys.is_empty(),
+            api_key: config.api_key.clone(),
+            api_keys: config.api_keys.clone(),
             mode: config.load_balancing_mode.clone(),
             session_affinity_enabled: config.session_affinity_enabled,
             queue_max_size: config.queue_max_size,
@@ -1047,6 +1057,16 @@ impl PersistedDispatchConfig {
     }
 
     pub fn apply_to_config(&self, config: &mut Config) {
+        let has_api_key_fields = self
+            .api_key
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            || !self.api_keys.is_empty();
+        if self.api_key_configured || has_api_key_fields {
+            config.api_key = self.api_key.clone();
+            config.api_keys = self.api_keys.clone();
+            config.normalize_api_key_configs();
+        }
         config.load_balancing_mode = self.mode.clone();
         config.session_affinity_enabled = self.session_affinity_enabled;
         config.queue_max_size = self.queue_max_size;
@@ -3962,6 +3982,9 @@ mod tests {
         let store = StateStore::file(Some(config_path.clone()), None);
 
         let dispatch = PersistedDispatchConfig {
+            api_key_configured: false,
+            api_key: None,
+            api_keys: Vec::new(),
             mode: "balanced".to_string(),
             session_affinity_enabled: true,
             queue_max_size: 16,

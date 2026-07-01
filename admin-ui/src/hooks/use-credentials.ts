@@ -23,6 +23,8 @@ import {
   getModelCatalog,
   setLoadBalancingMode,
   setCredentialGroupsConfig,
+  getApiKeysConfig,
+  setApiKeysConfig,
   getModelCapabilitiesConfig,
   setModelCapabilitiesConfig,
 } from '@/api/credentials'
@@ -35,6 +37,7 @@ import type {
   SetCredentialProxyRequest,
   SetCredentialProfileRequest,
   SetCredentialGroupsConfigRequest,
+  UpdateApiKeyConfigRequest,
   UpdateLoadBalancingConfigRequest,
   UpdateModelCapabilitiesConfigRequest,
 } from '@/types/api'
@@ -332,6 +335,24 @@ export function useSetCredentialGroupsConfig() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentialGroupsConfig'] })
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+export function useApiKeysConfig() {
+  return useQuery({
+    queryKey: ['apiKeysConfig'],
+    queryFn: getApiKeysConfig,
+  })
+}
+
+export function useSetApiKeysConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (payload: UpdateApiKeyConfigRequest) => setApiKeysConfig(payload),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['apiKeysConfig'] })
+      queryClient.invalidateQueries({ queryKey: ['credentialGroupsConfig'] })
     },
   })
 }

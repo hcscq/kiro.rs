@@ -38,6 +38,8 @@ import type {
   UpdateModelCapabilitiesConfigRequest,
   CredentialGroupsConfigResponse,
   SetCredentialGroupsConfigRequest,
+  ApiKeysConfigResponse,
+  UpdateApiKeyConfigRequest,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -458,6 +460,18 @@ export async function setCredentialGroupsConfig(
     '/config/credential-groups',
     payload
   )
+  return data
+}
+
+export async function getApiKeysConfig(): Promise<ApiKeysConfigResponse> {
+  const { data } = await api.get<ApiKeysConfigResponse>('/config/api-keys')
+  return data
+}
+
+export async function setApiKeysConfig(
+  payload: UpdateApiKeyConfigRequest
+): Promise<ApiKeysConfigResponse> {
+  const { data } = await api.put<ApiKeysConfigResponse>('/config/api-keys', payload)
   return data
 }
 

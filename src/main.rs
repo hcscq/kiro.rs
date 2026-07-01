@@ -5,6 +5,7 @@ mod common;
 mod http_client;
 mod kiro;
 mod model;
+mod quota_probe;
 mod state;
 pub mod token;
 
@@ -31,6 +32,7 @@ use axum::{
 };
 use chrono::Utc;
 use clap::Parser;
+use common::auth::ApiKeyRegistry;
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
@@ -977,6 +979,7 @@ async fn shutdown_signal(
     }
     sleep(SHUTDOWN_DRAIN_DELAY).await;
     let _ = shutdown_tx.send(true);
+    tracing::info!("server shutdown signal sent");
 }
 
 #[tokio::main]
@@ -1006,6 +1009,25 @@ async fn main() {
             tracing::error!("导出 file backend 回滚文件失败: {}", err);
             std::process::exit(1);
         });
+        return;
+    }
+
+    if let Some(CliCommand::QuotaProbe(command)) = &args.command {
+        let config_path = args
+            .config
+            .clone()
+            .unwrap_or_else(|| Config::default_config_path().to_string());
+        let credentials_path = args
+            .credentials
+            .clone()
+            .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
+
+        quota_probe::run_quota_probe(&config_path, &credentials_path, command)
+            .await
+            .unwrap_or_else(|err| {
+                tracing::error!("quota probe failed: {}", err);
+                std::process::exit(1);
+            });
         return;
     }
 
@@ -1166,6 +1188,7 @@ async fn main() {
         tracing::error!("{}", err);
         std::process::exit(1);
     });
+    let api_key_registry = ApiKeyRegistry::new(api_key_entries.clone());
     let api_key_log_sample = api_key_entries
         .first()
         .map(|entry| entry.key.clone())
@@ -1246,6 +1269,7 @@ async fn main() {
         );
 
         let token_manager = Arc::clone(&token_manager);
+        let api_key_registry = api_key_registry.clone();
         let mut shutdown = background_tasks.subscribe();
         background_tasks.spawn("external_state_sync", async move {
             let mut ticker = tokio::time::interval(sync_interval);
@@ -1259,6 +1283,16 @@ async fn main() {
                 match token_manager.sync_from_state() {
                     Ok(report) => {
                         if report.dispatch_config_reloaded {
+                            let (api_key, api_keys) = token_manager.api_key_config_snapshot();
+                            match token_manager.api_key_config_to_auth_entries(api_key, api_keys) {
+                                Ok(entries) => {
+                                    api_key_registry.replace(entries);
+                                    tracing::info!("外部状态热同步: 已应用最新 API Key 配置");
+                                }
+                                Err(err) => {
+                                    tracing::error!("外部状态热同步: API Key 配置无效: {}", err);
+                                }
+                            }
                             tracing::info!("外部状态热同步: 已应用最新调度配置");
                         }
                         if report.stats_reloaded {
@@ -1287,8 +1321,8 @@ async fn main() {
         thinking_signature_validation_mode = config.thinking_signature_validation_mode.as_str(),
         "Anthropic thinking signature validation mode configured"
     );
-    let anthropic_app = anthropic::create_router_with_provider_and_api_keys(
-        api_key_entries.clone(),
+    let anthropic_app = anthropic::create_router_with_provider_and_api_key_registry(
+        api_key_registry.clone(),
         &thinking_signature_key_material,
         Some(kiro_provider),
         conversion_runtime.clone(),
@@ -1307,7 +1341,11 @@ async fn main() {
             tracing::warn!("admin_api_key 配置为空，Admin API 未启用");
             anthropic_app
         } else {
-            let admin_service = admin::AdminService::new(token_manager.clone());
+            let admin_service = admin::AdminService::new_with_api_key_registry(
+                token_manager.clone(),
+                Some(api_key_registry.clone()),
+                Some(admin_key.trim().to_string()),
+            );
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             if state_store.is_external() {
                 let sync_interval =
@@ -1495,6 +1533,9 @@ mod tests {
         config.rate_limit_cooldown_ms = 2000;
 
         let dispatch = PersistedDispatchConfig {
+            api_key_configured: false,
+            api_key: None,
+            api_keys: Vec::new(),
             mode: "balanced".into(),
             session_affinity_enabled: true,
             queue_max_size: 16,
@@ -1592,6 +1633,42 @@ mod tests {
             "/v1/messages/count_tokens"
         ));
         assert!(!is_message_request(&Method::GET, "/readyz"));
+    }
+
+    #[test]
+    fn drain_query_defaults_to_hard_and_accepts_soft_mode() {
+        let default_query = DrainQuery {
+            wait_seconds: None,
+            mode: None,
+            soft_seconds: None,
+        };
+        assert_eq!(
+            default_query.mode.unwrap_or(DrainMode::Hard),
+            DrainMode::Hard
+        );
+
+        let soft_query: DrainQuery =
+            serde_json::from_str(r#"{"mode":"soft","softSeconds":10}"#).unwrap();
+        assert_eq!(soft_query.mode, Some(DrainMode::Soft));
+        assert_eq!(soft_query.soft_seconds, Some(10));
+
+        let hard_query: DrainQuery = serde_json::from_str(r#"{"mode":"hard"}"#).unwrap();
+        assert_eq!(hard_query.mode, Some(DrainMode::Hard));
+    }
+
+    #[test]
+    fn request_drain_implies_readiness_drain_but_not_reverse() {
+        let health = RuntimeHealth::default();
+        health.mark_readiness_draining();
+        let state = drain_state(&health);
+        assert!(state.readiness_draining);
+        assert!(!state.request_draining);
+
+        let health = RuntimeHealth::default();
+        health.mark_request_draining();
+        let state = drain_state(&health);
+        assert!(state.readiness_draining);
+        assert!(state.request_draining);
     }
 
     #[test]

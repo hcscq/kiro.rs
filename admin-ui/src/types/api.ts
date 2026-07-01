@@ -318,6 +318,29 @@ export interface SetCredentialGroupsConfigRequest {
   groups: CredentialGroupConfigItem[]
 }
 
+export interface ApiKeyConfigItem {
+  id: string
+  keyMask: string
+  allowedCredentialGroups: string[]
+}
+
+export interface ApiKeysConfigResponse {
+  legacyFullAccessKey: boolean
+  legacyKeyMask?: string | null
+  keys: ApiKeyConfigItem[]
+}
+
+export interface ApiKeyConfigUpdateItem {
+  id?: string
+  key?: string
+  allowedCredentialGroups: string[]
+}
+
+export interface UpdateApiKeyConfigRequest {
+  legacyApiKey?: string | null
+  keys: ApiKeyConfigUpdateItem[]
+}
+
 export type CredentialProxyMode = 'auto' | 'pool' | 'custom' | 'direct' | 'global'
 
 export interface SetCredentialProxyRequest {

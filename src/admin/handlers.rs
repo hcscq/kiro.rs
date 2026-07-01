@@ -23,6 +23,7 @@ use super::{
         SetLoadBalancingModeRequest, SetMaxConcurrencyRequest, SetModelCapabilitiesConfigRequest,
         SetOverageStatusRequest, SetPriorityRequest, StartExternalIdpLoginRequest,
         StartIdcDeviceLoginRequest, SubmitExternalIdpCallbackRequest, SuccessResponse,
+        UpdateApiKeyConfigRequest,
     },
 };
 
@@ -566,6 +567,15 @@ pub async fn get_credential_groups_config(State(state): State<AdminState>) -> im
     }
 }
 
+/// GET /api/admin/config/api-keys
+/// 获取客户端 API Key 配置
+pub async fn get_api_keys_config(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.get_api_keys_config() {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// GET /api/admin/config/model-capabilities
 /// 获取账号类型模型策略配置
 pub async fn get_model_capabilities_config(State(state): State<AdminState>) -> impl IntoResponse {
@@ -600,6 +610,18 @@ pub async fn set_credential_groups_config(
     Json(payload): Json<SetCredentialGroupsConfigRequest>,
 ) -> impl IntoResponse {
     match state.service.set_credential_groups_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// PUT /api/admin/config/api-keys
+/// 设置客户端 API Key 配置
+pub async fn set_api_keys_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<UpdateApiKeyConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_api_keys_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

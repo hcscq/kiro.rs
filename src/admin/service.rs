@@ -18,7 +18,8 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::common::auth::{
-    DEFAULT_CREDENTIAL_GROUP, effective_credential_groups, normalize_credential_groups,
+    ApiKeyRegistry, DEFAULT_CREDENTIAL_GROUP, effective_credential_groups,
+    normalize_credential_groups,
 };
 use crate::common::logging::summarize_upstream_error;
 use crate::http_client::{ProxyConfig, build_client, build_client_no_redirect};
@@ -27,28 +28,28 @@ use crate::kiro::token_manager::{CredentialEntrySnapshot, MultiTokenManager};
 use crate::model::account_type_preset::{
     built_in_account_type_presets, infer_standard_account_type_id_from_subscription,
 };
-use crate::model::config::{Config, CredentialGroupConfig};
+use crate::model::config::{ApiKeyConfig, Config, CredentialGroupConfig};
 use crate::model::model_catalog::built_in_model_catalog;
 use crate::state::{CachedBalanceRecord, RuntimeCoordinationStatus, StateChangeKind};
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, AdminStateEvent, BalanceResponse,
-    CachedBalanceResponse, CredentialGroupConfigItem, CredentialGroupUsageItem,
-    CredentialGroupsConfigResponse, CredentialProfilesResponse, CredentialRuntimeStatusItem,
-    CredentialStatusItem, CredentialsDeltaRequest, CredentialsDeltaResponse,
-    CredentialsRuntimeDeltaRequest, CredentialsRuntimeDeltaResponse, CredentialsStatusResponse,
-    ExternalIdpLoginFlow, ExternalIdpLoginPhase, ExternalIdpLoginStartResponse,
-    ExternalIdpLoginStatus, ExternalIdpLoginStatusResponse, ExternalIdpOidcDiscoverySummary,
-    ExternalIdpProbeRequest, ExternalIdpProbeResponse, ExternalIdpProbeStatus,
-    IdcDeviceLoginStartResponse, IdcDeviceLoginStatus, IdcDeviceLoginStatusResponse,
-    LoadBalancingModeResponse, ModelCapabilitiesConfigResponse, ModelCatalogItemResponse,
-    ModelCatalogResponse, ProxyPoolConfigResponse, ProxyPoolEntryResponse,
-    SetCredentialGroupsConfigRequest, SetCredentialGroupsRequest, SetCredentialModelPolicyRequest,
-    SetCredentialProfileRequest, SetCredentialProxyRequest, SetCredentialSourceRequest,
-    SetLoadBalancingModeRequest, SetModelCapabilitiesConfigRequest,
+    AddCredentialRequest, AddCredentialResponse, AdminStateEvent, ApiKeyConfigItem,
+    ApiKeysConfigResponse, BalanceResponse, CachedBalanceResponse, CredentialGroupConfigItem,
+    CredentialGroupUsageItem, CredentialGroupsConfigResponse, CredentialProfilesResponse,
+    CredentialRuntimeStatusItem, CredentialStatusItem, CredentialsDeltaRequest,
+    CredentialsDeltaResponse, CredentialsRuntimeDeltaRequest, CredentialsRuntimeDeltaResponse,
+    CredentialsStatusResponse, ExternalIdpLoginFlow, ExternalIdpLoginPhase,
+    ExternalIdpLoginStartResponse, ExternalIdpLoginStatus, ExternalIdpLoginStatusResponse,
+    ExternalIdpOidcDiscoverySummary, ExternalIdpProbeRequest, ExternalIdpProbeResponse,
+    ExternalIdpProbeStatus, IdcDeviceLoginStartResponse, IdcDeviceLoginStatus,
+    IdcDeviceLoginStatusResponse, LoadBalancingModeResponse, ModelCapabilitiesConfigResponse,
+    ModelCatalogItemResponse, ModelCatalogResponse, ProxyPoolConfigResponse,
+    ProxyPoolEntryResponse, SetCredentialGroupsConfigRequest, SetCredentialGroupsRequest,
+    SetCredentialModelPolicyRequest, SetCredentialProfileRequest, SetCredentialProxyRequest,
+    SetCredentialSourceRequest, SetLoadBalancingModeRequest, SetModelCapabilitiesConfigRequest,
     StandardAccountTypePresetResponse, StartExternalIdpLoginRequest, StartIdcDeviceLoginRequest,
-    SubmitExternalIdpCallbackRequest,
+    SubmitExternalIdpCallbackRequest, UpdateApiKeyConfigRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -80,6 +81,8 @@ const IDC_GRANT_SCOPES: &[&str] = &[
 /// 封装所有 Admin API 的业务逻辑
 pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
+    api_key_registry: Option<ApiKeyRegistry>,
+    admin_api_key: Option<String>,
     balance_cache: Mutex<HashMap<u64, CachedBalanceRecord>>,
     last_balance_cache_revision: Mutex<u64>,
     events_tx: watch::Sender<AdminStateEvent>,
@@ -887,6 +890,14 @@ pub enum AdminWriteRoute {
 
 impl AdminService {
     pub fn new(token_manager: Arc<MultiTokenManager>) -> Self {
+        Self::new_with_api_key_registry(token_manager, None, None)
+    }
+
+    pub fn new_with_api_key_registry(
+        token_manager: Arc<MultiTokenManager>,
+        api_key_registry: Option<ApiKeyRegistry>,
+        admin_api_key: Option<String>,
+    ) -> Self {
         let state_store = token_manager.state_store();
         let balance_cache = match Self::load_pruned_balance_cache(&state_store) {
             Ok(cache) => cache,
@@ -928,6 +939,8 @@ impl AdminService {
 
         Self {
             token_manager,
+            api_key_registry,
+            admin_api_key,
             balance_cache: Mutex::new(balance_cache),
             last_balance_cache_revision: Mutex::new(balance_cache_revision),
             events_tx,
@@ -1317,7 +1330,8 @@ impl AdminService {
 
     fn scoped_api_key_group_counts(&self) -> BTreeMap<String, usize> {
         let mut counts = BTreeMap::new();
-        for api_key in &self.token_manager.config().api_keys {
+        let (_, api_keys) = self.token_manager.api_key_config_snapshot();
+        for api_key in &api_keys {
             for group in normalize_credential_groups(&api_key.allowed_credential_groups) {
                 *counts.entry(group).or_insert(0) += 1;
             }
@@ -4530,8 +4544,8 @@ impl AdminService {
             .collect::<Vec<_>>();
         let legacy_full_access_key = self
             .token_manager
-            .config()
-            .api_key
+            .api_key_config_snapshot()
+            .0
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty());
 
@@ -4544,6 +4558,138 @@ impl AdminService {
             legacy_full_access_key,
             unknown_credential_groups,
         })
+    }
+
+    fn mask_api_key(value: &str) -> String {
+        let trimmed = value.trim();
+        let char_count = trimmed.chars().count();
+        if char_count <= 8 {
+            return "*".repeat(char_count.max(1));
+        }
+        let prefix: String = trimmed.chars().take(4).collect();
+        let suffix: String = trimmed
+            .chars()
+            .rev()
+            .take(4)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        format!("{prefix}...{suffix}")
+    }
+
+    pub fn get_api_keys_config(&self) -> Result<ApiKeysConfigResponse, AdminServiceError> {
+        self.sync_runtime_state_for_read()?;
+        let (legacy_api_key, api_keys) = self.token_manager.api_key_config_snapshot();
+        let legacy_key_mask = legacy_api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(Self::mask_api_key);
+        let legacy_full_access_key = legacy_key_mask.is_some();
+        let keys = api_keys
+            .into_iter()
+            .enumerate()
+            .map(|(index, api_key)| ApiKeyConfigItem {
+                id: api_key
+                    .id
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| format!("api-key-{}", index + 1)),
+                key_mask: Self::mask_api_key(&api_key.key),
+                allowed_credential_groups: normalize_credential_groups(
+                    &api_key.allowed_credential_groups,
+                ),
+            })
+            .collect();
+
+        Ok(ApiKeysConfigResponse {
+            legacy_full_access_key,
+            legacy_key_mask,
+            keys,
+        })
+    }
+
+    pub fn set_api_keys_config(
+        &self,
+        req: UpdateApiKeyConfigRequest,
+    ) -> Result<ApiKeysConfigResponse, AdminServiceError> {
+        self.ensure_runtime_write_leader()?;
+        let (previous_legacy_api_key, previous_api_keys) =
+            self.token_manager.api_key_config_snapshot();
+        let previous_by_id = previous_api_keys
+            .into_iter()
+            .enumerate()
+            .map(|(index, api_key)| {
+                let id = api_key
+                    .id
+                    .clone()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| format!("api-key-{}", index + 1));
+                (id, api_key.key)
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let legacy_api_key = match req.legacy_api_key {
+            Some(Some(value)) => {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }
+            Some(None) => None,
+            None => previous_legacy_api_key,
+        };
+        if let (Some(admin_api_key), Some(legacy_api_key)) =
+            (self.admin_api_key.as_deref(), legacy_api_key.as_deref())
+        {
+            if crate::common::auth::constant_time_eq(admin_api_key, legacy_api_key) {
+                return Err(AdminServiceError::InvalidCredential(
+                    "客户端 API Key 不能与 Admin API Key 相同".to_string(),
+                ));
+            }
+        }
+
+        let mut api_keys = Vec::new();
+        for (index, item) in req.keys.into_iter().enumerate() {
+            let id = item
+                .id
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| format!("api-key-{}", index + 1));
+            let key = item
+                .key
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .or_else(|| previous_by_id.get(&id).cloned())
+                .ok_or_else(|| {
+                    AdminServiceError::InvalidCredential(format!("apiKeys[{}].key 不能为空", index))
+                })?;
+            if let Some(admin_api_key) = self.admin_api_key.as_deref() {
+                if crate::common::auth::constant_time_eq(admin_api_key, &key) {
+                    return Err(AdminServiceError::InvalidCredential(
+                        "客户端 API Key 不能与 Admin API Key 相同".to_string(),
+                    ));
+                }
+            }
+
+            api_keys.push(ApiKeyConfig {
+                id: Some(id),
+                key,
+                allowed_credential_groups: item.allowed_credential_groups,
+            });
+        }
+
+        let entries = self
+            .token_manager
+            .set_api_key_config(legacy_api_key, api_keys)
+            .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?;
+        if let Some(registry) = &self.api_key_registry {
+            registry.replace(entries);
+        }
+
+        self.get_api_keys_config()
     }
 
     pub fn get_model_catalog(&self) -> ModelCatalogResponse {
@@ -5011,7 +5157,9 @@ mod tests {
     use chrono::Duration;
 
     use crate::admin::types::BalanceResponse;
-    use crate::admin::types::{KnownCredentialFingerprint, KnownCredentialRuntimeFingerprint};
+    use crate::admin::types::{
+        ApiKeyConfigUpdateItem, KnownCredentialFingerprint, KnownCredentialRuntimeFingerprint,
+    };
     use crate::kiro::model::credentials::KiroCredentials;
     use crate::model::config::{Config, ProxyPoolConfig, ProxyPoolEntry};
 
@@ -5203,6 +5351,110 @@ mod tests {
         assert!(persisted.credential_groups.iter().any(|group| {
             group.name == "stable" && group.display_name.as_deref() == Some("Stable")
         }));
+
+        std::fs::remove_dir_all(config_path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn set_api_keys_config_updates_registry_and_persists() {
+        let config_path = temp_config_path("api-keys-config");
+        let mut config = Config::load(&config_path).unwrap();
+        config.api_key = Some("legacy-old".to_string());
+        config.save().expect("seed config should be writable");
+        let manager = Arc::new(
+            MultiTokenManager::new(config, vec![available_credential()], None, None, false)
+                .unwrap(),
+        );
+        let initial_entries = manager
+            .api_key_config_to_auth_entries(Some("legacy-old".to_string()), Vec::new())
+            .unwrap();
+        let registry = ApiKeyRegistry::new(initial_entries);
+        let service = AdminService::new_with_api_key_registry(
+            manager,
+            Some(registry.clone()),
+            Some("admin-key".to_string()),
+        );
+
+        let response = service
+            .set_api_keys_config(UpdateApiKeyConfigRequest {
+                legacy_api_key: Some(None),
+                keys: vec![ApiKeyConfigUpdateItem {
+                    id: Some("stable".to_string()),
+                    key: Some("client-stable".to_string()),
+                    allowed_credential_groups: vec!["default".to_string()],
+                }],
+            })
+            .unwrap();
+
+        assert!(!response.legacy_full_access_key);
+        assert_eq!(response.keys.len(), 1);
+        assert_eq!(response.keys[0].id, "stable");
+        assert!(registry.find("legacy-old").is_none());
+        assert!(registry.find("client-stable").is_some());
+
+        let persisted = Config::load(&config_path).unwrap();
+        assert!(persisted.api_key.is_none());
+        assert_eq!(persisted.api_keys.len(), 1);
+        assert_eq!(persisted.api_keys[0].id.as_deref(), Some("stable"));
+        assert_eq!(persisted.api_keys[0].key, "client-stable");
+
+        std::fs::remove_dir_all(config_path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn set_api_keys_config_omitted_legacy_keeps_existing_key() {
+        let config_path = temp_config_path("api-keys-keep-legacy");
+        let mut config = Config::load(&config_path).unwrap();
+        config.api_key = Some("legacy-current".to_string());
+        config.save().expect("seed config should be writable");
+        let manager = Arc::new(
+            MultiTokenManager::new(config, vec![available_credential()], None, None, false)
+                .unwrap(),
+        );
+        let service = AdminService::new(manager);
+
+        let response = service
+            .set_api_keys_config(UpdateApiKeyConfigRequest {
+                legacy_api_key: None,
+                keys: Vec::new(),
+            })
+            .unwrap();
+
+        assert!(response.legacy_full_access_key);
+        let persisted = Config::load(&config_path).unwrap();
+        assert_eq!(persisted.api_key.as_deref(), Some("legacy-current"));
+
+        std::fs::remove_dir_all(config_path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn set_api_keys_config_rejects_clearing_all_client_keys() {
+        let config_path = temp_config_path("api-keys-clear-all");
+        let mut config = Config::load(&config_path).unwrap();
+        config.api_key = Some("legacy-current".to_string());
+        config.api_keys = vec![ApiKeyConfig {
+            id: Some("stable".to_string()),
+            key: "client-stable".to_string(),
+            allowed_credential_groups: vec![DEFAULT_CREDENTIAL_GROUP.to_string()],
+        }];
+        config.save().expect("seed config should be writable");
+        let manager = Arc::new(
+            MultiTokenManager::new(config, vec![available_credential()], None, None, false)
+                .unwrap(),
+        );
+        let service = AdminService::new(manager);
+
+        let error = service
+            .set_api_keys_config(UpdateApiKeyConfigRequest {
+                legacy_api_key: Some(None),
+                keys: Vec::new(),
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("未设置 apiKey 或 apiKeys"));
+        let persisted = Config::load(&config_path).unwrap();
+        assert_eq!(persisted.api_key.as_deref(), Some("legacy-current"));
+        assert_eq!(persisted.api_keys.len(), 1);
 
         std::fs::remove_dir_all(config_path.parent().unwrap()).unwrap();
     }

@@ -115,6 +115,30 @@ pub struct ResponseUsageRecorder {
     model: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ProbeCredentialSelector {
+    pub credential_id: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProbeResponse {
+    pub credential_id: u64,
+    pub auth_account_type: Option<String>,
+    pub account_type: Option<String>,
+    pub resolved_account_type: Option<String>,
+    pub model: Option<String>,
+    pub effective_model: Option<String>,
+    pub region: String,
+    pub status_code: Option<u16>,
+    pub retry_after: Option<String>,
+    pub content_type: Option<String>,
+    pub body: Bytes,
+    pub error: Option<String>,
+    pub latency_ms: u128,
+    pub request_body_bytes: usize,
+    pub response_body_bytes: usize,
+}
+
 impl ResponseUsageRecorder {
     fn new(
         token_manager: Arc<MultiTokenManager>,
@@ -1734,6 +1758,283 @@ impl KiroProvider {
 
     pub fn server_web_tools_mode(&self) -> ServerWebToolsMode {
         self.token_manager.config().server_web_tools_mode
+    }
+
+    pub(crate) async fn call_api_probe_once(
+        &self,
+        request_body: &str,
+        selector: ProbeCredentialSelector,
+        timeout_duration: Duration,
+        omit_agent_mode_header: bool,
+    ) -> ProbeResponse {
+        let started_at = Instant::now();
+        let mut excluded = HashSet::new();
+        let total = self.token_manager.total_count();
+        for entry in self.token_manager.snapshot().entries {
+            if entry.id != selector.credential_id {
+                excluded.insert(entry.id);
+            }
+        }
+        if total == 0 {
+            return ProbeResponse {
+                credential_id: selector.credential_id,
+                auth_account_type: None,
+                account_type: None,
+                resolved_account_type: None,
+                model: Self::extract_model_from_request(request_body),
+                effective_model: None,
+                region: String::new(),
+                status_code: None,
+                retry_after: None,
+                content_type: None,
+                body: Bytes::new(),
+                error: Some("no credentials loaded".to_string()),
+                latency_ms: started_at.elapsed().as_millis(),
+                request_body_bytes: request_body.len(),
+                response_body_bytes: 0,
+            };
+        }
+
+        let requested_model = Self::extract_model_from_request(request_body);
+        let ctx = match self
+            .token_manager
+            .acquire_context_with_weight_excluding(requested_model.as_deref(), 1.0, &excluded)
+            .await
+        {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                return ProbeResponse {
+                    credential_id: selector.credential_id,
+                    auth_account_type: None,
+                    account_type: None,
+                    resolved_account_type: None,
+                    model: requested_model,
+                    effective_model: None,
+                    region: String::new(),
+                    status_code: None,
+                    retry_after: None,
+                    content_type: None,
+                    body: Bytes::new(),
+                    error: Some(format!("failed to acquire selected credential: {err}")),
+                    latency_ms: started_at.elapsed().as_millis(),
+                    request_body_bytes: request_body.len(),
+                    response_body_bytes: 0,
+                };
+            }
+        };
+
+        let (ctx_id, credentials, token, lease) = ctx.into_parts();
+        let config = self.token_manager.config();
+        let region = credentials.effective_api_region(config).to_string();
+        let auth_account_type = credentials.detected_auth_account_type();
+        let account_type = credentials.account_type.clone();
+        let resolved_account_type = credentials.resolved_account_type();
+        let effective_model = requested_model.as_deref().and_then(|model| {
+            credentials
+                .effective_model_id_for_request(model)
+                .map(|model_id| model_id.to_string())
+        });
+        let machine_id = match machine_id::generate_from_credentials(&credentials, config) {
+            Some(machine_id) => machine_id,
+            None => {
+                drop(lease);
+                return ProbeResponse {
+                    credential_id: ctx_id,
+                    auth_account_type,
+                    account_type,
+                    resolved_account_type,
+                    model: requested_model,
+                    effective_model,
+                    region,
+                    status_code: None,
+                    retry_after: None,
+                    content_type: None,
+                    body: Bytes::new(),
+                    error: Some("failed to generate machine_id".to_string()),
+                    latency_ms: started_at.elapsed().as_millis(),
+                    request_body_bytes: request_body.len(),
+                    response_body_bytes: 0,
+                };
+            }
+        };
+
+        let effective_profile_arn = credentials
+            .effective_profile_arn_for_kiro_requests()
+            .map(str::to_string);
+        let strip_profile_arn =
+            credentials.detected_auth_account_type().as_deref() == Some("enterprise");
+        let model_rewrite = match (requested_model.as_deref(), effective_model.as_deref()) {
+            (Some(requested), Some(effective)) if requested != effective => {
+                Some(effective.to_string())
+            }
+            _ => None,
+        };
+        let mut original_request_body = None;
+        let body = Self::request_body_for_profile_arn_and_model(
+            request_body,
+            &mut original_request_body,
+            &effective_profile_arn,
+            &model_rewrite,
+            strip_profile_arn,
+        );
+        let request_body_bytes = body.len();
+        let url = self.base_url_for(&credentials);
+        let x_amz_user_agent = format!(
+            "aws-sdk-js/1.0.34 KiroIDE-{}-{}",
+            config.kiro_version, machine_id
+        );
+        let user_agent = format!(
+            "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
+            config.system_version, config.node_version, config.kiro_version, machine_id
+        );
+
+        let mut request = match self.client_for(&credentials) {
+            Ok(client) => client
+                .post(&url)
+                .body(body)
+                .header("content-type", "application/json")
+                .header("x-amzn-codewhisperer-optout", "true")
+                .header("x-amz-user-agent", &x_amz_user_agent)
+                .header("user-agent", &user_agent)
+                .header("host", &self.base_domain_for(&credentials))
+                .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
+                .header("amz-sdk-request", "attempt=1; max=1")
+                .header("Authorization", format!("Bearer {}", token)),
+            Err(err) => {
+                drop(lease);
+                return ProbeResponse {
+                    credential_id: ctx_id,
+                    auth_account_type,
+                    account_type,
+                    resolved_account_type,
+                    model: requested_model,
+                    effective_model,
+                    region,
+                    status_code: None,
+                    retry_after: None,
+                    content_type: None,
+                    body: Bytes::new(),
+                    error: Some(format!("failed to build HTTP client: {err}")),
+                    latency_ms: started_at.elapsed().as_millis(),
+                    request_body_bytes,
+                    response_body_bytes: 0,
+                };
+            }
+        };
+        if !omit_agent_mode_header {
+            request = request.header("x-amzn-kiro-agent-mode", "vibe");
+        }
+        request = Self::external_idp_token_type_header(request, &credentials);
+
+        let send_result = timeout(timeout_duration, request.send()).await;
+        let response = match send_result {
+            Ok(Ok(response)) => response,
+            Ok(Err(err)) => {
+                drop(lease);
+                return ProbeResponse {
+                    credential_id: ctx_id,
+                    auth_account_type,
+                    account_type,
+                    resolved_account_type,
+                    model: requested_model,
+                    effective_model,
+                    region,
+                    status_code: err.status().map(|status| status.as_u16()),
+                    retry_after: None,
+                    content_type: None,
+                    body: Bytes::new(),
+                    error: Some(err.to_string()),
+                    latency_ms: started_at.elapsed().as_millis(),
+                    request_body_bytes,
+                    response_body_bytes: 0,
+                };
+            }
+            Err(_) => {
+                drop(lease);
+                return ProbeResponse {
+                    credential_id: ctx_id,
+                    auth_account_type,
+                    account_type,
+                    resolved_account_type,
+                    model: requested_model,
+                    effective_model,
+                    region,
+                    status_code: None,
+                    retry_after: None,
+                    content_type: None,
+                    body: Bytes::new(),
+                    error: Some(format!(
+                        "request timed out after {}s",
+                        timeout_duration.as_secs()
+                    )),
+                    latency_ms: started_at.elapsed().as_millis(),
+                    request_body_bytes,
+                    response_body_bytes: 0,
+                };
+            }
+        };
+
+        let status_code = response.status().as_u16();
+        let retry_after = response_header_for_log(response.headers(), "retry-after");
+        let content_type = response_header_for_log(response.headers(), "content-type");
+        let body_result = timeout(timeout_duration, response.bytes()).await;
+        drop(lease);
+        match body_result {
+            Ok(Ok(body)) => ProbeResponse {
+                credential_id: ctx_id,
+                auth_account_type,
+                account_type,
+                resolved_account_type,
+                model: requested_model,
+                effective_model,
+                region,
+                status_code: Some(status_code),
+                retry_after,
+                content_type,
+                response_body_bytes: body.len(),
+                body,
+                error: None,
+                latency_ms: started_at.elapsed().as_millis(),
+                request_body_bytes,
+            },
+            Ok(Err(err)) => ProbeResponse {
+                credential_id: ctx_id,
+                auth_account_type,
+                account_type,
+                resolved_account_type,
+                model: requested_model,
+                effective_model,
+                region,
+                status_code: Some(status_code),
+                retry_after,
+                content_type,
+                body: Bytes::new(),
+                error: Some(format!("failed to read response body: {err}")),
+                latency_ms: started_at.elapsed().as_millis(),
+                request_body_bytes,
+                response_body_bytes: 0,
+            },
+            Err(_) => ProbeResponse {
+                credential_id: ctx_id,
+                auth_account_type,
+                account_type,
+                resolved_account_type,
+                model: requested_model,
+                effective_model,
+                region,
+                status_code: Some(status_code),
+                retry_after,
+                content_type,
+                body: Bytes::new(),
+                error: Some(format!(
+                    "response body read timed out after {}s",
+                    timeout_duration.as_secs()
+                )),
+                latency_ms: started_at.elapsed().as_millis(),
+                request_body_bytes,
+                response_body_bytes: 0,
+            },
+        }
     }
 
     pub fn supports_model(&self, model: &str) -> bool {

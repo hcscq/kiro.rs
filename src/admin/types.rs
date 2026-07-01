@@ -618,6 +618,43 @@ pub struct SetCredentialGroupsConfigRequest {
     pub groups: Vec<CredentialGroupConfigItem>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiKeyConfigItem {
+    pub id: String,
+    pub key_mask: String,
+    pub allowed_credential_groups: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiKeysConfigResponse {
+    pub legacy_full_access_key: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legacy_key_mask: Option<String>,
+    pub keys: Vec<ApiKeyConfigItem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiKeyConfigUpdateItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub allowed_credential_groups: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateApiKeyConfigRequest {
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub legacy_api_key: Option<Option<String>>,
+    #[serde(default)]
+    pub keys: Vec<ApiKeyConfigUpdateItem>,
+}
+
 /// 设置凭据超额使用开关请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
