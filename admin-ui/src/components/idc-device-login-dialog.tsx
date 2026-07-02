@@ -89,6 +89,7 @@ const DEFAULT_IDC_AUTH_REGIONS = [
   'ap-northeast-1',
   'ap-southeast-1',
 ]
+const BUILDER_ID_AUTH_REGION = 'us-east-1'
 const BUILDER_ID_START_URL = 'https://view.awsapps.com/start'
 
 function uniqueValues(values: string[]): string[] {
@@ -418,7 +419,7 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
   const [mode, setMode] = useState<LoginMode>('idc')
   const [provider, setProvider] = useState<LoginProvider>('BuilderId')
   const [startUrl, setStartUrl] = useState('')
-  const [region, setRegion] = useState(initialDefaults.authRegion)
+  const [region, setRegion] = useState(BUILDER_ID_AUTH_REGION)
   const [apiRegion, setApiRegion] = useState(initialDefaults.apiRegion)
   const [profileArn, setProfileArn] = useState(initialDefaults.profileArn)
   const [priority, setPriority] = useState(initialDefaults.priority)
@@ -472,7 +473,7 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
     setMode('idc')
     setProvider('BuilderId')
     setStartUrl('')
-    setRegion(defaults.authRegion)
+    setRegion(BUILDER_ID_AUTH_REGION)
     setApiRegion(defaults.apiRegion)
     setProfileArn(defaults.profileArn)
     setPriority(defaults.priority)
@@ -555,7 +556,10 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
     }
   }
 
-  const buildCredentialOptionsPayload = (label = '登录'):
+  const buildCredentialOptionsPayload = (
+    label = '登录',
+    fixedAuthRegion?: string
+  ):
     | Partial<StartIdcDeviceLoginRequest & StartExternalIdpLoginRequest>
     | null => {
     const parsedPriority = priority.trim() ? Number.parseInt(priority, 10) : 0
@@ -579,6 +583,9 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
     if (!proxyPayload) return null
     const normalizedCredentialGroups = normalizeCredentialGroups(credentialGroups)
 
+    const savedAuthRegion = fixedAuthRegion ? readCredentialDefaultsDraft().authRegion : region.trim()
+    const effectiveAuthRegion = fixedAuthRegion ?? savedAuthRegion
+
     persistCredentialDefaultsDraft({
       priority: String(parsedPriority),
       maxConcurrency: maxConcurrency.trim(),
@@ -587,7 +594,7 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
       sourceBatch: sourceBatch.trim(),
       credentialGroups: credentialGroups.trim(),
       accountType: accountType.trim(),
-      authRegion: region.trim(),
+      authRegion: savedAuthRegion,
       apiRegion: apiRegion.trim(),
       profileArn: profileArn.trim(),
       machineId: machineId.trim(),
@@ -598,7 +605,7 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
     })
 
     return {
-      authRegion: region.trim() || undefined,
+      authRegion: effectiveAuthRegion || undefined,
       apiRegion: apiRegion.trim() || undefined,
       profileArn: profileArn.trim() || undefined,
       priority: parsedPriority,
@@ -659,7 +666,10 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
       return
     }
 
-    const credentialOptions = buildCredentialOptionsPayload('IdC 登录')
+    const credentialOptions = buildCredentialOptionsPayload(
+      'IdC 登录',
+      provider === 'BuilderId' ? BUILDER_ID_AUTH_REGION : undefined
+    )
     if (!credentialOptions) return
 
     const payload: StartIdcDeviceLoginRequest = {
@@ -687,8 +697,8 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
     const workEmail = externalWorkEmail.trim()
     const domainName = externalDomainName.trim()
     const issuerUrl = externalIssuerUrl.trim()
-    if (!workEmail && !domainName && !issuerUrl) {
-      toast.error('需要填写工作邮箱、域名或 Issuer URL')
+    if (!domainName && !issuerUrl && !workEmail.includes('@')) {
+      toast.error('探测需要组织域名、邮箱型账号或 Issuer URL')
       return
     }
 
@@ -740,7 +750,7 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
     const scopes = externalScopes.trim()
 
     if (!workEmail && !domainName && !issuerUrl) {
-      toast.error('需要填写工作邮箱、域名或 Issuer URL')
+      toast.error('需要填写账号、域名或 Issuer URL')
       return
     }
 
@@ -939,6 +949,15 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
     externalSession.phase === 'idp-authorization'
   const authRegionOptions = uniqueValues([...recentAuthRegions, ...DEFAULT_IDC_AUTH_REGIONS])
 
+  const handleProviderChange = (nextProvider: LoginProvider) => {
+    setProvider(nextProvider)
+    if (nextProvider === 'BuilderId') {
+      setRegion(BUILDER_ID_AUTH_REGION)
+      return
+    }
+    setRegion(readCredentialDefaultsDraft().authRegion)
+  }
+
   const resetSessionForNextLogin = () => {
     const nextMode = sessionMode
     setSession(null)
@@ -956,7 +975,11 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
     }
   }
 
-  const renderCredentialOptions = (disabled: boolean, idPrefix: string) => (
+  const renderCredentialOptions = (
+    disabled: boolean,
+    idPrefix: string,
+    fixedAuthRegion?: string
+  ) => (
     <div className="space-y-3 rounded-md border p-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2 text-sm font-medium">
@@ -1087,10 +1110,10 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
               <Input
                 id={`${idPrefix}-auth-region`}
                 list="idc-auth-region-options"
-                value={region}
+                value={fixedAuthRegion ?? region}
                 onChange={(event) => setRegion(event.target.value)}
                 placeholder="us-east-1"
-                disabled={disabled}
+                disabled={disabled || Boolean(fixedAuthRegion)}
               />
             </div>
             <div className="space-y-1.5">
@@ -1262,7 +1285,7 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
                     <button
                       key={item}
                       type="button"
-                      onClick={() => setProvider(item)}
+                      onClick={() => handleProviderChange(item)}
                       disabled={starting}
                       className={cn(
                         'h-10 rounded-md border text-sm font-medium transition-colors',
@@ -1297,7 +1320,11 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
                   </div>
                 )}
 
-                {renderCredentialOptions(starting, 'idc')}
+                {renderCredentialOptions(
+                  starting,
+                  'idc',
+                  provider === 'BuilderId' ? BUILDER_ID_AUTH_REGION : undefined
+                )}
 
                 <DialogFooter>
                   <Button
@@ -1323,19 +1350,19 @@ export function IdcDeviceLoginDialog({ open, onOpenChange }: IdcDeviceLoginDialo
                 <div className="grid gap-3 sm:grid-cols-2">
                   <div className="space-y-1.5">
                     <label htmlFor="external-work-email" className="text-sm font-medium">
-                      工作邮箱
+                      账号
                     </label>
                     <Input
                       id="external-work-email"
                       value={externalWorkEmail}
                       onChange={(event) => setExternalWorkEmail(event.target.value)}
-                      placeholder="name@example.com"
+                      placeholder="邮箱或组织账号"
                       disabled={externalProbing}
                     />
                   </div>
                   <div className="space-y-1.5">
                     <label htmlFor="external-domain" className="text-sm font-medium">
-                      域名
+                      组织域名
                     </label>
                     <Input
                       id="external-domain"

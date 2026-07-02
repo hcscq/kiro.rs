@@ -972,11 +972,11 @@ pub struct IdcDeviceLoginStatusResponse {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalIdpProbeRequest {
-    /// 工作邮箱；后端会提取 @ 后的域名做 Kiro 组织发现
+    /// 账号或工作邮箱；邮箱型账号可用于 Kiro 组织发现，其他值只作为 login_hint
     #[serde(default)]
     pub work_email: Option<String>,
 
-    /// 直接指定组织域名；优先级低于 workEmail
+    /// 直接指定组织域名；优先级高于 workEmail 派生域名
     #[serde(default)]
     pub domain_name: Option<String>,
 
@@ -1089,7 +1089,7 @@ pub struct ExternalIdpProbeResponse {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartExternalIdpLoginRequest {
-    /// 工作邮箱；手动 issuer/client/scopes 不完整时会走 Kiro portal 组织发现
+    /// 账号或工作邮箱；邮箱型账号可用于 Kiro 组织发现，其他值只作为 login_hint
     #[serde(default)]
     pub work_email: Option<String>,
 
@@ -1113,7 +1113,7 @@ pub struct StartExternalIdpLoginRequest {
     #[serde(default)]
     pub audience: Option<String>,
 
-    /// 可选 login_hint；留空时使用 workEmail
+    /// 可选 login_hint；留空时使用账号/workEmail
     #[serde(default)]
     pub login_hint: Option<String>,
 

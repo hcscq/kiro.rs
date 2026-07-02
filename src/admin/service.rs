@@ -57,6 +57,7 @@ const BALANCE_CACHE_TTL_SECS: i64 = 300;
 const IDC_DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 const IDC_REFRESH_GRANT_TYPE: &str = "refresh_token";
 const BUILDER_ID_START_URL: &str = "https://view.awsapps.com/start";
+const BUILDER_ID_AUTH_REGION: &str = "us-east-1";
 const IDC_LOGIN_SESSION_RETENTION_SECS: i64 = 15 * 60;
 const IDC_DEVICE_LOGIN_CLIENT_NAME: &str = "Kiro IDE";
 const EXTERNAL_IDP_LOGIN_SESSION_SECS: i64 = 10 * 60;
@@ -280,7 +281,7 @@ fn resolve_idc_device_start_url(
     start_url: Option<&str>,
 ) -> Result<String, AdminServiceError> {
     if provider.eq_ignore_ascii_case("BuilderId") {
-        return Ok(start_url.unwrap_or(BUILDER_ID_START_URL).trim().to_string());
+        return Ok(BUILDER_ID_START_URL.to_string());
     }
 
     let Some(start_url) = start_url.map(str::trim).filter(|value| !value.is_empty()) else {
@@ -296,6 +297,29 @@ fn resolve_idc_device_start_url(
         ));
     }
     Ok(start_url.to_string())
+}
+
+fn resolve_idc_device_auth_region(
+    provider: &str,
+    auth_region: Option<&str>,
+    region: Option<&str>,
+    config: &Config,
+) -> Result<String, AdminServiceError> {
+    if provider.eq_ignore_ascii_case("BuilderId") {
+        return Ok(BUILDER_ID_AUTH_REGION.to_string());
+    }
+
+    let region = auth_region
+        .or(region)
+        .unwrap_or_else(|| config.effective_auth_region())
+        .trim()
+        .to_string();
+    if region.is_empty() {
+        return Err(AdminServiceError::InvalidCredential(
+            "登录 region 不能为空".to_string(),
+        ));
+    }
+    Ok(region)
 }
 
 fn normalize_domain_name(domain: &str) -> Result<String, AdminServiceError> {
@@ -330,17 +354,13 @@ fn domain_from_work_email(email: &str) -> Result<String, AdminServiceError> {
     normalize_domain_name(domain)
 }
 
+fn domain_from_optional_work_email(value: Option<&str>) -> Option<String> {
+    value.and_then(|email| domain_from_work_email(email).ok())
+}
+
 fn resolve_external_idp_probe_domain(
     req: &ExternalIdpProbeRequest,
 ) -> Result<String, AdminServiceError> {
-    if let Some(email) = req
-        .work_email
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return domain_from_work_email(email);
-    }
     if let Some(domain) = req
         .domain_name
         .as_deref()
@@ -348,6 +368,9 @@ fn resolve_external_idp_probe_domain(
         .filter(|value| !value.is_empty())
     {
         return normalize_domain_name(domain);
+    }
+    if let Some(domain) = domain_from_optional_work_email(req.work_email.as_deref()) {
+        return Ok(domain);
     }
     if req
         .issuer_url
@@ -358,8 +381,20 @@ fn resolve_external_idp_probe_domain(
     {
         return Ok("direct-issuer".to_string());
     }
+    if req
+        .work_email
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+    {
+        return Err(AdminServiceError::InvalidCredential(
+            "External IdP 探测需要域名、邮箱型账号或 Issuer URL；非邮箱账号只能作为登录提示"
+                .to_string(),
+        ));
+    }
     Err(AdminServiceError::InvalidCredential(
-        "External IdP 探测需要 workEmail、domainName 或 issuerUrl".to_string(),
+        "External IdP 探测需要账号、domainName 或 issuerUrl".to_string(),
     ))
 }
 
@@ -805,16 +840,23 @@ fn build_kiro_portal_auth_url(
     state: &str,
     code_challenge: &str,
     redirect_uri: &str,
+    login_hint: Option<&str>,
 ) -> Result<String, AdminServiceError> {
     let mut url = url::Url::parse(KIRO_AUTH_PORTAL_URL)
         .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
     url.set_path("signin");
-    url.query_pairs_mut()
-        .append_pair("state", state)
-        .append_pair("code_challenge", code_challenge)
-        .append_pair("code_challenge_method", "S256")
-        .append_pair("redirect_uri", redirect_uri)
-        .append_pair("redirect_from", "KiroIDE");
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs
+            .append_pair("state", state)
+            .append_pair("code_challenge", code_challenge)
+            .append_pair("code_challenge_method", "S256")
+            .append_pair("redirect_uri", redirect_uri)
+            .append_pair("redirect_from", "KiroIDE");
+        if let Some(login_hint) = login_hint.map(str::trim).filter(|value| !value.is_empty()) {
+            pairs.append_pair("login_hint", login_hint);
+        }
+    }
     Ok(url.to_string())
 }
 
@@ -1998,12 +2040,10 @@ impl AdminService {
         req.proxy_password = normalize_optional_string(req.proxy_password.as_deref());
         req.proxy_id = normalize_optional_string(req.proxy_id.as_deref());
 
-        let discovery_domain = if let Some(email) = req.work_email.as_deref() {
-            Some(domain_from_work_email(email)?)
-        } else if let Some(domain) = req.domain_name.as_deref() {
+        let discovery_domain = if let Some(domain) = req.domain_name.as_deref() {
             Some(normalize_domain_name(domain)?)
         } else {
-            None
+            domain_from_optional_work_email(req.work_email.as_deref())
         };
 
         let config = self.token_manager.config();
@@ -2108,8 +2148,12 @@ impl AdminService {
             let portal_state = random_oauth_state()?;
             let portal_code_verifier = random_pkce_code_verifier()?;
             let code_challenge = pkce_s256_challenge(&portal_code_verifier);
-            let auth_url =
-                build_kiro_portal_auth_url(&portal_state, &code_challenge, callback_url)?;
+            let auth_url = build_kiro_portal_auth_url(
+                &portal_state,
+                &code_challenge,
+                callback_url,
+                session.login_hint.as_deref(),
+            )?;
             session.portal_state = Some(portal_state);
             session.portal_code_verifier = Some(portal_code_verifier);
             session.auth_url = Some(auth_url);
@@ -2555,17 +2599,15 @@ impl AdminService {
         req.start_url = Some(start_url.clone());
 
         let config = self.token_manager.config();
-        let region = req
-            .auth_region
-            .as_deref()
-            .or(req.region.as_deref())
-            .unwrap_or_else(|| config.effective_auth_region())
-            .trim()
-            .to_string();
-        if region.is_empty() {
-            return Err(AdminServiceError::InvalidCredential(
-                "登录 region 不能为空".to_string(),
-            ));
+        let region = resolve_idc_device_auth_region(
+            &provider,
+            req.auth_region.as_deref(),
+            req.region.as_deref(),
+            &config,
+        )?;
+        if provider.eq_ignore_ascii_case("BuilderId") {
+            req.region = None;
+            req.auth_region = Some(region.clone());
         }
 
         let proxy = self.login_proxy_for_request(&req)?;
@@ -5714,6 +5756,14 @@ mod tests {
             resolve_idc_device_start_url("BuilderId", None).unwrap(),
             BUILDER_ID_START_URL
         );
+        assert_eq!(
+            resolve_idc_device_start_url(
+                "BuilderId",
+                Some("https://d-1234567890.awsapps.com/start")
+            )
+            .unwrap(),
+            BUILDER_ID_START_URL
+        );
         assert!(resolve_idc_device_start_url("Enterprise", None).is_err());
         assert!(
             resolve_idc_device_start_url("Enterprise", Some("http://example.com/start")).is_err()
@@ -5725,6 +5775,37 @@ mod tests {
             )
             .unwrap(),
             "https://d-1234567890.awsapps.com/start"
+        );
+    }
+
+    #[test]
+    fn resolve_idc_device_auth_region_pins_builder_id_to_us_east_1() {
+        let mut config = Config::default();
+        config.region = "eu-west-1".to_string();
+        config.auth_region = Some("ap-southeast-1".to_string());
+
+        assert_eq!(
+            resolve_idc_device_auth_region(
+                "BuilderId",
+                Some("eu-central-1"),
+                Some("us-west-2"),
+                &config
+            )
+            .unwrap(),
+            BUILDER_ID_AUTH_REGION
+        );
+        assert_eq!(
+            resolve_idc_device_auth_region("Enterprise", Some("eu-central-1"), None, &config)
+                .unwrap(),
+            "eu-central-1"
+        );
+        assert_eq!(
+            resolve_idc_device_auth_region("Enterprise", None, Some("us-west-2"), &config).unwrap(),
+            "us-west-2"
+        );
+        assert_eq!(
+            resolve_idc_device_auth_region("Enterprise", None, None, &config).unwrap(),
+            "ap-southeast-1"
         );
     }
 
@@ -5798,6 +5879,28 @@ mod tests {
     }
 
     #[test]
+    fn builder_id_device_login_add_request_uses_pinned_auth_region() {
+        let manager =
+            Arc::new(MultiTokenManager::new(Config::default(), vec![], None, None, false).unwrap());
+        let service = AdminService::new(manager);
+        let mut session = idc_device_login_session_for_test("BuilderId");
+        session.region = BUILDER_ID_AUTH_REGION.to_string();
+        session.request.auth_region = Some(BUILDER_ID_AUTH_REGION.to_string());
+        session.request.api_region = Some("eu-central-1".to_string());
+
+        let req = service.build_idc_device_add_credential_request(
+            &session,
+            AwsCreateTokenResponse {
+                refresh_token: "refresh-token".to_string(),
+            },
+        );
+
+        assert_eq!(req.region, None);
+        assert_eq!(req.auth_region.as_deref(), Some(BUILDER_ID_AUTH_REGION));
+        assert_eq!(req.api_region.as_deref(), Some("eu-central-1"));
+    }
+
+    #[test]
     fn enterprise_device_login_add_request_persists_provider_and_start_url() {
         let manager =
             Arc::new(MultiTokenManager::new(Config::default(), vec![], None, None, false).unwrap());
@@ -5846,6 +5949,11 @@ mod tests {
             domain_from_work_email("User@Example.COM").unwrap(),
             "example.com"
         );
+        assert_eq!(
+            domain_from_optional_work_email(Some("User@Example.COM")).as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(domain_from_optional_work_email(Some("missing-at")), None);
         assert_eq!(
             normalize_domain_name("@Example.COM").unwrap(),
             "example.com"
@@ -5937,6 +6045,25 @@ mod tests {
         let kiro_pkce_req: StartExternalIdpLoginRequest =
             serde_json::from_str(r#"{"flow":"kiro-pkce"}"#).unwrap();
         assert_eq!(kiro_pkce_req.flow, ExternalIdpLoginFlow::KiroPkce);
+    }
+
+    #[test]
+    fn external_idp_portal_url_preserves_non_email_login_hint() {
+        let url = build_kiro_portal_auth_url(
+            "state-1",
+            "challenge-1",
+            "https://proxy.example.com/api/admin/auth/external-idp/callback",
+            Some("domain\\user01"),
+        )
+        .unwrap();
+        let parsed = url::Url::parse(&url).unwrap();
+        let pairs: HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+
+        assert_eq!(pairs.get("state").map(String::as_str), Some("state-1"));
+        assert_eq!(
+            pairs.get("login_hint").map(String::as_str),
+            Some("domain\\user01")
+        );
     }
 
     #[test]
