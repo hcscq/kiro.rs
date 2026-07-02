@@ -2608,6 +2608,8 @@ impl AdminService {
         if provider.eq_ignore_ascii_case("BuilderId") {
             req.region = None;
             req.auth_region = Some(region.clone());
+        } else if provider.eq_ignore_ascii_case("Enterprise") && req.api_region.is_none() {
+            req.api_region = Some(region.clone());
         }
 
         let proxy = self.login_proxy_for_request(&req)?;
@@ -3800,6 +3802,21 @@ impl AdminService {
         token: AwsCreateTokenResponse,
     ) -> AddCredentialRequest {
         let req = &session.request;
+        let is_enterprise = session.provider.eq_ignore_ascii_case("Enterprise");
+        let auth_region = req
+            .auth_region
+            .clone()
+            .or_else(|| req.region.clone())
+            .or_else(|| Some(session.region.clone()));
+        let api_region = if is_enterprise {
+            req.api_region
+                .clone()
+                .or_else(|| req.region.clone())
+                .or_else(|| req.auth_region.clone())
+                .or_else(|| Some(session.region.clone()))
+        } else {
+            req.api_region.clone()
+        };
         AddCredentialRequest {
             refresh_token: token.refresh_token,
             auth_method: "idc".to_string(),
@@ -3807,7 +3824,7 @@ impl AdminService {
             // idc imports, which do not persist provider=BuilderId. Persisting it
             // makes quota lookups inject Kiro's fixed BuilderId profileArn and can
             // report a paid account as KIRO FREE.
-            provider: if session.provider.eq_ignore_ascii_case("Enterprise") {
+            provider: if is_enterprise {
                 Some(session.provider.clone())
             } else {
                 None
@@ -3825,17 +3842,13 @@ impl AdminService {
             rate_limit_bucket_capacity: None,
             rate_limit_refill_per_second: None,
             // The device-login region is the AWS SSO OIDC/Auth region. Persist it
-            // as authRegion so it does not become the API region fallback for
-            // Enterprise ListAvailableModels/runtime calls.
+            // as authRegion; for Enterprise, use it as the API region default only
+            // when the user did not choose an explicit API region.
             region: None,
-            auth_region: req
-                .auth_region
-                .clone()
-                .or_else(|| req.region.clone())
-                .or_else(|| Some(session.region.clone())),
-            api_region: req.api_region.clone(),
+            auth_region: auth_region.clone(),
+            api_region,
             machine_id: req.machine_id.clone(),
-            start_url: if session.provider.eq_ignore_ascii_case("Enterprise") {
+            start_url: if is_enterprise {
                 Some(session.start_url.clone())
             } else {
                 None
@@ -5923,13 +5936,14 @@ mod tests {
     }
 
     #[test]
-    fn enterprise_device_login_add_request_keeps_auth_region_out_of_api_region_fallback() {
+    fn enterprise_device_login_add_request_defaults_api_region_to_login_region() {
         let manager =
             Arc::new(MultiTokenManager::new(Config::default(), vec![], None, None, false).unwrap());
         let service = AdminService::new(manager);
         let mut session = idc_device_login_session_for_test("Enterprise");
-        session.region = "us-east-2".to_string();
-        session.request.region = Some("us-east-2".to_string());
+        session.region = "eu-central-1".to_string();
+        session.request.auth_region = Some("eu-central-1".to_string());
+        session.request.api_region = None;
 
         let req = service.build_idc_device_add_credential_request(
             &session,
@@ -5939,8 +5953,8 @@ mod tests {
         );
 
         assert_eq!(req.region, None);
-        assert_eq!(req.auth_region.as_deref(), Some("us-east-2"));
-        assert_eq!(req.api_region, None);
+        assert_eq!(req.auth_region.as_deref(), Some("eu-central-1"));
+        assert_eq!(req.api_region.as_deref(), Some("eu-central-1"));
     }
 
     #[test]
