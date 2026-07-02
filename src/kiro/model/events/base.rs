@@ -16,6 +16,8 @@ pub enum EventType {
     Metering,
     /// 上下文使用率事件
     ContextUsage,
+    /// 元数据事件
+    Metadata,
     /// 推理内容事件
     ReasoningContent,
     /// 未知事件类型
@@ -30,6 +32,7 @@ impl EventType {
             "toolUseEvent" => Self::ToolUse,
             "meteringEvent" => Self::Metering,
             "contextUsageEvent" => Self::ContextUsage,
+            "metadataEvent" => Self::Metadata,
             "reasoningContentEvent" => Self::ReasoningContent,
             _ => Self::Unknown,
         }
@@ -42,6 +45,7 @@ impl EventType {
             Self::ToolUse => "toolUseEvent",
             Self::Metering => "meteringEvent",
             Self::ContextUsage => "contextUsageEvent",
+            Self::Metadata => "metadataEvent",
             Self::ReasoningContent => "reasoningContentEvent",
             Self::Unknown => "unknown",
         }
@@ -75,6 +79,8 @@ pub enum Event {
     Metering(()),
     /// 上下文使用率
     ContextUsage(super::ContextUsageEvent),
+    /// 元数据
+    Metadata(super::MetadataEvent),
     /// 推理内容
     ReasoningContent(super::ReasoningContentEvent),
     /// 未知事件 (保留原始帧数据)
@@ -126,6 +132,10 @@ impl Event {
             EventType::ContextUsage => {
                 let payload = super::ContextUsageEvent::from_frame(&frame)?;
                 Ok(Self::ContextUsage(payload))
+            }
+            EventType::Metadata => {
+                let payload = super::MetadataEvent::from_frame(&frame)?;
+                Ok(Self::Metadata(payload))
             }
             EventType::ReasoningContent => {
                 let payload = super::ReasoningContentEvent::from_frame(&frame)?;
@@ -182,6 +192,7 @@ mod tests {
             EventType::from_str("contextUsageEvent"),
             EventType::ContextUsage
         );
+        assert_eq!(EventType::from_str("metadataEvent"), EventType::Metadata);
         assert_eq!(
             EventType::from_str("reasoningContentEvent"),
             EventType::ReasoningContent

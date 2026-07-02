@@ -73,6 +73,8 @@ const AMAZON_EVENTSTREAM_CONTENT_TYPE: &str = "application/vnd.amazon.eventstrea
 const MAX_NON_STREAM_EVENTSTREAM_STALL_FAILOVERS: usize = 1;
 const CONTEXT_LENGTH_EXCEEDED_CODE: &str = "context_length_exceeded";
 const CONTEXT_LENGTH_EXCEEDED_PUBLIC_MESSAGE: &str = "prompt is too long: context window is full. Reduce conversation history, system prompt, or tools.";
+const UPSTREAM_NO_USABLE_CONTENT_PUBLIC_MESSAGE: &str =
+    "Upstream did not return usable content. Retry later or adjust the request.";
 const DEFAULT_CAPTURE_400_DIR: &str = "/app/diagnostics/400-bodies";
 const DEFAULT_CAPTURE_400_MAX_PER_CLASS: usize = 3;
 const DEFAULT_CAPTURE_400_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
@@ -784,6 +786,10 @@ fn summarize_error_sources(error: &reqwest::Error) -> String {
     sources.join(" | ")
 }
 
+fn summarize_metadata_stop_reason(value: impl AsRef<str>) -> String {
+    summarize_text_for_log(value.as_ref().trim(), 64)
+}
+
 fn response_header_for_log(headers: &HeaderMap, name: &'static str) -> Option<String> {
     headers
         .get(name)
@@ -836,6 +842,8 @@ struct NonStreamEventStreamReadDiagnostics {
     tool_use_stop_events: usize,
     metering_events: usize,
     context_usage_events: usize,
+    metadata_events: usize,
+    metadata_stop_reason: Option<String>,
     unknown_events: usize,
     error_events: usize,
     exception_events: usize,
@@ -879,6 +887,12 @@ impl NonStreamEventStreamReadDiagnostics {
             Ok(Event::ContextUsage(_)) => {
                 self.context_usage_events = self.context_usage_events.saturating_add(1);
             }
+            Ok(Event::Metadata(metadata)) => {
+                self.metadata_events = self.metadata_events.saturating_add(1);
+                if let Some(stop_reason) = metadata.stop_reason {
+                    self.metadata_stop_reason = Some(summarize_metadata_stop_reason(stop_reason));
+                }
+            }
             Ok(Event::Unknown {}) => {
                 self.unknown_events = self.unknown_events.saturating_add(1);
             }
@@ -907,6 +921,7 @@ impl NonStreamEventStreamReadDiagnostics {
     fn safe_to_retry_stall(&self) -> bool {
         self.observed_frames > 0
             && !self.has_usable_output()
+            && self.metadata_events == 0
             && self.error_events == 0
             && self.exception_events == 0
             && self.payload_parse_errors == 0
@@ -1064,6 +1079,9 @@ async fn read_response_body_with_trace_timeout(
                         eventstream_tool_use_stop_events = diagnostics.tool_use_stop_events,
                         eventstream_metering_events = diagnostics.metering_events,
                         eventstream_context_usage_events = diagnostics.context_usage_events,
+                        eventstream_metadata_events = diagnostics.metadata_events,
+                        eventstream_metadata_stop_reason =
+                            diagnostics.metadata_stop_reason.as_deref().unwrap_or(""),
                         eventstream_unknown_events = diagnostics.unknown_events,
                         eventstream_error_events = diagnostics.error_events,
                         eventstream_exception_events = diagnostics.exception_events,
@@ -1105,6 +1123,8 @@ struct StreamContentStartProbe {
     reasoning_events: usize,
     reasoning_text_bytes: usize,
     tool_use_events: usize,
+    metadata_events: usize,
+    metadata_stop_reason: Option<String>,
     error_events: usize,
     completion_evidence_events: usize,
 }
@@ -1121,6 +1141,8 @@ impl StreamContentStartProbe {
             reasoning_events: 0,
             reasoning_text_bytes: 0,
             tool_use_events: 0,
+            metadata_events: 0,
+            metadata_stop_reason: None,
             error_events: 0,
             completion_evidence_events: 0,
         }
@@ -1159,6 +1181,15 @@ impl StreamContentStartProbe {
             }
             Event::Metering(()) => {
                 self.non_error_events = self.non_error_events.saturating_add(1);
+                false
+            }
+            Event::Metadata(metadata) => {
+                self.non_error_events = self.non_error_events.saturating_add(1);
+                self.metadata_events = self.metadata_events.saturating_add(1);
+                if let Some(stop_reason) = metadata.stop_reason.as_deref() {
+                    self.metadata_stop_reason =
+                        Some(summarize_metadata_stop_reason(stop_reason.to_string()));
+                }
                 false
             }
             Event::Error { .. } | Event::Exception { .. } => {
@@ -1212,6 +1243,8 @@ impl StreamContentStartProbe {
             reasoning_events: self.reasoning_events,
             reasoning_text_bytes: self.reasoning_text_bytes,
             tool_use_events: self.tool_use_events,
+            metadata_events: self.metadata_events,
+            metadata_stop_reason: self.metadata_stop_reason.clone(),
             error_events: self.error_events,
             completion_evidence_events: self.completion_evidence_events,
         }
@@ -1226,7 +1259,7 @@ fn stream_content_probe_safe_prefix_len(buffer: &str) -> usize {
     boundary
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct StreamContentStartProbeDiagnostics {
     observed_events: usize,
     non_error_events: usize,
@@ -1235,6 +1268,8 @@ struct StreamContentStartProbeDiagnostics {
     reasoning_events: usize,
     reasoning_text_bytes: usize,
     tool_use_events: usize,
+    metadata_events: usize,
+    metadata_stop_reason: Option<String>,
     error_events: usize,
     completion_evidence_events: usize,
 }
@@ -1248,6 +1283,22 @@ impl StreamContentStartProbeDiagnostics {
 
     fn is_legal_empty_completion(&self) -> bool {
         !self.has_usable_output() && self.completion_evidence_events > 0 && self.error_events == 0
+    }
+
+    fn empty_output_classification(&self) -> &'static str {
+        if self
+            .metadata_stop_reason
+            .as_deref()
+            .is_some_and(|reason| reason.eq_ignore_ascii_case("CONTENT_FILTERED"))
+        {
+            "metadata_content_filtered"
+        } else if self.metadata_events > 0 {
+            "metadata_without_output"
+        } else if self.non_error_events > 0 {
+            "non_output_events_only"
+        } else {
+            "no_observed_events"
+        }
     }
 }
 
@@ -1779,6 +1830,9 @@ fn capture_stream_ended_without_content_for_diagnostics_inner(
         "prefetch_reasoning_events": diagnostics.reasoning_events,
         "prefetch_reasoning_text_bytes": diagnostics.reasoning_text_bytes,
         "prefetch_tool_use_events": diagnostics.tool_use_events,
+        "prefetch_metadata_events": diagnostics.metadata_events,
+        "prefetch_metadata_stop_reason": diagnostics.metadata_stop_reason,
+        "prefetch_empty_output_classification": diagnostics.empty_output_classification(),
         "prefetch_error_events": diagnostics.error_events,
         "prefetch_completion_evidence_events": diagnostics.completion_evidence_events,
         "total_elapsed_ms": req.total_elapsed.as_millis(),
@@ -1806,6 +1860,9 @@ fn capture_stream_ended_without_content_for_diagnostics_inner(
         request_body_bytes = req.request_body.len(),
         prefetched_bytes = req.prefetched_bytes,
         prefetch_observed_events = diagnostics.observed_events,
+        prefetch_metadata_events = diagnostics.metadata_events,
+        prefetch_metadata_stop_reason = diagnostics.metadata_stop_reason.as_deref().unwrap_or(""),
+        prefetch_empty_output_classification = diagnostics.empty_output_classification(),
         prefetch_completion_evidence_events = diagnostics.completion_evidence_events,
         capture_dir = %class_dir.display(),
         "已保存流式空响应请求体诊断样本"
@@ -4518,6 +4575,14 @@ impl KiroProvider {
                                 .as_ref()
                                 .map(|diagnostics| diagnostics.tool_use_events)
                                 .unwrap_or(0);
+                            let eventstream_metadata_events = eventstream_diagnostics
+                                .as_ref()
+                                .map(|diagnostics| diagnostics.metadata_events)
+                                .unwrap_or(0);
+                            let eventstream_metadata_stop_reason = eventstream_diagnostics
+                                .as_ref()
+                                .and_then(|diagnostics| diagnostics.metadata_stop_reason.as_deref())
+                                .unwrap_or("");
                             let eventstream_unknown_events = eventstream_diagnostics
                                 .as_ref()
                                 .map(|diagnostics| diagnostics.unknown_events)
@@ -4587,6 +4652,8 @@ impl KiroProvider {
                                 eventstream_reasoning_events,
                                 eventstream_reasoning_text_bytes,
                                 eventstream_tool_use_events,
+                                eventstream_metadata_events,
+                                eventstream_metadata_stop_reason,
                                 eventstream_unknown_events,
                                 eventstream_error_events,
                                 eventstream_exception_events,
@@ -4994,7 +5061,7 @@ impl KiroProvider {
                                     elapsed,
                                     total_elapsed: overall_started_at.elapsed(),
                                     prefetched_bytes,
-                                    probe_diagnostics,
+                                    probe_diagnostics: probe_diagnostics.clone(),
                                 },
                             );
                             tracing::warn!(
@@ -5017,6 +5084,11 @@ impl KiroProvider {
                                 prefetch_reasoning_text_bytes =
                                     probe_diagnostics.reasoning_text_bytes,
                                 prefetch_tool_use_events = probe_diagnostics.tool_use_events,
+                                prefetch_metadata_events = probe_diagnostics.metadata_events,
+                                prefetch_metadata_stop_reason =
+                                    probe_diagnostics.metadata_stop_reason.as_deref().unwrap_or(""),
+                                prefetch_empty_output_classification =
+                                    probe_diagnostics.empty_output_classification(),
                                 prefetch_error_events = probe_diagnostics.error_events,
                                 prefetch_completion_evidence_events =
                                     probe_diagnostics.completion_evidence_events,
@@ -5024,17 +5096,19 @@ impl KiroProvider {
                             );
                             return Err(anyhow::Error::new(PublicProviderError::bad_gateway(
                                 format!(
-                                    "{} API 上游流提前结束且没有合法空完成证据: request_id={} credential_id={} attempt={} prefetched_bytes={} observed_events={} completion_evidence_events={} total_elapsed_ms={}",
+                                    "{} API 上游流提前结束且没有合法空完成证据: request_id={} credential_id={} attempt={} prefetched_bytes={} observed_events={} metadata_events={} empty_output_classification={} completion_evidence_events={} total_elapsed_ms={}",
                                     api_type,
                                     request_id,
                                     ctx_id,
                                     attempt + 1,
                                     prefetched_bytes,
                                     probe_diagnostics.observed_events,
+                                    probe_diagnostics.metadata_events,
+                                    probe_diagnostics.empty_output_classification(),
                                     probe_diagnostics.completion_evidence_events,
                                     overall_started_at.elapsed().as_millis()
                                 ),
-                                "Upstream stream ended before a complete response was received. Retry later.",
+                                UPSTREAM_NO_USABLE_CONTENT_PUBLIC_MESSAGE,
                             )));
                         }
                         Err(err) => {
@@ -6312,8 +6386,10 @@ mod tests {
         assert_eq!(public.error_type(), "api_error");
         assert_eq!(
             public.public_message(),
-            "Upstream stream ended before a complete response was received. Retry later."
+            UPSTREAM_NO_USABLE_CONTENT_PUBLIC_MESSAGE
         );
+        assert!(!public.public_message().contains("CONTENT_FILTERED"));
+        assert!(!public.public_message().contains("request_id"));
         assert!(
             public
                 .to_string()
@@ -6802,6 +6878,8 @@ mod tests {
                 reasoning_events: 0,
                 reasoning_text_bytes: 0,
                 tool_use_events: 0,
+                metadata_events: 0,
+                metadata_stop_reason: None,
                 error_events: 0,
                 completion_evidence_events: 0,
             },
@@ -7996,6 +8074,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_stream_content_prefetch_records_metadata_stop_reason() {
+        let metadata = event_frame("metadataEvent", br#"{"stopReason":"CONTENT_FILTERED"}"#);
+        let context_usage = event_frame("contextUsageEvent", br#"{"contextUsagePercentage":8.3}"#);
+        let metering = event_frame("meteringEvent", br#"{"unit":"credit","usage":0.1}"#);
+        let result =
+            prefetch_probe_result_for_chunks(vec![metadata, context_usage, metering], false).await;
+
+        match result {
+            StreamContentStartPrefetch::EndedWithoutContent {
+                probe_diagnostics, ..
+            } => {
+                assert_eq!(probe_diagnostics.observed_events, 3);
+                assert_eq!(probe_diagnostics.non_error_events, 3);
+                assert_eq!(probe_diagnostics.metadata_events, 1);
+                assert_eq!(
+                    probe_diagnostics.metadata_stop_reason.as_deref(),
+                    Some("CONTENT_FILTERED")
+                );
+                assert_eq!(
+                    probe_diagnostics.empty_output_classification(),
+                    "metadata_content_filtered"
+                );
+                assert_eq!(probe_diagnostics.completion_evidence_events, 0);
+                assert!(!probe_diagnostics.is_legal_empty_completion());
+            }
+            StreamContentStartPrefetch::Ready { ready_reason, .. } => {
+                panic!("metadata-only EOF must not be ready: {ready_reason}")
+            }
+            StreamContentStartPrefetch::TimedOut { .. } => {
+                panic!("metadata-only EOF should be classified immediately")
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_stream_content_prefetch_accepts_empty_assistant_completion() {
         let frame = event_frame("assistantResponseEvent", br#"{"content":""}"#);
         let result = prefetch_probe_result_for_chunks(vec![frame], false).await;
@@ -8153,6 +8266,27 @@ mod tests {
         assert_eq!(diagnostics.assistant_events, 1);
         assert_eq!(diagnostics.assistant_content_bytes, 5);
         assert!(diagnostics.has_usable_output());
+        assert!(!diagnostics.safe_to_retry_stall());
+    }
+
+    #[test]
+    fn test_non_stream_eventstream_diagnostics_counts_metadata_stop_reason() {
+        let mut decoder = EventStreamDecoder::new();
+        let frame = event_frame("metadataEvent", br#"{"stopReason":"CONTENT_FILTERED"}"#);
+        decoder.feed(&frame).unwrap();
+
+        let parsed = decoder.decode().unwrap().unwrap();
+        let mut diagnostics = NonStreamEventStreamReadDiagnostics::default();
+        diagnostics.observe_frame(parsed);
+
+        assert_eq!(diagnostics.observed_frames, 1);
+        assert_eq!(diagnostics.metadata_events, 1);
+        assert_eq!(
+            diagnostics.metadata_stop_reason.as_deref(),
+            Some("CONTENT_FILTERED")
+        );
+        assert_eq!(diagnostics.unknown_events, 0);
+        assert!(!diagnostics.has_usable_output());
         assert!(!diagnostics.safe_to_retry_stall());
     }
 
