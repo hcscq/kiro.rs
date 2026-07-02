@@ -43,6 +43,7 @@ struct BufferedAnthropicRequest {
     method: Method,
     uri: Uri,
     original_uri: Option<Uri>,
+    api_key_context: Option<ApiKeyAuthContext>,
     headers: HeaderMap,
     body: Bytes,
 }
@@ -53,10 +54,12 @@ impl BufferedAnthropicRequest {
             .extensions
             .get::<OriginalUri>()
             .map(|value| value.0.clone());
+        let api_key_context = parts.extensions.get::<ApiKeyAuthContext>().cloned();
         Self {
             method: parts.method,
             uri: parts.uri,
             original_uri,
+            api_key_context,
             headers: parts.headers,
             body,
         }
@@ -95,6 +98,9 @@ impl BufferedAnthropicRequest {
         request.extensions_mut().insert(buffered_body);
         if let Some(original_uri) = self.original_uri {
             request.extensions_mut().insert(OriginalUri(original_uri));
+        }
+        if let Some(api_key_context) = self.api_key_context {
+            request.extensions_mut().insert(api_key_context);
         }
         request
     }
@@ -568,13 +574,15 @@ pub fn cors_layer() -> tower_http::cors::CorsLayer {
 mod tests {
     use super::{
         ANTHROPIC_RUNTIME_LEADER_REQUIRED_HEADER, AppState, auth_middleware,
-        message_routing_middleware, requires_leader_message_routing,
+        BufferedAnthropicRequest, message_routing_middleware, requires_leader_message_routing,
         response_requires_runtime_leader_forwarding, strip_internal_routing_headers,
     };
+    use crate::common::auth::{ApiKeyAuthContext, CredentialGroupScope};
     use axum::{
+        extract::OriginalUri,
         Router,
-        body::Body,
-        http::{Method, Response, StatusCode},
+        body::{Body, Bytes},
+        http::{Method, Request, Response, StatusCode, Uri},
         middleware,
         routing::post,
     };
@@ -618,6 +626,38 @@ mod tests {
         assert!(response_requires_runtime_leader_forwarding(&response));
         strip_internal_routing_headers(&mut response);
         assert!(!response_requires_runtime_leader_forwarding(&response));
+    }
+
+    #[test]
+    fn buffered_anthropic_request_preserves_api_key_context() {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(OriginalUri(
+            "/v1/messages".parse::<Uri>().unwrap(),
+        ));
+        request.extensions_mut().insert(ApiKeyAuthContext {
+            id: "cheap".to_string(),
+            credential_group_scope: CredentialGroupScope::Groups(vec!["cheap".to_string()]),
+        });
+
+        let (parts, _) = request.into_parts();
+        let rebuilt =
+            BufferedAnthropicRequest::from_request_parts(parts, Bytes::from_static(b"{}"))
+                .into_axum_request();
+        let context = rebuilt
+            .extensions()
+            .get::<ApiKeyAuthContext>()
+            .expect("api key context should survive request buffering");
+
+        assert_eq!(context.id, "cheap");
+        assert_eq!(
+            context.credential_group_scope,
+            CredentialGroupScope::Groups(vec!["cheap".to_string()])
+        );
+        assert!(rebuilt.extensions().get::<OriginalUri>().is_some());
     }
 
     #[tokio::test]
